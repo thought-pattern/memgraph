@@ -11,6 +11,8 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 
 #include <mgp.hpp>
@@ -47,17 +49,36 @@ void ShowIndexInfo(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result
 void CosineSimilarityFunction(mgp_list *args, mgp_func_context *ctx, mgp_func_result *res, mgp_memory *memory);
 }  // namespace VectorSearch
 
+namespace {
+void ReportProcedureError(const mgp::RecordFactory &record_factory, const char *message) noexcept {
+  try {
+    record_factory.SetErrorMessage(message);
+  } catch (...) {
+  }
+}
+
+void ReportFunctionError(mgp_func_result *res, const char *message, mgp_memory *memory) noexcept {
+  try {
+    mgp::func_result_set_error_msg(res, message, memory);
+  } catch (...) {
+  }
+}
+}  // namespace
+
 void VectorSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto result_set_size = arguments[1].ValueInt();
+    if (result_set_size < 0 || result_set_size > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("result_set_size must be between 0 and INT_MAX.");
+    }
     auto query_vector = arguments[2].ValueList();
 
-    auto results = mgp::SearchVectorIndex(memgraph_graph, index_name, query_vector, result_set_size);
+    auto results = mgp::SearchVectorIndex(memgraph_graph, index_name, query_vector, static_cast<int>(result_set_size));
 
     for (const auto &result : results) {
       auto record = record_factory.NewRecord();
@@ -69,21 +90,27 @@ void VectorSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
     }
 
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in vector_search.search.");
   }
 }
 
 void VectorSearch::SearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto result_set_size = arguments[1].ValueInt();
+    if (result_set_size < 0 || result_set_size > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("result_set_size must be between 0 and INT_MAX.");
+    }
     auto query_vector = arguments[2].ValueList();
 
-    auto results = mgp::SearchVectorIndexOnEdges(memgraph_graph, index_name, query_vector, result_set_size);
+    auto results =
+        mgp::SearchVectorIndexOnEdges(memgraph_graph, index_name, query_vector, static_cast<int>(result_set_size));
 
     for (const auto &result : results) {
       auto record = record_factory.NewRecord();
@@ -95,16 +122,19 @@ void VectorSearch::SearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_re
     }
 
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in vector_search.search_edges.");
   }
 }
 
 void VectorSearch::ShowIndexInfo(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
+    (void)arguments;
     const auto index_info = mgp::GetVectorIndexInfo(memgraph_graph);
 
     for (const auto &info : index_info) {
@@ -121,15 +151,16 @@ void VectorSearch::ShowIndexInfo(mgp_list *args, mgp_graph *memgraph_graph, mgp_
       record.Insert(VectorSearch::kReturnIndexType.data(), info_list[8].ValueString());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in vector_search.show_index_info.");
   }
 }
 
 void VectorSearch::CosineSimilarityFunction(mgp_list *args, mgp_func_context * /*ctx*/, mgp_func_result *res,
                                             mgp_memory *memory) {
+  mgp::MemoryDispatcherGuard guard{memory};
   try {
-    mgp::MemoryDispatcherGuard guard{memory};
-
     const auto vector1 = mgp::Value(mgp::ref_type, mgp::list_at(args, 0)).ValueList();
     const auto vector2 = mgp::Value(mgp::ref_type, mgp::list_at(args, 1)).ValueList();
 
@@ -167,7 +198,9 @@ void VectorSearch::CosineSimilarityFunction(mgp_list *args, mgp_func_context * /
     auto result = mgp::Result(res);
     result.SetValue(cosine_similarity);
   } catch (const std::exception &e) {
-    mgp::func_result_set_error_msg(res, e.what(), memory);
+    ReportFunctionError(res, e.what(), memory);
+  } catch (...) {
+    ReportFunctionError(res, "Unknown error occurred in vector_search.cosine_similarity.", memory);
   }
 }
 
@@ -234,6 +267,8 @@ extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *mem
                      memory);
   } catch (const std::exception &e) {
     std::cerr << "Error while initializing query module: " << e.what() << '\n';
+    return 1;
+  } catch (...) {
     return 1;
   }
 

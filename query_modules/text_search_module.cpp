@@ -62,6 +62,13 @@ void AggregateEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *resul
 }  // namespace TextSearch
 
 namespace {
+void ReportProcedureError(const mgp::RecordFactory &record_factory, const char *message) noexcept {
+  try {
+    record_factory.SetErrorMessage(message);
+  } catch (...) {
+  }
+}
+
 int64_t ExtractInt(const mgp::Map &config, std::string_view key) {
   const auto value = config.At(key);
   if (!value.IsInt()) {
@@ -139,9 +146,9 @@ mgp::TextSearchConfig TextSearch::ParseConfig(const mgp::Map &config, bool fuzzy
 void TextSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
@@ -153,7 +160,9 @@ void TextSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *r
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.search.");
   }
 }
 
@@ -162,9 +171,9 @@ void TextSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *r
 void TextSearch::FuzzyPhraseSearch(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto config_map = arguments[2].ValueMap();
@@ -179,7 +188,9 @@ void TextSearch::FuzzyPhraseSearch(mgp_list *args, mgp_graph *memgraph_graph, mg
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.fuzzy_phrase_search.");
   }
 }
 
@@ -188,9 +199,9 @@ void TextSearch::FuzzyPhraseSearchEdges(mgp_list *args, mgp_graph *memgraph_grap
                                         mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto config_map = arguments[2].ValueMap();
@@ -205,16 +216,18 @@ void TextSearch::FuzzyPhraseSearchEdges(mgp_list *args, mgp_graph *memgraph_grap
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.fuzzy_phrase_search_edges.");
   }
 }
 
 void TextSearch::RegexSearch(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/false);
@@ -226,7 +239,9 @@ void TextSearch::RegexSearch(mgp_list *args, mgp_graph *memgraph_graph, mgp_resu
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.regex_search.");
   }
 }
 
@@ -234,9 +249,9 @@ void TextSearch::SearchAllProperties(mgp_list *args, mgp_graph *memgraph_graph, 
                                      mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = fmt::format("{}:{}", kSearchAllPrefix, arguments[1].ValueString());
     const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
@@ -248,16 +263,18 @@ void TextSearch::SearchAllProperties(mgp_list *args, mgp_graph *memgraph_graph, 
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.search_all.");
   }
 }
 
 void TextSearch::Aggregate(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto aggregation_query = arguments[2].ValueString();
@@ -266,16 +283,18 @@ void TextSearch::Aggregate(mgp_list *args, mgp_graph *memgraph_graph, mgp_result
     auto record = record_factory.NewRecord();
     record.Insert(TextSearch::kReturnAggregation.data(), aggregation_result.data());
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.aggregate.");
   }
 }
 
 void TextSearch::SearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
@@ -287,16 +306,18 @@ void TextSearch::SearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_resu
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.search_edges.");
   }
 }
 
 void TextSearch::RegexSearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/false);
@@ -308,7 +329,9 @@ void TextSearch::RegexSearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.regex_search_edges.");
   }
 }
 
@@ -316,9 +339,9 @@ void TextSearch::SearchAllPropertiesEdges(mgp_list *args, mgp_graph *memgraph_gr
                                           mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = fmt::format("{}:{}", kSearchAllPrefix, arguments[1].ValueString());
     const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
@@ -330,16 +353,18 @@ void TextSearch::SearchAllPropertiesEdges(mgp_list *args, mgp_graph *memgraph_gr
       record.Insert(TextSearch::kReturnScore.data(), row_list[1].ValueDouble());
     }
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.search_all_edges.");
   }
 }
 
 void TextSearch::AggregateEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
 
   try {
+    auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
     const auto aggregation_query = arguments[2].ValueString();
@@ -348,7 +373,9 @@ void TextSearch::AggregateEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_r
     auto record = record_factory.NewRecord();
     record.Insert(TextSearch::kReturnAggregation.data(), aggregation_result.data());
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    ReportProcedureError(record_factory, e.what());
+  } catch (...) {
+    ReportProcedureError(record_factory, "Unknown error occurred in text_search.aggregate_edges.");
   }
 }
 
@@ -487,6 +514,8 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  memory);
   } catch (const std::exception &e) {
     std::cerr << "Error while initializing query module: " << e.what() << '\n';
+    return 1;
+  } catch (...) {
     return 1;
   }
 

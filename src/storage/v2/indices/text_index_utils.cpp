@@ -10,10 +10,12 @@
 // licenses/APL.txt.
 
 #include <filesystem>
+#include <fstream>
 #include <range/v3/all.hpp>
 
 #include <mgcxx_text_search.hpp>
 #include <nlohmann/json.hpp>
+#include "storage/v2/exceptions.hpp"
 #include "storage/v2/indices/property_path.hpp"
 #include "storage/v2/indices/text_index_utils.hpp"
 #include "storage/v2/name_id_mapper.hpp"
@@ -58,8 +60,160 @@ std::string ToLowerCasePreservingBooleanOperators(std::string_view input) {
   return result;
 }
 
-std::string MakeIndexPath(const std::string &base_path, std::string_view index_name) {
-  return (std::filesystem::path(base_path) / index_name).string();
+void ValidateTextIndexName(std::string_view index_name) {
+  if (index_name.empty()) {
+    throw TextSearchException("Invalid text index name: name must not be empty.");
+  }
+  if (index_name == "." || index_name == ".." || index_name == kTextIndicesWatermarkFile) {
+    throw TextSearchException("Invalid text index name '{}'.", index_name);
+  }
+  for (const char ch : index_name) {
+    if (ch == '/' || ch == '\\' || ch == '\0') {
+      throw TextSearchException("Invalid text index name: path separators and null bytes are forbidden.");
+    }
+  }
+  const std::filesystem::path name_path(index_name);
+  if (name_path.is_absolute() || name_path.has_root_path() || name_path.has_parent_path() ||
+      std::distance(name_path.begin(), name_path.end()) != 1) {
+    throw TextSearchException("Invalid text index name '{}': must be a single path component.", index_name);
+  }
+}
+
+std::string MakeIndexPath(const std::filesystem::path &base_path, std::string_view index_name) {
+  ValidateTextIndexName(index_name);
+  if (base_path.empty()) {
+    throw TextSearchException("Text index base directory must not be empty.");
+  }
+  auto normalized_base = base_path.lexically_normal();
+  if (!normalized_base.has_filename() && normalized_base != normalized_base.root_path()) {
+    normalized_base = normalized_base.parent_path();
+  }
+  const auto candidate = (normalized_base / std::filesystem::path(index_name)).lexically_normal();
+  const auto rel = candidate.lexically_relative(normalized_base);
+  if (rel.empty() || rel == "." || rel == ".." || rel.is_absolute() || *rel.begin() == ".." ||
+      std::distance(rel.begin(), rel.end()) != 1) {
+    throw TextSearchException("Invalid text index path: '{}' escapes text indices directory.", index_name);
+  }
+  return candidate.string();
+}
+
+bool TextIndicesWatermark::ContainsCleanNodeIndex(const TextIndexSpec &spec) const noexcept {
+  return std::ranges::contains(clean_node_indices, spec);
+}
+
+bool TextIndicesWatermark::ContainsCleanEdgeIndex(const TextEdgeIndexSpec &spec) const noexcept {
+  return std::ranges::contains(clean_edge_indices, spec);
+}
+
+void WriteTextIndicesWatermark(const std::filesystem::path &text_indices_dir,
+                               const TextIndicesWatermark &watermark) noexcept {
+  try {
+    std::error_code ec;
+    std::filesystem::create_directories(text_indices_dir, ec);
+    if (ec) return;
+
+    nlohmann::json payload;
+    payload["storage_uuid"] = watermark.storage_uuid;
+    payload["last_durable_timestamp"] = watermark.last_durable_timestamp;
+    payload["num_committed_txns"] = watermark.num_committed_txns;
+
+    nlohmann::json nodes = nlohmann::json::array();
+    for (const auto &spec : watermark.clean_node_indices) {
+      nlohmann::json props = nlohmann::json::array();
+      for (const auto &prop : spec.properties) {
+        props.push_back(prop.AsUint());
+      }
+      nodes.push_back({{"index_name", spec.index_name}, {"scope", spec.label.AsUint()}, {"properties", std::move(props)}});
+    }
+    payload["clean_node_indices"] = std::move(nodes);
+
+    nlohmann::json edges = nlohmann::json::array();
+    for (const auto &spec : watermark.clean_edge_indices) {
+      nlohmann::json props = nlohmann::json::array();
+      for (const auto &prop : spec.properties) {
+        props.push_back(prop.AsUint());
+      }
+      edges.push_back(
+          {{"index_name", spec.index_name}, {"scope", spec.edge_type.AsUint()}, {"properties", std::move(props)}});
+    }
+    payload["clean_edge_indices"] = std::move(edges);
+
+    const auto final_path = text_indices_dir / kTextIndicesWatermarkFile;
+    const auto tmp_path = text_indices_dir / (std::string(kTextIndicesWatermarkFile) + ".tmp");
+    {
+      std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+      if (!out.is_open()) return;
+      const auto serialized = payload.dump();
+      out.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+      out.flush();
+      if (!out.good()) {
+        out.close();
+        std::filesystem::remove(tmp_path, ec);
+        return;
+      }
+    }
+    std::filesystem::rename(tmp_path, final_path, ec);
+    if (ec) {
+      std::filesystem::remove(tmp_path, ec);
+    }
+  } catch (...) {
+  }
+}
+
+std::optional<TextIndicesWatermark> ReadTextIndicesWatermark(const std::filesystem::path &text_indices_dir) noexcept {
+  try {
+    const auto final_path = text_indices_dir / kTextIndicesWatermarkFile;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(final_path, ec) || ec) {
+      return std::nullopt;
+    }
+    std::ifstream in(final_path, std::ios::binary);
+    if (!in.is_open()) {
+      return std::nullopt;
+    }
+    const auto payload = nlohmann::json::parse(in, nullptr, /*allow_exceptions=*/true);
+    if (!payload.is_object()) {
+      return std::nullopt;
+    }
+
+    TextIndicesWatermark watermark;
+    watermark.storage_uuid = payload.at("storage_uuid").get<std::string>();
+    watermark.last_durable_timestamp = payload.at("last_durable_timestamp").get<uint64_t>();
+    watermark.num_committed_txns = payload.at("num_committed_txns").get<uint64_t>();
+
+    for (const auto &entry : payload.at("clean_node_indices")) {
+      std::vector<PropertyId> props;
+      for (const auto &raw_prop : entry.at("properties")) {
+        props.push_back(PropertyId::FromUint(raw_prop.get<uint64_t>()));
+      }
+      watermark.clean_node_indices.push_back(TextIndexSpec{
+          .index_name = entry.at("index_name").get<std::string>(),
+          .label = LabelId::FromUint(entry.at("scope").get<uint64_t>()),
+          .properties = std::move(props),
+      });
+    }
+
+    for (const auto &entry : payload.at("clean_edge_indices")) {
+      std::vector<PropertyId> props;
+      for (const auto &raw_prop : entry.at("properties")) {
+        props.push_back(PropertyId::FromUint(raw_prop.get<uint64_t>()));
+      }
+      watermark.clean_edge_indices.push_back(TextEdgeIndexSpec{
+          .index_name = entry.at("index_name").get<std::string>(),
+          .edge_type = EdgeTypeId::FromUint(entry.at("scope").get<uint64_t>()),
+          .properties = std::move(props),
+      });
+    }
+    return watermark;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+void ClearTextIndicesWatermark(const std::filesystem::path &text_indices_dir) noexcept {
+  std::error_code ec;
+  std::filesystem::remove(text_indices_dir / kTextIndicesWatermarkFile, ec);
+  std::filesystem::remove(text_indices_dir / (std::string(kTextIndicesWatermarkFile) + ".tmp"), ec);
 }
 
 nlohmann::json SerializeProperties(const std::map<PropertyId, PropertyValue> &properties,

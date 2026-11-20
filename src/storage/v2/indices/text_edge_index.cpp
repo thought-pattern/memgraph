@@ -97,39 +97,74 @@ void TextEdgeIndex::PublishActiveIndices(ActiveIndicesUpdater const &updater) {
 
 void TextEdgeIndex::CreateIndex(const TextEdgeIndexSpec &index_info, VerticesIterable vertices,
                                 NameIdMapper *name_id_mapper, ProgressCallback const &on_progress) {
-  CreateTantivyIndex(MakeIndexPath(text_index_storage_dir_, index_info.index_name), index_info);
-
-  auto &index_data = *index_->at(index_info.index_name);
-  for (const auto &vertex : vertices) {
-    // Reported per vertex examined, not per edge indexed: a long run of vertices with no matching edge is
-    // still progress.
-    if (on_progress) on_progress();
-    const auto edges_accessor = vertex.OutEdges(View::NEW, {index_info.edge_type}).value();
-    for (const auto &edge : edges_accessor.edges) {
-      // If properties are specified, we serialize only those properties; otherwise, all properties of the edge.
-      auto edge_properties = index_info.properties.empty()
-                                 ? edge.Properties(View::NEW).value()
-                                 : edge.PropertiesByPropertyIds(index_info.properties, View::NEW).value();
-      TextEdgeIndex::AddEdgeToTextIndex(edge.Gid().AsInt(),
-                                        edge.FromVertex().Gid().AsInt(),
-                                        edge.ToVertex().Gid().AsInt(),
-                                        SerializeProperties(edge_properties, name_id_mapper),
-                                        StringifyProperties(edge_properties),
-                                        index_data.context);
+  const auto index_path = MakeIndexPath(text_index_storage_dir_, index_info.index_name);
+  if (index_->contains(index_info.index_name)) {
+    throw TextSearchException("Text edge index {} already exists at path: {}.", index_info.index_name, index_path);
+  }
+  if (std::filesystem::exists(index_path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(index_path, ec);
+    if (ec) {
+      throw TextSearchException("Failed to remove orphan text edge index directory {}: {}", index_info.index_name,
+                                ec.message());
     }
   }
+
   try {
-    mgcxx::text_search::commit(index_data.context);
-  } catch (const std::exception &e) {
-    throw TextSearchException("Text index commit error: {}", e.what());
+    CreateTantivyIndex(index_path, index_info);
+
+    auto &index_data = *index_->at(index_info.index_name);
+    for (const auto &vertex : vertices) {
+      // Reported per vertex examined, not per edge indexed: a long run of vertices with no matching edge is
+      // still progress.
+      if (on_progress) on_progress();
+      const auto edges_accessor = vertex.OutEdges(View::NEW, {index_info.edge_type}).value();
+      for (const auto &edge : edges_accessor.edges) {
+        // If properties are specified, we serialize only those properties; otherwise, all properties of the edge.
+        auto edge_properties = index_info.properties.empty()
+                                   ? edge.Properties(View::NEW).value()
+                                   : edge.PropertiesByPropertyIds(index_info.properties, View::NEW).value();
+        TextEdgeIndex::AddEdgeToTextIndex(edge.Gid().AsInt(),
+                                          edge.FromVertex().Gid().AsInt(),
+                                          edge.ToVertex().Gid().AsInt(),
+                                          SerializeProperties(edge_properties, name_id_mapper),
+                                          StringifyProperties(edge_properties),
+                                          index_data.context);
+      }
+    }
+    try {
+      mgcxx::text_search::commit(index_data.context);
+    } catch (const std::exception &e) {
+      throw TextSearchException("Text index commit error: {}", e.what());
+    }
+  } catch (...) {
+    if (index_->contains(index_info.index_name)) {
+      auto evicted = DropIndex(index_info.index_name);
+      if (evicted) evicted->deferred_drop = true;
+    } else {
+      std::error_code ec;
+      std::filesystem::remove_all(index_path, ec);
+    }
+    throw;
   }
 }
 
 void TextEdgeIndex::RecoverIndex(const TextEdgeIndexSpec &index_info, utils::SkipListDb<Vertex>::Accessor vertices,
                                  NameIdMapper *name_id_mapper, ActiveIndicesUpdater const &updater,
-                                 ProgressCallback const &on_progress) {
+                                 ProgressCallback const &on_progress, bool force_rebuild) {
   const auto index_path = MakeIndexPath(text_index_storage_dir_, index_info.index_name);
-  auto needs_rebuild = !std::filesystem::exists(index_path);
+  const auto watermark = ReadTextIndicesWatermark(text_index_storage_dir_);
+  bool needs_rebuild = force_rebuild || !std::filesystem::exists(index_path) || !watermark.has_value() ||
+                       !watermark->ContainsCleanEdgeIndex(index_info);
+
+  if (needs_rebuild && std::filesystem::exists(index_path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(index_path, ec);
+    if (ec) {
+      throw TextSearchException("Failed to remove stale text edge index {}: {}", index_info.index_name, ec.message());
+    }
+  }
+
   try {
     CreateTantivyIndex(index_path, index_info);
   } catch (const TextSearchException &) {
@@ -145,40 +180,51 @@ void TextEdgeIndex::RecoverIndex(const TextEdgeIndexSpec &index_info, utils::Ski
     CreateTantivyIndex(index_path, index_info);
   }
 
-  if (needs_rebuild) {
-    auto &context = index_->at(index_info.index_name)->context;
-    for (const auto &vertex : vertices) {
-      for (const auto &[edge_type, to_vertex, edge_ref] : vertex.out_edges) {
-        if (edge_type != index_info.edge_type) continue;
+  try {
+    if (needs_rebuild) {
+      auto &context = index_->at(index_info.index_name)->context;
+      for (const auto &vertex : vertices) {
+        if (vertex.deleted()) continue;
+        for (const auto &[edge_type, to_vertex, edge_ref] : vertex.out_edges) {
+          if (edge_type != index_info.edge_type) continue;
 
-        auto *edge = edge_ref.ptr;
-        auto properties_to_index =
-            FilterPropertiesToIndex(index_info.properties, edge->properties.ExtractPropertyIds());
-        if (properties_to_index.empty()) continue;
+          auto *edge = edge_ref.ptr;
+          if (edge->deleted()) continue;
+          auto properties_to_index =
+              FilterPropertiesToIndex(index_info.properties, edge->properties.ExtractPropertyIds());
+          if (properties_to_index.empty()) continue;
 
-        auto properties_to_index_map = ExtractProperties(edge->properties, properties_to_index);
-        TextEdgeIndex::AddEdgeToTextIndex(edge->gid.AsInt(),
-                                          vertex.gid.AsInt(),
-                                          to_vertex->gid.AsInt(),
-                                          SerializeProperties(properties_to_index_map, name_id_mapper),
-                                          StringifyProperties(properties_to_index_map),
-                                          context);
+          auto properties_to_index_map = ExtractProperties(edge->properties, properties_to_index);
+          TextEdgeIndex::AddEdgeToTextIndex(edge->gid.AsInt(),
+                                            vertex.gid.AsInt(),
+                                            to_vertex->gid.AsInt(),
+                                            SerializeProperties(properties_to_index_map, name_id_mapper),
+                                            StringifyProperties(properties_to_index_map),
+                                            context);
+        }
+      }
+
+      try {
+        mgcxx::text_search::commit(context);
+      } catch (const std::exception &e) {
+        throw TextSearchException("Text index commit error: {}", e.what());
       }
     }
 
-    try {
-      mgcxx::text_search::commit(context);
-    } catch (const std::exception &e) {
-      throw TextSearchException("Text index commit error: {}", e.what());
+    if (on_progress) on_progress();
+
+    PublishActiveIndices(updater);
+  } catch (...) {
+    if (index_->contains(index_info.index_name)) {
+      auto evicted = DropIndex(index_info.index_name);
+      if (evicted) evicted->deferred_drop = true;
     }
+    throw;
   }
-
-  if (on_progress) on_progress();
-
-  PublishActiveIndices(updater);
 }
 
 std::shared_ptr<TextEdgeIndexData> TextEdgeIndex::DropIndex(const std::string &index_name) {
+  ValidateTextIndexName(index_name);
   auto it = index_->find(index_name);
   if (it == index_->end()) {
     throw TextSearchException("Text index {} doesn't exist.", index_name);
@@ -211,6 +257,17 @@ std::vector<TextEdgeIndexSpec> TextEdgeIndex::ListIndices() const {
   ret.reserve(index_->size());
   for (const auto &[index_name, data_ptr] : *index_) {
     ret.emplace_back(index_name, data_ptr->scope, data_ptr->properties);
+  }
+  return ret;
+}
+
+std::vector<TextEdgeIndexSpec> TextEdgeIndex::ListCleanIndices() const {
+  std::vector<TextEdgeIndexSpec> ret;
+  ret.reserve(index_->size());
+  for (const auto &[index_name, data_ptr] : *index_) {
+    if (!data_ptr->dirty.load(std::memory_order_acquire)) {
+      ret.emplace_back(index_name, data_ptr->scope, data_ptr->properties);
+    }
   }
   return ret;
 }
@@ -452,6 +509,12 @@ void TextEdgeIndex::ActiveIndices::ApplyTrackedChanges(Transaction &tx, NameIdMa
       }
       mgcxx::text_search::commit(index_data_ptr->context);
     } catch (const std::exception &e) {
+      index_data_ptr->dirty.store(true, std::memory_order_release);
+      try {
+        mgcxx::text_search::rollback(index_data_ptr->context);
+      } catch (const std::exception &rollback_err) {
+        spdlog::error("Failed to roll back text edge index uncommitted changes: {}", rollback_err.what());
+      }
       throw TextSearchException("Text search error: {}", e.what());
     }
   }

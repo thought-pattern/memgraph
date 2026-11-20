@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 
@@ -45,6 +46,10 @@ struct TextEdgeIndexData {
   /// Set by DropIndex so the context stays valid for existing snapshots until
   /// the last reference is released.
   bool deferred_drop{false};
+
+  /// Set if a post-WAL ApplyTrackedChanges batch failed and rolled back, requiring
+  /// recovery on next startup to rebuild the index from durable graph state.
+  std::atomic<bool> dirty{false};
 
   TextEdgeIndexData(mgcxx::text_search::Context context, EdgeTypeId scope, std::vector<PropertyId> properties)
       : context(std::move(context)), scope(scope), properties(std::move(properties)) {}
@@ -146,7 +151,7 @@ class TextEdgeIndex {
 
   void RecoverIndex(const TextEdgeIndexSpec &index_info, utils::SkipListDb<Vertex>::Accessor vertices,
                     NameIdMapper *name_id_mapper, ActiveIndicesUpdater const &updater,
-                    ProgressCallback const &on_progress = {});
+                    ProgressCallback const &on_progress = {}, bool force_rebuild = false);
 
   /// Removes the index from the live container and returns the evicted
   /// TextEdgeIndexData. The caller MUST keep the returned shared_ptr until
@@ -166,6 +171,9 @@ class TextEdgeIndex {
 
   /// ListIndices on the owning class (for snapshot creation, outside transaction context).
   std::vector<TextEdgeIndexSpec> ListIndices() const;
+
+  /// Returns specs for edge indices whose on-disk Tantivy state has not experienced a failed batch.
+  std::vector<TextEdgeIndexSpec> ListCleanIndices() const;
 
   /// Empties the live container and returns the evicted TextEdgeIndexData
   /// entries. The caller owns the flip-and-publish contract: match DropIndex

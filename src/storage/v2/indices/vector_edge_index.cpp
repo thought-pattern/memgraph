@@ -457,15 +457,31 @@ VectorEdgeIndex::VectorSearchEdgeResults VectorEdgeIndex::SearchEdges(std::strin
     throw VectorSearchException("Vector edge index {} does not exist.", index_name);
   }
   auto &item_ptr = index_->at(*maybe_id);
+  if (query_vector.size() != item_ptr->spec.dimension) {
+    throw VectorSearchException(
+        "Query vector dimension ({}) does not match vector edge index '{}' dimension ({}).",
+        query_vector.size(),
+        index_name,
+        item_ptr->spec.dimension);
+  }
+  if (result_set_size == 0) {
+    return {};
+  }
   auto &mg_index = item_ptr->mg_index;
-
-  VectorSearchEdgeResults result;
-  result.reserve(result_set_size);
 
   auto guard = utils::SharedResourceLockGuard(mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
   auto ep_lock = std::shared_lock{edge_endpoints_mutex_};
+  const auto index_size = mg_index.index.size();
+  if (index_size == 0) {
+    return {};
+  }
+
+  VectorSearchEdgeResults result;
+  const auto clamped_size = std::min<std::size_t>(result_set_size, index_size);
+  result.reserve(clamped_size);
+
   const auto result_keys = mg_index.index.filtered_search(
-      query_vector.data(), result_set_size, [this](Edge *edge) { return edge_endpoints_.contains(edge); });
+      query_vector.data(), clamped_size, [this](Edge *edge) { return edge_endpoints_.contains(edge); });
   for (std::size_t i = 0; i < result_keys.size(); ++i) {
     auto *edge = static_cast<Edge *>(result_keys[i].member.key);
     auto [from_vertex, to_vertex, edge_type] = edge_endpoints_.at(edge);

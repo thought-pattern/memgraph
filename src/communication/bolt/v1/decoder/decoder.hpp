@@ -33,6 +33,8 @@ namespace memgraph::communication::bolt {
 template <typename Buffer>
 class Decoder {
  public:
+  static constexpr size_t kMaxDecodeDepth = 128;
+
   explicit Decoder(Buffer &buffer) : buffer_(buffer), major_v_(0) {}
 
   /**
@@ -51,6 +53,11 @@ class Decoder {
    *          false otherwise
    */
   bool ReadValue(Value *data) {
+    if (depth_ >= kMaxDecodeDepth) {
+      return false;
+    }
+    const DepthGuard depth_guard{depth_};
+
     uint8_t value;
 
     if (!buffer_.Read(&value, 1)) {
@@ -239,6 +246,20 @@ class Decoder {
   // classes, this could be just a template and each version of the driver would use the appropriate decoder.
 
  private:
+  struct DepthGuard {
+    size_t &depth;
+    explicit DepthGuard(size_t &d) noexcept : depth(d) { ++depth; }
+    ~DepthGuard() noexcept { --depth; }
+  };
+
+  size_t depth_{0};
+
+  bool HasRemainingEntries(size_t count, size_t min_bytes_per_entry = 1) {
+    if constexpr (requires { buffer_.Size(); }) {
+      return count <= buffer_.Size() / min_bytes_per_entry;
+    }
+    return true;
+  }
   bool ReadNull(const Marker &marker, Value *data) {
     DMG_ASSERT(marker == Marker::Null, "Received invalid marker!");
     *data = Value();
@@ -334,43 +355,25 @@ class Decoder {
   }
 
   bool ReadString(const Marker &marker, Value *data) {
-    static constexpr int kMaxStackBuffer = 8192;
-    std::array<uint8_t, kMaxStackBuffer> buffer;  // intentionally uninitialized for performance
     auto size = ReadTypeSize(marker, MarkerString);
-    if (size == -1) {
+    if (size < 0 || !HasRemainingEntries(static_cast<size_t>(size), 1)) {
       return false;
     }
-    // Here we use a temporary buffer on the stack to prevent temporary
-    // allocations. Most of strings that are decoded are small so it makes no
-    // sense to allocate a temporary buffer every time we decode a string. This
-    // way we allocate a temporary buffer only when the string is large. This
-    // wouldn't be necessary if we had full C++17 support. In C++17 we could
-    // preallocate the `buffer[size]` in the destination string `*data =
-    // Value(std::string('\0', size))` and just call
-    // `buffer_.Read(data->ValueString().data())`.
-    if (size < kMaxStackBuffer) {
-      if (!buffer_.Read(buffer.data(), size)) {
-        SPDLOG_WARN("[ReadString] Missing data!");
-        return false;
-      }
-      *data = Value(std::string(reinterpret_cast<char *>(buffer.data()), size));
-    } else {
-      std::unique_ptr<uint8_t[]> ret(new uint8_t[size]);
-      if (!buffer_.Read(ret.get(), size)) {
-        SPDLOG_WARN("[ReadString] Missing data!");
-        return false;
-      }
-      *data = Value(std::string(reinterpret_cast<char *>(ret.get()), size));
+    std::string str(static_cast<size_t>(size), '\0');
+    if (size > 0 && !buffer_.Read(reinterpret_cast<uint8_t *>(str.data()), static_cast<size_t>(size))) {
+      SPDLOG_WARN("[ReadString] Missing data!");
+      return false;
     }
+    *data = Value(std::move(str));
     return true;
   }
 
   bool ReadList(const Marker &marker, Value *data) {
     auto size = ReadTypeSize(marker, MarkerList);
-    if (size == -1) {
+    if (size < 0 || !HasRemainingEntries(static_cast<size_t>(size), 1)) {
       return false;
     }
-    *data = Value(std::vector<Value>(size));
+    *data = Value(std::vector<Value>(static_cast<size_t>(size)));
     auto &ret = data->ValueList();
     for (int64_t i = 0; i < size; ++i) {
       if (!ReadValue(&ret[i])) {
@@ -382,7 +385,7 @@ class Decoder {
 
   bool ReadMap(const Marker &marker, Value *data) {
     auto size = ReadTypeSize(marker, MarkerMap);
-    if (size == -1) {
+    if (size < 0 || !HasRemainingEntries(static_cast<size_t>(size), 2)) {
       return false;
     }
 
@@ -399,7 +402,7 @@ class Decoder {
       }
       ret.emplace(std::move(dv_key.ValueString()), std::move(dv_val));
     }
-    return ret.size() == size;
+    return ret.size() == static_cast<size_t>(size);
   }
 
   bool ReadVertex(Value *data) {

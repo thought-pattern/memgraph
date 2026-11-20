@@ -495,12 +495,28 @@ VectorIndex::VectorSearchNodeResults VectorIndex::SearchNodes(std::string_view i
     throw VectorSearchException(fmt::format("Vector index {} does not exist.", index_name));
   }
   auto &item_ptr = it->second;
-
-  VectorSearchNodeResults result;
-  result.reserve(result_set_size);
+  if (query_vector.size() != item_ptr->spec.dimension) {
+    throw VectorSearchException(fmt::format(
+        "Query vector dimension ({}) does not match vector index '{}' dimension ({}).",
+        query_vector.size(),
+        index_name,
+        item_ptr->spec.dimension));
+  }
+  if (result_set_size == 0) {
+    return {};
+  }
 
   auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
-  const auto result_keys = item_ptr->mg_index.index.search(query_vector.data(), result_set_size);
+  const auto index_size = item_ptr->mg_index.index.size();
+  if (index_size == 0) {
+    return {};
+  }
+
+  VectorSearchNodeResults result;
+  const auto clamped_size = std::min<std::size_t>(result_set_size, index_size);
+  result.reserve(clamped_size);
+
+  const auto result_keys = item_ptr->mg_index.index.search(query_vector.data(), clamped_size);
   for (std::size_t i = 0; i < result_keys.size(); ++i) {
     const auto &vertex = static_cast<Vertex *>(result_keys[i].member.key);
     result.emplace_back(

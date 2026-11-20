@@ -44,6 +44,7 @@
 #include "storage/v2/indices/edge_property_index.hpp"
 #include "storage/v2/indices/edge_type_property_index.hpp"
 #include "storage/v2/indices/point_index.hpp"
+#include "storage/v2/indices/text_index_utils.hpp"
 #include "storage/v2/inmemory/claimed_objects.hpp"
 #include "storage/v2/inmemory/edge_property_index.hpp"
 #include "storage/v2/inmemory/edge_type_index.hpp"
@@ -436,6 +437,10 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
     });
     metric_handles_.snapshot_recovery_latency_seconds.Observe(
         std::chrono::duration<double>(recovery_timer.Elapsed()).count());
+    const auto text_indices_dir = config_.durability.storage_directory / kTextIndicesDirectory;
+    const auto text_watermark = ReadTextIndicesWatermark(text_indices_dir);
+    ClearTextIndicesWatermark(text_indices_dir);
+
     if (info) {
       vertex_id_.store(info->next_vertex_id, std::memory_order_release);
       edge_id_.store(info->next_edge_id, std::memory_order_release);
@@ -448,6 +453,30 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
           info->last_durable_timestamp,
           timestamp_,
           info->num_committed_txns);
+
+      if (text_watermark.has_value() &&
+          !text_watermark->MatchesStorageState(
+              std::string{uuid()}, info->last_durable_timestamp, info->num_committed_txns)) {
+        auto updater = indices_.MakeUpdater();
+        for (const auto &spec : indices_.text_index_.ListIndices()) {
+          {
+            auto evicted = indices_.text_index_.DropIndex(spec.index_name);
+            indices_.text_index_.PublishActiveIndices(updater);
+            if (evicted) evicted->deferred_drop = true;
+          }
+          indices_.text_index_.RecoverIndex(
+              spec, vertices_.access(), name_id_mapper_.get(), updater, {}, /*force_rebuild=*/true);
+        }
+        for (const auto &spec : indices_.text_edge_index_.ListIndices()) {
+          {
+            auto evicted = indices_.text_edge_index_.DropIndex(spec.index_name);
+            indices_.text_edge_index_.PublishActiveIndices(updater);
+            if (evicted) evicted->deferred_drop = true;
+          }
+          indices_.text_edge_index_.RecoverIndex(
+              spec, vertices_.access(), name_id_mapper_.get(), updater, {}, /*force_rebuild=*/true);
+        }
+      }
     }
 
     if (config_.track_label_counts) {
@@ -462,6 +491,7 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
 
   } else if (config_.durability.snapshot_wal_mode != Config::Durability::SnapshotWalMode::DISABLED ||
              config_.durability.snapshot_on_exit) {
+    ClearTextIndicesWatermark(config_.durability.storage_directory / kTextIndicesDirectory);
     bool files_moved = false;
     auto backup_root = config_.durability.storage_directory / durability::kBackupDirectory;
     for (const auto &[path, dirname, what] :
@@ -577,6 +607,18 @@ InMemoryStorage::~InMemoryStorage() {
   // A broken database must not write an exit snapshot over its untouched corrupt files.
   if (config_.durability.snapshot_on_exit && this->create_snapshot_handler && !IsBroken()) {
     create_snapshot_handler("exit");
+  }
+  if (!IsBroken() &&
+      (!indices_.text_index_.ListIndices().empty() || !indices_.text_edge_index_.ListIndices().empty())) {
+    const auto ts_info = repl_storage_state_.commit_ts_info_.load(std::memory_order_acquire);
+    WriteTextIndicesWatermark(config_.durability.storage_directory / kTextIndicesDirectory,
+                              TextIndicesWatermark{
+                                  .storage_uuid = std::string{uuid()},
+                                  .last_durable_timestamp = ts_info.ldt_,
+                                  .num_committed_txns = ts_info.num_committed_txns_,
+                                  .clean_node_indices = indices_.text_index_.ListCleanIndices(),
+                                  .clean_edge_indices = indices_.text_edge_index_.ListCleanIndices(),
+                              });
   }
   // Leak fix: a deleted light edge whose delta chain was never GC-unlinked
   // (an older txn was active at delete time) is referenced ONLY by an un-GC'd
@@ -1396,6 +1438,7 @@ void InMemoryStorage::InMemoryAccessor::PublishCommit(uint64_t const durability_
   }
 
   CheckForFastDiscardOfDeltas();
+  utils::OnScopeExit const clear_transaction_active{[this] { is_transaction_active_ = false; }};
   // Skip the virtual dispatch when the txn didn't touch any text/text-edge data
   // (the common case for the commit hot path).
   if (!transaction_.text_index_change_collector_.empty()) {
@@ -1404,8 +1447,6 @@ void InMemoryStorage::InMemoryAccessor::PublishCommit(uint64_t const durability_
   if (!transaction_.text_edge_index_change_collector_.empty()) {
     transaction_.active_indices_->text_edge_->ApplyTrackedChanges(transaction_, mem_storage->name_id_mapper_.get());
   }
-
-  is_transaction_active_ = false;
 }
 
 void InMemoryStorage::InMemoryAccessor::FinalizeCommitPhase(uint64_t const durability_commit_timestamp,
@@ -4862,6 +4903,7 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
     if (timestamp_ > 0) commit_log_->MarkFinishedInRange(0, timestamp_ - 1);
 
     spdlog::trace("Recovering derived state from snapshot.");
+    ClearTextIndicesWatermark(config_.durability.storage_directory / kTextIndicesDirectory);
     storage::durability::RecoverDerivedState(&vertices_,
                                              &edges_,
                                              name_id_mapper_.get(),

@@ -4957,6 +4957,9 @@ mgp_error mgp_graph_search_vector_index(mgp_graph *graph, const char *index_name
     std::vector<std::tuple<memgraph::storage::VertexAccessor, double, double>> found_vertices;
     std::optional<std::string> error_msg = std::nullopt;
     try {
+      if (result_size < 0) {
+        throw memgraph::storage::VectorSearchException("Result set size must be non-negative.");
+      }
       std::vector<float> search_query_vector;
       search_query_vector.reserve(search_query->elems.size());
       for (auto &elem : search_query->elems) {
@@ -4980,7 +4983,8 @@ mgp_error mgp_graph_search_vector_index(mgp_graph *graph, const char *index_name
         throw std::logic_error(
             "Unrecognized argument type when performing vector search, expected values are Double or Int!");
       }
-      found_vertices = graph->getImpl()->VectorIndexSearchOnNodes(index_name, result_size, search_query_vector);
+      found_vertices =
+          graph->getImpl()->VectorIndexSearchOnNodes(index_name, static_cast<uint64_t>(result_size), search_query_vector);
 #ifdef MG_ENTERPRISE
       if (graph->ctx && graph->ctx->auth_checker) {
         const auto searched_property = VectorIndexSearchedProperty(*graph, index_name);
@@ -5006,6 +5010,9 @@ mgp_error mgp_graph_search_vector_index_on_edges(mgp_graph *graph, const char *i
     std::vector<std::tuple<memgraph::storage::EdgeAccessor, double, double>> found_edges;
     std::optional<std::string> error_msg = std::nullopt;
     try {
+      if (result_size < 0) {
+        throw memgraph::storage::VectorSearchException("Result set size must be non-negative.");
+      }
       std::vector<float> search_query_vector;
       search_query_vector.reserve(search_query->elems.size());
       for (auto &elem : search_query->elems) {
@@ -5029,7 +5036,8 @@ mgp_error mgp_graph_search_vector_index_on_edges(mgp_graph *graph, const char *i
         throw std::logic_error(
             "Unrecognized argument type when performing vector search, expected values are Double or Int!");
       }
-      found_edges = graph->getImpl()->VectorIndexSearchOnEdges(index_name, result_size, search_query_vector);
+      found_edges =
+          graph->getImpl()->VectorIndexSearchOnEdges(index_name, static_cast<uint64_t>(result_size), search_query_vector);
 #ifdef MG_ENTERPRISE
       if (graph->ctx && graph->ctx->auth_checker) {
         const auto searched_property = VectorEdgeIndexSearchedProperty(*graph, index_name);

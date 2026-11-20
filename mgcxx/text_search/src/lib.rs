@@ -678,11 +678,58 @@ fn create_index_schema(
     Ok(schema)
 }
 
+fn validate_index_path(index_path: &std::path::Path, raw_path: &str) -> Result<(), std::io::Error> {
+    if raw_path.is_empty() || raw_path.contains('\0') {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid text search index path: empty or null byte.",
+        ));
+    }
+    if index_path.file_name().map_or(true, |name| name.is_empty()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid text search index path {:?}: missing directory name.", index_path),
+        ));
+    }
+    if index_path.parent().map_or(true, |parent| index_path.is_absolute() && parent.as_os_str().is_empty()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid text search index path {:?}: root directory is forbidden.", index_path),
+        ));
+    }
+    let mut saw_normal = false;
+    for component in index_path.components() {
+        match component {
+            std::path::Component::ParentDir | std::path::Component::CurDir => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid text search index path {:?}: relative traversal components are forbidden.",
+                        index_path
+                    ),
+                ));
+            }
+            std::path::Component::Normal(_) => {
+                saw_normal = true;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    if !saw_normal {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid text search index path {:?}.", index_path),
+        ));
+    }
+    Ok(())
+}
+
 fn create_index_dir_structure(
     path: &String,
     schema: &Schema,
 ) -> Result<(Index, std::path::PathBuf), std::io::Error> {
     let index_path = std::path::Path::new(path);
+    validate_index_path(index_path, path)?;
     if !index_path.exists() {
         match std::fs::create_dir_all(index_path) {
             Ok(_) => {
@@ -1077,9 +1124,12 @@ fn search_gids_pinned(
         )
     })?;
 
+    let top_limit = input
+        .effective_limit()
+        .min((searcher_ctx.searcher.num_docs() as usize).max(1));
     let top_docs = searcher_ctx
         .searcher
-        .search(&query, &TopDocs::with_limit(input.effective_limit()))
+        .search(&query, &TopDocs::with_limit(top_limit))
         .map_err(|e| {
             Error::new(
                 ErrorKind::Other,
@@ -1158,10 +1208,11 @@ fn regex_search_gids_pinned(
     let regex = compiled_regex(context, &input.search_query)?;
 
     let limit = input.effective_limit();
-    let mut docs: Vec<ffi::GidScore> = Vec::with_capacity(limit);
+    let initial_capacity = limit.min(searcher_ctx.searcher.num_docs() as usize).min(4096);
+    let mut docs: Vec<ffi::GidScore> = Vec::with_capacity(initial_capacity);
     // A single doc can carry several matching terms (kAllField concatenates all property values),
     // so dedup on the globally-unique gid.
-    let mut seen: HashSet<u64> = HashSet::with_capacity(limit);
+    let mut seen: HashSet<u64> = HashSet::with_capacity(initial_capacity);
 
     'segments: for segment_reader in searcher_ctx.searcher.segment_readers() {
         let inverted_index = segment_reader.inverted_index(search_field).map_err(|e| {
@@ -1219,9 +1270,12 @@ fn search_edge_gids_pinned(
         )
     })?;
 
+    let top_limit = input
+        .effective_limit()
+        .min((searcher_ctx.searcher.num_docs() as usize).max(1));
     let top_docs = searcher_ctx
         .searcher
-        .search(&query, &TopDocs::with_limit(input.effective_limit()))
+        .search(&query, &TopDocs::with_limit(top_limit))
         .map_err(|e| {
             Error::new(
                 ErrorKind::Other,
@@ -1417,8 +1471,9 @@ fn regex_search_edge_gids_pinned(
     let regex = compiled_regex(context, &input.search_query)?;
 
     let limit = input.effective_limit();
-    let mut docs: Vec<ffi::EdgeGidScore> = Vec::with_capacity(limit);
-    let mut seen: HashSet<u64> = HashSet::with_capacity(limit);
+    let initial_capacity = limit.min(searcher_ctx.searcher.num_docs() as usize).min(4096);
+    let mut docs: Vec<ffi::EdgeGidScore> = Vec::with_capacity(initial_capacity);
+    let mut seen: HashSet<u64> = HashSet::with_capacity(initial_capacity);
 
     'segments: for segment_reader in searcher_ctx.searcher.segment_readers() {
         let inverted_index = segment_reader.inverted_index(search_field).map_err(|e| {
@@ -1526,6 +1581,8 @@ fn drop_index(context: ffi::Context) -> Result<(), std::io::Error> {
     // Dropping context triggers TantivyContext::drop, which calls wait_merging_threads
     // before releasing the writer, then drops index_reader and index via field drop.
     drop(context);
+
+    validate_index_path(&index_path, &index_path.to_string_lossy())?;
 
     // Now safe to remove the directory
     if index_path.exists() {

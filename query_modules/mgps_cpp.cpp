@@ -9,6 +9,8 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include <cctype>
+#include <exception>
 #include <mgp.hpp>
 #include <string>
 
@@ -21,49 +23,60 @@ constexpr std::string_view kParameterParams = "params";
 
 void Validate(mgp_list *args, mgp_graph * /*memgraph_graph*/, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
-  const auto arguments = mgp::List(args);
-  const auto predicate = arguments[0].ValueBool();
+  try {
+    const auto arguments = mgp::List(args);
+    const auto predicate = arguments[0].ValueBool();
 
-  if (!predicate) {
-    return;
-  }
-
-  auto message = std::string(arguments[1].ValueString());
-  const auto params = arguments[2].ValueList();
-
-  // Replace format specifiers: %d (int), %f (double), %s (string)
-  std::size_t pos = 0;
-  for (const auto &param : params) {
-    pos = message.find('%', pos);
-    if (pos == std::string::npos || pos + 1 >= message.size()) break;
-
-    const char spec = message[pos + 1];
-    if (!std::isalpha(static_cast<unsigned char>(spec))) {
-      ++pos;
-      continue;
+    if (!predicate) {
+      return;
     }
 
-    std::string replacement;
-    switch (spec) {
-      case 'd':
-        replacement = std::to_string(param.ValueInt());
-        break;
-      case 'f':
-        replacement = std::to_string(param.ValueDouble());
-        break;
-      case 's':
-        replacement = std::string(param.ValueString());
-        break;
-      default:
-        static_cast<void>(
-            mgp_result_set_error_msg(result, ("Unsupported format specifier: %" + std::string(1, spec)).c_str()));
-        return;
-    }
-    message.replace(pos, 2, replacement);
-    pos += replacement.size();
-  }
+    auto message = std::string(arguments[1].ValueString());
+    const auto params = arguments[2].ValueList();
 
-  static_cast<void>(mgp_result_set_error_msg(result, message.c_str()));
+    // Replace format specifiers: %d (int), %f (double), %s (string)
+    std::size_t pos = 0;
+    for (const auto &param : params) {
+      while (true) {
+        pos = message.find('%', pos);
+        if (pos == std::string::npos || pos + 1 >= message.size()) {
+          pos = std::string::npos;
+          break;
+        }
+        if (std::isalpha(static_cast<unsigned char>(message[pos + 1]))) {
+          break;
+        }
+        pos += (message[pos + 1] == '%') ? 2 : 1;
+      }
+      if (pos == std::string::npos) break;
+
+      const char spec = message[pos + 1];
+      std::string replacement;
+      switch (spec) {
+        case 'd':
+          replacement = std::to_string(param.ValueInt());
+          break;
+        case 'f':
+          replacement = std::to_string(param.ValueDouble());
+          break;
+        case 's':
+          replacement = std::string(param.ValueString());
+          break;
+        default:
+          static_cast<void>(
+              mgp_result_set_error_msg(result, ("Unsupported format specifier: %" + std::string(1, spec)).c_str()));
+          return;
+      }
+      message.replace(pos, 2, replacement);
+      pos += replacement.size();
+    }
+
+    static_cast<void>(mgp_result_set_error_msg(result, message.c_str()));
+  } catch (const std::exception &e) {
+    static_cast<void>(mgp_result_set_error_msg(result, e.what()));
+  } catch (...) {
+    static_cast<void>(mgp_result_set_error_msg(result, "Unknown error occurred in mgps.validate."));
+  }
 }
 
 }  // namespace Mgps
@@ -81,7 +94,9 @@ extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *mem
                  {},  // No return values - void procedure
                  module,
                  memory);
-  } catch (const std::exception &e) {
+  } catch (const std::exception &) {
+    return 1;
+  } catch (...) {
     return 1;
   }
 

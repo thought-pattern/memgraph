@@ -122,64 +122,65 @@ Value::Value(const Value &other) : type_(other.type_) {
 Value &Value::operator=(const Value &other) {
   if (this != &other) {
     this->~Value();
-    // set the type of this
-    type_ = other.type_;
+    // Leave *this as a valid Null if placement-new copy construction below throws.
+    type_ = Type::Null;
 
     switch (other.type_) {
       case Type::Null:
         return *this;
       case Type::Bool:
         this->bool_v = other.bool_v;
-        return *this;
+        break;
       case Type::Int:
         this->int_v = other.int_v;
-        return *this;
+        break;
       case Type::Double:
         this->double_v = other.double_v;
-        return *this;
+        break;
       case Type::String:
         new (&string_v) std::string(other.string_v);
-        return *this;
+        break;
       case Type::List:
         new (&list_v) std::vector<Value>(other.list_v);
-        return *this;
+        break;
       case Type::Map:
         new (&map_v) map_t(other.map_v);
-        return *this;
+        break;
       case Type::Vertex:
         new (&vertex_v) Vertex(other.vertex_v);
-        return *this;
+        break;
       case Type::Edge:
         new (&edge_v) Edge(other.edge_v);
-        return *this;
+        break;
       case Type::UnboundedEdge:
         new (&unbounded_edge_v) UnboundedEdge(other.unbounded_edge_v);
-        return *this;
+        break;
       case Type::Path:
         new (&path_v) Path(other.path_v);
-        return *this;
+        break;
       case Type::Date:
         new (&date_v) utils::Date(other.date_v);
-        return *this;
+        break;
       case Type::LocalTime:
         new (&local_time_v) utils::LocalTime(other.local_time_v);
-        return *this;
+        break;
       case Type::LocalDateTime:
         new (&local_date_time_v) utils::LocalDateTime(other.local_date_time_v);
-        return *this;
+        break;
       case Type::Duration:
         new (&duration_v) utils::Duration(other.duration_v);
-        return *this;
+        break;
       case Type::ZonedDateTime:
         new (&zoned_date_time_v) utils::ZonedDateTime(other.zoned_date_time_v);
-        return *this;
+        break;
       case Type::Point2d:
         new (&point_2d_v) Point2d(other.point_2d_v);
-        return *this;
+        break;
       case Type::Point3d:
         new (&point_3d_v) Point3d(other.point_3d_v);
-        return *this;
+        break;
     }
+    type_ = other.type_;
   }
   return *this;
 }
