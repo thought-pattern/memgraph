@@ -1442,7 +1442,9 @@ void InMemoryStorage::InMemoryAccessor::PublishCommit(uint64_t const durability_
   CheckForFastDiscardOfDeltas();
   utils::OnScopeExit const clear_transaction_active{[this] { is_transaction_active_ = false; }};
   // Skip the virtual dispatch when the txn didn't touch any text/text-edge data
-  // (the common case for the commit hot path).
+  // (the common case for the commit hot path). Neither call throws: the transaction is already
+  // committed, and PeriodicCommit's caller would otherwise abort an accessor with no active
+  // transaction. A batch that fails marks its index dirty instead.
   if (!transaction_.text_index_change_collector_.empty()) {
     transaction_.active_indices_->text_->ApplyTrackedChanges(transaction_, mem_storage->name_id_mapper_.get());
   }

@@ -685,7 +685,9 @@ void Storage::Accessor::MarkEdgeAsDeleted(Edge *edge) {
 std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::CreateTextIndex(
     const TextIndexSpec &text_index_info, ProgressCallback const &on_progress) {
   MG_ASSERT(type() == UNIQUE, "Creating a text index requires unique access to storage!");
-  ValidateTextIndexName(text_index_info.index_name);
+  if (!IsValidTextIndexName(text_index_info.index_name)) {
+    return std::unexpected{storage::StorageIndexDefinitionError{IndexDefinitionError{}}};
+  }
 
   // Check for name conflicts with existing text edge indexes
   if (storage_->indices_.text_edge_index_.IndexExists(text_index_info.index_name)) {
@@ -723,7 +725,9 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Cre
 std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::CreateTextEdgeIndex(
     const TextEdgeIndexSpec &text_edge_index_info, ProgressCallback const &on_progress) {
   MG_ASSERT(type() == UNIQUE, "Creating a text edge index requires unique access to storage!");
-  ValidateTextIndexName(text_edge_index_info.index_name);
+  if (!IsValidTextIndexName(text_edge_index_info.index_name)) {
+    return std::unexpected{storage::StorageIndexDefinitionError{IndexDefinitionError{}}};
+  }
 
   // Check for name conflicts with existing text node indexes
   if (storage_->indices_.text_index_.IndexExists(text_edge_index_info.index_name)) {
@@ -758,7 +762,9 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Cre
 std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::DropTextIndex(
     const std::string &index_name) {
   MG_ASSERT(type() == UNIQUE, "Dropping a text index requires unique access to storage!");
-  ValidateTextIndexName(index_name);
+  if (!IsValidTextIndexName(index_name)) {
+    return std::unexpected{storage::StorageIndexDefinitionError{IndexDefinitionError{}}};
+  }
   auto updater = storage_->indices_.MakeUpdater();
   auto &metric_handles = storage_->metric_handles_;
   if (storage_->indices_.text_index_.IndexExists(index_name)) {

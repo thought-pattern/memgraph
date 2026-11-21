@@ -83,6 +83,9 @@ std::string ToLowerCasePreservingBooleanOperators(std::string_view input);
 // Validate that a text index name is a single safe directory component.
 void ValidateTextIndexName(std::string_view index_name);
 
+// The same check for callers that report an invalid name through a return value instead.
+bool IsValidTextIndexName(std::string_view index_name);
+
 // Make index path from base directory and index name, rejecting any traversal outside base_path.
 std::string MakeIndexPath(const std::filesystem::path &base_path, std::string_view index_name);
 

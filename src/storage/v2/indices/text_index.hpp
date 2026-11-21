@@ -85,6 +85,8 @@ struct TextIndexActiveIndices {
   virtual std::vector<TextIndexSpec> ListIndices() const = 0;
   virtual std::optional<uint64_t> ApproximateVerticesTextCount(std::string_view index_name) const = 0;
 
+  /// Called after the transaction is durable, so it reports nothing to the caller: a batch that
+  /// cannot be published marks its index dirty and the remaining indexes are still applied.
   virtual void ApplyTrackedChanges(Transaction &tx, NameIdMapper *name_id_mapper) = 0;
 };
 

@@ -484,61 +484,73 @@ std::optional<uint64_t> TextIndex::ActiveIndices::ApproximateVerticesTextCount(s
 }
 
 void TextIndex::ActiveIndices::ApplyTrackedChanges(Transaction &tx, NameIdMapper *name_id_mapper) {
+  // Runs once the transaction is durable, so a failure here must not surface as a failed commit and
+  // must not stop the batches behind it. An index whose batch was not published is marked dirty,
+  // which keeps it out of the shutdown watermark so that recovery rebuilds it from the graph.
   for (const auto &[index_data_ptr, pending] : tx.text_index_change_collector_) {
-    struct PreparedDoc {
-      std::int64_t gid;
-      nlohmann::json properties;
-      std::string all_property_values;
-    };
+    try {
+      struct PreparedDoc {
+        std::int64_t gid;
+        nlohmann::json properties;
+        std::string all_property_values;
+      };
 
-    std::vector<std::int64_t> gids_to_remove;
-    gids_to_remove.reserve(pending.to_remove.size());
-    for (const auto *vertex : pending.to_remove) {
-      gids_to_remove.push_back(vertex->gid.AsInt());
-    }
+      std::vector<std::int64_t> gids_to_remove;
+      gids_to_remove.reserve(pending.to_remove.size());
+      for (const auto *vertex : pending.to_remove) {
+        gids_to_remove.push_back(vertex->gid.AsInt());
+      }
 
-    std::vector<PreparedDoc> docs_to_add;
-    docs_to_add.reserve(pending.to_add.size());
-    // Every vertex here belongs to the same index, so it is read for the same properties.
-    auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_data_ptr->properties);
-    auto values = std::vector<PropertyValue>(ordered.size());
+      std::vector<PreparedDoc> docs_to_add;
+      docs_to_add.reserve(pending.to_add.size());
+      // Every vertex here belongs to the same index, so it is read for the same properties.
+      auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_data_ptr->properties);
+      auto values = std::vector<PropertyValue>(ordered.size());
 
-    for (const auto *vertex : pending.to_add) {
-      if (index_data_ptr->properties.empty()) {
-        auto const vertex_properties = vertex->properties.Properties();
-        auto fields = TextFieldsOf(vertex_properties, name_id_mapper);
+      for (const auto *vertex : pending.to_add) {
+        if (index_data_ptr->properties.empty()) {
+          auto const vertex_properties = vertex->properties.Properties();
+          auto fields = TextFieldsOf(vertex_properties, name_id_mapper);
+          docs_to_add.push_back({.gid = vertex->gid.AsInt(),
+                                 .properties = std::move(fields.properties),
+                                 .all_property_values = std::move(fields.all_property_values)});
+          continue;
+        }
+        vertex->properties.ExtractPropertyValuesMissingAsNull(ordered, values);
+        auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
         docs_to_add.push_back({.gid = vertex->gid.AsInt(),
                                .properties = std::move(fields.properties),
                                .all_property_values = std::move(fields.all_property_values)});
-        continue;
       }
-      vertex->properties.ExtractPropertyValuesMissingAsNull(ordered, values);
-      auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
-      docs_to_add.push_back({.gid = vertex->gid.AsInt(),
-                             .properties = std::move(fields.properties),
-                             .all_property_values = std::move(fields.all_property_values)});
-    }
 
-    const std::lock_guard lock(index_data_ptr->write_mutex);
-    try {
-      for (auto gid : gids_to_remove) {
-        mgcxx::text_search::delete_document(index_data_ptr->context,
-                                            mgcxx::text_search::SearchInput{.search_query = fmt::format("gid:{}", gid)},
-                                            kDoSkipCommit);
+      const std::lock_guard lock(index_data_ptr->write_mutex);
+      try {
+        for (auto gid : gids_to_remove) {
+          mgcxx::text_search::delete_document(
+              index_data_ptr->context,
+              mgcxx::text_search::SearchInput{.search_query = fmt::format("gid:{}", gid)},
+              kDoSkipCommit);
+        }
+        for (auto &doc : docs_to_add) {
+          TextIndex::AddNodeToTextIndex(
+              doc.gid, std::move(doc.properties), std::move(doc.all_property_values), index_data_ptr->context);
+        }
+        mgcxx::text_search::commit(index_data_ptr->context);
+      } catch (const std::exception &) {
+        // Rolled back while write_mutex is still held, so no other writer builds on the partial batch.
+        try {
+          mgcxx::text_search::rollback(index_data_ptr->context);
+        } catch (const std::exception &rollback_err) {
+          spdlog::error("Failed to roll back text index uncommitted changes: {}", rollback_err.what());
+        }
+        throw;
       }
-      for (auto &doc : docs_to_add) {
-        TextIndex::AddNodeToTextIndex(
-            doc.gid, std::move(doc.properties), std::move(doc.all_property_values), index_data_ptr->context);
-      }
-      mgcxx::text_search::commit(index_data_ptr->context);
     } catch (const std::exception &e) {
       index_data_ptr->dirty.store(true, std::memory_order_release);
-      try {
-        mgcxx::text_search::rollback(index_data_ptr->context);
-      } catch (const std::exception &rollback_err) {
-        spdlog::error("Failed to roll back text index uncommitted changes: {}", rollback_err.what());
-      }
-      throw TextSearchException("Text search error: {}", e.what());
+      spdlog::error(
+          "A committed transaction was not published to a text index, which stays stale until it is rebuilt on "
+          "the next startup: {}",
+          e.what());
     }
   }
 }

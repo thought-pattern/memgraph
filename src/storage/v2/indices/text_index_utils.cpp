@@ -80,6 +80,15 @@ void ValidateTextIndexName(std::string_view index_name) {
   }
 }
 
+bool IsValidTextIndexName(std::string_view index_name) {
+  try {
+    ValidateTextIndexName(index_name);
+  } catch (const TextSearchException &) {
+    return false;
+  }
+  return true;
+}
+
 std::string MakeIndexPath(const std::filesystem::path &base_path, std::string_view index_name) {
   ValidateTextIndexName(index_name);
   if (base_path.empty()) {
