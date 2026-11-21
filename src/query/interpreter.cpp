@@ -11,6 +11,7 @@
 
 #include "query/interpreter.hpp"
 #include <fmt/format.h>
+#include <numeric>
 #include "ctre.hpp"
 #include "memory/db_arena_fwd.hpp"
 
@@ -3761,6 +3762,8 @@ PullPlan::PullPlan(const std::shared_ptr<PlanWrapper> plan, const Parameters &pa
   ctx_.symbol_table = plan->symbol_table();
   ctx_.evaluation_context.timestamp = QueryTimestamp();
   ctx_.evaluation_context.parameters = parameters;
+  ctx_.evaluation_context.lazy_vector_refs =
+      dba != nullptr && plan->rw_type() == plan::ReadWriteTypeChecker::RWType::R && dba->CanHoldLazyVectorRefs();
   // Nothing a plan without an accessor can evaluate resolves an id, so there is nothing to resolve.
   if (dba != nullptr) {
     ctx_.evaluation_context.properties = NamesToProperties(plan->ast_storage().properties_, dba);
@@ -5948,6 +5951,9 @@ PreparedQuery PrepareTtlQuery(ParsedQuery parsed_query, bool in_explicit_transac
 
   MG_ASSERT(current_db.db_acc_, "Time to live query expects a current DB");
   auto db_acc = *current_db.db_acc_;
+  if (db_acc->GetStorageMode() == storage::StorageMode::ON_DISK_TRANSACTIONAL) {
+    throw DisabledForOnDisk("TTL");
+  }
 
   MG_ASSERT(current_db.db_transactional_accessor_, "Time to live query expects a current DB transaction");
   auto *dba = &*current_db.execution_db_accessor_;
@@ -6702,7 +6708,7 @@ Callback SwitchMemoryDevice(storage::StorageMode current_mode, storage::StorageM
             main_guard.unlock();
             in.SwitchToOnDisk();
           })) {  // Try exclusively failed
-        throw utils::BasicException(
+        throw RetryBasicException(
             "You cannot switch from an in-memory storage mode to the on-disk storage mode when there are "
             "multiple sessions active. Close all other sessions and try again. As Memgraph Lab uses "
             "multiple sessions to run queries in parallel, "
@@ -6925,10 +6931,14 @@ PreparedQuery PrepareCreateSnapshotQuery(ParsedQuery parsed_query, bool in_expli
                        storage::InMemoryStorage::CreateSnapshotErrorToString(maybe_path.error()));
           break;
         case storage::InMemoryStorage::CreateSnapshotError::AbortSnapshot:
+          throw RetryBasicException("Failed to create snapshot. {}.",
+                                    storage::InMemoryStorage::CreateSnapshotErrorToString(maybe_path.error()));
+        // NoSpaceLeft: a full disk persists until an operator frees space, so retrying cannot succeed.
         case storage::InMemoryStorage::CreateSnapshotError::NoSpaceLeft:
           throw utils::BasicException("Failed to create snapshot. {}.",
                                       storage::InMemoryStorage::CreateSnapshotErrorToString(maybe_path.error()));
         case storage::InMemoryStorage::CreateSnapshotError::AlreadyRunning:
+          throw RetryBasicException(storage::InMemoryStorage::CreateSnapshotErrorToString(maybe_path.error()));
         case storage::InMemoryStorage::CreateSnapshotError::NothingNewToWrite:
           throw utils::BasicException(storage::InMemoryStorage::CreateSnapshotErrorToString(maybe_path.error()));
       }
@@ -7024,10 +7034,10 @@ PreparedQuery PrepareRecoverSnapshotQuery(ParsedQuery parsed_query, bool in_expl
                   "Please clean them manually, or re-run RECOVER SNAPSHOT ... FORCE.");
             }
             case DownloadFailure: {
-              throw utils::BasicException("Failed to download snapshot file from {}", path);
+              throw RetryBasicException("Failed to download snapshot file from {}", path);
             }
             case S3GetFailure: {
-              throw utils::BasicException("Failed to download snapshot file from s3 {}", path);
+              throw RetryBasicException("Failed to download snapshot file from s3 {}", path);
             }
             case S3MissingAwsRegion: {
               throw utils::BasicException(utils::AwsValidationErrorToStr(utils::AwsValidationError::AWS_REGION));
@@ -8834,6 +8844,23 @@ PreparedQuery PrepareConstraintQuery(ParsedQuery parsed_query, bool in_explicit_
       .rw_type = RWType::NONE};
 }
 
+#ifdef MG_ENTERPRISE
+// Applies only to names minted by CREATE/RENAME; databases restored or replicated under older names are not checked.
+constexpr size_t kMaxDatabaseNameLength = 63;
+constexpr std::string_view kInvalidDatabaseNameMsg =
+    "Invalid database name: a name must be 1-63 bytes long, contain no control characters, and not start or end with "
+    "a space.";
+
+bool IsValidDatabaseName(std::string_view name) {
+  if (name.empty() || name.size() > kMaxDatabaseNameLength) return false;
+  if (name.front() == ' ' || name.back() == ' ') return false;
+  return std::ranges::none_of(name, [](char c) {
+    const auto u = static_cast<unsigned char>(c);
+    return u < 0x20 || u == 0x7F;
+  });
+}
+#endif
+
 PreparedQuery PrepareMultiDatabaseQuery(ParsedQuery parsed_query, InterpreterContext *interpreter_context,
                                         Interpreter &interpreter) {
 #ifdef MG_ENTERPRISE
@@ -8852,6 +8879,7 @@ PreparedQuery PrepareMultiDatabaseQuery(ParsedQuery parsed_query, InterpreterCon
       if (is_replica) {
         throw QueryException("Query forbidden on the replica!");
       }
+      if (!IsValidDatabaseName(query->db_name_)) throw QueryRuntimeException(kInvalidDatabaseNameMsg);
       return PreparedQuery{
           .header = {"STATUS"},
           .privileges = std::move(parsed_query.required_privileges),
@@ -8880,10 +8908,6 @@ PreparedQuery PrepareMultiDatabaseQuery(ParsedQuery parsed_query, InterpreterCon
               }
             } else {
               res = "Successfully created database " + db_name;
-              db_handler->Get(db_name)->storage()->ttl_.SetUserCheck([interpreter_context]() {
-                const auto locked_repl_state = interpreter_context->repl_state->ReadLock();
-                return locked_repl_state->IsMainWriteable();
-              });
             }
             status.emplace_back(std::vector<TypedValue>{TypedValue(res)});
             auto pull_plan = std::make_shared<PullPlanVector>(std::move(status));
@@ -8983,6 +9007,7 @@ PreparedQuery PrepareMultiDatabaseQuery(ParsedQuery parsed_query, InterpreterCon
       if (!query->new_db_name_) {
         throw QueryException("New database name is required for RENAME DATABASE query.");
       }
+      if (!IsValidDatabaseName(*query->new_db_name_)) throw QueryRuntimeException(kInvalidDatabaseNameMsg);
 
       return PreparedQuery{
           .header = {"STATUS"},
@@ -11698,7 +11723,7 @@ void Interpreter::CommitAuthTransaction() {
   auto claimed = TransactionStatus::ACTIVE;
   while (!transaction_status_.compare_exchange_weak(claimed, TransactionStatus::STARTED_COMMITTING)) {
     if (claimed == TransactionStatus::TERMINATED) {
-      throw memgraph::utils::BasicException(
+      throw RetryBasicException(
           "Aborting transaction commit because the transaction was requested to stop from other session. ");
     }
     MG_ASSERT(claimed == TransactionStatus::ACTIVE || claimed == TransactionStatus::VERIFYING,
@@ -11865,7 +11890,7 @@ void Interpreter::Commit() {
   auto expected = TransactionStatus::ACTIVE;
   while (!transaction_status_.compare_exchange_weak(expected, TransactionStatus::STARTED_COMMITTING)) {
     if (expected == TransactionStatus::TERMINATED) {
-      throw memgraph::utils::BasicException(
+      throw RetryBasicException(
           "Aborting transaction commit because the transaction was requested to stop from other session. ");
     }
     expected = TransactionStatus::ACTIVE;
@@ -11930,8 +11955,14 @@ void Interpreter::Commit() {
                         user_or_role_,
                         interpreter_context_->auth_checker);
       } catch (const utils::BasicException &e) {
-        throw utils::BasicException(
-            fmt::format("Trigger '{}' caused the transaction to fail.\nException: {}", trigger.Name(), e.what()));
+        auto message =
+            fmt::format("Trigger '{}' caused the transaction to fail.\nException: {}", trigger.Name(), e.what());
+        // Preserve the retryability of the original failure: a retryable exception (serialization
+        // conflict, HintedAbortError, OOM) must stay retryable after being rewrapped.
+        if (dynamic_cast<const utils::RetryableException *>(&e)) {
+          throw RetryBasicException(std::move(message));
+        }
+        throw utils::BasicException(std::move(message));
       }
     }
     SPDLOG_DEBUG("Finished executing before commit triggers");

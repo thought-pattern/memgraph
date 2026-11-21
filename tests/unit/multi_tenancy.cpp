@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <thread>
+#include <vector>
 
 #include "auth/auth.hpp"
 #include "communication/bolt/v1/value.hpp"
@@ -142,7 +143,7 @@ class MultiTenantTest : public ::testing::Test {
           } {
       memgraph::license::RegisterLicenseSettings(memgraph::license::global_license_checker, settings);
       memgraph::flags::run_time::Initialize(settings);
-      memgraph::license::global_license_checker.CheckEnvLicense(settings);
+      memgraph::license::global_license_checker.EnableTesting();
     }
 
     auto NewInterpreter() { return InterpreterFaker{&interpreter_context, dbms.Get()}; }
@@ -349,6 +350,44 @@ TEST_F(MultiTenantTest, DbmsUpdate) {
   ASSERT_EQ(RunQuery(interpreter2, "MATCH(n) RETURN count(*)")[0][0].ValueInt(), 3);
   RunQuery(interpreter2, "COMMIT");
   ASSERT_THROW(RunQuery(interpreter2, "MATCH(n) RETURN n"), memgraph::query::DatabaseContextRequiredException);
+}
+
+// A replica builds a tenant from MAIN's name and uuid and its own flags, so the tenant matches what a restart of the
+// replica recovers it as.
+TEST_F(MultiTenantTest, UpdateUsesLocalConfig) {
+  min_mg.reset();
+  config.salient.property_store_compression_level = memgraph::utils::CompressionLevel::HIGH;
+  config.salient.items = {.properties_on_edges = true,
+                          .enable_edges_metadata = true,
+                          .enable_schema_metadata = true,
+                          .enable_schema_info = true,
+                          .enable_label_index_auto_creation = true,
+                          .enable_edge_type_index_auto_creation = true,
+                          .storage_light_edge = true,
+                          .delta_on_identical_property_update = false,
+                          .property_store_compression_enabled = true};
+  min_mg.emplace(config);
+  auto &dbms = DBMS();
+
+  memgraph::storage::SalientConfig const from_main{.name = "tenant",
+                                                   .uuid = memgraph::utils::UUID{},
+                                                   .storage_mode = memgraph::storage::StorageMode::IN_MEMORY_ANALYTICAL,
+                                                   .items = {.properties_on_edges = false}};
+  auto expected = config.salient;
+  expected.name = "tenant";
+  expected.uuid = from_main.uuid;
+
+  auto created = dbms.Update(from_main);
+  ASSERT_TRUE(created.has_value());
+  EXPECT_EQ(created.value()->config().salient, expected);
+
+  // Drop-and-recreate under a new uuid takes the same path.
+  auto from_main_recreated = from_main;
+  from_main_recreated.uuid = memgraph::utils::UUID{};
+  expected.uuid = from_main_recreated.uuid;
+  auto recreated = dbms.Update(from_main_recreated);
+  ASSERT_TRUE(recreated.has_value());
+  EXPECT_EQ(recreated.value()->config().salient, expected);
 }
 
 // Rebinding the default database's uuid retires the old one. Rows left under it are unreachable, and
@@ -790,6 +829,27 @@ TEST_F(MultiTenantTest, RenameDatabaseErrors) {
   UseDatabase(interpreter2, "rename_error_db2", "Using rename_error_db2");
   ASSERT_NO_THROW(RenameDatabase(
       interpreter1, "rename_error_db2", "new_name2", "Successfully renamed database rename_error_db2 to new_name2"));
+}
+
+TEST_F(MultiTenantTest, InvalidDatabaseNames) {
+  CleanupDatabases();
+  auto interpreter = this->NewInterpreter();
+  const auto quote = [](const std::string &name) { return "`" + name + "`"; };
+
+  const std::vector<std::string> invalid{
+      "", " ", " lead", "trail ", "new\nline", std::string("a\0b", 3), std::string(64, 'x')};
+  for (const auto &name : invalid) {
+    ASSERT_THROW(RunMtQuery(interpreter, "CREATE DATABASE " + quote(name)), memgraph::query::QueryRuntimeException);
+  }
+
+  ASSERT_NO_THROW(RunMtQuery(interpreter, "CREATE DATABASE " + quote(std::string(63, 'x'))));
+  ASSERT_NO_THROW(RunMtQuery(interpreter, "CREATE DATABASE " + quote("a b..c/d")));
+
+  RunMtQuery(interpreter, "CREATE DATABASE valid_src", "Successfully created database valid_src");
+  ASSERT_THROW(RenameDatabase(interpreter, "valid_src", quote("bad\nname")), memgraph::query::QueryRuntimeException);
+  UseDatabase(interpreter, "valid_src", "Using valid_src");
+  ASSERT_NO_THROW(
+      RenameDatabase(interpreter, "valid_src", "valid_dst", "Successfully renamed database valid_src to valid_dst"));
 }
 
 TEST_F(MultiTenantTest, RenameDatabaseConcurrency) {

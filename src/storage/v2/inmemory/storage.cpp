@@ -25,6 +25,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include <boost/unordered/unordered_flat_set.hpp>
+#include "absl/hash/hash.h"
 #include "ctre.hpp"
 #include "dbms/constants.hpp"
 #include "flags/experimental.hpp"
@@ -369,7 +371,7 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
     // LOAD-BEARING for hot/cold RESUME: a resumed tenant is rebuilt through this ctor
     // (recover_on_startup=true), so this deny-default (false) is what prevents TTL from
     // running under the permissive struct-default in the window between the TTL scheduler
-    // starting (inside RecoverData) and on_published_ rewiring the MAIN-only user check.
+    // starting (inside RecoverData) and the DbmsHandler applying the user check.
     // Do not move or remove this call.
     ttl_.SetUserCheck([]() -> bool { return false; });
     // Recover data
@@ -1694,8 +1696,8 @@ void InMemoryStorage::InMemoryAccessor::Abort(ProgressCallback const &on_progres
     // Applies each undo delta in the chain, and optionally unlinks the deltas
     // from the vertex head.
     auto process_vertex_deltas = [&](Vertex *vertex, Delta *start, bool delta_chunk_attached_to_vertex) {
-      auto remove_in_edges = absl::flat_hash_set<EdgeRef>{};
-      auto remove_out_edges = absl::flat_hash_set<EdgeRef>{};
+      auto remove_in_edges = boost::unordered_flat_set<EdgeRef, absl::Hash<EdgeRef>>{};
+      auto remove_out_edges = boost::unordered_flat_set<EdgeRef, absl::Hash<EdgeRef>>{};
 
       Delta *current = start;
       while (current != nullptr &&
@@ -3121,7 +3123,7 @@ void InMemoryStorage::SetStorageMode(StorageMode new_storage_mode) {
       }
       // Anything enqueued in the gap between drain and UNIQUE can't be drained here without deadlock.
       if (!async_indexer_.IsIdle()) {
-        throw utils::BasicException(
+        throw utils::RetryableException(
             "Cannot switch to IN_MEMORY_ANALYTICAL: an async index creation task (from CREATE INDEX "
             "or ENABLE TTL) was enqueued concurrently with the storage mode change. Wait for pending "
             "index creation to finish and retry.");
@@ -3188,9 +3190,14 @@ void InMemoryStorage::SetStorageMode(StorageMode new_storage_mode) {
         // from durability, and the next recovery would silently drop it. Stay analytical instead: the
         // mode, the cached ldt and every durability file are still untouched at this point, so the user
         // can fix the cause and retry. CreateSnapshot has already removed whatever partial file it wrote.
-        throw utils::BasicException(
+        constexpr std::string_view kMsg =
             "Failed to create the snapshot required to leave IN_MEMORY_ANALYTICAL. The database is still in "
-            "analytical mode and its data is unchanged; check the logs for the cause and retry.");
+            "analytical mode and its data is unchanged; check the logs for the cause and retry.";
+        // A full disk persists until space is freed, so only the abort/IO case is retryable.
+        if (snapshot_path.error() == durability::SnapshotCreationError::kNoSpaceLeft) {
+          throw utils::BasicException(kMsg);
+        }
+        throw utils::RetryableException(kMsg);
       }
 
       // Publish the snapshot's timestamp as the cached ldt. Analytical writes never reach
@@ -4569,7 +4576,7 @@ auto InMemoryStorage::InMemoryAccessor::HandleDurabilityAndReplicate(uint64_t du
   }
 
   // Every fused task borrows this frame (commands, streams), so if anything below throws before
-  // ShipDeltas collected them, collect them here; on the normal path this is a no-op. Declared before
+  // CollectShipResults collected them, collect them here; on the normal path this is a no-op. Declared before
   // wal_promise on purpose: during unwind the promise must be destroyed first, so tasks blocked on
   // the gate observe the broken promise and finish before this guard joins them.
   auto const collect_workers = utils::OnScopeExit{[&]() noexcept { replicating_txn.DrainShipFutures(); }};
@@ -4648,7 +4655,7 @@ auto InMemoryStorage::InMemoryAccessor::HandleDurabilityAndReplicate(uint64_t du
   // state, which other transactions may overwrite in place the moment this transaction becomes
   // visible. A replica-side failure is contained inside its task (the replica drops to recovery):
   // main and the healthy replicas still commit, consistent with the WAL.
-  bool const replicas_ok = replicating_txn.ShipDeltas(durability_commit_timestamp, commit_args);
+  bool const replicas_ok = replicating_txn.CollectShipResults(commit_args);
 
   // Returns only the status of SYNC and STRICT_SYNC replicas.
   return replicas_ok;

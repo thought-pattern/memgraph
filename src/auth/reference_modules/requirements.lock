@@ -25,7 +25,7 @@ lxml==6.1.0
     #   -r src/auth/reference_modules/requirements.txt
     #   python3-saml
     #   xmlsec
-pyasn1==0.6.4
+pyasn1==0.6.5
     # via ldap3
 pycparser==3.12
     # via cffi
@@ -33,7 +33,7 @@ pyjwt==2.15.1
     # via -r src/auth/reference_modules/requirements.txt
 python3-saml==1.16.0
     # via -r src/auth/reference_modules/requirements.txt
-pyyaml==6.0.1
+pyyaml==6.0.3
     # via -r src/auth/reference_modules/requirements.txt
 requests==2.34.2
     # via -r src/auth/reference_modules/requirements.txt

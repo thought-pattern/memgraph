@@ -3,12 +3,18 @@ set(test_prefix ${test_bench_prefix})
 find_package(gflags REQUIRED)
 find_package(antlr4-runtime REQUIRED)
 find_package(range-v3 REQUIRED)
+find_package(absl REQUIRED)
+find_package(Boost REQUIRED)
 
 include_directories(${antlr4-runtime_INCLUDE_DIR})
 
 
 
-function(add_benchmark test_cpp)
+# Build a benchmark executable and attach it to the memgraph__benchmark target
+# without registering a ctest. CI selects the benchmarks it runs by ctest name, so
+# one added this way is still built, and so cannot bit-rot, but no CI job runs it.
+# Use it for benchmarks meant to be run by hand.
+function(add_local_benchmark test_cpp)
   # get exec name (remove extension from the abs path)
   get_filename_component(exec_name ${test_cpp} NAME_WE)
   set(target_name ${test_prefix}${exec_name})
@@ -18,14 +24,28 @@ function(add_benchmark test_cpp)
   # requires unique logical target names
   set_target_properties(${target_name} PROPERTIES OUTPUT_NAME ${exec_name})
   target_link_libraries(${target_name} benchmark::benchmark gflags mg-memory)
+  add_dependencies(memgraph__benchmark ${target_name})
+endfunction(add_local_benchmark)
+
+# Build a benchmark and register it as a ctest labeled "benchmark", which is what
+# makes a CI job run it.
+function(add_benchmark test_cpp)
+  add_local_benchmark(${test_cpp} ${ARGN})
+  get_filename_component(exec_name ${test_cpp} NAME_WE)
+  set(target_name ${test_prefix}${exec_name})
   # register test - use modern add_test with COMMAND to get absolute path
   add_test(NAME ${target_name} COMMAND $<TARGET_FILE:${target_name}>)
   set_tests_properties(${target_name} PROPERTIES LABELS "benchmark")
-  add_dependencies(memgraph__benchmark ${target_name})
 endfunction(add_benchmark)
 
 add_benchmark(data_structures/ring_buffer.cpp)
 target_link_libraries(${test_prefix}ring_buffer mg-utils)
+
+add_benchmark(data_structures/flat_hash_set.cpp)
+target_link_libraries(${test_prefix}flat_hash_set absl::flat_hash_set Boost::headers)
+
+add_benchmark(data_structures/flat_hash_map.cpp)
+target_link_libraries(${test_prefix}flat_hash_map absl::flat_hash_map Boost::headers)
 
 add_benchmark(query/eval.cpp)
 target_link_libraries(${test_prefix}eval mg-query)
@@ -45,6 +65,9 @@ target_link_libraries(${test_prefix}aggregation mg-query)
 add_benchmark(query/typed_value_ops.cpp)
 target_link_libraries(${test_prefix}typed_value_ops mg-query)
 
+add_benchmark(query/typed_value_set.cpp)
+target_link_libraries(${test_prefix}typed_value_set mg-query absl::flat_hash_set Boost::headers)
+
 add_benchmark(query/expression_lowering.cpp)
 target_link_libraries(${test_prefix}expression_lowering mg-query)
 
@@ -58,6 +81,9 @@ target_link_libraries(${test_prefix}planner mg-query)
 
 add_benchmark(query/plan_v2_extract.cpp)
 target_link_libraries(${test_prefix}plan_v2_extract mg-query)
+
+add_local_benchmark(query/plan_v2_rewrite_saturation.cpp)
+target_link_libraries(${test_prefix}plan_v2_rewrite_saturation mg-query)
 
 add_benchmark(query/profile.cpp)
 target_link_libraries(${test_prefix}profile mg-query)
@@ -113,6 +139,9 @@ target_link_libraries(${test_prefix}storage_v2_enum_store_bench mg::storage)
 
 add_benchmark(storage_v2_edge_index_scan.cpp)
 target_link_libraries(${test_prefix}storage_v2_edge_index_scan mg::storage)
+
+add_local_benchmark(storage_v2_delete_edges.cpp)
+target_link_libraries(${test_prefix}storage_v2_delete_edges mg::storage)
 
 add_benchmark(storage_v2_label_property_index_predicate.cpp)
 target_link_libraries(${test_prefix}storage_v2_label_property_index_predicate mg::storage)

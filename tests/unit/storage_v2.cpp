@@ -16,6 +16,7 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <thread>
 
 #include "disk_test_utils.hpp"
@@ -3345,4 +3346,97 @@ TEST(StorageV2Analytical, ExpansionSeesWhatThisAccessorJustWrote) {
   EXPECT_EQ(edges->edges.At(0).EdgeType(), type);
   EXPECT_EQ(edges->edges.At(0).ToVertex(), to);
   EXPECT_EQ(edges->edges.At(0).FromVertex(), from);
+}
+
+TEST(StorageV2, UpdatePropertiesHonoursDeltaOnIdenticalPropertyUpdate) {
+  using namespace memgraph::storage;
+
+  for (bool const delta_on_identical : {true, false}) {
+    SCOPED_TRACE(delta_on_identical);
+    Config config{};
+    config.salient.items.delta_on_identical_property_update = delta_on_identical;
+    InMemoryStorage store{config};
+
+    Gid gid;
+    PropertyId prop;
+    {
+      auto acc = store.Access(WRITE);
+      auto vertex = acc->CreateVertex();
+      gid = vertex.Gid();
+      prop = acc->NameToProperty("p");
+      ASSERT_TRUE(vertex.SetProperty(prop, PropertyValue(1)).has_value());
+      ASSERT_TRUE(acc->PrepareForCommitPhase(memgraph::tests::MakeMainCommitArgs()).has_value());
+    }
+
+    auto acc = store.Access(WRITE);
+    auto vertex = acc->FindVertex(gid, View::OLD);
+    ASSERT_TRUE(vertex.has_value());
+    auto *transaction = acc->GetTransaction();
+    auto const before = transaction->deltas.size();
+    std::map<PropertyId, PropertyValue> update{{prop, PropertyValue(1)}};
+    ASSERT_TRUE(vertex->UpdateProperties(update).has_value());
+    EXPECT_EQ(transaction->deltas.size() - before, delta_on_identical ? 1U : 0U);
+    acc->Abort();
+  }
+}
+
+// Values come back in the order the read needed, which is not the order they were named in, so each
+// one is found through the paths rather than by the position it was asked at.
+auto ValueOf(memgraph::storage::OrderedPropertyPaths const &ordered,
+             std::span<memgraph::storage::PropertyValue const> values, memgraph::storage::PropertyId property)
+    -> memgraph::storage::PropertyValue const & {
+  auto const paths = ordered.paths();
+  auto const it = std::ranges::find(paths, memgraph::storage::PropertyPath{property});
+  MG_ASSERT(it != paths.end(), "The property was not among those read");
+  return values[std::distance(paths.begin(), it)];
+}
+
+// Reading a set of properties walks the record once, forward, so it can only find a property it has
+// not already passed. The order the caller asks in is its own business: it may group them however
+// suits it, and nothing about a property id tells a caller where the record keeps it. So the read
+// establishes the order it needs rather than answering Null for whatever arrived out of it.
+TEST(StorageV2PropertySet, AVertexAnswersPropertiesAskedForInAnyOrder) {
+  memgraph::storage::InMemoryStorage store;
+  auto acc = store.Access(memgraph::storage::WRITE);
+
+  // Interned in this order, so "zebra" holds the lower id while sorting after "apple".
+  auto const zebra = acc->NameToProperty("zebra");
+  auto const apple = acc->NameToProperty("apple");
+  ASSERT_LT(zebra.AsUint(), apple.AsUint());
+
+  auto v = acc->CreateVertex();
+  ASSERT_TRUE(v.SetProperty(zebra, memgraph::storage::PropertyValue(1)).has_value());
+  ASSERT_TRUE(v.SetProperty(apple, memgraph::storage::PropertyValue(2)).has_value());
+
+  auto const descending = std::array{apple, zebra};
+  auto const ordered = memgraph::storage::OrderedPropertyPaths::FromPropertyIds(descending);
+  auto values = std::vector<memgraph::storage::PropertyValue>(ordered.size());
+  ASSERT_TRUE(v.ReadPropertyValues(ordered, values, memgraph::storage::View::NEW).has_value());
+
+  EXPECT_EQ(ValueOf(ordered, values, zebra).ValueInt(), 1);
+  EXPECT_EQ(ValueOf(ordered, values, apple).ValueInt(), 2);
+}
+
+TEST(StorageV2PropertySet, AnEdgeAnswersPropertiesAskedForInAnyOrder) {
+  memgraph::storage::InMemoryStorage store{
+      memgraph::storage::Config{.salient = {.items = {.properties_on_edges = true}}}};
+  auto acc = store.Access(memgraph::storage::WRITE);
+
+  auto const zebra = acc->NameToProperty("zebra");
+  auto const apple = acc->NameToProperty("apple");
+  ASSERT_LT(zebra.AsUint(), apple.AsUint());
+
+  auto from = acc->CreateVertex();
+  auto to = acc->CreateVertex();
+  auto edge = acc->CreateEdge(&from, &to, acc->NameToEdgeType("et")).value();
+  ASSERT_TRUE(edge.SetProperty(zebra, memgraph::storage::PropertyValue(1)).has_value());
+  ASSERT_TRUE(edge.SetProperty(apple, memgraph::storage::PropertyValue(2)).has_value());
+
+  auto const descending = std::array{apple, zebra};
+  auto const ordered = memgraph::storage::OrderedPropertyPaths::FromPropertyIds(descending);
+  auto values = std::vector<memgraph::storage::PropertyValue>(ordered.size());
+  ASSERT_TRUE(edge.ReadPropertyValues(ordered, values, memgraph::storage::View::NEW).has_value());
+
+  EXPECT_EQ(ValueOf(ordered, values, zebra).ValueInt(), 1);
+  EXPECT_EQ(ValueOf(ordered, values, apple).ValueInt(), 2);
 }

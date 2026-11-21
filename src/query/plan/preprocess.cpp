@@ -93,8 +93,8 @@ std::vector<Expansion> NormalizePatterns(const SymbolTable &symbol_table, const 
               collector.symbols_.erase(symbol_table.at(*edge->filter_lambda_.accumulated_weight));
             }
           }
-          if (edge->type_ == EdgeAtom::Type::WEIGHTED_SHORTEST_PATH ||
-              edge->type_ == EdgeAtom::Type::ALL_SHORTEST_PATHS) {
+          // A no-op while the weight expression is not visited above; keep it next to that visit.
+          if (edge->weight_lambda_.expression) {
             collector.symbols_.erase(symbol_table.at(*edge->weight_lambda_.inner_edge));
             collector.symbols_.erase(symbol_table.at(*edge->weight_lambda_.inner_node));
           }
@@ -1345,9 +1345,8 @@ std::vector<SingleQueryPart> CollectSingleQueryParts(SymbolTable &symbol_table, 
   auto *query_part = &query_parts.back();
   for (auto *clause : single_query->clauses_) {
     if (auto *match = utils::Downcast<Match>(clause)) {
-      if (!query_part->remaining_clauses.empty()) {
-        // New match started
-        // This query part is done, continue with a new one.
+      // A MATCH after other clauses, or a non-optional MATCH after an OPTIONAL MATCH, starts a new part.
+      if (!query_part->remaining_clauses.empty() || (!match->optional_ && !query_part->optional_matching.empty())) {
         query_parts.emplace_back(SingleQueryPart{});
         query_part = &query_parts.back();
       }
@@ -1355,7 +1354,7 @@ std::vector<SingleQueryPart> CollectSingleQueryParts(SymbolTable &symbol_table, 
         query_part->optional_matching.emplace_back();
         AddMatching(*match, symbol_table, storage, query_part->optional_matching.back());
       } else {
-        DMG_ASSERT(query_part->optional_matching.empty(), "Match clause cannot follow optional match.");
+        DMG_ASSERT(query_part->optional_matching.empty(), "A part's matching cannot follow its optional_matching.");
         AddMatching(*match, symbol_table, storage, query_part->matching);
       }
     } else {

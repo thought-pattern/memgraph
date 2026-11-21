@@ -150,7 +150,10 @@ void VectorEdgeIndex::RecoverAllVectorEdgeIndices(std::vector<VectorEdgeIndexRec
                                                   ProgressCallback const &on_progress) {
   if (recovery_infos.empty()) return;
 
-  absl::flat_hash_map<PropertyId, std::vector<std::pair<uint64_t, std::shared_ptr<EdgeTypeIndexItem>>>> prop_to_items;
+  boost::unordered_flat_map<PropertyId,
+                            std::vector<std::pair<uint64_t, std::shared_ptr<EdgeTypeIndexItem>>>,
+                            std::hash<PropertyId>>
+      prop_to_items;
   try {
     for (auto &ri : recovery_infos) {
       auto index_id = SetupIndex(ri.spec, name_id_mapper);
@@ -599,6 +602,15 @@ utils::small_vector<float> VectorEdgeIndex::GetVectorPropertyFromEdgeIndex(Edge 
   utils::small_vector<float> vector(item_ptr->mg_index.index.dimensions());
   if (!item_ptr->mg_index.index.get(edge, vector.data())) return {};
   return vector;
+}
+
+bool VectorEdgeIndex::GetVectorInto(Edge *edge, uint64_t index_id, std::vector<float> &out) const {
+  auto it = index_->find(index_id);
+  if (it == index_->end()) return false;
+  auto &item_ptr = it->second;
+  auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+  out.resize(item_ptr->mg_index.index.dimensions());
+  return item_ptr->mg_index.index.get(edge, out.data());
 }
 
 utils::small_vector<uint64_t> VectorEdgeIndex::GetIndexIdsForEdgeTypeProperty(EdgeTypeId edge_type,

@@ -14,12 +14,13 @@
 #include <algorithm>
 #include <span>
 #include <string_view>
+#include <unordered_set>
 
 #include <range/v3/range/conversion.hpp>
 #include <range/v3/view/join.hpp>
 #include <range/v3/view/transform.hpp>
 
-#include "absl/container/flat_hash_map.h"
+#include <boost/unordered/unordered_flat_map.hpp>
 #include "storage/v2/common_function_signatures.hpp"
 #include "storage/v2/durability/serialization.hpp"
 #include "storage/v2/id_types.hpp"
@@ -142,7 +143,9 @@ struct VectorIndexRecoveryInfo {
 /// p is a tag (VectorIndexId), then vertex_vectors[p][v.gid] holds its float vector. A plain list in
 /// the property store is its own vector and wins over any map entry. Tag IDs are not trusted during recovery.
 struct VectorIndexRecovery {
-  using VertexVectors = absl::flat_hash_map<PropertyId, absl::flat_hash_map<Gid, utils::small_vector<float>>>;
+  using VertexVectors =
+      boost::unordered_flat_map<PropertyId, boost::unordered_flat_map<Gid, utils::small_vector<float>, std::hash<Gid>>,
+                                std::hash<PropertyId>>;
 
   /// Called on WAL VertexSetProperty. Mutates value: an empty tag becomes plain []. With a spec on p, a tag is
   /// captured into vertex_vectors[p][gid] and any other value erases it; without one, a stale tag becomes a list.
@@ -316,6 +319,10 @@ class VectorIndex {
   /// @return The vector of the vertex as a list of float values.
   utils::small_vector<float> GetVectorPropertyFromIndex(Vertex *vertex, std::string_view index_name,
                                                         NameIdMapper *name_id_mapper) const;
+
+  /// Reconstruct a vertex's indexed vector into `out` (resized to the index dimension); false if absent. Looked up by
+  /// name-id. Zero owning PropertyValue — used to materialize an embedding transiently.
+  bool GetVectorInto(Vertex *vertex, uint64_t index_id, std::vector<float> &out) const;
 
   /// @brief Lists the info of all existing indexes.
   /// @return A vector of VectorIndexInfo objects representing the indexes.

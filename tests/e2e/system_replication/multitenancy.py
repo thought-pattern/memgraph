@@ -16,6 +16,7 @@ import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict
+from unittest.mock import patch
 
 import interactive_mg_runner
 import mgclient
@@ -1013,6 +1014,81 @@ def test_multitenancy_replication_restart_replica_w_fc_w_rec(connection, replica
 
 
 @pytest.mark.parametrize("replica_name", [("replica_1"), ("replica_2")])
+def test_multitenancy_replication_unlicensed_main_keeps_replica_state(connection, replica_name, test_name):
+    # Goal: show that a MAIN which loses its licence leaves its replicas' users, roles, and databases alone
+    # 0/ Start replicas licensed as usual; start MAIN without the licence environment and license it by settings
+    # 1/ Setup replication, databases A and B, and an authorized user
+    # 2/ Break MAIN's licence with a mismatched organization name
+    # 3/ Validate users, roles, and data on the replica
+    # 4/ Restore MAIN's licence; the replica catches up on auth changes and data
+
+    # 0/
+    MEMGRAPH_INSTANCES_DESCRIPTION_WITH_RECOVERY = get_instances_with_recovery(test_name)
+    interactive_mg_runner.start(MEMGRAPH_INSTANCES_DESCRIPTION_WITH_RECOVERY, "replica_1")
+    interactive_mg_runner.start(MEMGRAPH_INSTANCES_DESCRIPTION_WITH_RECOVERY, "replica_2")
+    license_key = os.environ["MEMGRAPH_ENTERPRISE_LICENSE"]
+    organization_name = os.environ["MEMGRAPH_ORGANIZATION_NAME"]
+    with patch.dict(os.environ):
+        del os.environ["MEMGRAPH_ENTERPRISE_LICENSE"]
+        del os.environ["MEMGRAPH_ORGANIZATION_NAME"]
+        interactive_mg_runner.start(MEMGRAPH_INSTANCES_DESCRIPTION_WITH_RECOVERY, "main")
+    main_cursor = connection(BOLT_PORTS["main"], "main").cursor()
+    execute_and_fetch_all(main_cursor, f"SET DATABASE SETTING 'organization.name' TO '{organization_name}';")
+    execute_and_fetch_all(main_cursor, f"SET DATABASE SETTING 'enterprise.license' TO '{license_key}';")
+
+    # 1/
+    setup_replication(connection)
+    main_cursor = connection(BOLT_PORTS["main"], "main").cursor()
+    execute_and_fetch_all(main_cursor, "CREATE DATABASE A;")
+    execute_and_fetch_all(main_cursor, "CREATE DATABASE B;")
+    setup_main(main_cursor)
+    for query in [
+        "CREATE ROLE analyst;",
+        "CREATE USER tester IDENTIFIED BY 'tester';",
+        "GRANT ALL PRIVILEGES TO tester;",
+        "GRANT DATABASE * TO tester;",
+        "GRANT READ ON NODES CONTAINING LABELS * TO tester;",
+    ]:
+        execute_and_fetch_all(main_cursor, query)
+
+    cursor_replica = connection(BOLT_PORTS[replica_name], "replica", "tester", "tester").cursor()
+    mg_sleep_and_assert(7, get_number_of_nodes_func(cursor_replica, "A"))
+    mg_sleep_and_assert(2, get_number_of_nodes_func(cursor_replica, "B"))
+
+    # 2/
+    replica_logs = Path(interactive_mg_runner.BUILD_DIR, "e2e", "logs", get_logs_path(file, test_name))
+
+    def recoveries():
+        logs = replica_logs.glob(f"{replica_name.replace('_', '')}*.log")
+        return sum(log.read_text().count("SystemRecoveryHandler: SUCCESS") for log in logs)
+
+    recoveries_before = recoveries()
+    main_cursor = connection(BOLT_PORTS["main"], "main", "tester", "tester").cursor()
+    execute_and_fetch_all(main_cursor, f"SET DATABASE SETTING 'organization.name' TO '{organization_name}-invalid';")
+    mg_sleep_and_assert(False, lambda: dict(execute_and_fetch_all(main_cursor, "SHOW LICENSE INFO;"))["is_valid"])
+    mg_sleep_and_assert(True, lambda: recoveries() > recoveries_before)
+
+    # 3/
+    cursor_replica = connection(BOLT_PORTS[replica_name], "replica", "tester", "tester").cursor()
+    assert [row[0] for row in execute_and_fetch_all(cursor_replica, "SHOW USERS;")] == ["tester"]
+    assert [row[0] for row in execute_and_fetch_all(cursor_replica, "SHOW ROLES;")] == ["analyst"]
+    assert get_number_of_nodes_func(cursor_replica, "A")() == 7
+    assert get_number_of_nodes_func(cursor_replica, "B")() == 2
+
+    # 4/
+    execute_and_fetch_all(main_cursor, "CREATE USER late;")
+    recoveries_before = recoveries()
+    execute_and_fetch_all(main_cursor, f"SET DATABASE SETTING 'organization.name' TO '{organization_name}';")
+    mg_sleep_and_assert(True, lambda: dict(execute_and_fetch_all(main_cursor, "SHOW LICENSE INFO;"))["is_valid"])
+    mg_sleep_and_assert(True, lambda: recoveries() > recoveries_before)
+    assert sorted(row[0] for row in execute_and_fetch_all(cursor_replica, "SHOW USERS;")) == ["late", "tester"]
+    assert [row[0] for row in execute_and_fetch_all(cursor_replica, "SHOW ROLES;")] == ["analyst"]
+    execute_and_fetch_all(main_cursor, "USE DATABASE A;")
+    execute_and_fetch_all(main_cursor, "CREATE (:Node);")
+    mg_sleep_and_assert(8, get_number_of_nodes_func(cursor_replica, "A"))
+
+
+@pytest.mark.parametrize("replica_name", [("replica_1"), ("replica_2")])
 def test_multitenancy_replication_drop_replica(connection, replica_name, test_name):
     # Goal: show that the cluster can recover if a replica is dropped and registered again
     # 0/ Setup replication
@@ -1997,6 +2073,44 @@ def test_db_memory_tracking_cross_db_replication_isolation(connection, test_name
         f"replica_1 database B tenant_memory_tracked must NOT grow when only writing to A. "
         f"baseline_b={baseline_b} after_b={after_b}"
     )
+
+
+def test_replica_tenant_uses_local_flags(connection, test_name):
+    # Goal: a tenant a REPLICA receives from MAIN is built with the REPLICA's own flags, not the defaults.
+    # --schema-info-enabled is the observable one.
+    # 0/ Start all instances with --schema-info-enabled
+    # 1/ MAIN CREATE DATABASE before registering replicas (SystemRecovery path)
+    # 2/ Register replicas, MAIN CREATE DATABASE (CreateDatabase path)
+    # 3/ SHOW SCHEMA INFO works on both tenants on every REPLICA
+
+    # 0/
+    MEMGRAPH_INSTANCES_DESCRIPTION = create_memgraph_instances_with_role_recovery(test_name)
+    for instance in MEMGRAPH_INSTANCES_DESCRIPTION.values():
+        instance["args"].append("--schema-info-enabled=true")
+    interactive_mg_runner.start_all(MEMGRAPH_INSTANCES_DESCRIPTION, keep_directories=False)
+
+    main_cursor = connection(BOLT_PORTS["main"], "main").cursor()
+
+    # 1/
+    execute_and_fetch_all(main_cursor, "CREATE DATABASE recovered;")
+
+    # 2/
+    do_manual_setting_up(connection)
+    execute_and_fetch_all(main_cursor, "CREATE DATABASE created;")
+
+    # 3/
+    def show_schema_info(port, db_name):
+        cursor = connection(port, "replica").cursor()
+        try:
+            execute_and_fetch_all(cursor, f"USE DATABASE {db_name};")
+            execute_and_fetch_all(cursor, "SHOW SCHEMA INFO;")
+            return True
+        except Exception as e:
+            return str(e)
+
+    for replica in ("replica_1", "replica_2"):
+        for db_name in ("recovered", "created"):
+            mg_sleep_and_assert(True, partial(show_schema_info, BOLT_PORTS[replica], db_name))
 
 
 if __name__ == "__main__":

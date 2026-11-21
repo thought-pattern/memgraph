@@ -18,6 +18,7 @@
 #include "planner/rewrite/rewriter.hpp"
 #include "query/plan_v2/egraph/egraph_internal.hpp"
 #include "query/plan_v2/rewrite/fold.hpp"
+#include "query/plan_v2/rewrite/rewrites_internal.hpp"
 
 namespace memgraph::query::plan::v2 {
 
@@ -77,19 +78,16 @@ void TryFold(FoldCtx &ctx, symbol op, EClassId root, std::span<EClassId const> o
   // Already folded: the root carries the constant. A folded root keeps matching
   // (the operator e-node stays in the merged class), so without this guard every
   // re-match re-evaluates and re-interns only to redo a merge that is done.
-  if (auto const *root_expr = ctx.analysis(root).expression();
-      root_expr != nullptr && root_expr->known_constant_value) {
-    return;
-  }
+  if (ctx.analysis(root).known_constant() != nullptr) return;
   // Borrow the operands' constants by pointer: they live in the operand
   // e-classes' analysis and stay put across the read, so a large String/List/Map
   // constant is not copied out just to be folded.
   std::array<storage::ExternalPropertyValue const *, 2> operands{};
   std::size_t n = 0;
   for (auto cls : operand_classes) {
-    auto const *expr = ctx.analysis(cls).expression();
-    if (expr == nullptr || !expr->known_constant_value) return;
-    operands[n++] = &*expr->known_constant_value;
+    auto const *value = ctx.analysis(cls).known_constant();
+    if (value == nullptr) return;
+    operands[n++] = value;
   }
   auto const result = FoldConstant(op, std::span{operands.data(), n});
   if (!result) return;
@@ -116,7 +114,9 @@ auto MakeUnaryFoldRule(std::string name) -> RewriteRule<typed_egraph> {
       });
 }
 
-/// Singleton for default plan_v2 rewrite rules
+}  // namespace
+
+/// Singleton for default plan_v2 rewrite rules.
 auto DefaultRules() -> RuleSet<typed_egraph> const & {
   static auto const rules = [] {
     RuleSet<typed_egraph>::Builder builder;
@@ -131,7 +131,6 @@ auto DefaultRules() -> RuleSet<typed_egraph> const & {
   }();
   return rules;
 }
-}  // namespace
 
 // Public API: creates its own rewriter for standalone use
 auto ApplyInlineRewrite(egraph &eg) -> std::size_t {
@@ -140,7 +139,7 @@ auto ApplyInlineRewrite(egraph &eg) -> std::size_t {
 }
 
 auto ApplyAllRewrites(egraph &eg, RewriteConfig const &config) -> RewriteResult {
-  return Rewriter(impl_of(eg).graph, DefaultRules()).saturate(config);
+  return Rewriter(impl_of(eg).graph, DefaultRules()).saturate_incremental(config);
 }
 
 }  // namespace memgraph::query::plan::v2

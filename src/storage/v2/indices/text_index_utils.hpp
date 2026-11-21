@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -21,8 +22,10 @@
 #include <variant>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
-#include "nlohmann/json_fwd.hpp"
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <nlohmann/json.hpp>
+#include "absl/hash/hash.h"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/property_store.hpp"
 #include "storage/v2/property_value.hpp"
@@ -83,20 +86,23 @@ void ValidateTextIndexName(std::string_view index_name);
 // Make index path from base directory and index name, rejecting any traversal outside base_path.
 std::string MakeIndexPath(const std::filesystem::path &base_path, std::string_view index_name);
 
-// Serialize properties to JSON format
-nlohmann::json SerializeProperties(const std::map<PropertyId, PropertyValue> &properties, NameIdMapper *name_id_mapper);
+/// The two forms a text index holds a record's properties in: the properties, and all their values
+/// run together as the one string a search matches against.
+///
+/// One call gives both because both must come from one read: from two they could disagree, and the
+/// document would answer for a record that never held what it says.
+struct TextIndexFields {
+  nlohmann::json properties;
+  std::string all_property_values;
+};
 
-// Convert properties to string representation (space-joined values for the "all" text field)
-std::string StringifyProperties(const std::map<PropertyId, PropertyValue> &properties);
+/// For an index that names no properties, and so holds every property the record carries.
+TextIndexFields TextFieldsOf(const std::map<PropertyId, PropertyValue> &properties, NameIdMapper *name_id_mapper);
 
-// Extract properties from the property store and return them as a map
-std::map<PropertyId, PropertyValue> ExtractProperties(const PropertyStore &property_store,
-                                                      std::span<PropertyId const> properties);
-
-// Filter which properties to index: if index_properties is empty, return all entity_properties;
-// otherwise return the intersection.
-std::vector<PropertyId> FilterPropertiesToIndex(std::span<const PropertyId> index_properties,
-                                                std::vector<PropertyId> entity_properties);
+/// For an index that names the properties it holds. `values` holds one entry per path, in `paths`
+/// order, as reading a set of them in one pass gives them.
+TextIndexFields TextFieldsOf(std::span<PropertyPath const> paths, std::span<PropertyValue const> values,
+                             NameIdMapper *name_id_mapper);
 
 // Check if index properties match the given properties
 bool IndexPropertiesMatch(std::span<const PropertyId> index_properties,
@@ -112,6 +118,7 @@ struct TextIndexSpec {
 
   std::string index_name;
   LabelId label;
+  /// Naming none means indexing every property the entity carries.
   std::vector<PropertyId> properties;
 };
 
@@ -120,6 +127,7 @@ struct TextEdgeIndexSpec {
 
   std::string index_name;
   EdgeTypeId edge_type;
+  /// Naming none means indexing every property the entity carries.
   std::vector<PropertyId> properties;
 };
 
@@ -146,8 +154,8 @@ std::optional<TextIndicesWatermark> ReadTextIndicesWatermark(const std::filesyst
 void ClearTextIndicesWatermark(const std::filesystem::path &text_indices_dir) noexcept;
 
 struct TextIndexPending {
-  absl::flat_hash_set<const Vertex *> to_add;
-  absl::flat_hash_set<const Vertex *> to_remove;
+  boost::unordered_flat_set<const Vertex *, absl::Hash<const Vertex *>> to_add;
+  boost::unordered_flat_set<const Vertex *, absl::Hash<const Vertex *>> to_remove;
 };
 
 struct EdgeWithVertices {
@@ -166,13 +174,15 @@ struct EdgeWithVertices {
 };
 
 struct TextEdgeIndexPending {
-  absl::flat_hash_set<EdgeWithVertices> to_add;
-  absl::flat_hash_set<const Edge *> to_remove;
+  boost::unordered_flat_set<EdgeWithVertices, absl::Hash<EdgeWithVertices>> to_add;
+  boost::unordered_flat_set<const Edge *, absl::Hash<const Edge *>> to_remove;
 };
 
 // Text index change collector for transaction-level batching
-using TextIndexChangeCollector = absl::flat_hash_map<TextIndexData *, TextIndexPending>;
-using TextEdgeIndexChangeCollector = absl::flat_hash_map<TextEdgeIndexData *, TextEdgeIndexPending>;
+using TextIndexChangeCollector =
+    boost::unordered_flat_map<TextIndexData *, TextIndexPending, absl::Hash<TextIndexData *>>;
+using TextEdgeIndexChangeCollector =
+    boost::unordered_flat_map<TextEdgeIndexData *, TextEdgeIndexPending, absl::Hash<TextEdgeIndexData *>>;
 
 void TrackTextIndexChange(TextIndexChangeCollector &collector, std::span<TextIndexData *> indices, const Vertex *vertex,
                           TextIndexOp op);

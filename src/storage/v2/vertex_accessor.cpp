@@ -10,6 +10,7 @@
 // licenses/APL.txt.
 
 #include "storage/v2/vertex_accessor.hpp"
+#include <algorithm>
 #include <range/v3/all.hpp>
 #include <ranges>
 #include "storage/v2/constraints/constraint_violation.hpp"
@@ -22,6 +23,7 @@
 #include "storage/v2/hops_limit.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indexed_property_decoder.hpp"
+#include "storage/v2/indices/ordered_property_paths.hpp"
 #include "storage/v2/mvcc.hpp"
 #include "storage/v2/property_value.hpp"
 #include "storage/v2/schema_info.hpp"
@@ -48,6 +50,28 @@ static_assert(std::ranges::forward_range<ExpandedEdges>);
 static_assert(std::ranges::sized_range<ExpandedEdges>);
 
 namespace {
+const std::vector<EdgeTypeId> kNoEdgeTypes;
+
+struct EdgeReplayScan {
+  std::size_t n_applied{0};
+  bool replays_edges{false};
+};
+
+// What the replay for (transaction, delta, view) will do: how many deltas it applies, and whether any is an edge
+// delta of direction `dir`.
+template <EdgeDirection dir>
+EdgeReplayScan ScanEdgeReplay(Transaction const *transaction, Delta const *delta, View view) {
+  bool replays = false;
+  auto const n_applied = ApplyDeltasForRead(transaction, delta, view, [&replays](const Delta &d) {
+    if constexpr (dir == EdgeDirection::IN) {
+      replays |= d.action == Delta::Action::ADD_IN_EDGE || d.action == Delta::Action::REMOVE_IN_EDGE;
+    } else {
+      replays |= d.action == Delta::Action::ADD_OUT_EDGE || d.action == Delta::Action::REMOVE_OUT_EDGE;
+    }
+  });
+  return {n_applied, replays};
+}
+
 void HandleTypeConstraintViolation(Storage const *storage, ConstraintViolation const &violation) {
   throw TypeConstraintViolationException("IS TYPED {} violation on {}({})",
                                          TypeConstraintKindToString(*violation.constraint_kind),
@@ -616,7 +640,7 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> Vertex
 
   if (vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
-  const bool skip_duplicate_update = storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_update = !storage_->config_.salient.items.delta_on_identical_property_update;
   using ReturnType = decltype(vertex_->properties.UpdateProperties(properties));
   std::optional<ReturnType> id_old_new_change;
   utils::AtomicMemoryBlock([storage = storage_,
@@ -711,21 +735,30 @@ Result<std::map<PropertyId, PropertyValue>> VertexAccessor::ClearProperties() {
   return std::move(properties).value_or(ReturnType{});
 }
 
-Result<PropertyValue> VertexAccessor::GetProperty(PropertyId property, View view) const {
+template <bool kCompact, typename OnLocked>
+Result<PropertyValue> VertexAccessor::GetPropertyImpl(PropertyId property, View view, OnLocked &&on_locked) const {
+  constexpr bool kHook = !std::is_null_pointer_v<std::remove_cvref_t<OnLocked>>;
+  static_assert(kCompact || !kHook);
   bool exists = true;
   bool deleted = false;
   Delta *delta = nullptr;
   VertexReadLock read_lock{vertex_};
-  auto value = std::invoke([&]() -> PropertyValue {
+  auto value = [&]() -> PropertyValue {
     auto const guard = read_lock.AcquireLock();
     deleted = vertex_->deleted();
     delta = vertex_->delta();
-    auto prop_value = vertex_->properties.GetProperty(
-        property,
-        IndexedPropertyDecoder<Vertex>{
-            .indices = &storage_->indices_, .name_id_mapper = storage_->name_id_mapper_.get(), .entity = vertex_});
-    return prop_value;
-  });
+    if constexpr (kCompact) {
+      auto raw = vertex_->properties.GetProperty(property);
+      if constexpr (kHook) on_locked(raw);
+      return raw;
+    } else {
+      auto prop_value = vertex_->properties.GetProperty(
+          property,
+          IndexedPropertyDecoder<Vertex>{
+              .indices = &storage_->indices_, .name_id_mapper = storage_->name_id_mapper_.get(), .entity = vertex_});
+      return prop_value;
+    }
+  }();
 
   // Checking cache has a cost, only do it if we have any deltas
   // if we have no deltas then what we already have from the vertex is correct.
@@ -754,13 +787,48 @@ Result<PropertyValue> VertexAccessor::GetProperty(PropertyId property, View view
       auto &cache = transaction_->manyDeltasCache;
       cache.StoreExists(view, vertex_, exists);
       cache.StoreDeleted(view, vertex_, deleted);
-      cache.StoreProperty(view, vertex_, property, value);
+      // Embeddings are not cached: it would pin O(dim) floats per vertex for the whole transaction.
+      if (!(kCompact && value.IsVectorIndexId())) cache.StoreProperty(view, vertex_, property, value);
     }
   }
 
   if (!exists) return std::unexpected{Error::NONEXISTENT_OBJECT};
   if (!for_deleted_ && deleted) return std::unexpected{Error::DELETED_OBJECT};
   return std::move(value);
+}
+
+Result<PropertyValue> VertexAccessor::GetProperty(PropertyId property, View view) const {
+  return GetPropertyImpl<false>(property, view, nullptr);
+}
+
+Result<PropertyValue> VertexAccessor::GetPropertyCompact(PropertyId property, View view) const {
+  return GetPropertyImpl<true>(property, view, nullptr);
+}
+
+bool VertexAccessor::GetVectorInto(PropertyId property, View view, std::vector<float> &out) const {
+  // Only the live ref (empty list) may read the index, which is correct only for the live value; delta refs carry
+  // their own floats. The index is read speculatively under the vertex lock and kept only if the live ref survives.
+  bool live_read_ok = false;
+  const auto maybe_value = GetPropertyImpl<true>(property, view, [&](const PropertyValue &raw) {
+    if (!raw.IsVectorIndexId() || !raw.ValueVectorIndexList().empty()) return;
+    const auto &ids = raw.ValueVectorIndexIds();
+    if (ids.empty()) return;
+    live_read_ok = storage_->indices_.vector_index_.GetVectorInto(vertex_, ids[0], out);
+  });
+  if (!maybe_value) return false;
+  if (maybe_value->IsVectorIndexId()) {
+    if (const auto &floats = maybe_value->ValueVectorIndexList(); !floats.empty()) {
+      out.assign(floats.begin(), floats.end());
+      return true;
+    }
+    return !maybe_value->ValueVectorIndexIds().empty() && live_read_ok;
+  }
+  // Left the index (e.g. label removal) and was rewritten to a plain numeric list.
+  if (!maybe_value->IsAnyList()) return false;
+  const auto floats = TryListToVector(*maybe_value);
+  if (!floats) return false;
+  out.assign(floats->begin(), floats->end());
+  return true;
 }
 
 Result<uint64_t> VertexAccessor::GetPropertySize(PropertyId property, View view) const {
@@ -783,7 +851,8 @@ Result<uint64_t> VertexAccessor::GetPropertySize(PropertyId property, View view)
   return property_store.PropertySize(property);
 };
 
-Result<std::map<PropertyId, PropertyValue>> VertexAccessor::Properties(View view) const {
+template <bool kCompact>
+Result<std::map<PropertyId, PropertyValue>> VertexAccessor::PropertiesImpl(View view) const {
   bool exists = true;
   bool deleted = false;
   std::map<PropertyId, PropertyValue> properties;
@@ -792,8 +861,12 @@ Result<std::map<PropertyId, PropertyValue>> VertexAccessor::Properties(View view
   {
     auto const guard = read_lock.AcquireLock();
     deleted = vertex_->deleted();
-    properties = vertex_->properties.Properties(IndexedPropertyDecoder<Vertex>{
-        .indices = &storage_->indices_, .name_id_mapper = storage_->name_id_mapper_.get(), .entity = vertex_});
+    if constexpr (kCompact) {
+      properties = vertex_->properties.Properties();
+    } else {
+      properties = vertex_->properties.Properties(IndexedPropertyDecoder<Vertex>{
+          .indices = &storage_->indices_, .name_id_mapper = storage_->name_id_mapper_.get(), .entity = vertex_});
+    }
     delta = vertex_->delta();
   }
 
@@ -824,7 +897,14 @@ Result<std::map<PropertyId, PropertyValue>> VertexAccessor::Properties(View view
       auto &cache = transaction_->manyDeltasCache;
       cache.StoreExists(view, vertex_, exists);
       cache.StoreDeleted(view, vertex_, deleted);
-      cache.StoreProperties(view, vertex_, properties);
+      if constexpr (kCompact) {
+        // A cached entry fixes one mode (floats vs. index ids) and would hand the wrong form to a read in the other.
+        const bool has_embedding =
+            std::ranges::any_of(properties, [](const auto &kv) { return kv.second.IsVectorIndexId(); });
+        if (!has_embedding) cache.StoreProperties(view, vertex_, properties);
+      } else {
+        cache.StoreProperties(view, vertex_, properties);
+      }
     }
   }
 
@@ -833,52 +913,55 @@ Result<std::map<PropertyId, PropertyValue>> VertexAccessor::Properties(View view
   return std::move(properties);
 }
 
+Result<std::map<PropertyId, PropertyValue>> VertexAccessor::Properties(View view) const {
+  return PropertiesImpl<false>(view);
+}
+
+Result<std::map<PropertyId, PropertyValue>> VertexAccessor::PropertiesCompact(View view) const {
+  return PropertiesImpl<true>(view);
+}
+
 std::vector<PropertyId> VertexAccessor::VectorIndexedProperties(std::span<LabelId const> labels) const {
   return transaction_->active_indices_->vector_->IndexedProperties(labels);
 }
 
-Result<std::map<PropertyId, PropertyValue>> VertexAccessor::PropertiesByPropertyIds(
-    std::span<PropertyId const> properties, View view) const {
+Result<void> VertexAccessor::ReadPropertyValues(OrderedPropertyPaths const &ordered_properties,
+                                                std::span<PropertyValue> out, View view) const {
+  MG_ASSERT(out.size() == ordered_properties.size(), "One value slot per property is required");
+  MG_ASSERT(std::ranges::all_of(ordered_properties.paths(), [](PropertyPath const &path) { return path.size() == 1; }),
+            "Replaying a property delta over a set of paths handles only single-property paths");
+  auto const paths = ordered_properties.paths();
   bool exists = true;
   bool deleted = false;
-  std::vector<PropertyValue> property_values;
-  property_values.reserve(properties.size());
   Delta *delta = nullptr;
   VertexReadLock read_lock{vertex_};
   {
     auto const guard = read_lock.AcquireLock();
     deleted = vertex_->deleted();
-    auto property_paths = properties |
-                          rv::transform([](PropertyId property) { return storage::PropertyPath{property}; }) |
-                          r::to<std::vector<storage::PropertyPath>>();
-    property_values = vertex_->properties.ExtractPropertyValuesMissingAsNull(property_paths);
+    vertex_->properties.ExtractPropertyValuesMissingAsNull(ordered_properties, out);
+    // Reading one property at a time decodes, so reading a set of them has to as well.
+    auto const decoder = IndexedPropertyDecoder<Vertex>{
+        .indices = &storage_->indices_, .name_id_mapper = storage_->name_id_mapper_.get(), .entity = vertex_};
+    for (auto &value : out) decoder.DecodeProperty(value);
     delta = vertex_->delta();
   }
-  auto properties_map =
-      rv::zip(properties, property_values) | rv::transform([](const auto &property_id_value_pair) {
-        return std::make_pair(std::get<0>(property_id_value_pair), std::get<1>(property_id_value_pair));
-      }) |
-      r::to<std::map<PropertyId, PropertyValue>>();
 
   // Checking cache has a cost, only do it if we have any deltas
   // if we have no deltas then what we already have from the vertex is correct.
   if (delta && transaction_->isolation_level != IsolationLevel::READ_UNCOMMITTED) {
-    // IsolationLevel::READ_COMMITTED would be tricky to propagate invalidation to
-    // so for now only cache for IsolationLevel::SNAPSHOT_ISOLATION
     auto const useCache = transaction_->UseCache();
     if (useCache) {
       auto const &cache = transaction_->manyDeltasCache;
       if (auto resError = HasError(view, cache, vertex_, for_deleted_); resError) return std::unexpected{*resError};
-      // Note: We don't have specific cache for properties by IDs, so we skip caching for now
     }
 
     auto const n_processed =
-        ApplyDeltasForRead(transaction_, delta, view, [&exists, &deleted, &properties_map](const Delta &delta) {
+        ApplyDeltasForRead(transaction_, delta, view, [&exists, &deleted, paths, out](const Delta &delta) {
           // clang-format off
           DeltaDispatch(delta, utils::ChainedOverloaded{
             Deleted_ActionMethod(deleted),
             Exists_ActionMethod(exists),
-            Properties_ActionMethod(properties_map)
+            PropertyValues_ActionMethod(paths, out)
           });
           // clang-format on
         });
@@ -887,13 +970,12 @@ Result<std::map<PropertyId, PropertyValue>> VertexAccessor::PropertiesByProperty
       auto &cache = transaction_->manyDeltasCache;
       cache.StoreExists(view, vertex_, exists);
       cache.StoreDeleted(view, vertex_, deleted);
-      // Note: We don't cache this specific subset of properties for now
     }
   }
 
   if (!exists) return std::unexpected{Error::NONEXISTENT_OBJECT};
   if (!for_deleted_ && deleted) return std::unexpected{Error::DELETED_OBJECT};
-  return std::move(properties_map);
+  return {};
 }
 
 auto VertexAccessor::BuildResultOutEdges(edge_store const &out_edges) const {
@@ -975,17 +1057,41 @@ Result<EdgesVertexAccessorResult> VertexAccessor::InEdges(View view, const std::
   bool deleted = false;
   auto in_edges = edge_store{};
   Delta *delta = nullptr;
+  bool defer_hops = false;
+  std::size_t replayed_n = 0;
+  // The full replayed list, when the many-deltas cache already holds it.
+  Edges const *cached_full = nullptr;
   int64_t expanded_count = 0;
+  bool const hops_used = hops_limit && hops_limit->IsUsed();
   VertexReadLock read_lock{vertex_};
   {
     auto const guard = read_lock.AcquireLock();
     deleted = vertex_->deleted();
-    if (edge_types.empty() && !destination) {
-      expanded_count = HandleExpansionsWithoutEdgeTypes(in_edges, hops_limit, EdgeDirection::IN);
-    } else {
-      expanded_count = HandleExpansionsWithEdgeTypes(in_edges, edge_types, destination, hops_limit, EdgeDirection::IN);
-    }
     delta = vertex_->delta();
+    if (hops_used) {
+      // The hop charge counts edges before the filter, so only the full list reproduces it: look up and
+      // store under the unfiltered key. The replay mutates the list, so the charge and the filter must come
+      // after it, and the cache must not see a budget-cut list. Copy the full list only if the replay will touch
+      // it or it is worth caching.
+      auto const cacheable = delta && transaction_->UseCache();
+      if (cacheable) {
+        if (auto const hit = transaction_->manyDeltasCache.GetInEdges(view, vertex_, nullptr, kNoEdgeTypes); hit)
+          cached_full = &hit->get();
+      }
+      if (!cached_full) {
+        auto const scan = ScanEdgeReplay<EdgeDirection::IN>(transaction_, delta, view);
+        defer_hops = scan.replays_edges || (cacheable && scan.n_applied >= FLAGS_delta_chain_cache_threshold);
+      }
+    }
+    if (defer_hops) {
+      in_edges = vertex_->in_edges;
+    } else if (cached_full) {
+      // Nothing to read from the live list; the cached one is projected below.
+    } else if (edge_types.empty() && !destination) {
+      expanded_count = HandleExpansionsWithoutEdgeTypes(in_edges, vertex_->in_edges, hops_limit);
+    } else {
+      expanded_count = HandleExpansionsWithEdgeTypes(in_edges, vertex_->in_edges, edge_types, destination, hops_limit);
+    }
   }
 
   // Checking cache has a cost, only do it if we have any deltas
@@ -997,38 +1103,65 @@ Result<EdgesVertexAccessorResult> VertexAccessor::InEdges(View view, const std::
     if (useCache) {
       auto const &cache = transaction_->manyDeltasCache;
       if (auto resError = HasError(view, cache, vertex_, for_deleted_); resError) return std::unexpected{*resError};
-      if (auto resInEdges = cache.GetInEdges(view, vertex_, destination_vertex, edge_types); resInEdges)
-        return EdgesVertexAccessorResult{
-            .edges = ExpandedEdges{*resInEdges, vertex_, storage_, transaction_, EdgeDirection::IN},
-            .expanded_count = expanded_count};
+      if (cached_full) {
+        // The entry is the full list, so charging the budget over it counts what the live list would have.
+        // Its replay, which would have set these, is skipped.
+        deleted = cache.GetDeleted(view, vertex_).value_or(false);
+        if (edge_types.empty() && !destination) {
+          expanded_count = HandleExpansionsWithoutEdgeTypes(in_edges, *cached_full, hops_limit);
+        } else {
+          expanded_count = HandleExpansionsWithEdgeTypes(in_edges, *cached_full, edge_types, destination, hops_limit);
+        }
+      } else if (!hops_used) {
+        if (auto resInEdges = cache.GetInEdges(view, vertex_, destination_vertex, edge_types); resInEdges)
+          return EdgesVertexAccessorResult{
+              .edges = ExpandedEdges{*resInEdges, vertex_, storage_, transaction_, EdgeDirection::IN},
+              .expanded_count = expanded_count};
+      }
     }
 
-    auto const n_processed = ApplyDeltasForRead(
-        transaction_,
-        delta,
-        view,
-        [&exists, &deleted, &in_edges, &edge_types, &destination_vertex](const Delta &delta) {
-          // clang-format off
-          DeltaDispatch(delta, utils::ChainedOverloaded{
-            Deleted_ActionMethod(deleted),
-            Exists_ActionMethod(exists),
-            Edges_ActionMethod<EdgeDirection::IN>(in_edges, edge_types, destination_vertex)
+    std::size_t n_processed = 0;
+    if (!cached_full) {
+      auto const &replay_types = defer_hops ? kNoEdgeTypes : edge_types;
+      auto const *replay_dst = defer_hops ? nullptr : destination_vertex;
+      n_processed = ApplyDeltasForRead(
+          transaction_, delta, view, [&exists, &deleted, &in_edges, &replay_types, &replay_dst](const Delta &delta) {
+            // clang-format off
+            DeltaDispatch(delta, utils::ChainedOverloaded{
+              Deleted_ActionMethod(deleted),
+              Exists_ActionMethod(exists),
+              Edges_ActionMethod<EdgeDirection::IN>(in_edges, replay_types, replay_dst)
+            });
+            // clang-format on
           });
-          // clang-format on
-        });
+    }
 
-    if (useCache && n_processed >= FLAGS_delta_chain_cache_threshold) {
+    if (useCache && !cached_full && n_processed >= FLAGS_delta_chain_cache_threshold) {
       auto &cache = transaction_->manyDeltasCache;
       cache.StoreExists(view, vertex_, exists);
       cache.StoreDeleted(view, vertex_, deleted);
-      cache.StoreInEdges(view, vertex_, destination_vertex, edge_types, in_edges);
+      if (!defer_hops) cache.StoreInEdges(view, vertex_, destination_vertex, edge_types, in_edges);
     }
+    replayed_n = n_processed;
   }
 
   if (!exists) [[unlikely]]
     return std::unexpected{Error::NONEXISTENT_OBJECT};
   if (deleted) [[unlikely]]
     return std::unexpected{Error::DELETED_OBJECT};
+
+  if (defer_hops) {
+    edge_store projected;
+    if (edge_types.empty() && !destination) {
+      expanded_count = HandleExpansionsWithoutEdgeTypes(projected, in_edges, hops_limit);
+    } else {
+      expanded_count = HandleExpansionsWithEdgeTypes(projected, in_edges, edge_types, destination, hops_limit);
+    }
+    if (transaction_->UseCache() && replayed_n >= FLAGS_delta_chain_cache_threshold) {
+      transaction_->manyDeltasCache.StoreInEdges(view, vertex_, nullptr, {}, std::move(in_edges));
+    }
+    in_edges = std::move(projected);
+  }
 
   if (transaction_->IsDiskStorage()) [[unlikely]] {
     return EdgesVertexAccessorResult{.edges = ExpandedEdges{BuildResultWithDisk(in_edges, disk_edges, view, "IN")},
@@ -1070,18 +1203,42 @@ Result<EdgesVertexAccessorResult> VertexAccessor::OutEdges(View view, const std:
   bool deleted = false;
   auto out_edges = edge_store{};
   Delta *delta = nullptr;
+  bool defer_hops = false;
+  std::size_t replayed_n = 0;
+  // The full replayed list, when the many-deltas cache already holds it.
+  Edges const *cached_full = nullptr;
   int64_t expanded_count = 0;
+  bool const hops_used = hops_limit && hops_limit->IsUsed();
   VertexReadLock read_lock{vertex_};
   {
     auto const guard = read_lock.AcquireLock();
     deleted = vertex_->deleted();
-    if (edge_types.empty() && !destination) {
-      expanded_count = HandleExpansionsWithoutEdgeTypes(out_edges, hops_limit, EdgeDirection::OUT);
+    delta = vertex_->delta();
+    if (hops_used) {
+      // The hop charge counts edges before the filter, so only the full list reproduces it: look up and
+      // store under the unfiltered key. The replay mutates the list, so the charge and the filter must come
+      // after it, and the cache must not see a budget-cut list. Copy the full list only if the replay will touch
+      // it or it is worth caching.
+      auto const cacheable = delta && transaction_->UseCache();
+      if (cacheable) {
+        if (auto const hit = transaction_->manyDeltasCache.GetOutEdges(view, vertex_, nullptr, kNoEdgeTypes); hit)
+          cached_full = &hit->get();
+      }
+      if (!cached_full) {
+        auto const scan = ScanEdgeReplay<EdgeDirection::OUT>(transaction_, delta, view);
+        defer_hops = scan.replays_edges || (cacheable && scan.n_applied >= FLAGS_delta_chain_cache_threshold);
+      }
+    }
+    if (defer_hops) {
+      out_edges = vertex_->out_edges;
+    } else if (cached_full) {
+      // Nothing to read from the live list; the cached one is projected below.
+    } else if (edge_types.empty() && !destination) {
+      expanded_count = HandleExpansionsWithoutEdgeTypes(out_edges, vertex_->out_edges, hops_limit);
     } else {
       expanded_count =
-          HandleExpansionsWithEdgeTypes(out_edges, edge_types, destination, hops_limit, EdgeDirection::OUT);
+          HandleExpansionsWithEdgeTypes(out_edges, vertex_->out_edges, edge_types, destination, hops_limit);
     }
-    delta = vertex_->delta();
   }
 
   // Checking cache has a cost, only do it if we have any deltas
@@ -1093,35 +1250,65 @@ Result<EdgesVertexAccessorResult> VertexAccessor::OutEdges(View view, const std:
     if (useCache) {
       auto const &cache = transaction_->manyDeltasCache;
       if (auto resError = HasError(view, cache, vertex_, for_deleted_); resError) return std::unexpected{*resError};
-      if (auto resOutEdges = cache.GetOutEdges(view, vertex_, dst_vertex, edge_types); resOutEdges)
-        return EdgesVertexAccessorResult{
-            .edges = ExpandedEdges{*resOutEdges, vertex_, storage_, transaction_, EdgeDirection::OUT},
-            .expanded_count = expanded_count};
+      if (cached_full) {
+        // The entry is the full list, so charging the budget over it counts what the live list would have.
+        // Its replay, which would have set these, is skipped.
+        deleted = cache.GetDeleted(view, vertex_).value_or(false);
+        if (edge_types.empty() && !destination) {
+          expanded_count = HandleExpansionsWithoutEdgeTypes(out_edges, *cached_full, hops_limit);
+        } else {
+          expanded_count = HandleExpansionsWithEdgeTypes(out_edges, *cached_full, edge_types, destination, hops_limit);
+        }
+      } else if (!hops_used) {
+        if (auto resOutEdges = cache.GetOutEdges(view, vertex_, dst_vertex, edge_types); resOutEdges)
+          return EdgesVertexAccessorResult{
+              .edges = ExpandedEdges{*resOutEdges, vertex_, storage_, transaction_, EdgeDirection::OUT},
+              .expanded_count = expanded_count};
+      }
     }
 
-    auto const n_processed = ApplyDeltasForRead(
-        transaction_, delta, view, [&exists, &deleted, &out_edges, &edge_types, &dst_vertex](const Delta &delta) {
-          // clang-format off
-          DeltaDispatch(delta, utils::ChainedOverloaded{
-            Deleted_ActionMethod(deleted),
-            Exists_ActionMethod(exists),
-            Edges_ActionMethod<EdgeDirection::OUT>(out_edges, edge_types, dst_vertex)
+    std::size_t n_processed = 0;
+    if (!cached_full) {
+      auto const &replay_types = defer_hops ? kNoEdgeTypes : edge_types;
+      auto const *replay_dst = defer_hops ? nullptr : dst_vertex;
+      n_processed = ApplyDeltasForRead(
+          transaction_, delta, view, [&exists, &deleted, &out_edges, &replay_types, &replay_dst](const Delta &delta) {
+            // clang-format off
+            DeltaDispatch(delta, utils::ChainedOverloaded{
+              Deleted_ActionMethod(deleted),
+              Exists_ActionMethod(exists),
+              Edges_ActionMethod<EdgeDirection::OUT>(out_edges, replay_types, replay_dst)
+            });
+            // clang-format on
           });
-          // clang-format on
-        });
+    }
 
-    if (useCache && n_processed >= FLAGS_delta_chain_cache_threshold) {
+    if (useCache && !cached_full && n_processed >= FLAGS_delta_chain_cache_threshold) {
       auto &cache = transaction_->manyDeltasCache;
       cache.StoreExists(view, vertex_, exists);
       cache.StoreDeleted(view, vertex_, deleted);
-      cache.StoreOutEdges(view, vertex_, dst_vertex, edge_types, out_edges);
+      if (!defer_hops) cache.StoreOutEdges(view, vertex_, dst_vertex, edge_types, out_edges);
     }
+    replayed_n = n_processed;
   }
 
   if (!exists) [[unlikely]]
     return std::unexpected{Error::NONEXISTENT_OBJECT};
   if (deleted) [[unlikely]]
     return std::unexpected{Error::DELETED_OBJECT};
+
+  if (defer_hops) {
+    edge_store projected;
+    if (edge_types.empty() && !destination) {
+      expanded_count = HandleExpansionsWithoutEdgeTypes(projected, out_edges, hops_limit);
+    } else {
+      expanded_count = HandleExpansionsWithEdgeTypes(projected, out_edges, edge_types, destination, hops_limit);
+    }
+    if (transaction_->UseCache() && replayed_n >= FLAGS_delta_chain_cache_threshold) {
+      transaction_->manyDeltasCache.StoreOutEdges(view, vertex_, nullptr, {}, std::move(out_edges));
+    }
+    out_edges = std::move(projected);
+  }
 
   if (transaction_->IsDiskStorage()) [[unlikely]] {
     return EdgesVertexAccessorResult{.edges = ExpandedEdges{BuildResultWithDisk(out_edges, disk_edges, view, "OUT")},
@@ -1248,9 +1435,8 @@ Result<size_t> VertexAccessor::OutDegree(View view) const {
   return degree;
 }
 
-int64_t VertexAccessor::HandleExpansionsWithoutEdgeTypes(edge_store &result_edges, HopsLimit *hops_limit,
-                                                         EdgeDirection direction) const {
-  const auto &edges = direction == EdgeDirection::IN ? vertex_->in_edges : vertex_->out_edges;
+int64_t VertexAccessor::HandleExpansionsWithoutEdgeTypes(edge_store &result_edges, const edge_store &edges,
+                                                         HopsLimit *hops_limit) {
   if (edges.empty()) return 0;
 
   uint64_t expanded_count = 0;
@@ -1266,11 +1452,9 @@ int64_t VertexAccessor::HandleExpansionsWithoutEdgeTypes(edge_store &result_edge
   return static_cast<int64_t>(expanded_count);
 }
 
-int64_t VertexAccessor::HandleExpansionsWithEdgeTypes(edge_store &result_edges,
+int64_t VertexAccessor::HandleExpansionsWithEdgeTypes(edge_store &result_edges, const edge_store &edges,
                                                       const std::vector<EdgeTypeId> &edge_types,
-                                                      const VertexAccessor *destination, HopsLimit *hops_limit,
-                                                      EdgeDirection direction) const {
-  const auto &edges = direction == EdgeDirection::IN ? vertex_->in_edges : vertex_->out_edges;
+                                                      const VertexAccessor *destination, HopsLimit *hops_limit) {
   if (edges.empty()) return 0;
 
   // Growing a doubling at a time reallocates and copies a high-degree list repeatedly, each new

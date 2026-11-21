@@ -101,7 +101,10 @@ void VectorIndex::RecoverAllVectorIndices(std::vector<VectorIndexRecoveryInfo> &
                                           ActiveIndicesUpdater const &updater, ProgressCallback const &on_progress) {
   if (recovery_infos.empty()) return;
 
-  absl::flat_hash_map<PropertyId, std::vector<std::pair<uint64_t, std::shared_ptr<IndexItem>>>> prop_to_items;
+  boost::unordered_flat_map<PropertyId,
+                            std::vector<std::pair<uint64_t, std::shared_ptr<IndexItem>>>,
+                            std::hash<PropertyId>>
+      prop_to_items;
   try {
     for (auto &ri : recovery_infos) {
       auto index_id = SetupIndex(ri.spec, name_id_mapper);
@@ -393,6 +396,15 @@ utils::small_vector<float> VectorIndex::GetVectorPropertyFromIndex(Vertex *verte
   utils::small_vector<float> vector(item_ptr->mg_index.index.dimensions());
   if (!item_ptr->mg_index.index.get(vertex, vector.data())) return {};
   return vector;
+}
+
+bool VectorIndex::GetVectorInto(Vertex *vertex, uint64_t index_id, std::vector<float> &out) const {
+  auto it = index_->find(index_id);
+  if (it == index_->end()) return false;
+  auto &item_ptr = it->second;
+  auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+  out.resize(item_ptr->mg_index.index.dimensions());
+  return item_ptr->mg_index.index.get(vertex, out.data());
 }
 
 std::vector<VectorIndexInfo> VectorIndex::ListVectorIndicesInfo() const {

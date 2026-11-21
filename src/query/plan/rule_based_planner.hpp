@@ -1268,7 +1268,9 @@ class RuleBasedPlanner : public SubqueryBranchPlanner {
 
       // additionally, check for Cyphermorphism of the previous branch with new bound symbols
       for (const auto &new_symbol : cross_branch_new_symbols) {
-        if (new_symbol.type() == Symbol::Type::EDGE) {
+        // A variable-length relationship binds a list of relationships, and those are still
+        // relationships two patterns may not share, so both kinds of symbol are checked.
+        if (new_symbol.type() == Symbol::Type::EDGE || new_symbol.type() == Symbol::Type::EDGE_LIST) {
           last_op = EnsureCyphermorphism(std::move(last_op), new_symbol, matching, new_bound_symbols);
         }
       }
@@ -1386,9 +1388,10 @@ class RuleBasedPlanner : public SubqueryBranchPlanner {
     const auto &node1_symbol = symbol_table.at(*expansion.node1->identifier_);
     const bool is_unseen_node = bound_symbols.insert(node1_symbol).second;
 
-    // we can just perform scanning from an edge if it's a simple edge
-    // we don't take into consideration path expansion as part of edge scanning
-    if (is_unseen_node && expansion.expand_from_edge && expansion.edge->type_ == EdgeAtom::Type::SINGLE) {
+    // Scan from a single-hop edge into a free node2 only; node1 is bound by now, so a self-loop's node2 is bound.
+    // TODO: a self-loop check in ScanAllByEdgeCursor would let (a)-[:T]->(a) keep the edge index.
+    if (is_unseen_node && expansion.expand_from_edge && expansion.edge->type_ == EdgeAtom::Type::SINGLE &&
+        !bound_symbols.contains(symbol_table.at(*expansion.node2->identifier_))) {
       const auto &node2_symbol = symbol_table.at(*expansion.node2->identifier_);
       const auto &edge_symbol = symbol_table.at(*expansion.edge->identifier_);
       auto edge_types = GetEdgeTypes(expansion.edge->edge_types_);
@@ -1479,7 +1482,7 @@ class RuleBasedPlanner : public SubqueryBranchPlanner {
       std::optional<ExpansionLambda> weight_lambda;
       std::optional<Symbol> total_weight;
 
-      if (edge->type_ == EdgeAtom::Type::WEIGHTED_SHORTEST_PATH || edge->type_ == EdgeAtom::Type::ALL_SHORTEST_PATHS) {
+      if (edge->weight_lambda_.expression) {
         weight_lambda.emplace(ExpansionLambda{.inner_edge_symbol = symbol_table.at(*edge->weight_lambda_.inner_edge),
                                               .inner_node_symbol = symbol_table.at(*edge->weight_lambda_.inner_node),
                                               .expression = edge->weight_lambda_.expression});
@@ -1565,7 +1568,6 @@ class RuleBasedPlanner : public SubqueryBranchPlanner {
             "WITH clause.");
       }
 
-      // TODO: Pass weight lambda.
       last_op = std::make_unique<ExpandVariable>(std::move(last_op),
                                                  node1_symbol,
                                                  node_symbol,

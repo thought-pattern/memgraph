@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -809,6 +810,35 @@ TEST_P(CypherMainVisitorTest, IntegerLiteral) {
   auto *return_clause = dynamic_cast<Return *>(single_query->clauses_[0]);
   ast_generator.CheckLiteral(return_clause->body_.named_expressions[0]->expression_, 42, 1);
   CheckRWType(query, kRead);
+}
+
+// Every form of index that names a set of properties refuses a repeat, and none of them refuses
+// two distinct ones.
+TEST_P(CypherMainVisitorTest, IndexPropertiesCannotRepeat) {
+  auto &ast_generator = *GetParam();
+
+  ASSERT_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop, prop)"), SemanticException);
+  ASSERT_THROW(ast_generator.ParseQuery("CREATE TEXT INDEX name ON :Label(prop, prop)"), SemanticException);
+  ASSERT_THROW(ast_generator.ParseQuery("CREATE TEXT EDGE INDEX name ON :Type(prop, prop)"), SemanticException);
+
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop, other)"));
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE TEXT INDEX name ON :Label(prop, other)"));
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE TEXT EDGE INDEX name ON :Type(prop, other)"));
+}
+
+// A path into a property is named twice only when every step matches, so two paths through one
+// outer property are distinct and allowed. A path that is a prefix of another is not: the shorter
+// one already indexes everything under it.
+TEST_P(CypherMainVisitorTest, NestedIndexPropertiesCannotRepeatOrNest) {
+  auto &ast_generator = *GetParam();
+
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop.inner, prop.other)"));
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(one.inner, two.inner)"));
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop, other.inner)"));
+  ASSERT_NO_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop.a.b, prop.a.c)"));
+
+  ASSERT_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop.inner, prop.inner)"), SemanticException);
+  ASSERT_THROW(ast_generator.ParseQuery("CREATE INDEX ON :Label(prop, prop.inner)"), SemanticException);
 }
 
 TEST_P(CypherMainVisitorTest, IntegerLiteralTooLarge) {
@@ -2410,6 +2440,33 @@ TEST_P(CypherMainVisitorTest, WithAnonymousVariableCapture) {
   CheckRWType(query, kRead);
 }
 
+TEST_P(CypherMainVisitorTest, MatchAfterOptionalMatch) {
+  auto &ast_generator = *GetParam();
+  CypherQuery *query = nullptr;
+  ASSERT_NO_THROW(
+      query = dynamic_cast<CypherQuery *>(ast_generator.ParseQuery("OPTIONAL MATCH (n) MATCH (n)-[r]->(m) RETURN m")));
+  ASSERT_TRUE(query);
+  const auto &clauses = query->single_query_->clauses_;
+  ASSERT_EQ(clauses.size(), 3U);
+  auto *optional_match = dynamic_cast<Match *>(clauses[0]);
+  auto *match = dynamic_cast<Match *>(clauses[1]);
+  ASSERT_TRUE(optional_match);
+  ASSERT_TRUE(match);
+  EXPECT_TRUE(optional_match->optional_);
+  EXPECT_FALSE(match->optional_);
+  EXPECT_NO_THROW(ast_generator.ParseQuery(
+      "OPTIONAL MATCH (n) MATCH (m) RETURN m UNION ALL OPTIONAL MATCH (n) MATCH (m) RETURN m"));
+
+  // Any clause between the pair is accepted, not only WITH.
+  for (const auto *between : {"UNWIND [1] AS x",
+                              "CALL () { RETURN 1 AS one }",
+                              "CALL mg.procedures() YIELD name",
+                              R"(LOAD CSV FROM "file.csv" WITH HEADER AS row)"}) {
+    EXPECT_NO_THROW(ast_generator.ParseQuery(fmt::format("OPTIONAL MATCH (n) {} MATCH (m) RETURN n, m", between)))
+        << between;
+  }
+}
+
 TEST_P(CypherMainVisitorTest, ClausesOrdering) {
   // Obviously some of the ridiculous combinations don't fail here, but they
   // will fail in semantic analysis or they make perfect sense as a part of
@@ -2423,7 +2480,8 @@ TEST_P(CypherMainVisitorTest, ClausesOrdering) {
   ASSERT_THROW(ast_generator.ParseQuery("RETURN 1 WITH n AS m RETURN 1"), SemanticException);
   ASSERT_THROW(ast_generator.ParseQuery("RETURN 1 AS n UNWIND n AS x RETURN x"), SemanticException);
 
-  ASSERT_THROW(ast_generator.ParseQuery("OPTIONAL MATCH (n) MATCH (m) RETURN n, m"), SemanticException);
+  EXPECT_THAT([&] { ast_generator.ParseQuery("OPTIONAL MATCH (n) CREATE (m) MATCH (k) RETURN k"); },
+              testing::ThrowsMessage<SemanticException>(HasSubstr("after an update")));
 
   CheckRWType(ast_generator.ParseQuery("OPTIONAL MATCH (n) WITH n MATCH (m) RETURN n, m"), kRead);
   CheckRWType(ast_generator.ParseQuery("OPTIONAL MATCH (n) OPTIONAL MATCH (m) RETURN n, m"), kRead);
@@ -3153,10 +3211,11 @@ TEST_P(CypherMainVisitorTest, MatchKShortestReturn) {
   CheckRWType(query, kRead);
 }
 
-TEST_P(CypherMainVisitorTest, MatchKShortestWithFilterReturn) {
+// A lone lambda is the weight, as for the weighted and all-shortest expansions; no total is needed.
+TEST_P(CypherMainVisitorTest, MatchKShortestLoneLambdaIsWeight) {
   auto &ast_generator = *GetParam();
-  auto *query = dynamic_cast<CypherQuery *>(
-      ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest (e, n | e.prop = 42)]->() RETURN r"));
+  auto *query =
+      dynamic_cast<CypherQuery *>(ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest (e, n | e.w)]->() RETURN r"));
   ASSERT_TRUE(query);
   auto *single_query = query->single_query_;
   ASSERT_EQ(single_query->clauses_.size(), 2U);
@@ -3165,20 +3224,47 @@ TEST_P(CypherMainVisitorTest, MatchKShortestWithFilterReturn) {
   auto *shortest = dynamic_cast<EdgeAtom *>(match->patterns_[0]->atoms_[1]);
   ASSERT_TRUE(shortest);
   EXPECT_EQ(shortest->type_, EdgeAtom::Type::KSHORTEST);
-  EXPECT_EQ(shortest->filter_lambda_.inner_edge->name_, "e");
-  EXPECT_TRUE(shortest->filter_lambda_.inner_edge->user_declared_);
-  EXPECT_EQ(shortest->filter_lambda_.inner_node->name_, "n");
-  EXPECT_TRUE(shortest->filter_lambda_.inner_node->user_declared_);
-  EXPECT_TRUE(shortest->filter_lambda_.expression);
-  EXPECT_FALSE(shortest->filter_lambda_.accumulated_path);
-  EXPECT_FALSE(shortest->weight_lambda_.expression);
+  EXPECT_FALSE(shortest->filter_lambda_.expression);
+  ASSERT_TRUE(shortest->weight_lambda_.expression);
+  EXPECT_EQ(shortest->weight_lambda_.inner_edge->name_, "e");
+  EXPECT_TRUE(shortest->weight_lambda_.inner_edge->user_declared_);
+  EXPECT_EQ(shortest->weight_lambda_.inner_node->name_, "n");
+  EXPECT_TRUE(shortest->weight_lambda_.inner_node->user_declared_);
+  ASSERT_TRUE(shortest->total_weight_);
+  EXPECT_FALSE(shortest->total_weight_->user_declared_);
   CheckRWType(query, kRead);
 }
 
-TEST_P(CypherMainVisitorTest, MatchKShortestWithLimitAndFilterReturn) {
+// A named total weight variable after the weight lambda.
+TEST_P(CypherMainVisitorTest, MatchKShortestWithWeightLambdaReturn) {
   auto &ast_generator = *GetParam();
   auto *query = dynamic_cast<CypherQuery *>(
-      ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest 1..3 |2 (e, n | e.prop = 42)]->() RETURN r"));
+      ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest (e, n | e.w) total]->() RETURN r"));
+  ASSERT_TRUE(query);
+  auto *match = dynamic_cast<Match *>(query->single_query_->clauses_[0]);
+  ASSERT_TRUE(match);
+  auto *shortest = dynamic_cast<EdgeAtom *>(match->patterns_[0]->atoms_[1]);
+  ASSERT_TRUE(shortest);
+  EXPECT_EQ(shortest->type_, EdgeAtom::Type::KSHORTEST);
+  EXPECT_EQ(shortest->weight_lambda_.inner_edge->name_, "e");
+  EXPECT_EQ(shortest->weight_lambda_.inner_node->name_, "n");
+  EXPECT_TRUE(shortest->weight_lambda_.expression);
+  ASSERT_TRUE(shortest->total_weight_);
+  EXPECT_EQ(shortest->total_weight_->name_, "total");
+  EXPECT_TRUE(shortest->total_weight_->user_declared_);
+  // The filter lambda is left empty but still carries the inner identifiers an inlined filter needs.
+  EXPECT_FALSE(shortest->filter_lambda_.expression);
+  EXPECT_FALSE(shortest->filter_lambda_.inner_edge->user_declared_);
+  EXPECT_FALSE(shortest->filter_lambda_.inner_node->user_declared_);
+  CheckRWType(query, kRead);
+}
+
+// Weight then filter, in the order the weighted and all-shortest expansions already take them, and
+// alongside the bounds and the path limit.
+TEST_P(CypherMainVisitorTest, MatchKShortestWithWeightAndFilterLambdasReturn) {
+  auto &ast_generator = *GetParam();
+  auto *query = dynamic_cast<CypherQuery *>(
+      ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest 1..3 |2 (e, n | e.w) total (f, m | m.ok)]->() RETURN r"));
   ASSERT_TRUE(query);
   auto *match = dynamic_cast<Match *>(query->single_query_->clauses_[0]);
   ASSERT_TRUE(match);
@@ -3188,32 +3274,133 @@ TEST_P(CypherMainVisitorTest, MatchKShortestWithLimitAndFilterReturn) {
   EXPECT_TRUE(shortest->lower_bound_);
   EXPECT_TRUE(shortest->upper_bound_);
   EXPECT_TRUE(shortest->limit_);
+  EXPECT_EQ(shortest->weight_lambda_.inner_edge->name_, "e");
+  EXPECT_TRUE(shortest->weight_lambda_.expression);
+  EXPECT_EQ(shortest->total_weight_->name_, "total");
+  EXPECT_EQ(shortest->filter_lambda_.inner_edge->name_, "f");
+  EXPECT_EQ(shortest->filter_lambda_.inner_node->name_, "m");
   EXPECT_TRUE(shortest->filter_lambda_.expression);
+  CheckRWType(query, kRead);
 }
 
-TEST_P(CypherMainVisitorTest, SemanticExceptionOnKShortestWithTwoLambdas) {
+// The variable between the two lambdas is optional; without it the total is still computed, just
+// under a name the query cannot reach.
+TEST_P(CypherMainVisitorTest, MatchKShortestWithAnonymousTotalWeightReturn) {
   auto &ast_generator = *GetParam();
-  ASSERT_THROW(ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest (e, n | 1) (e, n | e.prop = 42)]->() RETURN r"),
-               SemanticException);
+  auto *query = dynamic_cast<CypherQuery *>(
+      ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest (e, n | 1) (e, n | e.prop = 42)]->() RETURN r"));
+  ASSERT_TRUE(query);
+  auto *match = dynamic_cast<Match *>(query->single_query_->clauses_[0]);
+  ASSERT_TRUE(match);
+  auto *shortest = dynamic_cast<EdgeAtom *>(match->patterns_[0]->atoms_[1]);
+  ASSERT_TRUE(shortest);
+  EXPECT_EQ(shortest->type_, EdgeAtom::Type::KSHORTEST);
+  EXPECT_TRUE(shortest->weight_lambda_.expression);
+  EXPECT_TRUE(shortest->filter_lambda_.expression);
+  ASSERT_TRUE(shortest->total_weight_);
+  EXPECT_FALSE(shortest->total_weight_->user_declared_);
 }
 
-TEST_P(CypherMainVisitorTest, MatchKShortestFilterByPathReturn) {
+constexpr std::string_view kKShortestWeightFirstHint =
+    "KSHORTEST takes the weight lambda first. To filter without a weight, write (e, n | 1) (e, n | <filter>).";
+
+// A v3.13 path filter `(e, n, p | ...)` is now a weight lambda, which cannot take the path.
+TEST_P(CypherMainVisitorTest, SemanticExceptionOnKShortestWeightLambdaWithAccumulatedPath) {
   auto &ast_generator = *GetParam();
-  try {
-    ast_generator.ParseQuery(
-        "MATCH pth=()-[r:type1 *kShortest (e, n, p | startNode(relationships(e)[-1]) = "
-        "c:type3)]->(:type2) RETURN pth");
-    FAIL() << "Expected the accumulated path to be rejected for KSHORTEST";
-  } catch (const SemanticException &e) {
-    EXPECT_THAT(e.what(), HasSubstr("accumulated path"));
+  for (const auto *lambda :
+       {"(e, n, p | e.w) total", "(e, n, p | size(p) > 0)", "(e, n, p | e.w) total (f, m | m.ok)"}) {
+    SCOPED_TRACE(lambda);
+    try {
+      ast_generator.ParseQuery(fmt::format("MATCH ()-[r:type1 *kShortest {}]->() RETURN r", lambda));
+      ADD_FAILURE() << "Expected the accumulated path to be rejected in a weight lambda";
+    } catch (const SemanticException &e) {
+      EXPECT_EQ(std::string(e.what()),
+                fmt::format("The lambda for calculating weights cannot take the accumulated path or the "
+                            "accumulated weight. {}",
+                            kKShortestWeightFirstHint));
+    }
   }
 }
 
-TEST_P(CypherMainVisitorTest, MatchKShortestFilterByPathWeightReturn) {
+// A lone lambda shaped like a v3.13 filter is refused before any edge is read. A literal reaches the
+// visitor as a parameter when the query is cached, so only the uncached parse can see `true`; the
+// runtime check catches it there.
+TEST_P(CypherMainVisitorTest, SemanticExceptionOnKShortestBooleanShapedLoneLambda) {
   auto &ast_generator = *GetParam();
-  ASSERT_THROW(ast_generator.ParseQuery("MATCH pth=()-[r:type1 *kShortest (e, n, p, w | "
-                                        "startNode(relationships(e)[-1]) = c:type3 AND w < 50)]->(:type2) RETURN pth"),
-               SemanticException);
+  const bool cached = std::string(typeid(ast_generator).name()).ends_with("CachedAstGenerator");
+  std::vector<std::string> lambdas{"(e, n | n.id <> 'C')",
+                                   "(e, n | e.w > 0 AND n.ok)",
+                                   "(e, n | NOT e.hidden)",
+                                   "(e, n | n.name STARTS WITH 'a')",
+                                   "(e, n | n.id IN ['A'])",
+                                   "(e, n | e.a OR n.b)",
+                                   "(e, n | e.a XOR n.b)",
+                                   "(e, n | e.w = 1)",
+                                   "(e, n | e.w < 1)",
+                                   "(e, n | e.w > 1)",
+                                   "(e, n | e.w <= 1)",
+                                   "(e, n | e.w >= 1)",
+                                   "(e, n | e.w IS NULL)",
+                                   "(e, n | n.name =~ 'a.*')",
+                                   "(e, n | n.name ENDS WITH 'a')",
+                                   "(e, n | n.name CONTAINS 'a')"};
+  if (!cached) lambdas.emplace_back("(e, n | true)");
+  for (const auto &lambda : lambdas) {
+    SCOPED_TRACE(lambda);
+    try {
+      ast_generator.ParseQuery(fmt::format("MATCH ()-[r:type1 *kShortest {}]->() RETURN r", lambda));
+      ADD_FAILURE() << "Expected the boolean-shaped weight lambda to be refused";
+    } catch (const SemanticException &e) {
+      EXPECT_EQ(std::string(e.what()), kKShortestWeightFirstHint);
+    }
+  }
+}
+
+// Weights that are not boolean-shaped parse, and both KSHORTEST checks are for KSHORTEST only: the
+// weighted and all shortest path expansions keep accepting an accumulated path the body does not read.
+TEST_P(CypherMainVisitorTest, KShortestNumericWeightLambdaParses) {
+  auto &ast_generator = *GetParam();
+  for (const auto *query : {"MATCH ()-[r *kShortest (e, n | e.w)]->() RETURN r",
+                            "MATCH ()-[r *kShortest (e, n | n.cost + e.w)]->() RETURN r",
+                            "MATCH ()-[r *kShortest (e, n | e.w) (e, n | n.ok)]->() RETURN r",
+                            "MATCH ()-[r *wShortest (e, n | e.w > 0) total]->() RETURN r",
+                            "MATCH ()-[r:type1 *wShortest (e, n, p | e.w) total]->() RETURN r",
+                            "MATCH ()-[r:type1 *allShortest (e, n, p | e.w) total]->() RETURN r"}) {
+    SCOPED_TRACE(query);
+    EXPECT_NO_THROW(ast_generator.ParseQuery(query));
+  }
+}
+
+TEST_P(CypherMainVisitorTest, SemanticExceptionOnKShortestFilterLambdaWithAccumulatedPath) {
+  auto &ast_generator = *GetParam();
+  try {
+    ast_generator.ParseQuery("MATCH ()-[r:type1 *kShortest (e, n | e.w) total (f, m, p | size(p) > 0)]->() RETURN r");
+    FAIL() << "Expected the accumulated path to be rejected for KSHORTEST";
+  } catch (const SemanticException &e) {
+    EXPECT_EQ(std::string(e.what()), "KSHORTEST expansion does not support the accumulated path in a filter lambda.");
+  }
+}
+
+// Only the three weighted expansions take a total weight variable.
+TEST_P(CypherMainVisitorTest, SemanticExceptionOnTotalWeightWithBfs) {
+  auto &ast_generator = *GetParam();
+  try {
+    ast_generator.ParseQuery("MATCH ()-[r:type1 *bfs (e, n | true) total]->() RETURN r");
+    FAIL() << "Expected the total weight to be rejected for BFS";
+  } catch (const SemanticException &e) {
+    EXPECT_EQ(std::string(e.what()),
+              "Variable for total weight is allowed only with weighted, all shortest and K shortest path expansion.");
+  }
+}
+
+TEST_P(CypherMainVisitorTest, SemanticExceptionOnDepthFirstWithTwoLambdas) {
+  auto &ast_generator = *GetParam();
+  try {
+    ast_generator.ParseQuery("MATCH ()-[r:type1 * (e, n | 1) (e, n | true)]->() RETURN r");
+    FAIL() << "Expected two lambdas to be refused for a depth-first expansion";
+  } catch (const SemanticException &e) {
+    EXPECT_EQ(std::string(e.what()), "Only one filter lambda can be supplied.");
+  }
 }
 
 TEST_P(CypherMainVisitorTest, SemanticExceptionOnKShortestWithRangeBounds) {
@@ -5211,6 +5398,21 @@ TEST_P(CypherMainVisitorTest, GrantRevokeCoordinatorPrivilege) {
     ASSERT_TRUE(query);
     EXPECT_EQ(query->action_, AuthQuery::Action::REVOKE_PRIVILEGE);
     EXPECT_TRUE(query->all_privileges_);
+  }
+}
+
+TEST_P(CypherMainVisitorTest, RemovedCoordinatorPrivilege) {
+  auto &ast_generator = *GetParam();
+  for (const auto *query : {"GRANT COORDINATOR TO admin",
+                            "DENY COORDINATOR TO admin",
+                            "REVOKE COORDINATOR FROM admin",
+                            "GRANT MATCH, COORDINATOR TO admin"}) {
+    try {
+      ast_generator.ParseQuery(query);
+      FAIL() << "Expected SemanticException for: " << query;
+    } catch (const SemanticException &e) {
+      EXPECT_THAT(e.what(), HasSubstr("COORDINATOR privilege was removed")) << query;
+    }
   }
 }
 

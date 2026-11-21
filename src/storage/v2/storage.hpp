@@ -92,10 +92,10 @@ constexpr StorageAccessType ToAccessType(utils::ResourceLockGuard::Type type) {
   }
 }
 
-class SharedAccessTimeout : public utils::BasicException {
+class SharedAccessTimeout : public utils::RetryableException {
  public:
   SharedAccessTimeout()
-      : utils::BasicException(
+      : utils::RetryableException(
             "Cannot get shared access to the storage. Try stopping other parallel queries. "
             "You can increase the timeout via SET DATABASE SETTINGS 'storage.access_timeout_sec' TO 'value'; "
             "or via the --storage-access-timeout-sec flag. Run SHOW CONFIG to return the current value. "
@@ -103,10 +103,10 @@ class SharedAccessTimeout : public utils::BasicException {
   SPECIALIZE_GET_EXCEPTION_NAME(SharedAccessTimeout)
 };
 
-class UniqueAccessTimeout : public utils::BasicException {
+class UniqueAccessTimeout : public utils::RetryableException {
  public:
   UniqueAccessTimeout()
-      : utils::BasicException(
+      : utils::RetryableException(
             "Cannot get unique access to the storage. Try stopping other parallel queries. "
             "Note: Periodic snapshots also hold storage access. "
             "You can increase the timeout via SET DATABASE SETTINGS 'storage.access_timeout_sec' TO 'value'; "
@@ -115,10 +115,10 @@ class UniqueAccessTimeout : public utils::BasicException {
   SPECIALIZE_GET_EXCEPTION_NAME(UniqueAccessTimeout)
 };
 
-class ReadOnlyAccessTimeout : public utils::BasicException {
+class ReadOnlyAccessTimeout : public utils::RetryableException {
  public:
   ReadOnlyAccessTimeout()
-      : utils::BasicException(
+      : utils::RetryableException(
             "Cannot get read-only access to the storage. Try stopping other parallel queries. "
             "You can increase the timeout via SET DATABASE SETTINGS 'storage.access_timeout_sec' TO 'value'; "
             "or via the --storage-access-timeout-sec flag. Run SHOW CONFIG to return the current value. "
@@ -330,7 +330,7 @@ class Storage {
     return EdgeTypeId::FromUint(name_id_mapper_->NameToId(name));
   }
 
-  StorageMode GetStorageMode() const noexcept;
+  StorageMode GetStorageMode() const noexcept { return storage_mode_; }
 
   // True iff this storage's durability mode keeps BOTH periodic snapshots AND a WAL
   // chain — the precondition for hot/cold suspend (suspend tears down RAM and relies
@@ -839,6 +839,10 @@ class Accessor {
   /// The storage mode this accessor's hold pins, in force for the life of that hold. Prefer it over
   /// Storage::GetStorageMode(), which holds nothing and is stale on return.
   StorageMode GetPinnedStorageMode() const noexcept;
+
+  /// True when a vertex or edge vector index exists. The index set only changes under UNIQUE access, so the
+  /// answer is fixed for the transaction's life unless this accessor is itself the UNIQUE holder.
+  bool HasVectorIndices() const;
 
   std::string id() const { return storage_->name(); }
 

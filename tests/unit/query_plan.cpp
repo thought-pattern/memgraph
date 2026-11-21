@@ -11,7 +11,9 @@
 
 #include "query_plan_checker.hpp"
 
+#include <unistd.h>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <list>
 #include <memory>
@@ -30,6 +32,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "cache_properties_flag_guard.hpp"
+#include "flags/run_time_configurable.hpp"
 #include "query/exceptions.hpp"
 #include "query/frontend/ast/ast.hpp"
 #include "query/frontend/semantic/symbol_generator.hpp"
@@ -42,6 +46,11 @@
 
 #include "query_common.hpp"
 #include "utils/bound.hpp"
+#include "utils/on_scope_exit.hpp"
+#include "utils/settings.hpp"
+
+// NOLINTNEXTLINE (cppcoreguidelines-avoid-non-const-global-variables)
+DECLARE_bool(query_cache_properties);
 
 namespace memgraph::query {
 ::std::ostream &operator<<(::std::ostream &os, const Symbol &sym) {
@@ -887,11 +896,33 @@ TYPED_TEST(TestPlanner, SunkOrderByRestoresEverythingTheProjectionReads) {
   auto *produce = dynamic_cast<Produce *>(&plan);
   ASSERT_NE(produce, nullptr) << "expected the projection to have sunk above the Limit";
 
+  // What has to survive the restore is what runs above the OrderBy and reads a symbol it did not
+  // make itself. The projection is one such reader. The property cache is another: it sits between
+  // the two, so the slots it fills need no restoring, but the record it reads them from does.
+  // An omission does not fail the query, it reads as Null and the row comes back wrong.
+  auto required = std::vector<memgraph::query::Symbol>{};
+  auto made_in_between = std::vector<memgraph::query::Symbol>{};
+  for (auto const *op = produce->input().get(); op != nullptr && op != order_by;) {
+    if (auto const *cache = dynamic_cast<CacheProperties const *>(op)) {
+      for (auto const &group : cache->groups_) {
+        required.push_back(group.input_symbol());
+        for (auto const &cached : group.properties()) made_in_between.push_back(cached.output_symbol);
+      }
+    }
+    op = op->HasSingleInput() ? op->input().get() : nullptr;
+  }
+
   memgraph::query::plan::UsedSymbolsCollector collector(symbol_table);
   for (auto *named_expression : produce->named_expressions_) named_expression->Accept(collector);
   for (auto const &read : collector.symbols_) {
+    if (std::ranges::contains(made_in_between, read)) continue;
+    required.push_back(read);
+  }
+
+  ASSERT_FALSE(required.empty()) << "nothing above the OrderBy reads anything, so this asserts nothing";
+  for (auto const &read : required) {
     EXPECT_TRUE(std::ranges::contains(order_by->output_symbols_, read))
-        << "the projection reads " << read.name() << ", which the OrderBy below it does not restore";
+        << "the plan above the OrderBy reads " << read.name() << ", which the OrderBy does not restore";
   }
 }
 
@@ -1071,6 +1102,16 @@ TYPED_TEST(TestPlanner, MatchOptionalMatchWhereReturn) {
                                    RETURN("r")));
   std::list<BaseOpChecker *> optional{new ExpectScanAll(), new ExpectExpand(), new ExpectFilter()};
   CheckPlan<TypeParam>(query, this->storage, ExpectScanAll(), ExpectOptional(optional), ExpectProduce());
+  DeleteListContent(&optional);
+}
+
+TYPED_TEST(TestPlanner, OptionalMatchThenMatch) {
+  // OPTIONAL MATCH (n) MATCH (n)-[r]->(m) RETURN m: the MATCH expands on the optional's rows, above the Optional.
+  auto *query = QUERY(SINGLE_QUERY(OPTIONAL_MATCH(PATTERN(NODE("n"))),
+                                   MATCH(PATTERN(NODE("n"), EDGE("r", Direction::OUT), NODE("m"))),
+                                   RETURN("m")));
+  std::list<BaseOpChecker *> optional{new ExpectScanAll()};
+  CheckPlan<TypeParam>(query, this->storage, ExpectOptional(optional), ExpectExpand(), ExpectProduce());
   DeleteListContent(&optional);
 }
 
@@ -1322,6 +1363,66 @@ TYPED_TEST(TestPlanner, MatchEdgeTypeIndex) {
     auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
     CheckPlan(planner.plan(), symbol_table, ExpectScanAllByEdgeType(), ExpectConstructNamedPath(), ExpectProduce());
   }
+}
+
+TYPED_TEST(TestPlanner, MatchEdgeTypeIndexKeepsBoundEndpoint) {
+  // MATCH (m) WITH m MATCH (s)-[r:indexed_edgetype]->(m) RETURN s: the Expand into the WITH-bound m keeps
+  // existing_node, so it cannot become an edge scan, which would overwrite m.
+  FakeDbAccessor dba;
+  dba.SetIndexCount(dba.EdgeType("indexed_edgetype"), 1);
+  auto *query =
+      QUERY(SINGLE_QUERY(MATCH(PATTERN(NODE("m"))),
+                         WITH("m"),
+                         MATCH(PATTERN(NODE("s"), EDGE("r", Direction::OUT, {"indexed_edgetype"}), NODE("m"))),
+                         RETURN("s")));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(
+      planner.plan(), symbol_table, ExpectScanAll(), ExpectProduce(), ExpectScanAll(), ExpectExpand(), ExpectProduce());
+}
+
+TYPED_TEST(TestPlanner, VariableStartDoesNotScanAnEdgeIntoABoundEndpoint) {
+  // MATCH (m) WITH m MATCH (s)-[r]->(m) RETURN s: an edge scan writes both endpoints, so the plan that starts at
+  // the edge must keep an Expand into the WITH-bound m.
+  FakeDbAccessor dba;
+  auto *query = QUERY(SINGLE_QUERY(MATCH(PATTERN(NODE("m"))),
+                                   WITH("m"),
+                                   MATCH(PATTERN(NODE("s"), EDGE("r", Direction::OUT), NODE("m"))),
+                                   RETURN("s")));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planning_context = MakePlanningContext(&this->storage, &symbol_table, query, &dba);
+  auto query_parts = CollectQueryParts(symbol_table, this->storage, query, false);
+  size_t plan_count = 0;
+  for (auto &&plan : MakeLogicalPlanForSingleQuery<VariableStartPlanner>(query_parts, &planning_context)) {
+    ASSERT_TRUE(plan);
+    ++plan_count;
+    EXPECT_EQ(FindOpOfType<memgraph::query::plan::ScanAllByEdge>(plan.get()), nullptr);
+  }
+  ASSERT_GT(plan_count, 1U) << "the edge must be offered as a start";
+}
+
+TYPED_TEST(TestPlanner, MatchEdgeTypeIndexKeepsAnExpandOverAnotherScan) {
+  // MATCH (a) WITH a MATCH (x), (a)-[e:indexed_edgetype]->(b) RETURN x: without cartesian products the Expand from
+  // the bound a sits on ScanAll (x); an edge scan would drop x and overwrite a.
+  const auto settings_dir =
+      std::filesystem::temp_directory_path() / ("MG_tests_unit_query_plan_cartesian_" + std::to_string(getpid()));
+  memgraph::utils::OnScopeExit remove_dir{[&] { std::filesystem::remove_all(settings_dir); }};
+  memgraph::utils::Settings settings(settings_dir);
+  memgraph::flags::run_time::Initialize(settings);
+  settings.SetValue("cartesian-product-enabled", "false");
+  memgraph::utils::OnScopeExit restore{[&] { settings.SetValue("cartesian-product-enabled", "true"); }};
+
+  FakeDbAccessor dba;
+  dba.SetIndexCount(dba.EdgeType("indexed_edgetype"), 1);
+  auto *query = QUERY(SINGLE_QUERY(
+      MATCH(PATTERN(NODE("a"))),
+      WITH("a"),
+      MATCH(PATTERN(NODE("x")), PATTERN(NODE("a"), EDGE("e", Direction::OUT, {"indexed_edgetype"}), NODE("b"))),
+      RETURN("x")));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(
+      planner.plan(), symbol_table, ExpectScanAll(), ExpectProduce(), ExpectScanAll(), ExpectExpand(), ExpectProduce());
 }
 
 TYPED_TEST(TestPlanner, MatchEdgeTypePropertyIndexExistence) {
@@ -8999,6 +9100,140 @@ TYPED_TEST(TestPlanner, PreferCompositeIndexOverSinglePropertyIndex) {
             ExpectScanAllByLabelProperties(
                 label, composite_props, std::vector{ExpressionRange::Equal(lit_1), ExpressionRange::Equal(lit_2)}),
             ExpectProduce());
+}
+
+TYPED_TEST(TestPlanner, CachePropertiesDisabledByFlag) {
+  CachePropertiesFlagGuard guard{false};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto prop_b = PROPERTY_PAIR(dba, "b");
+  auto *query = QUERY(
+      SINGLE_QUERY(MATCH(PATTERN(NODE("n"))),
+                   RETURN(PROPERTY_LOOKUP(dba, "n", prop_a), AS("a"), PROPERTY_LOOKUP(dba, "n", prop_b), AS("b"))));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(planner.plan(), symbol_table, ExpectScanAll(), ExpectProduce());
+}
+
+TYPED_TEST(TestPlanner, CachePropertiesTwoLookupsOnOneSymbol) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto prop_b = PROPERTY_PAIR(dba, "b");
+  auto *query = QUERY(
+      SINGLE_QUERY(MATCH(PATTERN(NODE("n"))),
+                   RETURN(PROPERTY_LOOKUP(dba, "n", prop_a), AS("a"), PROPERTY_LOOKUP(dba, "n", prop_b), AS("b"))));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(planner.plan(), symbol_table, ExpectScanAll(), ExpectCacheProperties("n", 2), ExpectProduce());
+}
+
+TYPED_TEST(TestPlanner, CachePropertiesSingleLookupDoesNotFire) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto *query = QUERY(SINGLE_QUERY(MATCH(PATTERN(NODE("n"))), RETURN(PROPERTY_LOOKUP(dba, "n", prop_a), AS("a"))));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(planner.plan(), symbol_table, ExpectScanAll(), ExpectProduce());
+}
+
+// Reading one property twice is still one property to read, so there is nothing a pass of its own
+// would save: one pass for one property is what a lookup already does.
+TYPED_TEST(TestPlanner, CachePropertiesCountARepeatedLookupOnce) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto *query = QUERY(
+      SINGLE_QUERY(MATCH(PATTERN(NODE("n"))),
+                   RETURN(PROPERTY_LOOKUP(dba, "n", prop_a), AS("x"), PROPERTY_LOOKUP(dba, "n", prop_a), AS("y"))));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(planner.plan(), symbol_table, ExpectScanAll(), ExpectProduce());
+}
+
+// As above where a repeat sits beside a distinct property: the pass reads two properties, not the
+// three lookups that asked for them.
+TYPED_TEST(TestPlanner, CachePropertiesReadsEachDistinctPropertyOnce) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto prop_b = PROPERTY_PAIR(dba, "b");
+  auto *query = QUERY(SINGLE_QUERY(MATCH(PATTERN(NODE("n"))),
+                                   RETURN(PROPERTY_LOOKUP(dba, "n", prop_a),
+                                          AS("x"),
+                                          PROPERTY_LOOKUP(dba, "n", prop_a),
+                                          AS("y"),
+                                          PROPERTY_LOOKUP(dba, "n", prop_b),
+                                          AS("z"))));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(planner.plan(), symbol_table, ExpectScanAll(), ExpectCacheProperties("n", 2), ExpectProduce());
+}
+
+// A rewritten expression needs a copy of its own, because the candidate plans for one query share
+// the expressions they were planned from. One the rewrite leaves alone needs none, and copying it
+// would duplicate everything it holds, down to a whole subquery.
+TYPED_TEST(TestPlanner, CachePropertiesCopiesOnlyWhatItRewrites) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto prop_b = PROPERTY_PAIR(dba, "b");
+  auto *as_x = NEXPR("x", PROPERTY_LOOKUP(dba, "n", prop_a));
+  auto *as_y = NEXPR("y", PROPERTY_LOOKUP(dba, "n", prop_b));
+  auto *as_z = NEXPR("z", LITERAL(1));
+  auto *query = QUERY(SINGLE_QUERY(MATCH(PATTERN(NODE("n"))), RETURN(as_x, as_y, as_z)));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+
+  auto *produce = FindOpOfType<memgraph::query::plan::Produce>(&planner.plan());
+  ASSERT_NE(produce, nullptr);
+  auto const &projected = produce->named_expressions_;
+  auto holds = [&](auto *expression) { return std::ranges::find(projected, expression) != projected.end(); };
+  EXPECT_TRUE(holds(as_z)) << "an expression with no cached lookup was copied anyway";
+  EXPECT_FALSE(holds(as_x)) << "a rewritten expression must not be the one the other plans share";
+}
+
+// Every candidate plan the variable-start planner considers is rewritten, and they all share the
+// one symbol table that sizes a frame. The slots a pass writes belong to whichever plan is chosen,
+// so weighing more candidates must not widen the frame.
+TYPED_TEST(TestPlanner, CachePropertiesSlotsAreNotPaidForPerCandidatePlan) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto prop_b = PROPERTY_PAIR(dba, "b");
+  auto *query = QUERY(
+      SINGLE_QUERY(MATCH(PATTERN(NODE("n"), EDGE("r"), NODE("m"), EDGE("s"), NODE("o"))),
+                   RETURN(PROPERTY_LOOKUP(dba, "n", prop_a), AS("x"), PROPERTY_LOOKUP(dba, "n", prop_b), AS("y"))));
+
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto context = MakePlanningContext(&this->storage, &symbol_table, query, &dba);
+  auto query_parts = CollectQueryParts(symbol_table, this->storage, query, false);
+  memgraph::query::Parameters parameters;
+  PostProcessor post_processor{parameters, std::vector<memgraph::query::IndexHint>{}, &dba};
+
+  auto candidates = 0;
+  auto width_after_first = int32_t{};
+  for (auto plan : MakeLogicalPlanForSingleQuery<VariableStartPlanner>(query_parts, &context)) {
+    if (!plan) continue;
+    post_processor.Rewrite(std::move(plan), &context);
+    if (++candidates == 1) width_after_first = symbol_table.max_position();
+  }
+
+  ASSERT_GT(candidates, 1) << "the pattern must offer the planner a choice for this to prove anything";
+  EXPECT_EQ(symbol_table.max_position(), width_after_first);
+}
+
+TYPED_TEST(TestPlanner, CachePropertiesTwoSymbolsDoNotFire) {
+  CachePropertiesFlagGuard guard{true};
+  FakeDbAccessor dba;
+  auto prop_a = PROPERTY_PAIR(dba, "a");
+  auto *query = QUERY(
+      SINGLE_QUERY(MATCH(PATTERN(NODE("n"), EDGE("r"), NODE("m"))),
+                   RETURN(PROPERTY_LOOKUP(dba, "n", prop_a), AS("a"), PROPERTY_LOOKUP(dba, "m", prop_a), AS("b"))));
+  auto symbol_table = memgraph::query::MakeSymbolTable(query);
+  auto planner = MakePlanner<TypeParam>(&dba, this->storage, symbol_table, query);
+  CheckPlan(planner.plan(), symbol_table, ExpectScanAll(), ExpectExpand(), ExpectProduce());
 }
 
 }  // namespace

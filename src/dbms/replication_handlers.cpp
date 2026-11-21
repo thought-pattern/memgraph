@@ -364,14 +364,18 @@ bool ForceSuspendForRecovery(DbmsHandler &dbms_handler, std::string_view name) {
 }  // namespace
 
 bool SystemRecoveryHandler(DbmsHandler &dbms_handler, const std::vector<storage::SalientConfig> &database_configs,
-                           const std::vector<storage::ColdTenantRecovery> &cold_databases) {
+                           const std::vector<storage::ColdTenantRecovery> &cold_databases,
+                           bool const includes_all_databases) {
   /*
-   * NO LICENSE
+   * NO LICENSE, here or on MAIN: only the default DB is reconciled, and no other DB is dropped
    */
-  if (!license::global_license_checker.IsEnterpriseValidFast()) {
+  auto const licensed = license::global_license_checker.IsEnterpriseValidFast();
+  if (!licensed) {
     spdlog::error(
         "Handling SystemRecovery, an enterprise RPC message, without license. Check your license status by running "
         "SHOW LICENSE INFO.");
+  }
+  if (!licensed || !includes_all_databases) {
     for (const auto &config : database_configs) {
       // Only handle default DB
       if (config.name != kDefaultDB) continue;
@@ -389,7 +393,7 @@ bool SystemRecoveryHandler(DbmsHandler &dbms_handler, const std::vector<storage:
   /*
    * MULTI-TENANCY
    */
-  // The COLD set arrives as one ColdTenantRecovery per tenant (salient + stats + epoch), so the
+  // The COLD set arrives as one ColdTenantRecovery per tenant (salient + stats), so the
   // salient<->stats pairing is structural — the earlier mismatched-length guard is gone.
 
   // Seed the leftover-delete set from HOT *and* COLD tenants. All() skips COLD shells, so a
@@ -447,8 +451,7 @@ bool SystemRecoveryHandler(DbmsHandler &dbms_handler, const std::vector<storage:
     std::erase(old, name);
   }
 
-  // Reconcile the incoming COLD set: each named tenant must end as a COLD shell carrying MAIN's stats
-  // and epoch metadata.
+  // Reconcile the incoming COLD set: each named tenant must end as a COLD shell carrying MAIN's stats.
   for (const auto &cold : cold_databases) {
     const auto &config = cold.salient;
     const auto name = std::string{*config.name.str_view()};
