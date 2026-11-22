@@ -437,6 +437,12 @@ bool IsAllowedExtension(const auto &extension) {
                              [&](const auto allowed_extension) { return allowed_extension == extension; });
 }
 
+bool IsLoadableModuleExtension(const auto &extension) {
+  static constexpr std::array<std::string_view, 2> loadable_extensions{".py", ".so"};
+  return std::ranges::any_of(loadable_extensions,
+                             [&](const auto loadable_extension) { return loadable_extension == extension; });
+}
+
 bool IsSubPath(const auto &base, const auto &destination) {
   const auto relative = std::filesystem::relative(destination, base);
   return !relative.empty() && *relative.begin() != "..";
@@ -484,14 +490,14 @@ void RegisterMgGetModuleFiles(ModuleRegistry *module_registry, BuiltinModule *mo
                                  mgp_list * /*args*/, mgp_graph * /*unused*/, mgp_result *result, mgp_memory *memory) {
     for (const auto &module_directory : module_registry->GetModulesDirectory()) {
       for (const auto &dir_entry : std::filesystem::recursive_directory_iterator(module_directory)) {
-        if (dir_entry.is_regular_file() && IsAllowedExtension(dir_entry.path().extension())) {
+        if (dir_entry.is_regular_file() && IsLoadableModuleExtension(dir_entry.path().extension())) {
           mgp_result_record *record{nullptr};
           if (!TryOrSetError([&] { return mgp_result_new_record(result, &record); }, result)) {
             return;
           }
 
           const auto path_string = GetPathString(dir_entry);
-          const auto is_editable = IsFileEditable(dir_entry);
+          const auto is_editable = IsAllowedExtension(dir_entry.path().extension()) && IsFileEditable(dir_entry);
 
           const auto path_value = GetStringValueOrSetError(path_string.c_str(), memory, result);
           if (!path_value) {
