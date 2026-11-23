@@ -79,7 +79,7 @@ struct DurabilityThroughput {
 using StorageSnapshotResolver = std::function<std::optional<StorageSnapshot>(utils::UUID const &uuid)>;
 
 #ifdef MG_ENTERPRISE
-using InstanceStatusResolver = std::function<std::vector<coordination::InstanceStatus>()>;
+using InstanceStatusResolver = std::function<std::optional<std::vector<coordination::InstanceStatus>>()>;
 #endif
 
 struct GlobalMetricHandles {
@@ -536,6 +536,8 @@ class PrometheusMetrics {
   prometheus::Family<prometheus::Gauge> &instance_is_leader_family_;
   prometheus::Family<prometheus::Gauge> &instance_is_main_family_;
   prometheus::Family<prometheus::Gauge> &instance_last_response_seconds_family_;
+  prometheus::Family<prometheus::Gauge> &instance_status_refresh_failed_family_;
+  prometheus::Gauge *instance_status_refresh_failed_{nullptr};
 
   struct {
     std::mutex mutex;

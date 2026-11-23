@@ -50,7 +50,11 @@ void RelationshipsExist(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *r
 
 bool RelationshipExist(const mgp::Node &node, std::string &rel_type);
 
-bool FindRelationship(std::unordered_set<std::string_view> types, mgp::Relationships relationships);
+bool FindRelationship(const std::unordered_set<std::string> &types, mgp::Relationships relationships);
+
+void RelationshipsExistFunc(mgp_list *args, mgp_func_context *ctx, mgp_func_result *res, mgp_memory *memory);
+
+void RelationshipExistsFunc(mgp_list *args, mgp_func_context *ctx, mgp_func_result *res, mgp_memory *memory);
 
 void RelationshipExists(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory);
 

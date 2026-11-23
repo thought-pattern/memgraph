@@ -19,7 +19,7 @@ extern "C" int mgp_init_module(mgp_module *module, mgp_memory *memory) {
     const mgp::MemoryDispatcherGuard guard(memory);
     mgp::AddProcedure(CsvUtils::CreateCsvFile,
                       CsvUtils::kProcedureCreateCsvFile,
-                      mgp::ProcedureType::Read,
+                      mgp::ProcedureType::Write,
                       {
                           mgp::Parameter(CsvUtils::kArgumentCreateCsvFile1, mgp::Type::String),
                           mgp::Parameter(CsvUtils::kArgumentCreateCsvFile2, mgp::Type::String),
@@ -30,7 +30,7 @@ extern "C" int mgp_init_module(mgp_module *module, mgp_memory *memory) {
                       memory);
     mgp::AddProcedure(CsvUtils::DeleteCsvFile,
                       CsvUtils::kProcedureDeleteCsvFile,
-                      mgp::ProcedureType::Read,
+                      mgp::ProcedureType::Write,
                       {
                           mgp::Parameter(CsvUtils::kArgumentDeleteCsvFile1, mgp::Type::String),
                       },

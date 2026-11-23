@@ -1204,20 +1204,12 @@ std::optional<py::ExceptionInfo> InsertField(PyObject *key, PyObject *val, mgp_r
   return std::nullopt;
 }
 
-void SkipRecord(mgp_value *field_val, std::vector<RecordFieldCache> &current_record_cache) {
-  mgp_value_destroy(field_val);
-  for (auto &cache_entry : current_record_cache) {
-    mgp_value_destroy(cache_entry.field_val);
-  }
-}
-
-std::optional<py::ExceptionInfo> AddRecordFromPython(mgp_result *result, py::Object py_record, mgp_graph *graph,
+std::optional<py::ExceptionInfo> AddRecordFromPython(mgp_result *result, const py::Object &py_record,
+                                                     const py::Object &record_cls, mgp_graph *graph,
                                                      mgp_memory *memory) {
-  py::Object py_mgp(PyImport_ImportModule("mgp"));
-  if (!py_mgp) return py::FetchError();
-  auto record_cls = py_mgp.GetAttr("Record");
-  if (!record_cls) return py::FetchError();
-  if (!PyObject_IsInstance(py_record.Ptr(), record_cls.Ptr())) {
+  const int is_record = PyObject_IsInstance(py_record.Ptr(), record_cls.Ptr());
+  if (is_record < 0) return py::FetchError();
+  if (is_record == 0) {
     std::stringstream ss;
     ss << "Value '" << py_record << "' is not an instance of 'mgp.Record'";
     const auto &msg = ss.str();
@@ -1274,9 +1266,10 @@ std::optional<py::ExceptionInfo> AddRecordFromPython(mgp_result *result, py::Obj
     }
 
     if (!is_transactional) {
-      // If a deleted value is being inserted into a record, skip the whole record
+      // If a deleted value is being inserted into a record, skip the whole record;
+      // clear_record_cache owns cleanup of already-cached fields.
       if (ContainsDeleted(field_val)) {
-        SkipRecord(field_val, current_record_cache);
+        mgp_value_destroy(field_val);
         return std::nullopt;
       }
       current_record_cache.emplace_back(
@@ -1307,41 +1300,48 @@ std::optional<py::ExceptionInfo> AddRecordFromPython(mgp_result *result, py::Obj
   return std::nullopt;
 }
 
-std::optional<py::ExceptionInfo> AddMultipleRecordsFromPython(mgp_result *result, py::Object py_seq, mgp_graph *graph,
-                                                              mgp_memory *memory) {
-  Py_ssize_t len = PySequence_Size(py_seq.Ptr());
-  if (len == -1) return py::FetchError();
-  result->rows.reserve(len);
-  // This proved to be good enough constant not to lose performance on transformation
-  static constexpr auto del_cnt{100'000};
-  for (Py_ssize_t i = 0, curr_item = 0; i < len; ++i, ++curr_item) {
-    py::Object py_record(PySequence_GetItem(py_seq.Ptr(), curr_item));
-    if (!py_record) return py::FetchError();
-    auto maybe_exc = AddRecordFromPython(result, py_record, graph, memory);
-    if (maybe_exc) return maybe_exc;
-    // Once PySequence_DelSlice deletes "transformed" objects, starting index is 0 again.
-    if (i && i % del_cnt == 0) {
-      PySequence_DelSlice(py_seq.Ptr(), 0, del_cnt);
-      curr_item = -1;
-    }
-  }
-  // Clear at the end what left
-  PySequence_DelSlice(py_seq.Ptr(), 0, PySequence_Size(py_seq.Ptr()));
-  return std::nullopt;
-}
+std::optional<py::ExceptionInfo> ConsumePythonRecords(mgp_result *result, const py::Object &py_res, mgp_graph *graph,
+                                                      mgp_memory *memory) {
+  py::Object py_mgp(PyImport_ImportModule("mgp"));
+  if (!py_mgp) return py::FetchError();
+  auto record_cls = py_mgp.GetAttr("Record");
+  if (!record_cls) return py::FetchError();
 
-std::optional<py::ExceptionInfo> AddMultipleBatchRecordsFromPython(mgp_result *result, py::Object py_seq,
-                                                                   mgp_graph *graph, mgp_memory *memory) {
-  Py_ssize_t len = PySequence_Size(py_seq.Ptr());
-  if (len == -1) return py::FetchError();
-  result->rows.reserve(len);
-  for (Py_ssize_t i = 0; i < len; ++i) {
-    py::Object py_record(PySequence_GetItem(py_seq.Ptr(), i));
-    if (!py_record) return py::FetchError();
-    auto maybe_exc = AddRecordFromPython(result, py_record, graph, memory);
+  const int is_record = PyObject_IsInstance(py_res.Ptr(), record_cls.Ptr());
+  if (is_record < 0) return py::FetchError();
+  if (is_record > 0) {
+    return AddRecordFromPython(result, py_res, record_cls, graph, memory);
+  }
+
+  if (PyUnicode_Check(py_res.Ptr()) || PyBytes_Check(py_res.Ptr()) || PyByteArray_Check(py_res.Ptr()) ||
+      PyDict_Check(py_res.Ptr())) {
+    return AddRecordFromPython(result, py_res, record_cls, graph, memory);
+  }
+
+  PyObject *raw_iter = PyObject_GetIter(py_res.Ptr());
+  if (!raw_iter) {
+    if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+      PyErr_Clear();
+      return AddRecordFromPython(result, py_res, record_cls, graph, memory);
+    }
+    return py::FetchError();
+  }
+
+  py::Object py_iter(raw_iter);
+  const Py_ssize_t hint = PyObject_LengthHint(py_res.Ptr(), 0);
+  if (hint < 0) return py::FetchError();
+  if (hint > 0) {
+    result->rows.reserve(static_cast<size_t>(hint));
+  }
+
+  while (PyObject *item = PyIter_Next(py_iter.Ptr())) {
+    py::Object py_record(item);
+    auto maybe_exc = AddRecordFromPython(result, py_record, record_cls, graph, memory);
     if (maybe_exc) return maybe_exc;
   }
-  PySequence_DelSlice(py_seq.Ptr(), 0, PySequence_Size(py_seq.Ptr()));
+  if (PyErr_Occurred()) {
+    return py::FetchError();
+  }
   return std::nullopt;
 }
 
@@ -1393,13 +1393,8 @@ void CallPythonProcedure(const py::Object &py_cb, mgp_list *args, mgp_graph *gra
       // Void procedure - no records to process.
       return std::nullopt;
     }
-    if (PySequence_Check(py_res.Ptr())) {
-      if (is_batched) {
-        return AddMultipleBatchRecordsFromPython(result, py_res, graph, memory);
-      }
-      return AddMultipleRecordsFromPython(result, py_res, graph, memory);
-    }
-    return AddRecordFromPython(result, py_res, graph, memory);
+    static_cast<void>(is_batched);
+    return ConsumePythonRecords(result, py_res, graph, memory);
   };
 
   // It is *VERY IMPORTANT* to note that this code takes great care not to keep
@@ -1489,10 +1484,7 @@ void CallPythonTransformation(const py::Object &py_cb, mgp_messages *msgs, mgp_g
   auto call = [&](py::Object py_graph, py::Object py_messages) -> std::optional<py::ExceptionInfo> {
     auto py_res = py_cb.Call(py_graph, py_messages);
     if (!py_res) return py::FetchError();
-    if (PySequence_Check(py_res.Ptr())) {
-      return AddMultipleRecordsFromPython(result, py_res, graph, memory);
-    }
-    return AddRecordFromPython(result, py_res, graph, memory);
+    return ConsumePythonRecords(result, py_res, graph, memory);
   };
 
   // It is *VERY IMPORTANT* to note that this code takes great care not to keep

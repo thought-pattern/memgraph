@@ -305,6 +305,46 @@ if args.version:
     print(format_version(args.variant, args.version, offering, suffix=args.suffix), end="")
     sys.exit(0)
 
+# Support exported source archives (e.g. Conan cache builds without .git metadata).
+in_git_worktree = (
+    subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode
+    == 0
+)
+if not in_git_worktree:
+    exported_version_file = "MEMGRAPH_EXPORTED_VERSION"
+    if os.path.isfile(exported_version_file):
+        with open(exported_version_file, "r", encoding="utf-8") as vf:
+            exported_meta = json.load(vf)
+        exp_version = exported_meta.get("version", "0.0.0")
+        exp_distance = int(exported_meta.get("distance", 0) or 0)
+        exp_shorthash = exported_meta.get("shorthash", "")
+        if exp_distance > 0 and exp_shorthash:
+            print(
+                format_version(
+                    args.variant,
+                    exp_version,
+                    offering,
+                    distance=exp_distance,
+                    shorthash=exp_shorthash,
+                    suffix=args.suffix,
+                ),
+                end="",
+            )
+        else:
+            print(format_version(args.variant, exp_version, offering, suffix=args.suffix), end="")
+        sys.exit(0)
+    print(
+        "WARNING: Not inside a Git repository and no exported version metadata found. Using fallback version 0.0.0.",
+        file=sys.stderr,
+    )
+    print(format_version(args.variant, "0.0.0", offering, suffix=args.suffix), end="")
+    sys.exit(0)
+
 # check if we can connect to GitHub
 can_connect = can_connect_to_github()
 
@@ -348,7 +388,7 @@ except Exception:
 current_hash = get_output("git", "rev-parse", "HEAD")
 
 # --short option can be of variable length, this will fix the length to 12
-current_hash_short = get_output("git", "rev-parse", "HEAD", "|", "cut", "-c1-12")
+current_hash_short = current_hash[:12]
 
 # We want to find branches that exist on some remote and that are named
 # `release/[0-9]+\.[0-9]+`.
@@ -396,8 +436,11 @@ if current_version is None:
         original_branch = None
 
     if original_version is not None:
-        # Use the version from the original repository
-        version_str = ".".join(map(str, original_version)) + ".0"
+        # fetch_memgraph_repo_version() already returns all 3 release components (X, Y, Z)
+        if len(original_version) == 2:
+            version_str = ".".join(map(str, original_version)) + ".0"
+        else:
+            version_str = ".".join(map(str, original_version))
 
         # Calculate distance from master branch as a development version
         try:
@@ -424,22 +467,23 @@ if current_version is None:
         print(
             "Unable to determine version. No local release branches found and could not fetch from "
             "original repository. This repository may need to be updated or may not be a standard "
-            "Memgraph repository."
+            "Memgraph repository.",
+            file=sys.stderr,
         )
 
-        # just use latest version found locally in tags
+        # Filter valid vX.Y.Z release tags first and select the highest numeric version.
         tags = get_output("git", "tag").strip().split("\n")
-        non_rc_tags = [t for t in tags if "rc" not in t and t]
-        tag = non_rc_tags[-1] if non_rc_tags else ""
-        if tag:
-            # regex match for x.y.z format
-            match = re.match(r"^v[\d]+\.[\d]+\.[\d]+$", tag)
+        release_versions = []
+        for candidate_tag in tags:
+            cleaned_tag = candidate_tag.strip()
+            match = re.match(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)$", cleaned_tag)
             if match:
-                version_str = match.group(0)[1:]
-            else:
-                # fallback
-                print("WARNING: Unable to determine version from tag. Using fallback version 0.0.0.", file=sys.stderr)
-                version_str = "0.0.0"
+                release_versions.append(
+                    (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                )
+        if release_versions:
+            latest_local = max(release_versions)
+            version_str = "{}.{}.{}".format(*latest_local)
         else:
             print("WARNING: Unable to determine version from tag. Using fallback version 0.0.0.", file=sys.stderr)
             version_str = "0.0.0"

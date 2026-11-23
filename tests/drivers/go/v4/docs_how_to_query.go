@@ -53,11 +53,15 @@ func main() {
   node_value := node_record.(neo4j.Node)
   fmt.Println("Record matched.")
 
-  label := node_value.Labels()[0]
-  name := node_value.Props()["name"]
-  age := node_value.Props()["age"]
+  labels := node_value.Labels()
+  if len(labels) != 1 {
+    log.Fatal("Data doesn't match.")
+  }
+  label := labels[0]
+  name, name_ok := node_value.Props()["name"].(string)
+  age, age_ok := node_value.Props()["age"].(int64)
 
-  if label != "Person" && name != "Alice" && age != 22 {
+  if label != "Person" || !name_ok || name != "Alice" || !age_ok || age != 22 {
     log.Fatal("Data doesn't match.")
   }
 

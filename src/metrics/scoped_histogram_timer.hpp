@@ -20,12 +20,11 @@ namespace memgraph::metrics {
 class ScopedHistogramTimer {
  public:
   explicit ScopedHistogramTimer(prometheus::Histogram *histogram)
-      : histogram_(histogram), start_time_(std::chrono::high_resolution_clock::now()) {}
+      : histogram_(histogram), start_time_(std::chrono::steady_clock::now()) {}
 
   ~ScopedHistogramTimer() {
     if (histogram_) {
-      histogram_->Observe(
-          std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time_).count());
+      histogram_->Observe(std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count());
     }
   }
 
@@ -48,7 +47,7 @@ class ScopedHistogramTimer {
 
  private:
   prometheus::Histogram *histogram_;
-  std::chrono::high_resolution_clock::time_point start_time_;
+  std::chrono::steady_clock::time_point start_time_;
 };
 
 }  // namespace memgraph::metrics

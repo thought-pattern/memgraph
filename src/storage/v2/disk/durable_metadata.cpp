@@ -100,18 +100,23 @@ std::optional<std::vector<std::string>> DurableMetadata::LoadInfoFromAuxiliarySt
 
 bool DurableMetadata::PersistLabelIndexCreation(LabelId label) {
   const auto serialized_label = label.ToString();
-  if (auto label_index_store = durability_kvstore_.Get(kLabelIndexStr); label_index_store.has_value()) {
+  auto label_index_store = durability_kvstore_.GetStrict(kLabelIndexStr);
+  if (label_index_store.has_value()) {
     std::string &value = label_index_store.value();
     value += "|";
     value += serialized_label;
     return durability_kvstore_.Put(kLabelIndexStr, value);
+  }
+  if (label_index_store.error() == kvstore::KVStore::GetError::kReadError) {
+    return false;
   }
   return durability_kvstore_.Put(kLabelIndexStr, serialized_label);
 }
 
 bool DurableMetadata::PersistLabelIndexDeletion(LabelId label) {
   const auto serialized_label = label.ToString();
-  if (auto label_index_store = durability_kvstore_.Get(kLabelIndexStr); label_index_store.has_value()) {
+  auto label_index_store = durability_kvstore_.GetStrict(kLabelIndexStr);
+  if (label_index_store.has_value()) {
     const std::string &value = label_index_store.value();
     std::vector<std::string> labels = utils::Split(value, "|");
     std::erase(labels, serialized_label);
@@ -120,17 +125,21 @@ bool DurableMetadata::PersistLabelIndexDeletion(LabelId label) {
     }
     return durability_kvstore_.Put(kLabelIndexStr, utils::Join(labels, "|"));
   }
-  return true;
+  return label_index_store.error() != kvstore::KVStore::GetError::kReadError;
 }
 
 bool DurableMetadata::PersistLabelPropertyIndexAndExistenceConstraintCreation(LabelId label, PropertyId property,
                                                                               const std::string &key) {
   const std::string label_property_pair = label.ToString() + "," + property.ToString();
-  if (auto label_property_index_store = durability_kvstore_.Get(key); label_property_index_store.has_value()) {
+  auto label_property_index_store = durability_kvstore_.GetStrict(key);
+  if (label_property_index_store.has_value()) {
     std::string &value = label_property_index_store.value();
     value += "|";
     value += label_property_pair;
     return durability_kvstore_.Put(key, value);
+  }
+  if (label_property_index_store.error() == kvstore::KVStore::GetError::kReadError) {
+    return false;
   }
   return durability_kvstore_.Put(key, label_property_pair);
 }
@@ -138,7 +147,8 @@ bool DurableMetadata::PersistLabelPropertyIndexAndExistenceConstraintCreation(La
 bool DurableMetadata::PersistLabelPropertyIndexAndExistenceConstraintDeletion(LabelId label, PropertyId property,
                                                                               const std::string &key) {
   const std::string label_property_pair = label.ToString() + "," + property.ToString();
-  if (auto label_property_index_store = durability_kvstore_.Get(key); label_property_index_store.has_value()) {
+  auto label_property_index_store = durability_kvstore_.GetStrict(key);
+  if (label_property_index_store.has_value()) {
     const std::string &value = label_property_index_store.value();
     std::vector<std::string> label_properties = utils::Split(value, "|");
     std::erase(label_properties, label_property_pair);
@@ -147,7 +157,7 @@ bool DurableMetadata::PersistLabelPropertyIndexAndExistenceConstraintDeletion(La
     }
     return durability_kvstore_.Put(key, utils::Join(label_properties, "|"));
   }
-  return true;
+  return label_property_index_store.error() != kvstore::KVStore::GetError::kReadError;
 }
 
 bool DurableMetadata::PersistTextIndexCreation(const storage::TextIndexSpec &text_index) {
@@ -155,16 +165,21 @@ bool DurableMetadata::PersistTextIndexCreation(const storage::TextIndexSpec &tex
       text_index.properties | rv::transform([](const auto &property_id) { return property_id.ToString(); }), ",");
   const auto index_name_label_properties =
       fmt::format("{},{},{}", text_index.index_name, text_index.label.ToString(), properties_str);
-  if (auto text_index_store = durability_kvstore_.Get(kTextIndexStr); text_index_store.has_value()) {
+  auto text_index_store = durability_kvstore_.GetStrict(kTextIndexStr);
+  if (text_index_store.has_value()) {
     auto &value = text_index_store.value();
     value = fmt::format("{}|{}", value, index_name_label_properties);
     return durability_kvstore_.Put(kTextIndexStr, value);
+  }
+  if (text_index_store.error() == kvstore::KVStore::GetError::kReadError) {
+    return false;
   }
   return durability_kvstore_.Put(kTextIndexStr, index_name_label_properties);
 }
 
 bool DurableMetadata::PersistTextIndexDeletion(std::string_view index_name) {
-  if (auto text_index_store = durability_kvstore_.Get(kTextIndexStr); text_index_store.has_value()) {
+  auto text_index_store = durability_kvstore_.GetStrict(kTextIndexStr);
+  if (text_index_store.has_value()) {
     const std::string &value = text_index_store.value();
     std::vector<std::string> text_indices = utils::Split(value, "|");
     std::erase(text_indices, index_name);
@@ -173,16 +188,20 @@ bool DurableMetadata::PersistTextIndexDeletion(std::string_view index_name) {
     }
     return durability_kvstore_.Put(kTextIndexStr, utils::Join(text_indices, "|"));
   }
-  return true;
+  return text_index_store.error() != kvstore::KVStore::GetError::kReadError;
 }
 
 bool DurableMetadata::PersistUniqueConstraintCreation(LabelId label, const std::set<PropertyId> &properties) {
   const std::string entry = utils::GetKeyForUniqueConstraintsDurability(label, properties);
 
-  if (auto unique_store = durability_kvstore_.Get(kUniqueConstraintsStr); unique_store.has_value()) {
+  auto unique_store = durability_kvstore_.GetStrict(kUniqueConstraintsStr);
+  if (unique_store.has_value()) {
     std::string &value = unique_store.value();
     value += "|" + entry;
     return durability_kvstore_.Put(kUniqueConstraintsStr, value);
+  }
+  if (unique_store.error() == kvstore::KVStore::GetError::kReadError) {
+    return false;
   }
   return durability_kvstore_.Put(kUniqueConstraintsStr, entry);
 }
@@ -190,7 +209,8 @@ bool DurableMetadata::PersistUniqueConstraintCreation(LabelId label, const std::
 bool DurableMetadata::PersistUniqueConstraintDeletion(LabelId label, const std::set<PropertyId> &properties) {
   const std::string entry = utils::GetKeyForUniqueConstraintsDurability(label, properties);
 
-  if (auto unique_store = durability_kvstore_.Get(kUniqueConstraintsStr); unique_store.has_value()) {
+  auto unique_store = durability_kvstore_.GetStrict(kUniqueConstraintsStr);
+  if (unique_store.has_value()) {
     const std::string &value = unique_store.value();
     std::vector<std::string> unique_constraints = utils::Split(value, "|");
     std::erase(unique_constraints, entry);
@@ -199,7 +219,7 @@ bool DurableMetadata::PersistUniqueConstraintDeletion(LabelId label, const std::
     }
     return durability_kvstore_.Put(kUniqueConstraintsStr, utils::Join(unique_constraints, "|"));
   }
-  return true;
+  return unique_store.error() != kvstore::KVStore::GetError::kReadError;
 }
 
 }  // namespace memgraph::storage

@@ -1,12 +1,20 @@
 """
 This class contains implementations of different layers
 """
-from typing import Dict, List, Tuple
 
-import numpy as np
-import torch
-import torch.nn as nn
-from mage.tgn.definitions.tgn import GraphAttnDataType, GraphSumDataType
+from numpy import array as np_array
+from torch import (
+    Tensor as torch_Tensor,
+    bool as torch_bool,
+    cat as torch_cat,
+    concat as torch_concat,
+    device as torch_device,
+    nn,
+    ones as torch_ones,
+    sum as torch_sum,
+    zeros as torch_zeros,
+)
+
 from mage.tgn.helper.simple_mlp import MLP
 
 
@@ -23,7 +31,7 @@ class TGNLayer(nn.Module):
         node_features_dim: int,
         num_neighbors: int,
         num_of_layers: int,
-        device: torch.device,
+        device: torch_device,
     ):
         super().__init__()
         self.embedding_dimension = embedding_dimension
@@ -48,7 +56,7 @@ class TGNLayerGraphSumEmbedding(TGNLayer):
         node_features_dim: int,
         num_neighbors: int,
         num_of_layers: int,
-        device: torch.device,
+        device: torch_device,
     ):
         super().__init__(
             embedding_dimension,
@@ -61,7 +69,7 @@ class TGNLayerGraphSumEmbedding(TGNLayer):
         )
         # Initialize W1 matrix and W2 matrix
         self.linear_1s = nn.ModuleList(
-            torch.nn.Linear(
+            nn.Linear(
                 embedding_dimension + time_encoding_dim + edge_feature_dim,
                 embedding_dimension,
             )
@@ -69,23 +77,23 @@ class TGNLayerGraphSumEmbedding(TGNLayer):
         ).to(self.device)
 
         self.linear_2s = nn.ModuleList(
-            torch.nn.Linear(embedding_dimension + embedding_dimension, embedding_dimension)
-            for _ in range(self.num_of_layers)
+            nn.Linear(embedding_dimension + embedding_dimension, embedding_dimension) for _ in range(self.num_of_layers)
         ).to(self.device)
-        self.relu = torch.nn.ReLU()
+        self.relu = nn.ReLU()
 
-    def forward(self, data: GraphSumDataType):
-        node_layers: List[List[Tuple[int, int]]]
-        mappings: List[Dict[Tuple[int, int], int]]
-        edge_layers: List[List[int]]
-        neighbors_arr: List[List[Tuple[int, int]]]
-        features: torch.Tensor
-        edge_features: List[torch.Tensor]
-        time_features: List[torch.Tensor]
+    def forward(self, data: tuple) -> torch_Tensor:
+        if len(data) != 7:
+            raise ValueError(f"Graph-sum data must contain seven values, received {len(data)}")
+        node_layers: list[list[tuple[int, int]]]
+        mappings: list[dict[tuple[int, int], int]]
+        neighbors_arr: list[list[tuple[int, int]]]
+        features: torch_Tensor
+        edge_features: list[torch_Tensor]
+        time_features: list[torch_Tensor]
         (
             node_layers,
             mappings,
-            edge_layers,
+            _,
             neighbors_arr,
             features,
             edge_features,
@@ -98,34 +106,53 @@ class TGNLayerGraphSumEmbedding(TGNLayer):
             mapping = mappings[k]
             nodes = node_layers[k + 1]  # neighbors on next layer
             # represents how we globally gave index to node,timestamp mapping
-            global_indexes = np.array([mappings[0][(v, t)] for (v, t) in nodes])
-            cur_neighbors = [
-                neighbors_arr[index] for index in global_indexes
-            ]  # neighbors and timestamps of nodes from next layer
+            global_indexes = []
+            for node in nodes:
+                index = mappings[0].get(node, -1)
+                if index < 0:
+                    raise KeyError(f"Node {node} is missing from the global TGN mapping")
+                global_indexes.append(index)
+            cur_neighbors = [neighbors_arr[index] for index in global_indexes]
             curr_edges = [edge_features[index] for index in global_indexes]
             curr_time = [time_features[index] for index in global_indexes]
 
-            aggregate = self._aggregate(out, cur_neighbors, nodes, mapping, curr_edges, curr_time, k)
+            aggregate = self.internal_aggregate(out, cur_neighbors, nodes, mapping, curr_edges, curr_time, k)
 
-            curr_mapped_nodes = np.array([mapping[(v, t)] for (v, t) in nodes])
+            mapped_nodes = []
+            for node in nodes:
+                mapped_node = mapping.get(node, -1)
+                if mapped_node < 0:
+                    raise KeyError(f"Node {node} is missing from the current TGN mapping")
+                mapped_nodes.append(mapped_node)
+            curr_mapped_nodes = np_array(mapped_nodes)
 
-            concat_neigh_out = torch.cat((out[curr_mapped_nodes], aggregate), dim=1)
+            concat_neigh_out = torch_cat((out[curr_mapped_nodes], aggregate), dim=1)
             out = self.linear_2s[k](concat_neigh_out)
         return out
 
-    def _aggregate(
+    def internal_aggregate(
         self,
-        features: torch.Tensor,
-        rows: List[List[Tuple[int, int]]],
-        nodes: List[Tuple[int, int]],
-        mapping: Dict[Tuple[int, int], int],
-        edge_features: List[torch.Tensor],
-        time_features: List[torch.Tensor],
+        features: torch_Tensor,
+        rows: list[list[tuple[int, int]]],
+        nodes: list[tuple[int, int]],
+        mapping: dict[tuple[int, int], int],
+        edge_features: list[torch_Tensor],
+        time_features: list[torch_Tensor],
         layer: int,
-    ) -> torch.Tensor:
-        assert len(nodes) == len(rows)
-        mapped_rows = [np.array([mapping[(vi, ti)] for (vi, ti) in row]) for row in rows]
-        out = torch.rand(len(nodes), self.embedding_dimension, device=self.device)
+    ) -> torch_Tensor:
+        if len(nodes) != len(rows):
+            raise ValueError(f"Node and neighborhood counts differ: {len(nodes)} != {len(rows)}")
+        mapped_rows = []
+        for row in rows:
+            mapped_row = []
+            for node in row:
+                mapped_node = mapping.get(node, -1)
+                if mapped_node < 0:
+                    raise KeyError(f"Neighbor {node} is missing from the TGN mapping")
+                mapped_row.append(mapped_node)
+            # a row lists only sampled neighbors and may be empty; integer dtype keeps an empty row a valid index
+            mapped_rows.append(np_array(mapped_row, dtype=int))
+        out = torch_zeros(len(nodes), self.embedding_dimension, device=self.device)
 
         # row represents list of indexes of "current neighbors" of edge_features on i-th index
         for i, row in enumerate(mapped_rows):
@@ -134,11 +161,11 @@ class TGNLayerGraphSumEmbedding(TGNLayer):
             time_feature_curr = time_features[i][:]
             # shape(num_neighbors, embedding_dim+edge_features_dim+time_encoding_dim)
             # concatenation is done alongside columns, we have only 2 dimension, rows=0 and columns=1
-            aggregate = torch.concat((features_curr, edge_feature_curr, time_feature_curr), dim=1)
+            aggregate = torch_concat((features_curr, edge_feature_curr, time_feature_curr), dim=1)
 
             # sum rows, but keep this dimension
             # shape = (1, embedding_dim+edge_features_dim+time_encoding_dim)
-            aggregate_sum = torch.sum(aggregate, dim=0, keepdim=True)
+            aggregate_sum = torch_sum(aggregate, dim=0, keepdim=True)
             # shape = (1, embedding_dim)
             out_linear1 = self.linear_1s[layer](aggregate_sum)
             out_relu_linear1 = self.relu(out_linear1)
@@ -162,7 +189,7 @@ class TGNLayerGraphAttentionEmbedding(TGNLayer):
         num_neighbors: int,
         num_of_layers: int,
         num_attention_heads: int,
-        device: torch.device,
+        device: torch_device,
     ):
         super().__init__(
             embedding_dimension,
@@ -179,6 +206,11 @@ class TGNLayerGraphAttentionEmbedding(TGNLayer):
         self.value_dim = self.key_dim
         self.num_attention_heads = num_attention_heads
 
+        if num_attention_heads < 1 or self.query_dim % num_attention_heads != 0:
+            raise ValueError(
+                f"num_attention_heads ({num_attention_heads}) must be positive and divide query_dim ({self.query_dim})"
+            )
+
         self.mlps = nn.ModuleList(
             MLP(
                 [
@@ -193,30 +225,28 @@ class TGNLayerGraphAttentionEmbedding(TGNLayer):
         self.multi_head_attentions = nn.ModuleList(
             nn.MultiheadAttention(
                 embed_dim=self.query_dim,
-                kdim=self.key_dim * self.num_neighbors,
-                # set on neighbors num
-                vdim=self.value_dim * self.num_neighbors,
-                num_heads=num_attention_heads,  # this add as a parameter
+                kdim=self.key_dim,
+                vdim=self.value_dim,
+                num_heads=num_attention_heads,
                 batch_first=True,
             )
             for _ in range(self.num_of_layers)
-        ).to(
-            self.device
-        )  # this way no need to do torch.permute later <3
+        ).to(self.device)
 
-    def forward(self, data: GraphAttnDataType):
-        node_layers: List[List[Tuple[int, int]]]
-        mappings: List[Dict[Tuple[int, int], int]]
-        edge_layers: List[List[int]]
-        neighbors_arr: List[List[Tuple[int, int]]]
-        features: torch.Tensor
-        edge_features: List[torch.Tensor]
-        time_features: List[torch.Tensor]
-        time_encoder_zeros: torch.Tensor
+    def forward(self, data: tuple) -> torch_Tensor:
+        if len(data) != 8:
+            raise ValueError(f"Graph-attention data must contain eight values, received {len(data)}")
+        node_layers: list[list[tuple[int, int]]]
+        mappings: list[dict[tuple[int, int], int]]
+        neighbors_arr: list[list[tuple[int, int]]]
+        features: torch_Tensor
+        edge_features: list[torch_Tensor]
+        time_features: list[torch_Tensor]
+        time_encoder_zeros: torch_Tensor
         (
             node_layers,
             mappings,
-            edge_layers,
+            _,
             neighbors_arr,
             features,
             edge_features,
@@ -224,78 +254,96 @@ class TGNLayerGraphAttentionEmbedding(TGNLayer):
             time_encoder_zeros,
         ) = data
 
+        if tuple(time_encoder_zeros.shape) != (1, self.time_encoding_dim):
+            raise ValueError(
+                f"Zero-time encoding must have shape (1, {self.time_encoding_dim}); received {tuple(time_encoder_zeros.shape)}"
+            )
+
         out = features
 
         for k in range(self.num_of_layers):
             mapping = mappings[k]
-            # shape = N
-            nodes = node_layers[k + 1]  # neighbors on next layer
-            # represents how we globally gave index to (node,timestamp) mapping
-            global_indexes = np.array([mappings[0][(v, t)] for (v, t) in nodes])
-            cur_neighbors = [
-                neighbors_arr[index] for index in global_indexes
-            ]  # neighbors and timestamps of nodes from next layer
+            nodes = node_layers[k + 1]
+            global_indexes = []
+            for node in nodes:
+                index = mappings[0].get(node, -1)
+                if index < 0:
+                    raise KeyError(f"Node {node} is missing from the global TGN mapping")
+                global_indexes.append(index)
+            cur_neighbors = [neighbors_arr[index] for index in global_indexes]
             curr_edges = [edge_features[index] for index in global_indexes]
             curr_time = [time_features[index] for index in global_indexes]
 
-            # KEY_DIM = EMBEDDING_DIM + EDGE_FEATURES_DIM + TIME_ENC_DIM
-            # shape = (N, NUM_NEIGHBORS * KEY_DIM)
-            aggregate = self._aggregate(out, cur_neighbors, nodes, mapping, curr_edges, curr_time)
+            # Each target node i is its own batch element (N, num_neighbors, key_dim) so neighborhoods never mix across nodes.
+            keys, padding_mask, has_neighbors = self.internal_aggregate(out, cur_neighbors, nodes, mapping, curr_edges, curr_time)
+            values = keys
 
-            # add third dimension,
-            # shape = (1, N, NUM_NEIGHBORS * KEY_DIM)
-            aggregate_unsqueeze = torch.unsqueeze(aggregate, dim=0)
+            mapped_nodes = []
+            for node in nodes:
+                mapped_node = mapping.get(node, -1)
+                if mapped_node < 0:
+                    raise KeyError(f"Node {node} is missing from the current TGN mapping")
+                mapped_nodes.append(mapped_node)
+            curr_mapped_nodes = np_array(mapped_nodes)
 
-            curr_mapped_nodes = np.array([mapping[(v, t)] for (v, t) in nodes])
-
-            keys = aggregate_unsqueeze
-            values = aggregate_unsqueeze
-            # shape = (N, EMBEDDING_DIM + TIME_ENC_DIM)
-            query_concat = torch.concat(
+            query_concat = torch_concat(
                 (
                     out[curr_mapped_nodes],
                     time_encoder_zeros.repeat(len(curr_mapped_nodes), 1),
                 ),
                 dim=1,
             )
-            # shape = (1, N, EMBEDDING_DIM + TIME_ENC_DIM)
-            query = torch.unsqueeze(query_concat, dim=0)
+            query = query_concat.unsqueeze(1)
 
-            attn_out, _ = self.multi_head_attentions[k](query=query, key=keys, value=values)
-            # shape = (N, EMBED_DIM + TIME_ENC_DIM)
-            attn_out = torch.squeeze(attn_out)
-            # shape = (N, EMBED_DIM + TIME_ENC_DIM + EMBED_DIM)
-            concat_neigh_out = torch.cat((out[curr_mapped_nodes], attn_out), dim=1)
-            # shape = (N, EMBED_DIM)
+            attn_out = torch_zeros(len(curr_mapped_nodes), self.query_dim, device=self.device)
+            if bool(has_neighbors.any()):
+                active_attn, _ = self.multi_head_attentions[k](
+                    query=query[has_neighbors],
+                    key=keys[has_neighbors],
+                    value=values[has_neighbors],
+                    key_padding_mask=padding_mask[has_neighbors],
+                )
+                attn_out[has_neighbors] = active_attn.squeeze(1)
+
+            concat_neigh_out = torch_cat((out[curr_mapped_nodes], attn_out), dim=1)
             out = self.mlps[k](concat_neigh_out)
         return out
 
-    def _aggregate(
+    def internal_aggregate(
         self,
-        features: torch.Tensor,
-        rows: List[List[Tuple[int, int]]],
-        nodes: List[Tuple[int, int]],
-        mapping: Dict[Tuple[int, int], int],
-        edge_features: List[torch.Tensor],
-        time_features: List[torch.Tensor],
-    ) -> torch.Tensor:
-        assert len(nodes) == len(rows)
-        mapped_rows = [np.array([mapping[(vi, ti)] for (vi, ti) in row]) for row in rows]
+        features: torch_Tensor,
+        rows: list[list[tuple[int, int]]],
+        nodes: list[tuple[int, int]],
+        mapping: dict[tuple[int, int], int],
+        edge_features: list[torch_Tensor],
+        time_features: list[torch_Tensor],
+    ) -> tuple[torch_Tensor, torch_Tensor, torch_Tensor]:
+        if len(nodes) != len(rows):
+            raise ValueError(f"Node and neighborhood counts differ: {len(nodes)} != {len(rows)}")
+        mapped_rows = []
+        for row in rows:
+            mapped_row = []
+            for node in row:
+                mapped_node = mapping.get(node, -1)
+                if mapped_node < 0:
+                    raise KeyError(f"Neighbor {node} is missing from the TGN mapping")
+                mapped_row.append(mapped_node)
+            mapped_rows.append(np_array(mapped_row, dtype=int))
 
-        out = torch.rand(len(nodes), self.num_neighbors * self.key_dim, device=self.device)
+        out = torch_zeros(len(nodes), self.num_neighbors, self.key_dim, device=self.device)
+        padding_mask = torch_ones(len(nodes), self.num_neighbors, dtype=torch_bool, device=self.device)
+        has_neighbors = torch_zeros(len(nodes), dtype=torch_bool, device=self.device)
 
-        # row represents list of indexes of "current neighbors" of edge_features on i-th index
         for i, row in enumerate(mapped_rows):
+            neighbor_count = len(row)
+            if neighbor_count == 0:
+                continue
             features_curr = features[row][:]
             edge_feature_curr = edge_features[i][:]
             time_feature_curr = time_features[i][:]
+            aggregate = torch_concat((features_curr, edge_feature_curr, time_feature_curr), dim=1)
+            out[i, :neighbor_count, :] = aggregate
+            padding_mask[i, :neighbor_count] = False
+            has_neighbors[i] = True
 
-            # shape = (1, num_neighbors * (embedding_dim + edge_features_dim + time_encoding_dim)
-            # after doing concatenation on columns side, reshape to have 1 row
-            aggregate = torch.concat((features_curr, edge_feature_curr, time_feature_curr), dim=1).reshape(
-                (1, -1)
-            )  # -1 means to find dim by itself from matrix
-
-            out[i, :] = aggregate
-
-        return out
+        return out, padding_mask, has_neighbors

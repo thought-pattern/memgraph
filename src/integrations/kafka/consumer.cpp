@@ -16,6 +16,7 @@
 #include <algorithm>
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <unordered_set>
 
@@ -96,6 +97,7 @@ void CheckAndDestroyLastAssignmentIfNeeded(RdKafka::KafkaConsumer &consumer, con
                                          fmt::format("Couldn't restore commited offsets: '{}'", RdKafka::err2str(err)));
     }
     RdKafka::TopicPartition::destroy(last_assignment);
+    last_assignment.clear();
   }
 }
 
@@ -144,6 +146,11 @@ std::span<const char> Message::Payload() const {
 int64_t Message::Timestamp() const {
   const auto *c_message = message_->c_ptr();
   return rd_kafka_message_timestamp(c_message, nullptr);
+}
+
+int32_t Message::Partition() const {
+  const auto *c_message = message_->c_ptr();
+  return c_message->partition;
 }
 
 int64_t Message::Offset() const {
@@ -351,6 +358,28 @@ void Consumer::Check(std::optional<std::chrono::milliseconds> timeout, std::opti
     }
   }
 
+  std::map<std::pair<std::string, int32_t>, int64_t> first_seen_offsets;
+  utils::OnScopeExit capture_post_poll_assignment([this, &first_seen_offsets] {
+    if (!last_assignment_.empty()) {
+      return;
+    }
+    std::vector<RdKafka::TopicPartition *> assigned;
+    if (consumer_->assignment(assigned) != RdKafka::ERR_NO_ERROR || assigned.empty()) {
+      RdKafka::TopicPartition::destroy(assigned);
+      return;
+    }
+    if (consumer_->position(assigned) != RdKafka::ERR_NO_ERROR) {
+      RdKafka::TopicPartition::destroy(assigned);
+      return;
+    }
+    for (auto *tp : assigned) {
+      if (auto it = first_seen_offsets.find({tp->topic(), tp->partition()}); it != first_seen_offsets.end()) {
+        tp->set_offset(it->second);
+      }
+    }
+    last_assignment_ = std::move(assigned);
+  });
+
   const auto num_of_batches = limit_batches.value_or(kDefaultCheckBatchLimit);
   const auto timeout_to_use = timeout.value_or(kDefaultCheckTimeout);
   const auto start = std::chrono::steady_clock::now();
@@ -370,6 +399,11 @@ void Consumer::Check(std::optional<std::chrono::milliseconds> timeout, std::opti
 
     if (batch.empty()) {
       continue;
+    }
+    if (last_assignment_.empty()) {
+      for (const auto &msg : batch) {
+        first_seen_offsets.try_emplace({std::string(msg.TopicName()), msg.Partition()}, msg.Offset());
+      }
     }
     ++i;
 
@@ -500,6 +534,8 @@ std::expected<void, std::string> Consumer::SetConsumerOffsets(int64_t offset) {
     offset = RD_KAFKA_OFFSET_END;
   }
 
+  RdKafka::TopicPartition::destroy(last_assignment_);
+  last_assignment_.clear();
   cb_.set_offset(offset);
   if (const auto err = consumer_->subscribe(info_.topics); err != RdKafka::ERR_NO_ERROR) {
     return std::unexpected{

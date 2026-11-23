@@ -24,20 +24,29 @@ def list_build_files(date: int, image_type: str = "mage", mock: bool = False) ->
     files: list[str]
         list of package s3 keys for this date
     """
+    s3_uri = f"s3://deps.memgraph.io/daily-build/{image_type}{'_mock' if mock else ''}/{date}/"
     p = subprocess.run(
         [
             "aws",
             "s3",
             "ls",
-            f"s3://deps.memgraph.io/daily-build/{image_type}{'_mock' if mock else ''}/{date}/",
+            s3_uri,
             "--recursive",
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
+    if p.returncode != 0:
+        detail = p.stderr.strip() or p.stdout.strip() or f"exit status {p.returncode}"
+        raise RuntimeError(f"Failed to list S3 prefix {s3_uri}: {detail}")
 
     # extract the file keys found
-    files = [line.split()[3] for line in p.stdout.splitlines()]
+    files = []
+    for line in p.stdout.splitlines():
+        parts = line.split(maxsplit=3)
+        if len(parts) == 4:
+            files.append(parts[3])
 
     return files
 
@@ -257,6 +266,8 @@ def main(image_type: str, mock: bool = False) -> None:
 
     # collect packages part of the payload
     packages = list_daily_release_packages(date, image_type=image_type, mock=mock)
+    if not packages:
+        raise RuntimeError(f"No {image_type} packages found in S3 for build date {date}")
 
     # build the payload dict, print the JSON dump
     payload = {

@@ -164,47 +164,45 @@ docker run -p 7687:7687 -p 7444:7444 memgraph/memgraph-mage
 
 #### 2 Install MAGE with Docker build of the repository
 
-**0. a** Make sure that you have cloned the MAGE GitHub repository and positioned
-yourself inside the repo in your terminal:
+**0. a** Clone the Memgraph repository with submodules and enter the MAGE image packaging directory (`src/mage` holds the module sources, and `release/package/mage` holds `Dockerfile.release`):
 
 ```bash
-git clone --recurse-submodules https://github.com/memgraph/memgraph.git && cd memgraph/mage
+git clone --recurse-submodules https://github.com/memgraph/memgraph.git && cd memgraph/release/package/mage
+cp ../../../src/mage/python/requirements.txt ../../../src/mage/python/requirements-gpu.txt ./
+cp ../../../src/auth/reference_modules/requirements.txt ./auth-module-requirements.txt
+../../../tools/ci/mirrors/stage.sh .
+mkdir -p openssl wheels
 ```
 
-**0. b** Download Memgraph from our official download site inside your cloned MAGE repository. Set `${MEMGRAPH_VERSION}` to the latest release of Memgraph, and
-`${ARCHITECTURE}` to your system architecture (`amd64` or `arm64`):
+**0. b** Download the Memgraph and MAGE Debian packages from the official download site into `release/package/mage`. Set `${MEMGRAPH_VERSION}` to the target release of Memgraph, `${MAGE_VERSION}` to the matching MAGE package release, and `${ARCHITECTURE}` to the target architecture (`amd64` or `arm64`):
 
 ```bash
-
-curl -L "https://download.memgraph.com/memgraph/v${MEMGRAPH_VERSION}/ubuntu-24.04/memgraph_${MEMGRAPH_VERSION}-1_${ARCHITECTURE}.deb" > memgraph-${ARCHITECTURE}.deb
-
+curl -fL "https://download.memgraph.com/memgraph/v${MEMGRAPH_VERSION}/ubuntu-24.04/memgraph_${MEMGRAPH_VERSION}-1_${ARCHITECTURE}.deb" -o memgraph.deb
+curl -fL "https://download.memgraph.com/mage/v${MAGE_VERSION}/ubuntu-24.04/memgraph-mage_${MAGE_VERSION}_${ARCHITECTURE}.deb" -o memgraph-mage.deb
 ```
 
-or this one if you are on `arm64`:
+or on `arm64`:
 
 ```bash
-curl -L "https://download.memgraph.com/memgraph/v${MEMGRAPH_VERSION}/ubuntu-24.04-aarch64/memgraph_${MEMGRAPH_VERSION}-1_arm64.deb" > memgraph-arm64.deb
+curl -fL "https://download.memgraph.com/memgraph/v${MEMGRAPH_VERSION}/ubuntu-24.04-aarch64/memgraph_${MEMGRAPH_VERSION}-1_arm64.deb" -o memgraph.deb
+curl -fL "https://download.memgraph.com/mage/v${MAGE_VERSION}/ubuntu-24.04-aarch64/memgraph-mage_${MAGE_VERSION}_arm64.deb" -o memgraph-mage.deb
 ```
 
-**1.** To build the **MAGE** image run the following command where you set `${architecture}` to your system architecture (`amd64` or `arm64`):
+**1.** Build the **MAGE** image with `${ARCHITECTURE}` set to `amd64` or `arm64`:
 
-```
+```bash
 DOCKER_BUILDKIT=1 docker buildx build \
 --tag memgraph-mage:prod \
 --target prod \
---platform linux/${architecture} \
+--platform linux/${ARCHITECTURE} \
 --file Dockerfile.release \
 --load .
-
 ```
 
-This will build any new algorithm added to MAGE, and load it inside Memgraph.
+**2.** Start the container from the newly built `memgraph-mage:prod` tag:
 
-**2.** Start the container with the following command and enjoy Memgraph with
-**MAGE**:
-
-```
-docker run --rm -p 7687:7687 -p 7444:7444 --name mage memgraph-mage
+```bash
+docker run --rm -p 7687:7687 -p 7444:7444 --name mage memgraph-mage:prod
 ```
 
 **NOTE**: if you made any changes while the **MAGE** Docker container was

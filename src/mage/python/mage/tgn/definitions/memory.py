@@ -1,44 +1,60 @@
-from typing import Dict
+"""Utilities for memory."""
 
-import torch
+from torch import (
+    Tensor as torch_Tensor,
+    device as torch_device,
+    float32 as torch_float32,
+    float64 as torch_float64,
+    zeros as torch_zeros,
+)
 
 
 class Memory:
-    def __init__(self, memory_dimension: int, device: torch.device):
+    """Per-node memory vectors and their last update times."""
+
+    def __init__(self, memory_dimension: int, device: torch_device):
         self.memory_dimension = memory_dimension
         self.device = device
         self.init_memory()
 
     def init_memory(self):
-        self.memory_container: Dict[int, torch.Tensor] = {}
-        self.last_node_update: Dict[int, torch.Tensor] = {}
+        self.memory_container: dict[int, torch_Tensor] = {}
+        self.last_node_update: dict[int, torch_Tensor] = {}
+        return False
 
     # https://stackoverflow.com/questions/48274929/pytorch-runtimeerror-trying-to-backward-through-the-graph-a-second
     # -time-but
     def detach_tensor_grads(self):
-        for node_memory in self.memory_container.values():
-            if node_memory.grad is not None:
-                node_memory.grad.zero_()
+        """
+        Truncates autograd history at the batch boundary. Every node keeps its memory and last-update values, but the
+        stored tensors no longer reference the computation graph of an earlier, already backpropagated batch.
+        """
+        self.memory_container = {node: node_memory.detach() for node, node_memory in self.memory_container.items()}
+        self.last_node_update = {node: last_update.detach() for node, last_update in self.last_node_update.items()}
+        return False
 
-        for timestamp in self.last_node_update.values():
-            if timestamp.grad is not None:
-                timestamp.grad.zero_()
-
-    def get_node_memory(self, node: int) -> torch.Tensor:
-        if node not in self.memory_container:
-            self.memory_container[node] = torch.zeros(
-                self.memory_dimension,
-                dtype=torch.float32,
-                device=self.device,
-                requires_grad=True,
-            )
-        return self.memory_container[node]
-
-    def set_node_memory(self, node: int, node_memory: torch.Tensor) -> torch.Tensor:
+    def get_node_memory(self, node: int) -> torch_Tensor:
+        default_memory = torch_zeros(
+            self.memory_dimension,
+            dtype=torch_float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        node_memory = self.memory_container.get(node, default_memory)
         self.memory_container[node] = node_memory
-        return self.memory_container[node]
+        return node_memory
 
-    def get_last_node_update(self, node: int) -> torch.Tensor:
-        if node not in self.last_node_update:
-            self.last_node_update[node] = torch.zeros(1, dtype=torch.float32, device=self.device, requires_grad=True)
-        return self.last_node_update[node]
+    def set_node_memory(self, node: int, node_memory: torch_Tensor) -> torch_Tensor:
+        self.memory_container[node] = node_memory
+        return node_memory
+
+    def get_last_node_update(self, node: int) -> torch_Tensor:
+        # last-update times are exact integer timestamps, so they are kept in float64 rather than the model's float32
+        default_update = torch_zeros(1, dtype=torch_float64, device=self.device, requires_grad=True)
+        last_update = self.last_node_update.get(node, default_update)
+        self.last_node_update[node] = last_update
+        return last_update
+
+    def set_last_node_update(self, node: int, last_update: torch_Tensor) -> torch_Tensor:
+        self.last_node_update[node] = last_update
+        return last_update

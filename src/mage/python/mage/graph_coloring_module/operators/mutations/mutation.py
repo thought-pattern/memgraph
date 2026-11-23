@@ -1,8 +1,11 @@
+"""Utilities for mutation."""
+
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple
 
 from mage.graph_coloring_module.components.individual import Individual
 from mage.graph_coloring_module.graph import Graph
+
+DEFAULT_ARGUMENT_DICT = {}
 
 
 class Mutation(ABC):
@@ -10,8 +13,13 @@ class Mutation(ABC):
 
     @abstractmethod
     def mutate(
-        self, graph: Graph, individual: Individual, parameters: Dict[str, Any] = None
-    ) -> Tuple[Individual, List[int]]:
+        self,
+        graph: Graph,
+        individual: Individual,
+        parameters: dict = DEFAULT_ARGUMENT_DICT,
+    ) -> tuple[Individual, list[int]]:
         """A function that mutates the given individual and
         returns the new individual and nodes that was changed."""
-        pass
+        if parameters is DEFAULT_ARGUMENT_DICT:
+            parameters = DEFAULT_ARGUMENT_DICT.copy()
+        raise NotImplementedError

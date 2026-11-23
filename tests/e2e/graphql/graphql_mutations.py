@@ -45,7 +45,7 @@ def test_create(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, allow_generated_uuid=True)
 
     query_server.send_query("mutation { teardown }")
 
@@ -104,7 +104,7 @@ def test_nested_create(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, allow_generated_uuid=True)
 
     query_server.send_query("mutation { teardown }")
 

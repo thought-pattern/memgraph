@@ -1,5 +1,5 @@
 image:
-  repository: docker.io/memgraph/memgraph
+  repository: "{{IMAGE_REPOSITORY}}"
   # It is a bad practice to set the image tag name to 'latest' as it can trigger automatic upgrade of the charts
   # With some of the pullPolicy values. Please consider fixing the tag to a specific Memgraph version
   tag: "{{VERSION_TAG}}"

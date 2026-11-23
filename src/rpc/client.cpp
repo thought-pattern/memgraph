@@ -23,13 +23,13 @@ void Connection::Interrupt() {
   // mutex_, so EnsureConnected cannot run and client_ cannot change under it. Once that thread has
   // released the lock a reconnect may intervene and this interrupts the newer socket instead, which is
   // harmless -- nobody is blocked on the older one by then.
-  if (auto const sock = client_.load(std::memory_order_acquire)) sock->Shutdown();
+  if (auto const sock = client_.load(std::memory_order_seq_cst)) sock->Shutdown();
 }
 
 void Connection::Abort() {
   // Latch first so any thread that subsequently tries to open a stream fails fast instead of reconnecting, then break
   // the in-flight RPC. Nothing is destroyed, so this is safe with an RPC in flight.
-  aborted_.store(true, std::memory_order_release);
+  aborted_.store(true, std::memory_order_seq_cst);
   Interrupt();
 }
 
@@ -41,6 +41,10 @@ void Connection::Shutdown() {
 }
 
 auto Connection::EnsureConnected() -> std::shared_ptr<communication::Client> {
+  if (aborted_.load(std::memory_order_seq_cst)) {
+    throw GenericRpcFailedException();
+  }
+
   auto sock = client_.load(std::memory_order_acquire);
 
   // Retired by Shutdown, or broken while idle (a long-unused connection whose server has since died). IsConnected
@@ -50,9 +54,22 @@ auto Connection::EnsureConnected() -> std::shared_ptr<communication::Client> {
     sock.reset();
   }
 
-  if (sock) return sock;
+  if (sock) {
+    if (aborted_.load(std::memory_order_seq_cst)) {
+      sock->Shutdown();
+      throw GenericRpcFailedException();
+    }
+    return sock;
+  }
 
   sock = std::make_shared<communication::Client>(context_, connect_timeout_ms_);
+  // Publish before Connect so a concurrent Abort()/Interrupt() reaches `sock` while TLS handshake is in progress.
+  client_.store(sock, std::memory_order_seq_cst);
+  if (aborted_.load(std::memory_order_seq_cst)) {
+    sock->Shutdown();
+    client_.store(nullptr, std::memory_order_release);
+    throw GenericRpcFailedException();
+  }
   if (!sock->Connect(endpoint_)) {
     spdlog::error("Couldn't connect to remote address {}", endpoint_.SocketAddress());
     // Retire the previous socket too: whatever it was, it is not what the next attempt should reuse.
@@ -60,9 +77,13 @@ auto Connection::EnsureConnected() -> std::shared_ptr<communication::Client> {
     throw RpcFailedToConnectException();
   }
 
-  // Publishing drops the caller's share of the old socket, but not any share an in-flight RPC or a
-  // concurrent Interrupt still holds -- those keep it alive until they are done with it.
-  client_.store(sock, std::memory_order_release);
+  // Re-publish with seq_cst and re-check `aborted_` so an Abort() arriving during Connect() is never missed.
+  client_.store(sock, std::memory_order_seq_cst);
+  if (aborted_.load(std::memory_order_seq_cst)) {
+    sock->Shutdown();
+    client_.store(nullptr, std::memory_order_release);
+    throw GenericRpcFailedException();
+  }
   return sock;
 }
 

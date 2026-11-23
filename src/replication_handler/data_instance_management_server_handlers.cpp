@@ -427,11 +427,16 @@ void DataInstanceManagementServerHandlers::UpdateDataInstanceConfigHandler(
 
   {
     auto locked_repl_state = replication_handler.GetReplState();
-    locked_repl_state->UpdateDeltasBatchProgressSize(req.deltas_batch_progress_size);
+    if (!locked_repl_state->UpdateDeltasBatchProgressSize(req.deltas_batch_progress_size)) {
+      coordination::UpdateDataInstanceConfigRes const res{false};
+      rpc::SendFinalResponse(res, request_version, res_builder);
+      return;
+    }
 
     // The writing flag only exists on the main-role state; touching it on a replica would assert. Replicas reject
     // writes regardless of this flag, so the coordinator's intent is simply ignored there.
-    if (locked_repl_state->IsMain()) {
+    // An upgraded V1 request carries no disable_writing instruction, so only V2+ modifies writing_enabled_.
+    if (locked_repl_state->IsMain() && request_version >= coordination::UpdateDataInstanceConfigReq::kVersion) {
       if (req.disable_writing) {
         locked_repl_state->DisableWritingOnMain();
       } else {

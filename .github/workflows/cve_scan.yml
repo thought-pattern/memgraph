@@ -105,11 +105,15 @@ jobs:
             mage_amd_url="${base}/${mage_prefix}/${tag}/docker-x86_64/mage-${VERSION}.tar.gz"
             mage_arm_url="${base}/${mage_prefix}/${tag}/docker-aarch64/mage-${VERSION}-arm64.tar.gz"
           elif [[ -n "$CURRENT_BUILD_DATE" ]]; then
-            # Daily-build mode: resolve URLs by listing the daily-build S3 prefix.
-            mage_arm_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'arm64' 'mage')"
-            mage_amd_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'amd64' 'mage')"
-            memgraph_arm_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'arm64' 'memgraph')"
-            memgraph_amd_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'amd64' 'memgraph')"
+            # Daily-build mode: resolve URLs by listing the daily-build (or _mock) S3 prefix.
+            mock_args=()
+            if [[ "$MOCK" == "true" ]]; then
+              mock_args=(--mock)
+            fi
+            mage_arm_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'arm64' 'mage' "${mock_args[@]}")"
+            mage_amd_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'amd64' 'mage' "${mock_args[@]}")"
+            memgraph_arm_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'arm64' 'memgraph' "${mock_args[@]}")"
+            memgraph_amd_url="$(python3 tools/ci/cve-scan/get_cve_image_url.py 'amd64' 'memgraph' "${mock_args[@]}")"
           else
             echo "cve_scan: must pass either (version + rc_number) or date" >&2
             exit 1

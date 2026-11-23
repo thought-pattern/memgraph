@@ -215,8 +215,6 @@ std::optional<cugraph::edge_property_view_t<TEdgeT, double const *>> GetEdgeWeig
 template <typename TVertexT = int64_t, typename TEdgeT = int64_t, typename TWeightT = double>
 auto CreateCugraphLegacyFromMemgraph(const mg_graph::GraphView<> &mg_graph, raft::handle_t const &handle) {
   auto mg_nodes = mg_graph.Nodes();
-  auto mg_edges = mg_graph.Edges();
-  const auto n_edges = mg_edges.size();
   const auto n_vertices = mg_nodes.size();
 
   // Flatten the data vector into CSR format
@@ -249,7 +247,7 @@ auto CreateCugraphLegacyFromMemgraph(const mg_graph::GraphView<> &mg_graph, raft
 
   cugraph::legacy::GraphSparseContents<TVertexT, TEdgeT, TWeightT> csr_contents{
       static_cast<TVertexT>(n_vertices),
-      static_cast<TEdgeT>(n_edges),
+      static_cast<TEdgeT>(mg_dst.size()),
       std::make_unique<rmm::device_buffer>(std::move(offsets_buffer)),
       std::make_unique<rmm::device_buffer>(std::move(dsts_buffer)),
       std::make_unique<rmm::device_buffer>(std::move(weights_buffer))};

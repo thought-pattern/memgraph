@@ -204,7 +204,11 @@ inline void Save(const std::string_view obj, Builder *builder) {
 inline void Load(std::string *obj, Reader *reader) {
   uint64_t size = 0;
   Load(&size, reader);
-  *obj = std::string(size, '\0');
+  if (size > reader->RemainingRawBytes()) {
+    throw SlkReaderException(
+        "Declared string length {} exceeds remaining SLK stream bytes {}!", size, reader->RemainingRawBytes());
+  }
+  *obj = std::string(static_cast<size_t>(size), '\0');
   reader->Load(reinterpret_cast<uint8_t *>(obj->data()), size);
 }
 
@@ -280,7 +284,10 @@ template <typename T, size_t N>
 inline void Load(std::array<T, N> *obj, Reader *reader) {
   uint64_t size = 0;
   Load(&size, reader);
-  for (uint64_t i = 0; i < size; ++i) {
+  if (size != N) {
+    throw SlkReaderException("Unexpected fixed-array element count {} in SLK stream (expected {})!", size, N);
+  }
+  for (uint64_t i = 0; i < N; ++i) {
     Load(&(*obj)[i], reader);
   }
 }
@@ -643,27 +650,30 @@ void Load(T *enum_value, slk::Reader *reader) {
 
 template <typename... Args>
 inline void Save(std::variant<Args...> const &data, Builder *builder) {
-  slk::Save(data.index(), builder);
+  slk::Save(static_cast<uint64_t>(data.index()), builder);
   std::visit([builder](auto const &obj_type) { slk::Save(obj_type, builder); }, data);
 }
 
 template <typename... Args>
 inline void Load(std::variant<Args...> *data, Reader *reader) {
-  std::size_t index;
+  uint64_t index = 0;
   slk::Load(&index, reader);
 
   // Helper to load the type at the given index
-  [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-    (void)((Is == index ? (
-                              [&] {
-                                std::variant_alternative_t<Is, std::variant<Args...>> value;
-                                slk::Load(&value, reader);
-                                *data = std::move(value);
-                              }(),
-                              true)
-                        : false) ||
-           ...);
+  const bool matched = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+    return ((Is == index ? (
+                               [&] {
+                                 std::variant_alternative_t<Is, std::variant<Args...>> value;
+                                 slk::Load(&value, reader);
+                                 *data = std::move(value);
+                               }(),
+                               true)
+                         : false) ||
+            ...);
   }(std::index_sequence_for<Args...>{});
+  if (!matched) {
+    throw SlkReaderException("Unexpected variant index {} in SLK stream (expected < {})!", index, sizeof...(Args));
+  }
 }
 
 }  // namespace memgraph::slk

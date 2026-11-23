@@ -237,7 +237,7 @@ class NeoRunner(_QueryRunner):
                           help="Path to neo config file")
         self.args, remaining_args = argp.parse_known_args(args)
         database = Neo(remaining_args, self.args.runner_config)
-        super(NeoRunner, self).__init__(remaining_args, database)
+        super(NeoRunner, self).__init__(remaining_args, database, 1)
 
 
 class NeoParallelRunner(_QueryRunner):
@@ -255,7 +255,7 @@ class NeoParallelRunner(_QueryRunner):
         assert not APOLLO or self.args.num_client_workers, \
                 "--client-num-clients is obligatory flag on apollo"
         database = Neo(remaining_args, self.args.runner_config)
-        super(NeoRunner, self).__init__(
+        super(NeoParallelRunner, self).__init__(
                 remaining_args, database, self.args.num_client_workers)
 
 

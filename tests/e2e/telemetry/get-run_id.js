@@ -12,31 +12,33 @@ const runQuery = async (driver, query) => {
     activeSession.subscribe({
       onCompleted: async (summary) => {
         await session.close();
-        const result = summary;
-        resolve(result);
+        resolve(summary);
       },
       onError: async (error) => {
         await session.close();
         reject(error);
       },
     });
-  })
+  });
 };
 
 const main = async () => {
   const driver = neo4j.driver('bolt://localhost:7687');
-
-  query = "MATCH (n) RETURN n LIMIT 1;"
-
-  console.log('Query:', query);
-  const results = await runQuery(driver, query);
-  if (results.hasOwnProperty("run_id")) {
-    console.log("run_id:", results["run_id"]);
-  } else {
-    process.exit(1);
+  try {
+    const query = "MATCH (n) RETURN n LIMIT 1;";
+    console.log('Query:', query);
+    const results = await runQuery(driver, query);
+    if (results && Object.prototype.hasOwnProperty.call(results, "run_id")) {
+      console.log("run_id:", results["run_id"]);
+    } else {
+      process.exitCode = 1;
+    }
+  } finally {
+    await driver.close();
   }
-  await driver.close();
 };
 
-main(process.argv[2])
-  .catch((error) => console.error(error));
+main(process.argv[2]).catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

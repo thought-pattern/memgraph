@@ -28,12 +28,27 @@ constexpr char const *kArgumentDeletedVertices = "deleted_vertices";
 constexpr char const *kArgumentDeletedEdges = "deleted_edges";
 
 void InsertKatzRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const double katz_centrality,
-                      const int node_id) {
-  auto *record = mgp::result_new_record(result);
-
-  if (mg_utility::InsertNodeValueResult(graph, record, kFieldNode, node_id, memory)) {
-    mg_utility::InsertDoubleValueResult(record, kFieldRank, katz_centrality, memory);
+                      const std::uint64_t node_id) {
+  auto *vertex =
+      mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = static_cast<std::int64_t>(node_id)}, memory);
+  if (!vertex) {
+    return;
   }
+  auto *record = mgp::result_new_record(result);
+  if (record == nullptr) {
+    mgp::vertex_destroy(vertex);
+    throw mg_exception::NotEnoughMemoryException();
+  }
+  mg_utility::InsertNodeValueResult(record, kFieldNode, vertex, memory);
+  mg_utility::InsertDoubleValueResult(record, kFieldRank, katz_centrality, memory);
+}
+
+mgp_list *RequireListArg(mgp_list *args, std::size_t index, const char *name) {
+  auto *val = mgp::list_at(args, index);
+  if (val == nullptr || mgp::value_get_type(val) != MGP_VALUE_TYPE_LIST) {
+    throw std::invalid_argument(std::string(name) + " must be a list.");
+  }
+  return mgp::value_get_list(val);
 }
 
 void InsertMessageRecord(mgp_result *result, mgp_memory *memory, const char *message) {
@@ -98,13 +113,18 @@ void UpdateKatzCentrality(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
     }
 
     // Created vertices
-    auto created_vertices = mg_utility::GetNodeIDs(mgp::value_get_list(mgp::list_at(args, 0)));
-    auto created_edges = mg_utility::GetEdgeEndpointIDs(mgp::value_get_list(mgp::list_at(args, 1)));
-    auto created_edge_ids = mg_utility::GetEdgeIDs(mgp::value_get_list(mgp::list_at(args, 1)));
+    auto *created_vertices_list = RequireListArg(args, 0, kArgumentCreatedVertices);
+    auto *created_edges_list = RequireListArg(args, 1, kArgumentCreatedEdges);
+    auto *deleted_vertices_list = RequireListArg(args, 2, kArgumentDeletedVertices);
+    auto *deleted_edges_list = RequireListArg(args, 3, kArgumentDeletedEdges);
+
+    auto created_vertices = mg_utility::GetNodeIDs(created_vertices_list);
+    auto created_edges = mg_utility::GetEdgeEndpointIDs(created_edges_list);
+    auto created_edge_ids = mg_utility::GetEdgeIDs(created_edges_list);
 
     // Deleted entities
-    auto deleted_vertices = mg_utility::GetNodeIDs(mgp::value_get_list(mgp::list_at(args, 2)));
-    auto deleted_edges = mg_utility::GetEdgeEndpointIDs(mgp::value_get_list(mgp::list_at(args, 3)));
+    auto deleted_vertices = mg_utility::GetNodeIDs(deleted_vertices_list);
+    auto deleted_edges = mg_utility::GetEdgeEndpointIDs(deleted_edges_list);
 
     auto graph = mg_utility::GetGraphView(memgraph_graph, result, memory, mg_graph::GraphType::kDirectedGraph);
     std::transform(created_edge_ids.begin(),
@@ -163,7 +183,7 @@ extern "C" int mgp_init_module(mgp_module *module, mgp_memory *memory) {
       mgp::proc_add_result(proc, kFieldRank, mgp::type_float());
 
       mgp::value_destroy(default_alpha);
-      mgp::value_destroy(default_alpha);
+      mgp::value_destroy(default_epsilon);
     }
 
     {
@@ -181,22 +201,12 @@ extern "C" int mgp_init_module(mgp_module *module, mgp_memory *memory) {
       auto default_deleted_vertices = mgp::value_make_list(mgp::list_make_empty(0, memory));
       auto default_deleted_edges = mgp::value_make_list(mgp::list_make_empty(0, memory));
 
-      mgp::proc_add_opt_arg(proc,
-                            kArgumentCreatedVertices,
-                            mgp::type_nullable(mgp::type_list(mgp::type_node())),
-                            default_created_vertices);
-      mgp::proc_add_opt_arg(proc,
-                            kArgumentCreatedEdges,
-                            mgp::type_nullable(mgp::type_list(mgp::type_relationship())),
-                            default_created_edges);
-      mgp::proc_add_opt_arg(proc,
-                            kArgumentDeletedVertices,
-                            mgp::type_nullable(mgp::type_list(mgp::type_node())),
-                            default_deleted_vertices);
-      mgp::proc_add_opt_arg(proc,
-                            kArgumentDeletedEdges,
-                            mgp::type_nullable(mgp::type_list(mgp::type_relationship())),
-                            default_deleted_edges);
+      mgp::proc_add_opt_arg(proc, kArgumentCreatedVertices, mgp::type_list(mgp::type_node()), default_created_vertices);
+      mgp::proc_add_opt_arg(
+          proc, kArgumentCreatedEdges, mgp::type_list(mgp::type_relationship()), default_created_edges);
+      mgp::proc_add_opt_arg(proc, kArgumentDeletedVertices, mgp::type_list(mgp::type_node()), default_deleted_vertices);
+      mgp::proc_add_opt_arg(
+          proc, kArgumentDeletedEdges, mgp::type_list(mgp::type_relationship()), default_deleted_edges);
 
       mgp::value_destroy(default_created_vertices);
       mgp::value_destroy(default_created_edges);

@@ -242,11 +242,24 @@ memgraph::utils::Settings::ValidatorResult ValidQueryTimeoutStr(std::string_view
   const auto error = [] {
     return std::unexpected{fmt::format("Value must be a number in range [0, {}].", kMaxQueryTimeoutSec)};
   };
+  if (in.empty() || std::isspace(static_cast<unsigned char>(in.front())) != 0 ||
+      std::isspace(static_cast<unsigned char>(in.back())) != 0) {
+    return error();
+  }
+  std::string_view digits_check = in;
+  if (digits_check.front() == '+') {
+    digits_check.remove_prefix(1);
+  }
+  if (digits_check.empty() || digits_check.starts_with("0x") || digits_check.starts_with("0X") ||
+      in.front() == '-') {
+    return error();
+  }
   const std::string str{in};
   try {
     size_t n_processed = 0;
     const auto value = std::stod(str, &n_processed);
-    if (n_processed != str.size() || !std::isfinite(value) || value < 0 || value > kMaxQueryTimeoutSec) {
+    if (n_processed != str.size() || !std::isfinite(value) || std::signbit(value) || value < 0 ||
+        value > kMaxQueryTimeoutSec) {
       return error();
     }
   } catch (const std::logic_error & /* invalid_argument or out_of_range */) {
@@ -293,6 +306,8 @@ memgraph::utils::Settings::ValidatorResult ValidBoolStr(std::string_view in) {
   }
   return {};
 }
+
+std::string NormalizeBoolStr(std::string_view in) { return memgraph::utils::ToLowerCase(in); }
 
 auto GenHandler(memgraph::utils::Settings &settings, std::string flag, std::string key) {
   return [key = std::move(key), flag = std::move(flag), &settings]() -> std::string {
@@ -393,7 +408,10 @@ void Initialize(utils::Settings &settings) {
                            Durability durability,
                            std::function<void(const std::string &)> post_update = [](auto) {},
                            utils::Settings::Validation validator =
-                               [](std::string_view) -> utils::Settings::ValidatorResult { return {}; }) {
+                               [](std::string_view) -> utils::Settings::ValidatorResult { return {}; },
+                           utils::Settings::Sensitivity sensitivity = utils::Settings::Sensitivity::kPlain,
+                           utils::Settings::Normalizer normalizer =
+                               [](std::string_view in) { return std::string{in}; }) {
     // Get flag info
     gflags::CommandLineFlagInfo info;
     gflags::GetCommandLineFlagInfo(flag.c_str(), &info);
@@ -405,8 +423,13 @@ void Initialize(utils::Settings &settings) {
     };
 
     if (durability == Durability::kPersisted) {
-      settings.RegisterSetting(
-          key, info.default_value, utils::Settings::Persistence::kPersisted, callback, std::move(validator));
+      settings.RegisterSetting(key,
+                               info.default_value,
+                               utils::Settings::Persistence::kPersisted,
+                               callback,
+                               std::move(validator),
+                               sensitivity,
+                               std::move(normalizer));
       if (info.is_default) {
         // The stored value is already in the settings map; propagate it to the flag and the caches
         callback();
@@ -417,8 +440,13 @@ void Initialize(utils::Settings &settings) {
     }
 
     // Register setting; a leftover from an older version is deleted from the store and handed back
-    const auto leftover = settings.RegisterSetting(
-        key, info.default_value, utils::Settings::Persistence::kRuntimeOnly, callback, std::move(validator));
+    const auto leftover = settings.RegisterSetting(key,
+                                                   info.default_value,
+                                                   utils::Settings::Persistence::kRuntimeOnly,
+                                                   callback,
+                                                   std::move(validator),
+                                                   sensitivity,
+                                                   std::move(normalizer));
 
     // Applying through SetValue validates the leftover and runs the callback that propagates it to the flag and the
     // caches. A flag given on the command line always wins over the leftover.
@@ -458,7 +486,9 @@ void Initialize(utils::Settings &settings) {
       kHopsLimitPartialResultsSettingKey,
       Durability::kRestoreOnce,
       [](const std::string &val) { hops_limit_partial_results = val == "true"; },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   /*
    * Register log level
@@ -493,7 +523,9 @@ void Initialize(utils::Settings &settings) {
           TurnOffStdErr();
         }
       },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   /*
    * Register cartesian enable flag
@@ -503,7 +535,9 @@ void Initialize(utils::Settings &settings) {
       kCartesianProductEnabledSettingKey,
       Durability::kFlagOnly,
       [](const std::string &val) { cartesian_product_enabled_ = val == "true"; },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   /*
    * Register debug query plans
@@ -513,7 +547,9 @@ void Initialize(utils::Settings &settings) {
       kDebugQueryPlansSettingKey,
       Durability::kFlagOnly,
       [](const std::string &val) { debug_query_plans_ = val == "true"; },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   /*
    * Register storage GC aggressive flag
@@ -523,7 +559,9 @@ void Initialize(utils::Settings &settings) {
       kStorageGcAggressiveSettingKey,
       Durability::kRestoreOnce,
       [](const std::string &val) { storage_gc_aggressive_ = val == "true"; },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   /*
    * Register omit vector index properties on return flag
@@ -533,7 +571,9 @@ void Initialize(utils::Settings &settings) {
       kOmitVectorIndexPropertiesOnReturnSettingKey,
       Durability::kRestoreOnce,
       [](const std::string &val) { omit_vector_index_properties_on_return_ = val == "true"; },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   /*
    * Register timezone setting
@@ -601,8 +641,18 @@ void Initialize(utils::Settings &settings) {
 
   // AWS Section
   register_flag(kAwsRegionGFlagsKey, kAwsRegionSettingKey, Durability::kPersisted);
-  register_flag(kAwsAccessGFlagsKey, kAwsAccessSettingKey, Durability::kPersisted);
-  register_flag(kAwsSecretGFlagsKey, kAwsSecretSettingKey, Durability::kPersisted);
+  register_flag(kAwsAccessGFlagsKey,
+                kAwsAccessSettingKey,
+                Durability::kPersisted,
+                [](auto) {},
+                [](std::string_view) -> utils::Settings::ValidatorResult { return {}; },
+                utils::Settings::Sensitivity::kSecret);
+  register_flag(kAwsSecretGFlagsKey,
+                kAwsSecretSettingKey,
+                Durability::kPersisted,
+                [](auto) {},
+                [](std::string_view) -> utils::Settings::ValidatorResult { return {}; },
+                utils::Settings::Sensitivity::kSecret);
   register_flag(kAwsEndpointUrlGFlagsKey, kAwsEndpointUrlSettingKey, Durability::kPersisted);
 
   register_flag(
@@ -657,14 +707,18 @@ void Initialize(utils::Settings &settings) {
       std::string{memgraph::flags::run_time::kLogFailedQueriesKey},
       Durability::kRestoreOnce,
       [](const std::string &val) { log_failed_queries_.store(val == "true", std::memory_order_release); },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 
   register_flag(
       kLogQueryPlanGFlagsKey,
       std::string{memgraph::flags::run_time::kLogQueryPlanKey},
       Durability::kRestoreOnce,
       [](const std::string &val) { log_query_plan_.store(val == "true", std::memory_order_release); },
-      ValidBoolStr);
+      ValidBoolStr,
+      utils::Settings::Sensitivity::kPlain,
+      NormalizeBoolStr);
 }
 
 std::string GetServerName() {
@@ -694,7 +748,7 @@ bool GetAlsoLogToStderr() {
   if (!ValidBoolStr(v).has_value()) {
     throw std::invalid_argument("Wrong value provided for the --also-log-to-stderr value");
   }
-  return v == "true";
+  return NormalizeBoolStr(v) == "true";
 }
 
 auto GetAwsAccessKey() -> std::string {
@@ -758,7 +812,7 @@ constexpr std::array<std::string_view, 3> kSessionSettableKeys{
 // Read a bool overlay (stored canonical lowercase by ValidateSessionSettingValue),
 // falling back to the cached global when no session override is present.
 bool EffectiveBool(const logging::SessionLogContext &ctx, std::string_view key, bool global) {
-  if (auto overlay = ctx.GetSetting(key); overlay.has_value()) return *overlay == "true";
+  if (auto overlay = ctx.GetSetting(key); overlay.has_value()) return NormalizeBoolStr(*overlay) == "true";
   return global;
 }
 }  // namespace
@@ -773,11 +827,17 @@ std::optional<std::string> ValidateSessionSettingValue(std::string_view key, std
     return std::nullopt;
   }
   if (key == kLogFailedQueriesKey || key == kLogQueryPlanKey) {
-    // The effective-value readers compare verbatim to "true", so only lowercase is valid.
-    if (value != "true" && value != "false") return fmt::format("Setting '{}' requires 'true' or 'false'", key);
+    if (!ValidBoolStr(value).has_value()) return fmt::format("Setting '{}' requires 'true' or 'false'", key);
     return std::nullopt;
   }
   return std::nullopt;  // Not session-settable; callers gate on IsSessionSettable first.
+}
+
+std::string NormalizeSessionSettingValue(std::string_view key, std::string_view value) {
+  if (key == kLogFailedQueriesKey || key == kLogQueryPlanKey) {
+    return NormalizeBoolStr(value);
+  }
+  return std::string{value};
 }
 
 int64_t GetEffectiveLogMinDurationMs(const logging::SessionLogContext &ctx) {

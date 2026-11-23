@@ -103,6 +103,8 @@ void PrintObject(std::ostream *out, const DbAccessor *dba, const T &arg);
 
 void PrintObject(std::ostream *out, const DbAccessor *dba, const std::string &str);
 
+void PrintObject(std::ostream *out, const DbAccessor *dba, const char *str);
+
 void PrintObject(std::ostream *out, const DbAccessor *dba, Aggregation::Op op);
 
 void PrintObject(std::ostream *out, const DbAccessor *dba, Expression *expr);
@@ -110,6 +112,23 @@ void PrintObject(std::ostream *out, const DbAccessor *dba, Expression *expr);
 void PrintObject(std::ostream *out, AllPropertiesLookup *apl);
 
 void PrintObject(std::ostream *out, const DbAccessor *dba, Identifier *expr);
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const Where *where);
+void PrintObject(std::ostream *out, const DbAccessor *dba, Where *where);
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const LabelTerm &term);
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const NodeAtom *atom);
+void PrintObject(std::ostream *out, const DbAccessor *dba, NodeAtom *atom);
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const EdgeAtom *atom);
+void PrintObject(std::ostream *out, const DbAccessor *dba, EdgeAtom *atom);
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const PatternAtom *atom);
+void PrintObject(std::ostream *out, const DbAccessor *dba, PatternAtom *atom);
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const Pattern *pattern);
+void PrintObject(std::ostream *out, const DbAccessor *dba, Pattern *pattern);
 
 void PrintObject(std::ostream *out, const DbAccessor *dba, const storage::PropertyValue &value);
 
@@ -141,15 +160,21 @@ void PrintObject(std::ostream *out, PropertyIx const &property);
 
 template <typename T>
 void PrintObject(std::ostream *out, const DbAccessor * /*dba*/, const T &arg) {
-  static_assert(!std::is_convertible_v<T, Expression *>,
-                "This overload shouldn't be called with pointers convertible "
-                "to Expression *. This means your other PrintObject overloads aren't "
-                "being called for certain AST nodes when they should (or perhaps such "
-                "overloads don't exist yet).");
+  static_assert(!std::is_pointer_v<T>,
+                "This overload shouldn't be called with raw AST pointers. "
+                "Provide a dedicated PrintObject overload for the pointed-to AST node.");
   *out << arg;
 }
 
 void PrintObject(std::ostream *out, const DbAccessor * /*dba*/, const std::string &str) { *out << utils::Escape(str); }
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const char *str) {
+  if (str) {
+    PrintObject(out, dba, std::string{str});
+  } else {
+    *out << "<null>";
+  }
+}
 
 void PrintObject(std::ostream *out, const DbAccessor * /*dba*/, Aggregation::Op op) {
   *out << Aggregation::OpToString(op);
@@ -174,6 +199,149 @@ void PrintObject(std::ostream *out, AllPropertiesLookup *apl) {
 
 void PrintObject(std::ostream *out, const DbAccessor *dba, Identifier *expr) {
   PrintObject(out, dba, static_cast<Expression *>(expr));
+}
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const Where *where) {
+  if (where) {
+    PrintObject(out, dba, where->expression_);
+  } else {
+    *out << "<null>";
+  }
+}
+void PrintObject(std::ostream *out, const DbAccessor *dba, Where *where) {
+  PrintObject(out, dba, static_cast<const Where *>(where));
+}
+
+void PrintPatternProperties(
+    std::ostream *out, const DbAccessor *dba,
+    const std::variant<std::unordered_map<PropertyIx, Expression *>, ParameterLookup *> &properties) {
+  if (const auto *prop_map = std::get_if<std::unordered_map<PropertyIx, Expression *>>(&properties)) {
+    if (prop_map->empty()) {
+      return;
+    }
+    std::map<std::string, Expression *> ordered;
+    for (const auto &[prop_ix, expr] : *prop_map) {
+      ordered[prop_ix.name] = expr;
+    }
+    *out << " ";
+    PrintObject(out, dba, ordered);
+  } else if (auto *param_lookup = std::get<ParameterLookup *>(properties)) {
+    *out << " ";
+    PrintObject(out, dba, static_cast<Expression *>(param_lookup));
+  }
+}
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const LabelTerm &term) {
+  if (const auto *lbl = term.As<LabelTerm::Label>()) {
+    *out << lbl->label.name;
+  } else if (const auto *dyn = term.As<LabelTerm::Dynamic>()) {
+    PrintObject(out, dba, dyn->expression);
+  } else if (term.As<LabelTerm::Wildcard>()) {
+    *out << "%";
+  } else if (const auto *conj = term.As<LabelTerm::And>()) {
+    *out << "(";
+    utils::PrintIterable(
+        *out, conj->operands, "&", [&dba](auto &stream, const auto &op) { PrintObject(&stream, dba, op); });
+    *out << ")";
+  } else if (const auto *disj = term.As<LabelTerm::Or>()) {
+    *out << "(";
+    utils::PrintIterable(
+        *out, disj->operands, "|", [&dba](auto &stream, const auto &op) { PrintObject(&stream, dba, op); });
+    *out << ")";
+  } else if (const auto *neg = term.As<LabelTerm::Not>()) {
+    *out << "!";
+    if (neg->operand) {
+      PrintObject(out, dba, *neg->operand);
+    } else {
+      *out << "<null>";
+    }
+  }
+}
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const NodeAtom *atom) {
+  if (!atom) {
+    *out << "<null>";
+    return;
+  }
+  *out << "(";
+  PrintObject(out, dba, atom->identifier_);
+  if (atom->label_term_) {
+    *out << ":";
+    PrintObject(out, dba, *atom->label_term_);
+  }
+  PrintPatternProperties(out, dba, atom->properties_);
+  *out << ")";
+}
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const EdgeAtom *atom) {
+  if (!atom) {
+    *out << "<null>";
+    return;
+  }
+  *out << (atom->direction_ == EdgeAtom::Direction::IN ? "<-[" : "-[");
+  PrintObject(out, dba, atom->identifier_);
+  if (!atom->edge_types_.empty()) {
+    *out << ":";
+    utils::PrintIterable(*out, atom->edge_types_, "|", [&dba](auto &stream, const auto &edge_type) {
+      if (const auto *ix = std::get_if<EdgeTypeIx>(&edge_type)) {
+        stream << ix->name;
+      } else {
+        PrintObject(&stream, dba, std::get<Expression *>(edge_type));
+      }
+    });
+  }
+  if (atom->IsVariable()) {
+    *out << "*";
+    if (atom->lower_bound_) {
+      PrintObject(out, dba, atom->lower_bound_);
+    }
+    if (atom->lower_bound_ || atom->upper_bound_) {
+      *out << "..";
+    }
+    if (atom->upper_bound_) {
+      PrintObject(out, dba, atom->upper_bound_);
+    }
+  }
+  PrintPatternProperties(out, dba, atom->properties_);
+  *out << (atom->direction_ == EdgeAtom::Direction::OUT ? "]->" : "]-");
+}
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const PatternAtom *atom) {
+  if (!atom) {
+    *out << "<null>";
+  } else if (const auto *node_atom = dynamic_cast<const NodeAtom *>(atom)) {
+    PrintObject(out, dba, node_atom);
+  } else if (const auto *edge_atom = dynamic_cast<const EdgeAtom *>(atom)) {
+    PrintObject(out, dba, edge_atom);
+  } else {
+    PrintObject(out, dba, atom->identifier_);
+  }
+}
+
+void PrintObject(std::ostream *out, const DbAccessor *dba, const Pattern *pattern) {
+  if (!pattern) {
+    *out << "<null>";
+    return;
+  }
+  *out << "(Pattern ";
+  PrintObject(out, dba, pattern->identifier_);
+  *out << " [";
+  utils::PrintIterable(*out, pattern->atoms_, ", ", [&dba](auto &stream, const PatternAtom *atom) {
+    PrintObject(&stream, dba, atom);
+  });
+  *out << "])";
+}
+void PrintObject(std::ostream *out, const DbAccessor *dba, NodeAtom *atom) {
+  PrintObject(out, dba, static_cast<const NodeAtom *>(atom));
+}
+void PrintObject(std::ostream *out, const DbAccessor *dba, EdgeAtom *atom) {
+  PrintObject(out, dba, static_cast<const EdgeAtom *>(atom));
+}
+void PrintObject(std::ostream *out, const DbAccessor *dba, PatternAtom *atom) {
+  PrintObject(out, dba, static_cast<const PatternAtom *>(atom));
+}
+void PrintObject(std::ostream *out, const DbAccessor *dba, Pattern *pattern) {
+  PrintObject(out, dba, static_cast<const Pattern *>(pattern));
 }
 
 void PrintObject(std::ostream *out, EnumValueAccess op) { *out << op.enum_name_ << "::" << op.enum_value_; }

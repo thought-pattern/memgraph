@@ -85,13 +85,16 @@ class Listener final {
    */
   void AddConnection(io::network::Socket &&connection) {
     auto guard = std::lock_guard{lock_};
+    if (!alive_.load(std::memory_order_acquire)) {
+      connection.Shutdown();
+      return;
+    }
 
     // Remember fd before moving connection into Session.
     int fd = connection.fd();
 
-    // Create a new Session for the connection.
-    sessions_.push_back(
-        std::make_unique<SessionHandler>(std::move(connection), data_, context_, inactivity_timeout_sec_));
+    // Create a new Session for the connection; only keep it if epoll watch registration succeeds.
+    auto session = std::make_unique<SessionHandler>(std::move(connection), data_, context_, inactivity_timeout_sec_);
 
     // Register the connection in Epoll.
     // We want to listen to an incoming event which is edge triggered and
@@ -99,7 +102,11 @@ class Listener final {
     // concurrently and that is why we use `EPOLLONESHOT`, for a detailed
     // description what are the problems and why this is correct see:
     // https://idea.popcount.org/2017-02-20-epoll-is-fundamentally-broken-12/
-    epoll_.Add(fd, EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT, sessions_.back().get());
+    if (!epoll_.TryAdd(fd, EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT, session.get())) {
+      spdlog::error("Dropping incoming {} connection on fd {}: epoll watch registration refused", service_name_, fd);
+      return;
+    }
+    sessions_.push_back(std::move(session));
   }
 
   /**
@@ -157,6 +164,14 @@ class Listener final {
    * complete.
    */
   void AwaitShutdown() {
+    alive_.store(false, std::memory_order_release);
+    {
+      // Interrupt active session I/O before joining workers so a worker blocked on write readiness wakes immediately.
+      auto guard = std::lock_guard{lock_};
+      for (auto &session : sessions_) {
+        session->socket().Shutdown();
+      }
+    }
     if (timeout_thread_.joinable()) timeout_thread_.join();
     for (auto &worker_thread : worker_threads_) {
       if (worker_thread.joinable()) worker_thread.join();

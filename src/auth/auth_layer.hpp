@@ -284,6 +284,84 @@ class AuthLayer {
       return false;
     }
   }
+
+  /// Atomically reconcile the replica's full auth configuration, profiles, roles, and accounts against a
+  /// SystemRecoveryReq snapshot. All storage writes buffer in one AtomicAuthOverlay and commit in a single batch;
+  /// on any failure, config and in-memory profile caches roll back so no partial rules remain visible.
+  [[nodiscard]] bool ApplySystemRecovery(Auth::Config auth_config, std::vector<User> const &users,
+                                         std::vector<Role> const &roles,
+                                         std::vector<UserProfiles::Profile> const &profiles, bool enterprise_licensed) {
+    AuthTransaction tx;
+    auto locked = Lock(&tx);
+    auto prev_config = locked->GetConfig();
+    auto prev_profiles = locked->CaptureProfileMemorySnapshot();
+
+    try {
+      locked->SetConfig(std::move(auth_config));
+
+      if (enterprise_licensed) {
+        auto old_profiles = locked->AllProfiles();
+        for (const auto &profile : profiles) {
+          if (!locked->CreateOrUpdateProfile(profile.name, profile.limits, profile.usernames)) {
+            spdlog::debug("SystemRecoveryHandler: Failed to save profile");
+            auto held = std::move(locked).Release();
+            held->SetConfig(std::move(prev_config));
+            held->RestoreProfileMemorySnapshot(std::move(prev_profiles));
+            return false;
+          }
+          std::erase_if(old_profiles, [&](const auto &p) { return p.name == profile.name; });
+        }
+        for (const auto &profile : old_profiles) {
+          if (locked->DropProfile(profile.name) == UserProfiles::DropResult::kFailed) {
+            spdlog::debug("SystemRecoveryHandler: Failed to remove profile \"{}\".", profile.name);
+            auto held = std::move(locked).Release();
+            held->SetConfig(std::move(prev_config));
+            held->RestoreProfileMemorySnapshot(std::move(prev_profiles));
+            return false;
+          }
+        }
+
+        auto old_roles = locked->AllRolenames();
+        for (const auto &role : roles) {
+          locked->SaveRole(role);
+          std::erase(old_roles, role.rolename());
+        }
+        for (const auto &role : old_roles) {
+          locked->RemoveRole(role, /*force=*/true);
+        }
+      }
+
+      auto old_users = locked->AllUsernames();
+      for (const auto &user : users) {
+        locked->SaveUser(user);
+        std::erase(old_users, user.username());
+      }
+      for (const auto &user : old_users) {
+        locked->RemoveUser(user);
+      }
+
+      auto held = std::move(locked).Release();
+      if (!Commit(held, tx, nullptr)) {
+        held->SetConfig(std::move(prev_config));
+        held->RestoreProfileMemorySnapshot(std::move(prev_profiles));
+        return false;
+      }
+      held->RefreshAllUserProfileResources();
+      return true;
+    } catch (const AuthException &e) {
+      spdlog::debug("SystemRecoveryHandler: Failed to reconcile auth state: {}", e.what());
+      auto held = std::move(locked).Release();
+      held->SetConfig(std::move(prev_config));
+      held->RestoreProfileMemorySnapshot(std::move(prev_profiles));
+      return false;
+    } catch (...) {
+      spdlog::error("SystemRecoveryHandler: Unexpected exception while reconciling auth state");
+      auto held = std::move(locked).Release();
+      held->SetConfig(std::move(prev_config));
+      held->RestoreProfileMemorySnapshot(std::move(prev_profiles));
+      return false;
+    }
+  }
 #endif
 
   /// Flush the transaction under the write lock. Returns false on conflict, leaving durable storage untouched and

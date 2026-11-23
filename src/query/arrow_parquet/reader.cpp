@@ -643,18 +643,19 @@ ParquetReader::ParquetReader(utils::pmr::string const &uri, utils::S3Config s3_c
 
     // When using a file that should be downloaded using https or ftp, we first download it and then load it
     if (url_matcher(uri)) {
+      auto const redacted_uri = requests::RedactUrlForLog(uri);
       auto temp_file = utils::DownloadTempFile::Create();
       if (!temp_file) {
         return std::unexpected{arrow::Status{
             arrow::StatusCode::IOError,
-            fmt::format("Couldn't create a file to download {} into: {}", uri, temp_file.error().message())}};
+            fmt::format("Couldn't create a file to download {} into: {}", redacted_uri, temp_file.error().message())}};
       }
 
       auto stream = temp_file->OpenStream();
       if (!stream) {
         return std::unexpected{arrow::Status{
             arrow::StatusCode::IOError,
-            fmt::format("Couldn't open the download of {} for writing: {}", uri, stream.error().message())}};
+            fmt::format("Couldn't open the download of {} for writing: {}", redacted_uri, stream.error().message())}};
       }
 
       if (auto const downloaded =
@@ -667,7 +668,7 @@ ParquetReader::ParquetReader(utils::pmr::string const &uri, utils::S3Config s3_c
         // could help.
         memgraph::query::ThrowDownloadFailed(
             downloaded.error().Retryable(),
-            fmt::format("Couldn't download file {}: {}", uri, downloaded.error().message));
+            fmt::format("Couldn't download file {}: {}", redacted_uri, downloaded.error().message));
       }
 
       // The reader takes a descriptor of its own, so the download outlives `temp_file` going out of
@@ -676,7 +677,7 @@ ParquetReader::ParquetReader(utils::pmr::string const &uri, utils::S3Config s3_c
       if (!fd) {
         return std::unexpected{
             arrow::Status{arrow::StatusCode::IOError,
-                          fmt::format("Couldn't read back the download of {}: {}", uri, fd.error().message())}};
+                          fmt::format("Couldn't read back the download of {}: {}", redacted_uri, fd.error().message())}};
       }
 
       return LoadFileFromDescriptor(std::move(*fd));

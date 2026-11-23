@@ -315,8 +315,13 @@ inline std::ostream &operator<<(std::ostream &os, const Object &py_object) {
     PyErr_Clear();
     return os;
   }
-  const char *utf8 = PyUnicode_AsUTF8(py_str.Ptr());
-  if (utf8) os << utf8;
+  Py_ssize_t utf8_size = 0;
+  const char *utf8 = PyUnicode_AsUTF8AndSize(py_str.Ptr(), &utf8_size);
+  if (utf8 && utf8_size >= 0) {
+    os.write(utf8, static_cast<std::streamsize>(utf8_size));
+  } else if (!utf8) {
+    PyErr_Clear();
+  }
   return os;
 }
 
@@ -366,8 +371,13 @@ struct [[nodiscard]] ExceptionInfo final {
       PyErr_Clear();
       continue;
     }
-    const char *utf8 = PyUnicode_AsUTF8(py_str);
-    if (utf8) ss << utf8;
+    Py_ssize_t utf8_size = 0;
+    const char *utf8 = PyUnicode_AsUTF8AndSize(py_str, &utf8_size);
+    if (utf8 && utf8_size >= 0) {
+      ss.write(utf8, static_cast<std::streamsize>(utf8_size));
+    } else if (!utf8) {
+      PyErr_Clear();
+    }
   }
   return ss.str();
 }

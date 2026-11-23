@@ -1,7 +1,7 @@
 import os
 
 
-def encode_chunk(visible_gpu: int | None, model_id: str, texts: list[str], batch_size: int):
+def encode_chunk(visible_gpu, model_id: str, texts: list[str], batch_size: int):
     """
     Runs in a spawned process. Returns (count, embeddings_as_list)
     """

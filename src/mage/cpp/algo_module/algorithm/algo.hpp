@@ -228,6 +228,9 @@ class Config {
       auto list = map.At("relationships_filter").ValueList();
       for (const auto value : list) {
         auto rel_type = std::string(value.ValueString());
+        if (rel_type.empty()) {
+          throw mgp::ValueException("Relationship filter entry must not be empty!");
+        }
         const size_t size = rel_type.size();
         const char first_elem = rel_type[0];
         const char last_elem = rel_type[size - 1];

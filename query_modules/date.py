@@ -1,42 +1,28 @@
 import datetime
 import re
 from enum import IntEnum
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import mgp
-from mage.date.constants import Conversion, Epoch
+from mage.date.constants import Epoch
 from mage.date.unit_conversion import to_int, to_timedelta
 
 
-def validate_timezone(timezone: str) -> None:
-    try:
-        ZoneInfo(timezone)
-    except (ValueError, KeyError):
+def validate_timezone(timezone: str) -> ZoneInfo:
+    if not isinstance(timezone, str) or not timezone:
         raise Exception("Timezone doesn't exist. Check documentation to see available timezones.")
+    try:
+        return ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError, KeyError) as err:
+        raise Exception("Timezone doesn't exist. Check documentation to see available timezones.") from err
 
 
-def getOffset(timezone, date):
-    offset = ZoneInfo(timezone).utcoffset(date)
-    if offset.days == 1:
-        return (
-            datetime.timedelta(
-                minutes=offset.seconds // Conversion.SECONDS_IN_MINUTE
-                + Conversion.HOURS_IN_DAY * Conversion.MINUTES_IN_HOUR
-            ),
-            False,
-        )
-    elif offset.days == -1:
-        return (
-            datetime.timedelta(
-                minutes=Conversion.HOURS_IN_DAY * Conversion.MINUTES_IN_HOUR
-                - offset.seconds // Conversion.SECONDS_IN_MINUTE
-            ),
-            True,
-        )
-    return (
-        datetime.timedelta(minutes=offset.seconds // Conversion.SECONDS_IN_MINUTE),
-        False,
-    )
+def localize_wall_datetime(naive_dt: datetime.datetime, zone: ZoneInfo) -> datetime.datetime:
+    z0 = naive_dt.replace(tzinfo=zone, fold=0)
+    z1 = naive_dt.replace(tzinfo=zone, fold=1)
+    if z0.utcoffset() != z1.utcoffset() and z0.dst():
+        return z1
+    return z0
 
 
 @mgp.read_proc
@@ -46,42 +32,25 @@ def parse(
     format: str = "%Y-%m-%d %H:%M:%S",
     timezone: str = "UTC",
 ) -> mgp.Record(parsed=int):
-    first_date = Epoch.UNIX_EPOCH
+    first_date = Epoch.UNIX_EPOCH.replace(tzinfo=datetime.timezone.utc)
     input_date = datetime.datetime.strptime(time, format)
+    zone = validate_timezone(timezone)
 
-    validate_timezone(timezone)
+    if input_date.tzinfo is None:
+        input_date = localize_wall_datetime(input_date, zone)
 
-    offset, add = getOffset(timezone, input_date)
-    tz_input = input_date + offset if add else input_date - offset
-
-    time_since = tz_input - first_date
+    time_since = input_date - first_date
 
     if unit == "ms":
-        parsed = (
-            time_since.days
-            * Conversion.HOURS_IN_DAY
-            * Conversion.MINUTES_IN_HOUR
-            * Conversion.SECONDS_IN_MINUTE
-            * Conversion.MILLISECONDS_IN_SECOND
-            + time_since.seconds * Conversion.MILLISECONDS_IN_SECOND
-        )
+        parsed = time_since // datetime.timedelta(milliseconds=1)
     elif unit == "s":
-        parsed = (
-            time_since.days * Conversion.HOURS_IN_DAY * Conversion.MINUTES_IN_HOUR * Conversion.SECONDS_IN_MINUTE
-            + time_since.seconds
-        )
+        parsed = time_since // datetime.timedelta(seconds=1)
     elif unit == "m":
-        parsed = (
-            time_since.days * Conversion.HOURS_IN_DAY * Conversion.MINUTES_IN_HOUR
-            + time_since.seconds // Conversion.SECONDS_IN_MINUTE
-        )
+        parsed = time_since // datetime.timedelta(minutes=1)
     elif unit == "h":
-        parsed = (
-            time_since.days * Conversion.HOURS_IN_DAY
-            + time_since.seconds // Conversion.SECONDS_IN_MINUTE // Conversion.MINUTES_IN_HOUR
-        )
+        parsed = time_since // datetime.timedelta(hours=1)
     elif unit == "d":
-        parsed = time_since.days
+        parsed = time_since // datetime.timedelta(days=1)
     else:
         raise Exception("Unit doesn't exist. Check documentation to see available units.")
 
@@ -95,7 +64,7 @@ def format(
     format: str = "%Y-%m-%d %H:%M:%S %Z",
     timezone: str = "UTC",
 ) -> mgp.Record(formatted=str):
-    first_date = Epoch.UNIX_EPOCH
+    first_date = Epoch.UNIX_EPOCH.replace(tzinfo=datetime.timezone.utc)
 
     if unit == "ms":
         new_date = first_date + datetime.timedelta(milliseconds=time)
@@ -110,12 +79,9 @@ def format(
     else:
         raise Exception("Unit doesn't exist. Check documentation to see available units.")
 
-    validate_timezone(timezone)
-    offset, subtract = getOffset(timezone, new_date)
-    tz_new = new_date - offset if subtract else new_date + offset
-
-    tz_aware = tz_new.replace(tzinfo=ZoneInfo(timezone))
-    return mgp.Record(formatted=tz_aware.strftime(format))
+    zone = validate_timezone(timezone)
+    local_date = new_date.astimezone(zone)
+    return mgp.Record(formatted=local_date.strftime(format))
 
 
 @mgp.function
@@ -134,43 +100,189 @@ def add(
 class FormatLength(IntEnum):
     """Enum for various date/time format lengths to replace magic numbers"""
 
+    BASIC_DATE = 8  # Length of 'YYYYMMDD'
     DATE = 10  # Length of 'YYYY-MM-DD'
     TIME = 8  # Length of 'HH:MM:SS'
 
 
 class DateFormatUtil:
     """
-    Utility class for converting between predefined ISO date formats using Python strftime and strptime.
+    Utility class for converting between predefined ISO date formats.
     """
 
     ISO_DATE_FORMATS = {
         "basic_iso_date": "%Y%m%d",  # BASIC_ISO_DATE: '20111203'
         "iso_local_date": "%Y-%m-%d",  # ISO_LOCAL_DATE: '2011-12-03'
         "iso_offset_date": "%Y-%m-%d%z",  # ISO_OFFSET_DATE: '2011-12-03+01:00'
-        "iso_date": "%Y-%m-%d",  # ISO_DATE: '2011-12-03' or '2011-12-03+01:00' (handled separately)
+        "iso_date": "%Y-%m-%d",  # ISO_DATE: '2011-12-03' or '2011-12-03+01:00'
         "iso_local_time": "%H:%M:%S",  # ISO_LOCAL_TIME: '10:15:30'
         "iso_offset_time": "%H:%M:%S%z",  # ISO_OFFSET_TIME: '10:15:30+01:00'
-        "iso_time": "%H:%M:%S",  # ISO_TIME: '10:15:30' or '10:15:30+01:00' (handled separately)
+        "iso_time": "%H:%M:%S",  # ISO_TIME: '10:15:30' or '10:15:30+01:00'
         "iso_local_date_time": "%Y-%m-%dT%H:%M:%S",  # ISO_LOCAL_DATE_TIME: '2011-12-03T10:15:30'
         "iso_offset_date_time": "%Y-%m-%dT%H:%M:%S%z",  # ISO_OFFSET_DATE_TIME: '2011-12-03T10:15:30+01:00'
-        "iso_zoned_date_time": "iso_zoned_date_time",  # Special case
-        "iso_date_time": "%Y-%m-%dT%H:%M:%S",  # ISO_DATE_TIME: '2011-12-03T10:15:30+01:00[Europe/Paris]' handled as zoned
+        "iso_zoned_date_time": "iso_zoned_date_time",  # ISO_ZONED_DATE_TIME: '2011-12-03T10:15:30+01:00[Europe/Paris]'
+        "iso_date_time": "iso_date_time",  # ISO_DATE_TIME: local, offset, or zoned ISO date-time
     }
 
     @staticmethod
     def get_format(format_str: str) -> str:
         format_lower = format_str.lower()
-        if format_lower == "iso_zoned_date_time" or format_lower == "iso_date_time":
-            return "iso_zoned_date_time"
         if format_lower not in DateFormatUtil.ISO_DATE_FORMATS:
             raise ValueError(f"Unsupported date format: {format_str}")
         return DateFormatUtil.ISO_DATE_FORMATS[format_lower]
 
 
+def strip_zone_bracket(temporal: str) -> str:
+    if "[" not in temporal and "]" not in temporal:
+        return temporal
+    if not temporal.endswith("]") or temporal.count("[") != 1 or temporal.count("]") != 1:
+        raise ValueError(f"Malformed zone suffix in '{temporal}'")
+    prefix, zone_part = temporal[:-1].split("[", 1)
+    if not zone_part:
+        raise ValueError(f"Empty zone suffix in '{temporal}'")
+    return prefix
+
+
+def parse_iso_temporal(temporal: str, format_name: str) -> datetime.datetime:
+    fmt = format_name.lower()
+    DateFormatUtil.get_format(fmt)
+    normalized = re.sub(r"(\.\d{6})\d*", r"\1", temporal)
+
+    if fmt == "basic_iso_date":
+        if len(temporal) != FormatLength.BASIC_DATE or not temporal.isdigit():
+            raise ValueError(f"Invalid basic_iso_date: '{temporal}'")
+        return datetime.datetime.strptime(temporal, "%Y%m%d")
+
+    if fmt == "iso_local_date":
+        if len(temporal) != FormatLength.DATE:
+            raise ValueError(f"Invalid iso_local_date: '{temporal}'")
+        parsed_date = datetime.date.fromisoformat(temporal)
+        return datetime.datetime(parsed_date.year, parsed_date.month, parsed_date.day)
+
+    if fmt == "iso_offset_date":
+        if len(temporal) <= FormatLength.DATE or temporal[FormatLength.DATE] not in "+-Zz":
+            raise ValueError(f"Invalid iso_offset_date: '{temporal}'")
+        return datetime.datetime.strptime(temporal, "%Y-%m-%d%z")
+
+    if fmt == "iso_date":
+        if len(temporal) == FormatLength.DATE:
+            parsed_date = datetime.date.fromisoformat(temporal)
+            return datetime.datetime(parsed_date.year, parsed_date.month, parsed_date.day)
+        if len(temporal) > FormatLength.DATE and temporal[FormatLength.DATE] in "+-Zz":
+            return datetime.datetime.strptime(temporal, "%Y-%m-%d%z")
+        raise ValueError(f"Invalid iso_date: '{temporal}'")
+
+    if fmt in ("iso_local_time", "iso_offset_time", "iso_time"):
+        if ":" not in normalized or "T" in normalized or "t" in normalized or " " in normalized:
+            raise ValueError(f"Invalid {fmt}: '{temporal}'")
+        parsed_time = datetime.time.fromisoformat(normalized)
+        if fmt == "iso_local_time" and parsed_time.tzinfo is not None:
+            raise ValueError(f"Unexpected offset in iso_local_time: '{temporal}'")
+        if fmt == "iso_offset_time" and parsed_time.tzinfo is None:
+            raise ValueError(f"Missing offset in iso_offset_time: '{temporal}'")
+        return datetime.datetime(
+            1900,
+            1,
+            1,
+            parsed_time.hour,
+            parsed_time.minute,
+            parsed_time.second,
+            parsed_time.microsecond,
+            tzinfo=parsed_time.tzinfo,
+        )
+
+    if fmt == "iso_local_date_time":
+        if ("T" not in normalized and "t" not in normalized) or "[" in normalized or "]" in normalized:
+            raise ValueError(f"Invalid iso_local_date_time: '{temporal}'")
+        dt = datetime.datetime.fromisoformat(normalized)
+        if dt.tzinfo is not None:
+            raise ValueError(f"Unexpected offset in iso_local_date_time: '{temporal}'")
+        return dt
+
+    if fmt == "iso_offset_date_time":
+        if ("T" not in normalized and "t" not in normalized) or "[" in normalized or "]" in normalized:
+            raise ValueError(f"Invalid iso_offset_date_time: '{temporal}'")
+        dt = datetime.datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            raise ValueError(f"Missing offset in iso_offset_date_time: '{temporal}'")
+        return dt
+
+    if fmt == "iso_zoned_date_time":
+        without_zone = re.sub(r"(\.\d{6})\d*", r"\1", strip_zone_bracket(temporal))
+        if "T" not in without_zone and "t" not in without_zone:
+            raise ValueError(f"Invalid iso_zoned_date_time: '{temporal}'")
+        dt = datetime.datetime.fromisoformat(without_zone)
+        if dt.tzinfo is None:
+            raise ValueError(f"Missing offset in iso_zoned_date_time: '{temporal}'")
+        return dt
+
+    if fmt == "iso_date_time":
+        has_zone = "[" in temporal
+        without_zone = re.sub(r"(\.\d{6})\d*", r"\1", strip_zone_bracket(temporal))
+        if "T" not in without_zone and "t" not in without_zone:
+            raise ValueError(f"Invalid iso_date_time: '{temporal}'")
+        dt = datetime.datetime.fromisoformat(without_zone)
+        if has_zone and dt.tzinfo is None:
+            raise ValueError(f"Zone suffix without offset in iso_date_time: '{temporal}'")
+        return dt
+
+    raise ValueError(f"Unsupported date format: {format_name}")
+
+
+def format_iso_temporal(dt: datetime.datetime, target_format: str) -> str:
+    fmt = target_format.lower()
+    DateFormatUtil.get_format(fmt)
+
+    if fmt in ("iso_offset_date", "iso_offset_time", "iso_offset_date_time") and dt.tzinfo is None:
+        raise Exception("missing timezone")
+
+    if fmt == "basic_iso_date":
+        return dt.strftime("%Y%m%d")
+
+    if fmt == "iso_local_date":
+        return dt.date().isoformat()
+
+    if fmt == "iso_offset_date":
+        offset_str = dt.replace(hour=0, minute=0, second=0, microsecond=0).timetz().isoformat()[FormatLength.TIME :]
+        return f"{dt.date().isoformat()}{offset_str}"
+
+    if fmt == "iso_date":
+        if dt.tzinfo is not None:
+            offset_str = dt.replace(hour=0, minute=0, second=0, microsecond=0).timetz().isoformat()[FormatLength.TIME :]
+            return f"{dt.date().isoformat()}{offset_str}"
+        return dt.date().isoformat()
+
+    if fmt == "iso_local_time":
+        return datetime.time(dt.hour, dt.minute, dt.second, dt.microsecond).isoformat()
+
+    if fmt == "iso_offset_time":
+        return dt.timetz().isoformat()
+
+    if fmt == "iso_time":
+        if dt.tzinfo is not None:
+            return dt.timetz().isoformat()
+        return datetime.time(dt.hour, dt.minute, dt.second, dt.microsecond).isoformat()
+
+    if fmt == "iso_local_date_time":
+        return dt.replace(tzinfo=None).isoformat()
+
+    if fmt == "iso_offset_date_time":
+        return dt.isoformat()
+
+    if fmt == "iso_zoned_date_time":
+        aware_dt = dt if dt.tzinfo is not None else dt.replace(tzinfo=ZoneInfo("UTC"))
+        return aware_dt.isoformat()
+
+    if fmt == "iso_date_time":
+        return dt.isoformat()
+
+    raise ValueError(f"Unsupported date format: {target_format}")
+
+
 @mgp.function
 def convert_format(temporal: mgp.Nullable[str], current_format: str, convert_to: str) -> mgp.Nullable[str]:
     """
-    Converts between specified ISO date formats using Python strftime and strptime.
+    Converts between specified ISO date formats.
     Supports zoned to offset conversion by removing zone part in '[]'.
     Offset to zoned returns the same string.
     Throws if parsing fails.
@@ -187,83 +299,8 @@ def convert_format(temporal: mgp.Nullable[str], current_format: str, convert_to:
         return None
 
     try:
-        current_formatter = DateFormatUtil.get_format(current_format)
-        convert_to_formatter = DateFormatUtil.get_format(convert_to)
-
-        # Parse input string
-        if current_formatter == "iso_zoned_date_time":
-            # Remove zone part in [] and parse
-            temporal_without_zone = temporal.split("[")[0]
-
-            if "." in temporal_without_zone:
-                temporal_without_zone = re.sub(r"(\.\d{6})\d*", r"\1", temporal_without_zone)
-                dt = datetime.datetime.strptime(temporal_without_zone, "%Y-%m-%dT%H:%M:%S.%f%z")
-            else:
-                dt = datetime.datetime.strptime(temporal_without_zone, "%Y-%m-%dT%H:%M:%S%z")
-        elif current_format.lower() == "iso_date":
-            # iso_date can have optional offset, try parsing with offset first
-            try:
-                dt = datetime.datetime.strptime(temporal, "%Y-%m-%d%z")
-            except ValueError:
-                dt = datetime.datetime.strptime(temporal, "%Y-%m-%d")
-        elif current_format.lower() == "iso_time":
-            # iso_time can have optional offset
-            try:
-                dt = datetime.datetime.strptime(temporal, "%H:%M:%S%z")
-            except ValueError:
-                dt = datetime.datetime.strptime(temporal, "%H:%M:%S")
-        else:
-            try:
-                dt = datetime.datetime.fromisoformat(temporal)
-            except Exception:
-                dt = datetime.datetime.strptime(temporal, current_formatter)
-
-        if convert_to.lower() in ["iso_offset_date", "iso_offset_time", "iso_offset_date_time"] and dt.tzinfo is None:
-            raise Exception("missing timezone")
-
-        # Convert to target format
-        if convert_to_formatter == "iso_zoned_date_time":
-            # Converting to zoned date time: return offset datetime string (no zone name)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-            converted = dt.isoformat()
-
-        elif convert_to.lower() == "iso_date":
-            # iso_date: include offset if timezone info is present
-            if dt.tzinfo is not None:
-                converted = dt.strftime("%Y-%m-%d%z")
-                # Format offset as +hh:mm
-                if len(converted) > FormatLength.DATE:
-                    converted = f"{converted[:-2]}:{converted[-2:]}"
-            else:
-                converted = dt.strftime("%Y-%m-%d")
-        elif convert_to.lower() == "iso_time":
-            # iso_time: include offset if timezone info is present
-            if dt.tzinfo is not None:
-                converted = dt.strftime("%H:%M:%S%z")
-                # Format offset as +hh:mm
-                if len(converted) > FormatLength.TIME:
-                    converted = f"{converted[:-2]}:{converted[-2:]}"
-            else:
-                converted = dt.strftime("%H:%M:%S")
-        elif convert_to.lower() in ["iso_zoned_date_time", "iso_offset_date_time"]:
-            converted = dt.isoformat()
-        else:
-            # For offset formats, ensure timezone is present
-            if convert_to_formatter.endswith("%z") and dt.tzinfo is None:
-                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-            # For local formats, remove timezone info
-            elif not convert_to_formatter.endswith("%z") and dt.tzinfo is not None:
-                dt = dt.replace(tzinfo=None)
-
-            converted = dt.strftime(convert_to_formatter)
-
-            # Format offset as +hh:mm for offset formats
-            if convert_to_formatter.endswith("%z") and len(converted) > FormatLength.DATE:
-                converted = f"{converted[:-2]}:{converted[-2:]}"
-
-        return converted
-
+        dt = parse_iso_temporal(temporal, current_format)
+        return format_iso_temporal(dt, convert_to)
     except Exception as e:
         raise Exception(f"Error converting '{temporal}' from '{current_format}' to '{convert_to}': {e}")
 

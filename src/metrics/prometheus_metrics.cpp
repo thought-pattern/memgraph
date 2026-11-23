@@ -814,7 +814,12 @@ PrometheusMetrics::PrometheusMetrics()
       instance_last_response_seconds_family_{prometheus::BuildGauge()
                                                  .Name("memgraph_instance_last_response_seconds")
                                                  .Help("Seconds since the last successful response from the instance")
-                                                 .Register(registry_)}
+                                                 .Register(registry_)},
+      instance_status_refresh_failed_family_{
+          prometheus::BuildGauge()
+              .Name("memgraph_instance_status_refresh_failed")
+              .Help("1 if the latest cluster instance status lookup failed and cached gauges were retained, 0 otherwise")
+              .Register(registry_)}
 #endif
 {
   // Populate GlobalMetricHandles — only session, memory, and HA metrics
@@ -907,6 +912,9 @@ PrometheusMetrics::PrometheusMetrics()
 
   // StorageInfo global/system level (no-db fallback, same family as per-db)
   global.show_storage_info = &show_storage_info_family_.Add(no_labels);
+#ifdef MG_ENTERPRISE
+  instance_status_refresh_failed_ = &instance_status_refresh_failed_family_.Add(no_labels);
+#endif
 }
 
 void PrometheusMetrics::SetStorageSnapshotResolver(StorageSnapshotResolver resolver) {
@@ -949,120 +957,143 @@ DatabaseMetricHandles PrometheusMetrics::CreateHandles(uint64_t entry_id) {
   // entry's life, whereas a database's name and uuid can both change. CollectForScrape substitutes the
   // current ones.
   prometheus::Labels const labels{{kEntryLabel, std::to_string(entry_id)}};
-  return DatabaseMetricHandles{
-      .vertex_count = {&vertex_count_family_.Add(labels)},
-      .edge_count = {&edge_count_family_.Add(labels)},
-      .disk_usage_bytes = {&disk_usage_family_.Add(labels)},
-      .db_memory_tracked_bytes = {&db_memory_tracked_family_.Add(labels)},
-      .db_peak_memory_tracked_bytes = {&db_peak_memory_tracked_family_.Add(labels)},
-      .db_storage_memory_tracked_bytes = {&db_storage_memory_tracked_family_.Add(labels)},
-      .db_embedding_memory_tracked_bytes = {&db_embedding_memory_tracked_family_.Add(labels)},
-      .db_query_memory_tracked_bytes = {&db_query_memory_tracked_family_.Add(labels)},
-      .once_operator = {&once_operator_family_.Add(labels)},
-      .create_node_operator = {&create_node_operator_family_.Add(labels)},
-      .create_expand_operator = {&create_expand_operator_family_.Add(labels)},
-      .scan_all_operator = {&scan_all_operator_family_.Add(labels)},
-      .scan_all_by_label_operator = {&scan_all_by_label_operator_family_.Add(labels)},
-      .scan_all_by_label_properties_operator = {&scan_all_by_label_properties_operator_family_.Add(labels)},
-      .scan_all_by_id_operator = {&scan_all_by_id_operator_family_.Add(labels)},
-      .scan_all_by_edge_operator = {&scan_all_by_edge_operator_family_.Add(labels)},
-      .scan_all_by_edge_type_operator = {&scan_all_by_edge_type_operator_family_.Add(labels)},
-      .scan_all_by_edge_type_property_operator = {&scan_all_by_edge_type_property_operator_family_.Add(labels)},
-      .scan_all_by_edge_property_operator = {&scan_all_by_edge_property_operator_family_.Add(labels)},
-      .scan_all_by_edge_id_operator = {&scan_all_by_edge_id_operator_family_.Add(labels)},
-      .scan_all_by_vertex_property_operator = {&scan_all_by_vertex_property_operator_family_.Add(labels)},
-      .scan_all_by_point_distance_operator = {&scan_all_by_point_distance_operator_family_.Add(labels)},
-      .scan_all_by_point_withinbbox_operator = {&scan_all_by_point_withinbbox_operator_family_.Add(labels)},
-      .expand_operator = {&expand_operator_family_.Add(labels)},
-      .expand_variable_operator = {&expand_variable_operator_family_.Add(labels)},
-      .construct_named_path_operator = {&construct_named_path_operator_family_.Add(labels)},
-      .filter_operator = {&filter_operator_family_.Add(labels)},
-      .produce_operator = {&produce_operator_family_.Add(labels)},
-      .delete_operator = {&delete_operator_family_.Add(labels)},
-      .set_property_operator = {&set_property_operator_family_.Add(labels)},
-      .set_properties_operator = {&set_properties_operator_family_.Add(labels)},
-      .set_labels_operator = {&set_labels_operator_family_.Add(labels)},
-      .remove_property_operator = {&remove_property_operator_family_.Add(labels)},
-      .remove_labels_operator = {&remove_labels_operator_family_.Add(labels)},
-      .edge_uniqueness_filter_operator = {&edge_uniqueness_filter_operator_family_.Add(labels)},
-      .empty_result_operator = {&empty_result_operator_family_.Add(labels)},
-      .accumulate_operator = {&accumulate_operator_family_.Add(labels)},
-      .aggregate_operator = {&aggregate_operator_family_.Add(labels)},
-      .skip_operator = {&skip_operator_family_.Add(labels)},
-      .limit_operator = {&limit_operator_family_.Add(labels)},
-      .order_by_operator = {&order_by_operator_family_.Add(labels)},
-      .merge_operator = {&merge_operator_family_.Add(labels)},
-      .optional_operator = {&optional_operator_family_.Add(labels)},
-      .unwind_operator = {&unwind_operator_family_.Add(labels)},
-      .cardinality_scale_operator = {&cardinality_scale_operator_family_.Add(labels)},
-      .distinct_operator = {&distinct_operator_family_.Add(labels)},
-      .union_operator = {&union_operator_family_.Add(labels)},
-      .cartesian_operator = {&cartesian_operator_family_.Add(labels)},
-      .call_procedure_operator = {&call_procedure_operator_family_.Add(labels)},
-      .foreach_operator = {&foreach_operator_family_.Add(labels)},
-      .evaluate_pattern_filter_operator = {&evaluate_pattern_filter_operator_family_.Add(labels)},
-      .apply_operator = {&apply_operator_family_.Add(labels)},
-      .indexed_join_operator = {&indexed_join_operator_family_.Add(labels)},
-      .hash_join_operator = {&hash_join_operator_family_.Add(labels)},
-      .roll_up_apply_operator = {&roll_up_apply_operator_family_.Add(labels)},
-      .conditional_operator = {&conditional_operator_family_.Add(labels)},
-      .periodic_commit_operator = {&periodic_commit_operator_family_.Add(labels)},
-      .periodic_subquery_operator = {&periodic_subquery_operator_family_.Add(labels)},
-      .set_nested_property_operator = {&set_nested_property_operator_family_.Add(labels)},
-      .remove_nested_property_operator = {&remove_nested_property_operator_family_.Add(labels)},
-      .active_label_indices = {&active_label_indices_family_.Add(labels)},
-      .active_label_property_indices = {&active_label_property_indices_family_.Add(labels)},
-      .active_edge_type_indices = {&active_edge_type_indices_family_.Add(labels)},
-      .active_edge_type_property_indices = {&active_edge_type_property_indices_family_.Add(labels)},
-      .active_edge_property_indices = {&active_edge_property_indices_family_.Add(labels)},
-      .active_vertex_property_indices = {&active_vertex_property_indices_family_.Add(labels)},
-      .active_point_indices = {&active_point_indices_family_.Add(labels)},
-      .active_text_indices = {&active_text_indices_family_.Add(labels)},
-      .active_text_edge_indices = {&active_text_edge_indices_family_.Add(labels)},
-      .active_vector_indices = {&active_vector_indices_family_.Add(labels)},
-      .active_vector_edge_indices = {&active_vector_edge_indices_family_.Add(labels)},
-      .active_existence_constraints = {&active_existence_constraints_family_.Add(labels)},
-      .active_unique_constraints = {&active_unique_constraints_family_.Add(labels)},
-      .active_type_constraints = {&active_type_constraints_family_.Add(labels)},
-      .streams_created = {&streams_created_family_.Add(labels)},
-      .messages_consumed = {&messages_consumed_family_.Add(labels)},
-      .triggers_created = {&triggers_created_family_.Add(labels)},
-      .triggers_executed = {&triggers_executed_family_.Add(labels)},
-      .active_transactions = {&active_transactions_family_.Add(labels)},
-      .committed_transactions = {&committed_transactions_family_.Add(labels)},
-      .rolled_back_transactions = {&rolled_back_transactions_family_.Add(labels)},
-      .failed_query = {&failed_query_family_.Add(labels)},
-      .failed_prepare = {&failed_prepare_family_.Add(labels)},
-      .failed_pull = {&failed_pull_family_.Add(labels)},
-      .successful_query = {&successful_query_family_.Add(labels)},
-      .write_write_conflicts = {&write_write_conflicts_family_.Add(labels)},
-      .transient_errors = {&transient_errors_family_.Add(labels)},
-      .unreleased_delta_objects = {&unreleased_delta_objects_family_.Add(labels)},
-      .read_query = {&read_query_family_.Add(labels)},
-      .write_query = {&write_query_family_.Add(labels)},
-      .read_write_query = {&read_write_query_family_.Add(labels)},
-      .deleted_nodes = {&deleted_nodes_family_.Add(labels)},
-      .deleted_edges = {&deleted_edges_family_.Add(labels)},
-      .show_schema = {&show_schema_family_.Add(labels)},
-      .show_storage_info = {&show_storage_info_family_.Add(labels)},
-      .query_execution_latency_seconds = {&query_execution_latency_family_.Add(labels, kLatencyBuckets)},
-      .snapshot_creation_latency_seconds = {&snapshot_creation_latency_family_.Add(labels, kLatencyBuckets)},
-      .snapshot_recovery_latency_seconds = {&snapshot_recovery_latency_family_.Add(labels, kLatencyBuckets)},
-      .gc_latency_seconds = {&gc_latency_family_.Add(labels, kLatencyBuckets)},
-      .gc_skiplist_cleanup_latency_seconds = {&gc_skiplist_cleanup_latency_family_.Add(labels, kLatencyBuckets)},
-      .gc_index_sweeps = {&gc_index_sweeps_family_.Add(labels)},
-  };
+  DatabaseMetricHandles handles{};
+  struct RollbackGuard {
+    PrometheusMetrics *self;
+    DatabaseMetricHandles *target;
+    bool active{true};
+    ~RollbackGuard() {
+      if (active) self->RemoveHandlesFromFamilies(*target);
+    }
+  } rollback{this, &handles};
+
+  handles.vertex_count = {&vertex_count_family_.Add(labels)};
+  handles.edge_count = {&edge_count_family_.Add(labels)};
+  handles.disk_usage_bytes = {&disk_usage_family_.Add(labels)};
+  handles.db_memory_tracked_bytes = {&db_memory_tracked_family_.Add(labels)};
+  handles.db_peak_memory_tracked_bytes = {&db_peak_memory_tracked_family_.Add(labels)};
+  handles.db_storage_memory_tracked_bytes = {&db_storage_memory_tracked_family_.Add(labels)};
+  handles.db_embedding_memory_tracked_bytes = {&db_embedding_memory_tracked_family_.Add(labels)};
+  handles.db_query_memory_tracked_bytes = {&db_query_memory_tracked_family_.Add(labels)};
+  handles.once_operator = {&once_operator_family_.Add(labels)};
+  handles.create_node_operator = {&create_node_operator_family_.Add(labels)};
+  handles.create_expand_operator = {&create_expand_operator_family_.Add(labels)};
+  handles.scan_all_operator = {&scan_all_operator_family_.Add(labels)};
+  handles.scan_all_by_label_operator = {&scan_all_by_label_operator_family_.Add(labels)};
+  handles.scan_all_by_label_properties_operator = {&scan_all_by_label_properties_operator_family_.Add(labels)};
+  handles.scan_all_by_id_operator = {&scan_all_by_id_operator_family_.Add(labels)};
+  handles.scan_all_by_edge_operator = {&scan_all_by_edge_operator_family_.Add(labels)};
+  handles.scan_all_by_edge_type_operator = {&scan_all_by_edge_type_operator_family_.Add(labels)};
+  handles.scan_all_by_edge_type_property_operator = {&scan_all_by_edge_type_property_operator_family_.Add(labels)};
+  handles.scan_all_by_edge_property_operator = {&scan_all_by_edge_property_operator_family_.Add(labels)};
+  handles.scan_all_by_edge_id_operator = {&scan_all_by_edge_id_operator_family_.Add(labels)};
+  handles.scan_all_by_vertex_property_operator = {&scan_all_by_vertex_property_operator_family_.Add(labels)};
+  handles.scan_all_by_point_distance_operator = {&scan_all_by_point_distance_operator_family_.Add(labels)};
+  handles.scan_all_by_point_withinbbox_operator = {&scan_all_by_point_withinbbox_operator_family_.Add(labels)};
+  handles.expand_operator = {&expand_operator_family_.Add(labels)};
+  handles.expand_variable_operator = {&expand_variable_operator_family_.Add(labels)};
+  handles.construct_named_path_operator = {&construct_named_path_operator_family_.Add(labels)};
+  handles.filter_operator = {&filter_operator_family_.Add(labels)};
+  handles.produce_operator = {&produce_operator_family_.Add(labels)};
+  handles.delete_operator = {&delete_operator_family_.Add(labels)};
+  handles.set_property_operator = {&set_property_operator_family_.Add(labels)};
+  handles.set_properties_operator = {&set_properties_operator_family_.Add(labels)};
+  handles.set_labels_operator = {&set_labels_operator_family_.Add(labels)};
+  handles.remove_property_operator = {&remove_property_operator_family_.Add(labels)};
+  handles.remove_labels_operator = {&remove_labels_operator_family_.Add(labels)};
+  handles.edge_uniqueness_filter_operator = {&edge_uniqueness_filter_operator_family_.Add(labels)};
+  handles.empty_result_operator = {&empty_result_operator_family_.Add(labels)};
+  handles.accumulate_operator = {&accumulate_operator_family_.Add(labels)};
+  handles.aggregate_operator = {&aggregate_operator_family_.Add(labels)};
+  handles.skip_operator = {&skip_operator_family_.Add(labels)};
+  handles.limit_operator = {&limit_operator_family_.Add(labels)};
+  handles.order_by_operator = {&order_by_operator_family_.Add(labels)};
+  handles.merge_operator = {&merge_operator_family_.Add(labels)};
+  handles.optional_operator = {&optional_operator_family_.Add(labels)};
+  handles.unwind_operator = {&unwind_operator_family_.Add(labels)};
+  handles.cardinality_scale_operator = {&cardinality_scale_operator_family_.Add(labels)};
+  handles.distinct_operator = {&distinct_operator_family_.Add(labels)};
+  handles.union_operator = {&union_operator_family_.Add(labels)};
+  handles.cartesian_operator = {&cartesian_operator_family_.Add(labels)};
+  handles.call_procedure_operator = {&call_procedure_operator_family_.Add(labels)};
+  handles.foreach_operator = {&foreach_operator_family_.Add(labels)};
+  handles.evaluate_pattern_filter_operator = {&evaluate_pattern_filter_operator_family_.Add(labels)};
+  handles.apply_operator = {&apply_operator_family_.Add(labels)};
+  handles.indexed_join_operator = {&indexed_join_operator_family_.Add(labels)};
+  handles.hash_join_operator = {&hash_join_operator_family_.Add(labels)};
+  handles.roll_up_apply_operator = {&roll_up_apply_operator_family_.Add(labels)};
+  handles.conditional_operator = {&conditional_operator_family_.Add(labels)};
+  handles.periodic_commit_operator = {&periodic_commit_operator_family_.Add(labels)};
+  handles.periodic_subquery_operator = {&periodic_subquery_operator_family_.Add(labels)};
+  handles.set_nested_property_operator = {&set_nested_property_operator_family_.Add(labels)};
+  handles.remove_nested_property_operator = {&remove_nested_property_operator_family_.Add(labels)};
+  handles.active_label_indices = {&active_label_indices_family_.Add(labels)};
+  handles.active_label_property_indices = {&active_label_property_indices_family_.Add(labels)};
+  handles.active_edge_type_indices = {&active_edge_type_indices_family_.Add(labels)};
+  handles.active_edge_type_property_indices = {&active_edge_type_property_indices_family_.Add(labels)};
+  handles.active_edge_property_indices = {&active_edge_property_indices_family_.Add(labels)};
+  handles.active_vertex_property_indices = {&active_vertex_property_indices_family_.Add(labels)};
+  handles.active_point_indices = {&active_point_indices_family_.Add(labels)};
+  handles.active_text_indices = {&active_text_indices_family_.Add(labels)};
+  handles.active_text_edge_indices = {&active_text_edge_indices_family_.Add(labels)};
+  handles.active_vector_indices = {&active_vector_indices_family_.Add(labels)};
+  handles.active_vector_edge_indices = {&active_vector_edge_indices_family_.Add(labels)};
+  handles.active_existence_constraints = {&active_existence_constraints_family_.Add(labels)};
+  handles.active_unique_constraints = {&active_unique_constraints_family_.Add(labels)};
+  handles.active_type_constraints = {&active_type_constraints_family_.Add(labels)};
+  handles.streams_created = {&streams_created_family_.Add(labels)};
+  handles.messages_consumed = {&messages_consumed_family_.Add(labels)};
+  handles.triggers_created = {&triggers_created_family_.Add(labels)};
+  handles.triggers_executed = {&triggers_executed_family_.Add(labels)};
+  handles.active_transactions = {&active_transactions_family_.Add(labels)};
+  handles.committed_transactions = {&committed_transactions_family_.Add(labels)};
+  handles.rolled_back_transactions = {&rolled_back_transactions_family_.Add(labels)};
+  handles.failed_query = {&failed_query_family_.Add(labels)};
+  handles.failed_prepare = {&failed_prepare_family_.Add(labels)};
+  handles.failed_pull = {&failed_pull_family_.Add(labels)};
+  handles.successful_query = {&successful_query_family_.Add(labels)};
+  handles.write_write_conflicts = {&write_write_conflicts_family_.Add(labels)};
+  handles.transient_errors = {&transient_errors_family_.Add(labels)};
+  handles.unreleased_delta_objects = {&unreleased_delta_objects_family_.Add(labels)};
+  handles.read_query = {&read_query_family_.Add(labels)};
+  handles.write_query = {&write_query_family_.Add(labels)};
+  handles.read_write_query = {&read_write_query_family_.Add(labels)};
+  handles.deleted_nodes = {&deleted_nodes_family_.Add(labels)};
+  handles.deleted_edges = {&deleted_edges_family_.Add(labels)};
+  handles.show_schema = {&show_schema_family_.Add(labels)};
+  handles.show_storage_info = {&show_storage_info_family_.Add(labels)};
+  handles.query_execution_latency_seconds = {&query_execution_latency_family_.Add(labels, kLatencyBuckets)};
+  handles.snapshot_creation_latency_seconds = {&snapshot_creation_latency_family_.Add(labels, kLatencyBuckets)};
+  handles.snapshot_recovery_latency_seconds = {&snapshot_recovery_latency_family_.Add(labels, kLatencyBuckets)};
+  handles.gc_latency_seconds = {&gc_latency_family_.Add(labels, kLatencyBuckets)};
+  handles.gc_skiplist_cleanup_latency_seconds = {&gc_skiplist_cleanup_latency_family_.Add(labels, kLatencyBuckets)};
+  handles.gc_index_sweeps = {&gc_index_sweeps_family_.Add(labels)};
+
+  rollback.active = false;
+  return handles;
 }
 
 DatabaseMetricHandles PrometheusMetrics::AddDatabaseUnsafe(utils::UUID const &uuid, std::string_view name) {
-  auto const entry_id = databases_.next_entry_id++;
+  auto const entry_id = databases_.next_entry_id;
   auto handles = CreateHandles(entry_id);
+  struct EntryRollbackGuard {
+    PrometheusMetrics *self;
+    DatabaseMetricHandles *target;
+    bool active{true};
+    ~EntryRollbackGuard() {
+      if (active) self->RemoveHandlesFromFamilies(*target);
+    }
+  } rollback{this, &handles};
+
+  std::string owned_name{name};
   databases_.entries.push_back({
       .id = entry_id,
       .uuid = uuid,
-      .db_name = std::string(name),
+      .db_name = std::move(owned_name),
       .handles = handles,
   });
+  ++databases_.next_entry_id;
+  rollback.active = false;
   if (name == dbms::kDefaultDB) {
     default_db_uuid_ = uuid;
   }
@@ -1127,107 +1158,116 @@ void PrometheusMetrics::ReleaseRegistration(uint64_t entry_id) {
 }
 
 void PrometheusMetrics::RemoveHandlesFromFamilies(DatabaseMetricHandles const &h) {
-  vertex_count_family_.Remove(h.vertex_count.get());
-  edge_count_family_.Remove(h.edge_count.get());
-  disk_usage_family_.Remove(h.disk_usage_bytes.get());
-  db_memory_tracked_family_.Remove(h.db_memory_tracked_bytes.get());
-  db_peak_memory_tracked_family_.Remove(h.db_peak_memory_tracked_bytes.get());
-  db_storage_memory_tracked_family_.Remove(h.db_storage_memory_tracked_bytes.get());
-  db_embedding_memory_tracked_family_.Remove(h.db_embedding_memory_tracked_bytes.get());
-  db_query_memory_tracked_family_.Remove(h.db_query_memory_tracked_bytes.get());
-  once_operator_family_.Remove(h.once_operator.get());
-  create_node_operator_family_.Remove(h.create_node_operator.get());
-  create_expand_operator_family_.Remove(h.create_expand_operator.get());
-  scan_all_operator_family_.Remove(h.scan_all_operator.get());
-  scan_all_by_label_operator_family_.Remove(h.scan_all_by_label_operator.get());
-  scan_all_by_label_properties_operator_family_.Remove(h.scan_all_by_label_properties_operator.get());
-  scan_all_by_id_operator_family_.Remove(h.scan_all_by_id_operator.get());
-  scan_all_by_edge_operator_family_.Remove(h.scan_all_by_edge_operator.get());
-  scan_all_by_edge_type_operator_family_.Remove(h.scan_all_by_edge_type_operator.get());
-  scan_all_by_edge_type_property_operator_family_.Remove(h.scan_all_by_edge_type_property_operator.get());
-  scan_all_by_edge_property_operator_family_.Remove(h.scan_all_by_edge_property_operator.get());
-  scan_all_by_edge_id_operator_family_.Remove(h.scan_all_by_edge_id_operator.get());
-  scan_all_by_vertex_property_operator_family_.Remove(h.scan_all_by_vertex_property_operator.get());
-  scan_all_by_point_distance_operator_family_.Remove(h.scan_all_by_point_distance_operator.get());
-  scan_all_by_point_withinbbox_operator_family_.Remove(h.scan_all_by_point_withinbbox_operator.get());
-  expand_operator_family_.Remove(h.expand_operator.get());
-  expand_variable_operator_family_.Remove(h.expand_variable_operator.get());
-  construct_named_path_operator_family_.Remove(h.construct_named_path_operator.get());
-  filter_operator_family_.Remove(h.filter_operator.get());
-  produce_operator_family_.Remove(h.produce_operator.get());
-  delete_operator_family_.Remove(h.delete_operator.get());
-  set_property_operator_family_.Remove(h.set_property_operator.get());
-  set_properties_operator_family_.Remove(h.set_properties_operator.get());
-  set_labels_operator_family_.Remove(h.set_labels_operator.get());
-  remove_property_operator_family_.Remove(h.remove_property_operator.get());
-  remove_labels_operator_family_.Remove(h.remove_labels_operator.get());
-  edge_uniqueness_filter_operator_family_.Remove(h.edge_uniqueness_filter_operator.get());
-  empty_result_operator_family_.Remove(h.empty_result_operator.get());
-  accumulate_operator_family_.Remove(h.accumulate_operator.get());
-  aggregate_operator_family_.Remove(h.aggregate_operator.get());
-  skip_operator_family_.Remove(h.skip_operator.get());
-  limit_operator_family_.Remove(h.limit_operator.get());
-  order_by_operator_family_.Remove(h.order_by_operator.get());
-  merge_operator_family_.Remove(h.merge_operator.get());
-  optional_operator_family_.Remove(h.optional_operator.get());
-  unwind_operator_family_.Remove(h.unwind_operator.get());
-  cardinality_scale_operator_family_.Remove(h.cardinality_scale_operator.get());
-  distinct_operator_family_.Remove(h.distinct_operator.get());
-  union_operator_family_.Remove(h.union_operator.get());
-  cartesian_operator_family_.Remove(h.cartesian_operator.get());
-  call_procedure_operator_family_.Remove(h.call_procedure_operator.get());
-  foreach_operator_family_.Remove(h.foreach_operator.get());
-  evaluate_pattern_filter_operator_family_.Remove(h.evaluate_pattern_filter_operator.get());
-  apply_operator_family_.Remove(h.apply_operator.get());
-  indexed_join_operator_family_.Remove(h.indexed_join_operator.get());
-  hash_join_operator_family_.Remove(h.hash_join_operator.get());
-  roll_up_apply_operator_family_.Remove(h.roll_up_apply_operator.get());
-  conditional_operator_family_.Remove(h.conditional_operator.get());
-  periodic_commit_operator_family_.Remove(h.periodic_commit_operator.get());
-  periodic_subquery_operator_family_.Remove(h.periodic_subquery_operator.get());
-  set_nested_property_operator_family_.Remove(h.set_nested_property_operator.get());
-  remove_nested_property_operator_family_.Remove(h.remove_nested_property_operator.get());
-  active_label_indices_family_.Remove(h.active_label_indices.get());
-  active_label_property_indices_family_.Remove(h.active_label_property_indices.get());
-  active_edge_type_indices_family_.Remove(h.active_edge_type_indices.get());
-  active_edge_type_property_indices_family_.Remove(h.active_edge_type_property_indices.get());
-  active_edge_property_indices_family_.Remove(h.active_edge_property_indices.get());
-  active_vertex_property_indices_family_.Remove(h.active_vertex_property_indices.get());
-  active_point_indices_family_.Remove(h.active_point_indices.get());
-  active_text_indices_family_.Remove(h.active_text_indices.get());
-  active_text_edge_indices_family_.Remove(h.active_text_edge_indices.get());
-  active_vector_indices_family_.Remove(h.active_vector_indices.get());
-  active_vector_edge_indices_family_.Remove(h.active_vector_edge_indices.get());
-  active_existence_constraints_family_.Remove(h.active_existence_constraints.get());
-  active_unique_constraints_family_.Remove(h.active_unique_constraints.get());
-  active_type_constraints_family_.Remove(h.active_type_constraints.get());
-  streams_created_family_.Remove(h.streams_created.get());
-  messages_consumed_family_.Remove(h.messages_consumed.get());
-  triggers_created_family_.Remove(h.triggers_created.get());
-  triggers_executed_family_.Remove(h.triggers_executed.get());
-  active_transactions_family_.Remove(h.active_transactions.get());
-  committed_transactions_family_.Remove(h.committed_transactions.get());
-  rolled_back_transactions_family_.Remove(h.rolled_back_transactions.get());
-  failed_query_family_.Remove(h.failed_query.get());
-  failed_prepare_family_.Remove(h.failed_prepare.get());
-  failed_pull_family_.Remove(h.failed_pull.get());
-  successful_query_family_.Remove(h.successful_query.get());
-  write_write_conflicts_family_.Remove(h.write_write_conflicts.get());
-  transient_errors_family_.Remove(h.transient_errors.get());
-  unreleased_delta_objects_family_.Remove(h.unreleased_delta_objects.get());
-  read_query_family_.Remove(h.read_query.get());
-  write_query_family_.Remove(h.write_query.get());
-  read_write_query_family_.Remove(h.read_write_query.get());
-  deleted_nodes_family_.Remove(h.deleted_nodes.get());
-  deleted_edges_family_.Remove(h.deleted_edges.get());
-  show_schema_family_.Remove(h.show_schema.get());
-  show_storage_info_family_.Remove(h.show_storage_info.get());
-  query_execution_latency_family_.Remove(h.query_execution_latency_seconds.get());
-  snapshot_creation_latency_family_.Remove(h.snapshot_creation_latency_seconds.get());
-  snapshot_recovery_latency_family_.Remove(h.snapshot_recovery_latency_seconds.get());
-  gc_latency_family_.Remove(h.gc_latency_seconds.get());
-  gc_skiplist_cleanup_latency_family_.Remove(h.gc_skiplist_cleanup_latency_seconds.get());
-  gc_index_sweeps_family_.Remove(h.gc_index_sweeps.get());
+  auto const remove_if_present = []<typename TFamily>(TFamily &family, auto const &handle) {
+    if constexpr (requires { handle.gauge; }) {
+      if (handle.gauge != nullptr) family.Remove(handle.gauge);
+    } else if constexpr (requires { handle.counter; }) {
+      if (handle.counter != nullptr) family.Remove(handle.counter);
+    } else {
+      if (handle.histogram != nullptr) family.Remove(handle.histogram);
+    }
+  };
+  remove_if_present(vertex_count_family_, h.vertex_count);
+  remove_if_present(edge_count_family_, h.edge_count);
+  remove_if_present(disk_usage_family_, h.disk_usage_bytes);
+  remove_if_present(db_memory_tracked_family_, h.db_memory_tracked_bytes);
+  remove_if_present(db_peak_memory_tracked_family_, h.db_peak_memory_tracked_bytes);
+  remove_if_present(db_storage_memory_tracked_family_, h.db_storage_memory_tracked_bytes);
+  remove_if_present(db_embedding_memory_tracked_family_, h.db_embedding_memory_tracked_bytes);
+  remove_if_present(db_query_memory_tracked_family_, h.db_query_memory_tracked_bytes);
+  remove_if_present(once_operator_family_, h.once_operator);
+  remove_if_present(create_node_operator_family_, h.create_node_operator);
+  remove_if_present(create_expand_operator_family_, h.create_expand_operator);
+  remove_if_present(scan_all_operator_family_, h.scan_all_operator);
+  remove_if_present(scan_all_by_label_operator_family_, h.scan_all_by_label_operator);
+  remove_if_present(scan_all_by_label_properties_operator_family_, h.scan_all_by_label_properties_operator);
+  remove_if_present(scan_all_by_id_operator_family_, h.scan_all_by_id_operator);
+  remove_if_present(scan_all_by_edge_operator_family_, h.scan_all_by_edge_operator);
+  remove_if_present(scan_all_by_edge_type_operator_family_, h.scan_all_by_edge_type_operator);
+  remove_if_present(scan_all_by_edge_type_property_operator_family_, h.scan_all_by_edge_type_property_operator);
+  remove_if_present(scan_all_by_edge_property_operator_family_, h.scan_all_by_edge_property_operator);
+  remove_if_present(scan_all_by_edge_id_operator_family_, h.scan_all_by_edge_id_operator);
+  remove_if_present(scan_all_by_vertex_property_operator_family_, h.scan_all_by_vertex_property_operator);
+  remove_if_present(scan_all_by_point_distance_operator_family_, h.scan_all_by_point_distance_operator);
+  remove_if_present(scan_all_by_point_withinbbox_operator_family_, h.scan_all_by_point_withinbbox_operator);
+  remove_if_present(expand_operator_family_, h.expand_operator);
+  remove_if_present(expand_variable_operator_family_, h.expand_variable_operator);
+  remove_if_present(construct_named_path_operator_family_, h.construct_named_path_operator);
+  remove_if_present(filter_operator_family_, h.filter_operator);
+  remove_if_present(produce_operator_family_, h.produce_operator);
+  remove_if_present(delete_operator_family_, h.delete_operator);
+  remove_if_present(set_property_operator_family_, h.set_property_operator);
+  remove_if_present(set_properties_operator_family_, h.set_properties_operator);
+  remove_if_present(set_labels_operator_family_, h.set_labels_operator);
+  remove_if_present(remove_property_operator_family_, h.remove_property_operator);
+  remove_if_present(remove_labels_operator_family_, h.remove_labels_operator);
+  remove_if_present(edge_uniqueness_filter_operator_family_, h.edge_uniqueness_filter_operator);
+  remove_if_present(empty_result_operator_family_, h.empty_result_operator);
+  remove_if_present(accumulate_operator_family_, h.accumulate_operator);
+  remove_if_present(aggregate_operator_family_, h.aggregate_operator);
+  remove_if_present(skip_operator_family_, h.skip_operator);
+  remove_if_present(limit_operator_family_, h.limit_operator);
+  remove_if_present(order_by_operator_family_, h.order_by_operator);
+  remove_if_present(merge_operator_family_, h.merge_operator);
+  remove_if_present(optional_operator_family_, h.optional_operator);
+  remove_if_present(unwind_operator_family_, h.unwind_operator);
+  remove_if_present(cardinality_scale_operator_family_, h.cardinality_scale_operator);
+  remove_if_present(distinct_operator_family_, h.distinct_operator);
+  remove_if_present(union_operator_family_, h.union_operator);
+  remove_if_present(cartesian_operator_family_, h.cartesian_operator);
+  remove_if_present(call_procedure_operator_family_, h.call_procedure_operator);
+  remove_if_present(foreach_operator_family_, h.foreach_operator);
+  remove_if_present(evaluate_pattern_filter_operator_family_, h.evaluate_pattern_filter_operator);
+  remove_if_present(apply_operator_family_, h.apply_operator);
+  remove_if_present(indexed_join_operator_family_, h.indexed_join_operator);
+  remove_if_present(hash_join_operator_family_, h.hash_join_operator);
+  remove_if_present(roll_up_apply_operator_family_, h.roll_up_apply_operator);
+  remove_if_present(conditional_operator_family_, h.conditional_operator);
+  remove_if_present(periodic_commit_operator_family_, h.periodic_commit_operator);
+  remove_if_present(periodic_subquery_operator_family_, h.periodic_subquery_operator);
+  remove_if_present(set_nested_property_operator_family_, h.set_nested_property_operator);
+  remove_if_present(remove_nested_property_operator_family_, h.remove_nested_property_operator);
+  remove_if_present(active_label_indices_family_, h.active_label_indices);
+  remove_if_present(active_label_property_indices_family_, h.active_label_property_indices);
+  remove_if_present(active_edge_type_indices_family_, h.active_edge_type_indices);
+  remove_if_present(active_edge_type_property_indices_family_, h.active_edge_type_property_indices);
+  remove_if_present(active_edge_property_indices_family_, h.active_edge_property_indices);
+  remove_if_present(active_vertex_property_indices_family_, h.active_vertex_property_indices);
+  remove_if_present(active_point_indices_family_, h.active_point_indices);
+  remove_if_present(active_text_indices_family_, h.active_text_indices);
+  remove_if_present(active_text_edge_indices_family_, h.active_text_edge_indices);
+  remove_if_present(active_vector_indices_family_, h.active_vector_indices);
+  remove_if_present(active_vector_edge_indices_family_, h.active_vector_edge_indices);
+  remove_if_present(active_existence_constraints_family_, h.active_existence_constraints);
+  remove_if_present(active_unique_constraints_family_, h.active_unique_constraints);
+  remove_if_present(active_type_constraints_family_, h.active_type_constraints);
+  remove_if_present(streams_created_family_, h.streams_created);
+  remove_if_present(messages_consumed_family_, h.messages_consumed);
+  remove_if_present(triggers_created_family_, h.triggers_created);
+  remove_if_present(triggers_executed_family_, h.triggers_executed);
+  remove_if_present(active_transactions_family_, h.active_transactions);
+  remove_if_present(committed_transactions_family_, h.committed_transactions);
+  remove_if_present(rolled_back_transactions_family_, h.rolled_back_transactions);
+  remove_if_present(failed_query_family_, h.failed_query);
+  remove_if_present(failed_prepare_family_, h.failed_prepare);
+  remove_if_present(failed_pull_family_, h.failed_pull);
+  remove_if_present(successful_query_family_, h.successful_query);
+  remove_if_present(write_write_conflicts_family_, h.write_write_conflicts);
+  remove_if_present(transient_errors_family_, h.transient_errors);
+  remove_if_present(unreleased_delta_objects_family_, h.unreleased_delta_objects);
+  remove_if_present(read_query_family_, h.read_query);
+  remove_if_present(write_query_family_, h.write_query);
+  remove_if_present(read_write_query_family_, h.read_write_query);
+  remove_if_present(deleted_nodes_family_, h.deleted_nodes);
+  remove_if_present(deleted_edges_family_, h.deleted_edges);
+  remove_if_present(show_schema_family_, h.show_schema);
+  remove_if_present(show_storage_info_family_, h.show_storage_info);
+  remove_if_present(query_execution_latency_family_, h.query_execution_latency_seconds);
+  remove_if_present(snapshot_creation_latency_family_, h.snapshot_creation_latency_seconds);
+  remove_if_present(snapshot_recovery_latency_family_, h.snapshot_recovery_latency_seconds);
+  remove_if_present(gc_latency_family_, h.gc_latency_seconds);
+  remove_if_present(gc_skiplist_cleanup_latency_family_, h.gc_skiplist_cleanup_latency_seconds);
+  remove_if_present(gc_index_sweeps_family_, h.gc_index_sweeps);
 }
 
 void PrometheusMetrics::RemoveEntryAt(std::list<DatabaseEntry>::iterator it) {
@@ -1315,8 +1355,15 @@ void PrometheusMetrics::UpdateGauges() {
   global.memory_res_bytes->Set(static_cast<double>(utils::GetMemoryRES()));
 
 #ifdef MG_ENTERPRISE
-  std::vector<coordination::InstanceStatus> instances;
-  if (instance_status_resolver_) instances = instance_status_resolver_();
+  std::optional<std::vector<coordination::InstanceStatus>> maybe_instances =
+      instance_status_resolver_ ? instance_status_resolver_()
+                                : std::optional<std::vector<coordination::InstanceStatus>>{std::in_place};
+  if (!maybe_instances.has_value()) {
+    instance_status_refresh_failed_->Set(1.0);
+    return;
+  }
+  instance_status_refresh_failed_->Set(0.0);
+  auto const &instances = *maybe_instances;
 
   auto const active_names = instances | rv::transform(&coordination::InstanceStatus::instance_name) |
                             r::to<std::unordered_set<std::string>>();
@@ -1750,6 +1797,7 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfoForJson() {
   int64_t total_scan_all_by_edge_type_property_operator = 0;
   int64_t total_scan_all_by_edge_property_operator = 0;
   int64_t total_scan_all_by_edge_id_operator = 0;
+  int64_t total_scan_all_by_vertex_property_operator = 0;
   int64_t total_scan_all_by_point_distance_operator = 0;
   int64_t total_scan_all_by_point_withinbbox_operator = 0;
   int64_t total_expand_operator = 0;
@@ -1794,6 +1842,7 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfoForJson() {
   int64_t total_active_edge_type_indices = 0;
   int64_t total_active_edge_type_property_indices = 0;
   int64_t total_active_edge_property_indices = 0;
+  int64_t total_active_vertex_property_indices = 0;
   int64_t total_active_point_indices = 0;
   int64_t total_active_text_indices = 0;
   int64_t total_active_text_edge_indices = 0;
@@ -1847,6 +1896,8 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfoForJson() {
           static_cast<int64_t>(h.scan_all_by_edge_type_property_operator.Value());
       total_scan_all_by_edge_property_operator += static_cast<int64_t>(h.scan_all_by_edge_property_operator.Value());
       total_scan_all_by_edge_id_operator += static_cast<int64_t>(h.scan_all_by_edge_id_operator.Value());
+      total_scan_all_by_vertex_property_operator +=
+          static_cast<int64_t>(h.scan_all_by_vertex_property_operator.Value());
       total_scan_all_by_point_distance_operator += static_cast<int64_t>(h.scan_all_by_point_distance_operator.Value());
       total_scan_all_by_point_withinbbox_operator +=
           static_cast<int64_t>(h.scan_all_by_point_withinbbox_operator.Value());
@@ -1892,6 +1943,7 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfoForJson() {
       total_active_edge_type_indices += static_cast<int64_t>(h.active_edge_type_indices.Value());
       total_active_edge_type_property_indices += static_cast<int64_t>(h.active_edge_type_property_indices.Value());
       total_active_edge_property_indices += static_cast<int64_t>(h.active_edge_property_indices.Value());
+      total_active_vertex_property_indices += static_cast<int64_t>(h.active_vertex_property_indices.Value());
       total_active_point_indices += static_cast<int64_t>(h.active_point_indices.Value());
       total_active_text_indices += static_cast<int64_t>(h.active_text_indices.Value());
       total_active_text_edge_indices += static_cast<int64_t>(h.active_text_edge_indices.Value());
@@ -1948,6 +2000,8 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfoForJson() {
       {"ScanAllByEdgeTypePropertyOperator", "Operator", "Counter", total_scan_all_by_edge_type_property_operator});
   out.push_back({"ScanAllByEdgePropertyOperator", "Operator", "Counter", total_scan_all_by_edge_property_operator});
   out.push_back({"ScanAllByEdgeIdOperator", "Operator", "Counter", total_scan_all_by_edge_id_operator});
+  out.push_back(
+      {"ScanAllByVertexPropertyOperator", "Operator", "Counter", total_scan_all_by_vertex_property_operator});
   out.push_back({"ScanAllByPointDistanceOperator", "Operator", "Counter", total_scan_all_by_point_distance_operator});
   out.push_back(
       {"ScanAllByPointWithinbboxOperator", "Operator", "Counter", total_scan_all_by_point_withinbbox_operator});
@@ -2001,6 +2055,7 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfoForJson() {
   out.push_back({"ActiveEdgeTypeIndices", "Index", "Gauge", total_active_edge_type_indices});
   out.push_back({"ActiveEdgeTypePropertyIndices", "Index", "Gauge", total_active_edge_type_property_indices});
   out.push_back({"ActiveEdgePropertyIndices", "Index", "Gauge", total_active_edge_property_indices});
+  out.push_back({"ActiveVertexPropertyIndices", "Index", "Gauge", total_active_vertex_property_indices});
   out.push_back({"ActivePointIndices", "Index", "Gauge", total_active_point_indices});
   out.push_back({"ActiveTextIndices", "Index", "Gauge", total_active_text_indices});
   out.push_back({"ActiveTextEdgeIndices", "Index", "Gauge", total_active_text_edge_indices});
@@ -2241,6 +2296,12 @@ std::vector<MetricInfo> PrometheusMetrics::GetGlobalMetricsInfo() const {
                  "HighAvailability",
                  "Counter",
                  static_cast<int64_t>(global.update_data_instance_config_rpc_fail->Value())});
+#ifdef MG_ENTERPRISE
+  out.push_back({"InstanceStatusRefreshFailed",
+                 "HighAvailability",
+                 "Gauge",
+                 static_cast<int64_t>(instance_status_refresh_failed_->Value())});
+#endif
 
   // HighAvailability histograms
   AppendHistogramPercentiles(out, "InstanceSuccCallback", "HighAvailability", *global.instance_succ_callback_seconds);
@@ -2469,13 +2530,21 @@ nlohmann::json PrometheusMetrics::GetTelemetryCounters() const {
     }
   }
 
-  // Global counters (sessions, HA)
+  // Global counters (sessions, HA, and no-db fallback query counters)
   active_sessions_v += static_cast<int64_t>(global.active_sessions->Value());
   active_bolt_v += static_cast<int64_t>(global.active_bolt_sessions->Value());
   active_tcp_v += static_cast<int64_t>(global.active_tcp_sessions->Value());
   active_ssl_v += static_cast<int64_t>(global.active_ssl_sessions->Value());
   active_ws_v += static_cast<int64_t>(global.active_websocket_sessions->Value());
   bolt_messages_v += static_cast<int64_t>(global.bolt_messages->Value());
+  read_query += static_cast<int64_t>(global.read_query->Value());
+  write_query += static_cast<int64_t>(global.write_query->Value());
+  read_write_query += static_cast<int64_t>(global.read_write_query->Value());
+  failed_query += static_cast<int64_t>(global.failed_query->Value());
+  failed_prepare += static_cast<int64_t>(global.failed_prepare->Value());
+  failed_pull += static_cast<int64_t>(global.failed_pull->Value());
+  successful_query += static_cast<int64_t>(global.successful_query->Value());
+  transient_errors += static_cast<int64_t>(global.transient_errors->Value());
 
   // clang-format off
   return {

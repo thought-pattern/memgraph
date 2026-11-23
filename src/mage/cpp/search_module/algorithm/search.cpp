@@ -13,13 +13,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
+#include <regex>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 namespace Search {
@@ -72,20 +73,29 @@ std::string_view ComparisonOperator(std::string_view raw) {
       ">, >=].");
 }
 
-// STARTS WITH / ENDS WITH / CONTAINS raise a runtime error on a non-string property (unlike the comparison
-// operators, which simply do not match), so they must be guarded to only ever be evaluated against strings.
-bool IsStringOnlyOperator(std::string_view comparison) {
-  return comparison == op::kStartsWith || comparison == op::kEndsWith || comparison == op::kContains;
-}
-
-std::string EscapeIdentifier(std::string_view name) {
-  std::string escaped;
-  escaped.reserve(name.size());
-  for (const char c : name) {
-    escaped.push_back(c);
-    if (c == '`') escaped.push_back('`');
+bool PropertyMatches(const mgp::Value &prop_value, std::string_view comparison, std::string_view target,
+                     const std::optional<std::regex> &compiled_regex) {
+  if (prop_value.IsNull()) {
+    return false;
   }
-  return escaped;
+  if (!prop_value.IsString()) {
+    return comparison == op::kNotEqual;
+  }
+
+  const std::string_view candidate = prop_value.ValueString();
+  if (comparison == op::kEqual) return candidate == target;
+  if (comparison == op::kNotEqual) return candidate != target;
+  if (comparison == op::kLess) return candidate < target;
+  if (comparison == op::kLessEqual) return candidate <= target;
+  if (comparison == op::kGreater) return candidate > target;
+  if (comparison == op::kGreaterEqual) return candidate >= target;
+  if (comparison == op::kStartsWith) return candidate.starts_with(target);
+  if (comparison == op::kEndsWith) return candidate.ends_with(target);
+  if (comparison == op::kContains) return candidate.find(target) != std::string_view::npos;
+  if (comparison == op::kRegex) {
+    return compiled_regex.has_value() && std::regex_match(candidate.begin(), candidate.end(), *compiled_regex);
+  }
+  return false;
 }
 
 LabelProperties ParseJsonLabelPropertyMap(std::string_view text) {
@@ -140,7 +150,8 @@ LabelProperties ParseLabelPropertyMap(const mgp::Value &argument) {
   return result;
 }
 
-// Shared driver. `deduplicate` distinguishes `node` (dedup by id) from `node_all`; one sub-query per pair.
+// Shared driver. `deduplicate` distinguishes `node` (dedup by id) from `node_all`; evaluated directly on the
+// caller's graph snapshot so uncommitted caller edits are visible and concurrent commits cannot leak across snapshots.
 void Run(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory, bool deduplicate) {
   const mgp::MemoryDispatcherGuard guard{memory};
   const auto arguments = mgp::List(args);
@@ -151,48 +162,34 @@ void Run(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memo
     if (arguments[2].IsNull()) return;  // a null value matches nothing (checked after operator validation)
     const std::string_view value = arguments[2].ValueString();
 
+    std::optional<std::regex> compiled_regex;
+    if (comparison == op::kRegex) {
+      try {
+        compiled_regex.emplace(std::string(value));
+      } catch (const std::regex_error &e) {
+        throw mgp::ValueException(std::string{"Regex error in '"} + std::string(value) + "': " + e.what());
+      }
+    }
+
     std::unordered_set<int64_t> seen;
-    // A sub-query node accessor is bound to the sub-query's transaction, freed with its result. Re-resolve each
-    // id against the caller's graph in a single lookup so the emitted node outlives that transaction; a null
-    // result means the id is not visible in the caller's snapshot, so skip it. The C API is used directly so the
-    // freshly-fetched vertex is handed straight to the result value instead of being copied into a wrapper.
-    const auto emit = [&](int64_t node_id) {
-      if (deduplicate && !seen.insert(node_id).second) return;
-      auto *vertex =
-          mgp::MemHandlerCallback(mgp::graph_get_vertex_by_id, memgraph_graph, mgp_vertex_id{.as_int = node_id});
-      if (vertex == nullptr) return;
-      auto *value = mgp::value_make_vertex(vertex);  // takes ownership of vertex
-      mgp::result_record_insert(mgp::result_new_record(result), kResultNode, value);
-      mgp::value_destroy(value);  // frees the value and the vertex it owns
-    };
-
-    // A non-string operand would silently drop rows (the sub-query error surfaces as an empty result), so
-    // string-only operators are guarded to never be evaluated against a non-string property.
-    const bool string_only = IsStringOnlyOperator(comparison);
-
-    // TODO(ivan): run these sub-queries inside the caller's transaction instead of a fresh one, so the search
-    // observes the caller's uncommitted writes and a single snapshot.
-    const mgp::QueryExecution query_execution{memgraph_graph};
+    const mgp::Graph graph{memgraph_graph};
     for (const auto &[label, properties] : label_properties) {
       for (const auto &property : properties) {
-        const std::string node_property = fmt::format("n.`{}`", EscapeIdentifier(property));
-        // The guard must be a CASE, not `valueType(...) = 'STRING' AND n.p <op> ...`: the planner does not
-        // preserve AND operand order, so the operator can be evaluated before the type check and still throw.
-        // A CASE evaluates only the branch it takes, so the operator is applied to string properties only.
-        std::string predicate = fmt::format("{} {} $value", node_property, comparison);
-        if (string_only) {
-          predicate =
-              fmt::format("CASE WHEN valueType({}) = 'STRING' THEN {} ELSE false END", node_property, predicate);
-        }
-        const std::string query =
-            fmt::format("MATCH (n:`{}`) WHERE {} RETURN id(n) AS node_id", EscapeIdentifier(label), predicate);
-
-        mgp::Map params;
-        params.Insert("value", mgp::Value(value));
-
-        auto results = query_execution.ExecuteQuery(query, params);
-        while (const auto row = results.PullOne()) {
-          emit(row->At("node_id").ValueInt());
+        for (const auto &node : graph.Nodes()) {
+          if (mgp::must_abort(memgraph_graph)) [[unlikely]] {
+            throw mgp::TerminatedMustAbortException();
+          }
+          if (!node.HasLabel(label)) {
+            continue;
+          }
+          if (!PropertyMatches(node.GetProperty(property), comparison, value, compiled_regex)) {
+            continue;
+          }
+          if (deduplicate && !seen.insert(node.Id().AsInt()).second) {
+            continue;
+          }
+          auto record = record_factory.NewRecord();
+          record.Insert(kResultNode, node);
         }
       }
     }

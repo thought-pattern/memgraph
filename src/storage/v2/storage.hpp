@@ -1376,6 +1376,8 @@ class Accessor {
 
   auto GetNameIdMapper() const -> NameIdMapper * { return storage_->name_id_mapper_.get(); }
 
+  auto GetDatabaseUuid() const -> utils::UUID const & { return storage_->uuid(); }
+
   bool CheckIndicesAreReady(IndicesCollection const &required_indices) const {
     return transaction_.active_indices_->CheckIndicesAreReady(required_indices);
   }

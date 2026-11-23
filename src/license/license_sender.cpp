@@ -35,19 +35,23 @@ namespace memgraph::license {
 
 LicenseInfoSender::LicenseInfoSender(std::string url, std::string uuid, std::string machine_id, int64_t memory_limit,
                                      utils::Synchronized<std::optional<LicenseInfo>, utils::SpinLock> &license_info,
-                                     std::chrono::seconds request_interval)
+                                     std::chrono::seconds request_interval, bool telemetry_enabled)
     : url_{std::move(url)},
       uuid_{std::move(uuid)},
       machine_id_{std::move(machine_id)},
       memory_limit_{memory_limit},
+      telemetry_enabled_{telemetry_enabled},
       license_info_{license_info} {
+  if (!telemetry_enabled_) {
+    return;
+  }
   scheduler_.SetInterval(
-      std::min(kFirstShotAfter, request_interval));  // use user-defined interval if shorter than first shot
+      std::min(kFirstShotAfter, request_interval));  // use configured interval if shorter than first shot
   scheduler_.Run(
       "Telemetry",
       [this, final_interval = request_interval, update_interval = kFirstShotAfter < request_interval]() mutable {
         SendData();
-        // First run after 60s; all subsequent runs at the user-defined interval
+        // First run after 60s; all subsequent runs at the configured interval
         if (update_interval) {
           update_interval = false;
           scheduler_.SetInterval(final_interval);
@@ -63,6 +67,9 @@ void LicenseInfoSender::Stop() {
 }
 
 void LicenseInfoSender::SendData() {
+  if (!telemetry_enabled_) {
+    return;
+  }
   nlohmann::json data = nlohmann::json::object();
 
   license_info_.WithLock([&data, this](const auto &license_info) mutable {
@@ -73,7 +80,7 @@ void LicenseInfoSender::SendData() {
               {"machine_id", machine_id_},
               {"type", "license-check"},
               {"license_type", LicenseTypeToString(license_info->license.type)},
-              {"license_key", license_info->license_key},
+              {"license_key", crypto::Sha256Hex(license_info->license_key)},
               {"organization", license_info->organization_name},
               {"valid", license_info->is_valid},
               {"physical_memory_size", memory_info.memory},

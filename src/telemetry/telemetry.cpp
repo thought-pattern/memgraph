@@ -110,7 +110,7 @@ Telemetry::~Telemetry() noexcept {
   }
 }
 
-void Telemetry::StoreData(const nlohmann::json &event, const nlohmann::json &data) {
+bool Telemetry::StoreData(const nlohmann::json &event, const nlohmann::json &data) {
   nlohmann::json payload = {{"run_id", uuid_},
                             {"type", "telemetry"},
                             {"product", kProduct},
@@ -120,7 +120,7 @@ void Telemetry::StoreData(const nlohmann::json &event, const nlohmann::json &dat
                             {"timestamp", utils::Timestamp::Now().SecWithNsecSinceTheEpoch()},
                             {"ssl", ssl_},
                             {"version", version_string}};
-  storage_.Put(fmt::format("{}:{}", uuid_, event.dump()), payload.dump());
+  return storage_.Put(fmt::format("{}:{}", uuid_, event.dump()), payload.dump());
 }
 
 void Telemetry::SendData(int timeout_seconds) {
@@ -168,10 +168,22 @@ void Telemetry::CollectData(const std::string &event) {
       }
     }
   }
+  const bool stored = event.empty() ? StoreData(num_, data) : StoreData(event, data);
+  if (!stored) {
+    if (data.contains("query_module_counters") && data["query_module_counters"].is_object()) {
+      std::unordered_map<std::string, int64_t> to_restore;
+      for (const auto &[proc_name, count_json] : data["query_module_counters"].items()) {
+        if (count_json.is_number_integer()) {
+          to_restore[proc_name] = count_json.get<int64_t>();
+        }
+      }
+      memgraph::query::plan::CallProcedure::RestoreCounters(to_restore);
+    }
+    spdlog::warn("Failed to persist telemetry sample to storage; procedure counters restored for next interval.");
+    return;
+  }
   if (event.empty()) {
-    StoreData(num_++, data);
-  } else {
-    StoreData(event, data);
+    ++num_;
   }
   if (num_ % send_every_n_ == 0 || event == kEventShutdown) {
     // Use shorter timeout for shutdown event

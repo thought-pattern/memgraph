@@ -6467,7 +6467,7 @@ bool SetNestedProperty::SetNestedPropertyCursor::Pull(Frame &frame, ExecutionCon
           leaf_map = &it->second.ValueMap();
         }
         for (const auto &[k, v] : rhs.ValueMap()) {
-          leaf_map->emplace(k, v);
+          leaf_map->insert_or_assign(k, v);
         }
         break;
       }
@@ -8763,6 +8763,9 @@ class UnwindCursor : public Cursor {
         ExpressionEvaluator evaluator = ExpressionEvaluator{&frame, context, storage::View::OLD};
 
         TypedValue input_value = self_.input_expression_->Accept(evaluator);
+        if (input_value.IsNull()) {
+          continue;
+        }
         if (!input_value.IsList())
           throw QueryRuntimeException("Argument of UNWIND must be a list, but '{}' was provided.", input_value.type());
         // Move the evaluted input_value_list to our vector.
@@ -9476,6 +9479,15 @@ std::unordered_map<std::string, int64_t> CallProcedure::GetAndResetCounters() {
   return ret;
 }
 
+void CallProcedure::RestoreCounters(const std::unordered_map<std::string, int64_t> &counters) {
+  if (counters.empty()) return;
+  procedure_counters_.WithLock([&](auto &stored) {
+    for (const auto &[name, delta] : counters) {
+      stored[name] += delta;
+    }
+  });
+}
+
 namespace {
 
 void CallCustomProcedure(const std::string_view fully_qualified_procedure_name, const mgp_proc &proc,
@@ -9909,14 +9921,24 @@ TypedValue CsvRowToTypedList(csv::Reader::Row &row, std::optional<utils::pmr::st
 
 TypedValue CsvRowToTypedMap(csv::Reader::Row &row, csv::Reader::Header header,
                             std::optional<utils::pmr::string> &nullif) {
-  // a valid row has the same number of elements as the header
+  if (row.size() != header.size()) {
+    throw QueryRuntimeException(
+        "CSV row column count ({}) does not match header column count ({})", row.size(), header.size());
+  }
   auto *mem = row.get_allocator().resource();
   TypedValue::TMap m{mem};
-  for (auto i = 0; i < row.size(); ++i) {
+  for (size_t i = 0; i < row.size(); ++i) {
+    const std::string col_name{header[i]};
+    bool inserted = false;
     if (!nullif || row[i] != nullif.value()) {
-      m.emplace(std::move(header[i]), std::move(row[i]));
+      inserted = m.emplace(std::move(header[i]), std::move(row[i])).second;
     } else {
-      m.emplace(std::piecewise_construct, std::forward_as_tuple(std::move(header[i])), std::forward_as_tuple());
+      inserted =
+          m.emplace(std::piecewise_construct, std::forward_as_tuple(std::move(header[i])), std::forward_as_tuple())
+              .second;
+    }
+    if (!inserted) {
+      throw QueryRuntimeException("CSV header contains duplicate column name '{}'", col_name);
     }
   }
   return {std::move(m), mem};
@@ -12167,51 +12189,34 @@ class ParallelBranchCursor : public Cursor {
                         utils::Priority /*unused*/) mutable {
         const OOMExceptionEnabler oom_exception;
         const utils::Timer timer;
-        if (main_thread != std::this_thread::get_id()) {  // Main thread can steal work, so ignore if stolen
-          mem_tracking.StartTracking();
-        }
-        // Create parallel operator entry in branch's stats tree
         context.stats_root = nullptr;
         context.stats = plan::ProfilingStats();
-        SCOPED_PROFILE_OP_BY_REF(self);
+        std::optional<ScopedProfile> profile;
 
         DMG_ASSERT(!context.auth_checker || context.auth_checker->IsThreadSafe(), "Auth checker is not thread safe");
         const auto &cursor = branch_cursors_[i];
         const auto metadata_i = i - 1;
 
-        // Declared before the `try` so it runs on every exit path, and so it
-        // tears down AFTER the catch (which still needs a valid `context` to
-        // record the exception) — moving `context` out is the last thing it
-        // does. This cleanup is pure bookkeeping that must NEVER be failed by
-        // the query memory limit: it runs while the query still holds its
-        // (possibly at-limit) memory, so any allocation here could otherwise
-        // throw OutOfMemoryException out of this `noexcept` destructor and
-        // std::terminate the whole server. The blocker exempts it from the limit.
+        // Declared before `StartTracking()` and `try` so it runs on every exit path, and so it
+        // tears down AFTER `catch` (which still needs a valid `context` to record the exception).
         auto on_exit = utils::OnScopeExit([&]() {
           const utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_blocker;
-          // Force state reset (life extended through the context)
-          // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
-          const_cast<std::optional<ScopedProfile> &>(profile).reset();
+          profile.reset();
           if (main_thread != std::this_thread::get_id()) {  // Main thread can steal work, so ignore if stolen
-            // NOTE: Parallel operators have to PullAll, so no need to worry about switching threads (at the bolt level)
-            // Main thread is handled by the higher level
             context.profile_execution_time += timer.Elapsed();
-            // Main thread will continue using the same tracker
             mem_tracking.StopTracking();
           }
-          // NOTE: hops limit is shared between threads, so we need to free the leftover quota
           context.hops_limit.Free();
-          // Move current context to the branch context for unification
           branch_contexts[metadata_i] = std::move(context);
         });
 
-        // Everything that can allocate runs inside the try: under a QUERY MEMORY
-        // LIMIT the OOMExceptionEnabler above is active, so a sibling branch that
-        // has already pushed usage near the limit can make even the per-branch
-        // setup (collectors, `frame_local`) throw OutOfMemoryException. This task
-        // runs on a worker thread, so an escaping exception would std::terminate
-        // the server instead of failing the query — capture every one here.
         try {
+          if (main_thread != std::this_thread::get_id()) {  // Main thread can steal work, so ignore if stolen
+            mem_tracking.StartTracking();
+          }
+          if (context.is_profile_query) {
+            profile.emplace(ComputeProfilingKey(this), self, &context);
+          }
           if (context.frame_change_collector != nullptr) {
             auto &collector =
                 branch_frame_collectors[metadata_i].emplace(context.frame_change_collector->get_allocator());

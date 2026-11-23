@@ -90,7 +90,7 @@ if (MG_ENABLE_CUGRAPH)
                         "-DCMAKE_BUILD_TYPE=${MG_CUGRAPH_BUILD_TYPE}"
                         "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
                         "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
-                        "-DCMAKE_CUDA_ARCHITECTURES='${MG_CUDA_ARCHITECTURES}'"
+                        "-DCMAKE_CUDA_ARCHITECTURES=${MG_CUDA_ARCHITECTURES}"
                         "-DBUILD_STATIC_FAISS=ON"
                         "-DBUILD_TESTS=OFF"
                         "-DBUILD_CUGRAPH_MG_TESTS=OFF"

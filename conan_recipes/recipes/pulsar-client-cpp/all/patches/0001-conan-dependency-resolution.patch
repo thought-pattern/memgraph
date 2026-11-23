@@ -14,16 +14,18 @@ index 3fa78d6..05d0c1b 100644
      # The latest Protobuf dependency on macOS requires the C++17 support and
      # it could only be found by the CONFIG mode
      set(LATEST_PROTOBUF TRUE)
-@@ -71,7 +71,7 @@ if (LINK_STATIC)
+@@ -71,7 +71,9 @@ if (LINK_STATIC)
      endif()
  endif ()
  
 -find_package(Boost REQUIRED)
-+find_package(Boost REQUIRED CONFIG)
++if (NOT USE_ASIO OR BUILD_PERF_TOOLS)
++    find_package(Boost REQUIRED CONFIG)
++endif ()
  message("Boost_INCLUDE_DIRS: " ${Boost_INCLUDE_DIRS})
  
  set(OPENSSL_ROOT_DIR ${OPENSSL_ROOT_DIR} /usr/lib64/)
-@@ -90,15 +90,24 @@ if (LATEST_PROTOBUF)
+@@ -90,15 +92,24 @@ if (LATEST_PROTOBUF)
  else ()
      find_package(Protobuf REQUIRED)
  endif ()
@@ -53,7 +55,7 @@ index 3fa78d6..05d0c1b 100644
  endif ()
  message("CURL_INCLUDE_DIRS: " ${CURL_INCLUDE_DIRS})
  message("CURL_LIBRARIES: " ${CURL_LIBRARIES})
-@@ -106,7 +115,17 @@ if (NOT CURL_INCLUDE_DIRS OR NOT CURL_LIBRARIES)
+@@ -106,7 +117,17 @@ if (NOT CURL_INCLUDE_DIRS OR NOT CURL_LIBRARIES)
      message(FATAL_ERROR "Could not find libcurl")
  endif ()
  
@@ -72,12 +74,14 @@ index 3fa78d6..05d0c1b 100644
  if (NOT ZLIB_FOUND)
      find_path(ZLIB_INCLUDE_DIRS NAMES zlib.h)
      find_library(ZLIB_LIBRARIES NAMES z zlib zdll zlib1 zlibstatic)
-@@ -191,7 +210,7 @@ if(BUILD_PERF_TOOLS)
+@@ -191,7 +212,9 @@ if(BUILD_PERF_TOOLS)
      set(BOOST_COMPONENTS ${BOOST_COMPONENTS} program_options)
  endif()
  
 -find_package(Boost REQUIRED COMPONENTS ${BOOST_COMPONENTS})
-+find_package(Boost REQUIRED CONFIG COMPONENTS ${BOOST_COMPONENTS})
++if (NOT USE_ASIO OR BUILD_PERF_TOOLS)
++    find_package(Boost REQUIRED CONFIG COMPONENTS ${BOOST_COMPONENTS})
++endif ()
  
  if (BUILD_TESTS)
      find_path(GTEST_INCLUDE_PATH gtest/gtest.h)

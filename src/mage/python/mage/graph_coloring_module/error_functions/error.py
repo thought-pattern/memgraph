@@ -1,20 +1,37 @@
+"""Utilities for error."""
+
 from abc import ABC, abstractmethod
-from typing import Any, Dict
 
 from mage.graph_coloring_module.components.individual import Individual
 from mage.graph_coloring_module.components.population import Population
 from mage.graph_coloring_module.graph import Graph
+
+DEFAULT_ARGUMENT_DICT = {}
 
 
 class Error(ABC):
     """A class that represents an error function."""
 
     @abstractmethod
-    def individual_err(self, graph: Graph, individual: Individual, parameters: Dict[str, Any] = None) -> float:
+    def individual_err(
+        self,
+        graph: Graph,
+        individual: Individual,
+        parameters: dict = DEFAULT_ARGUMENT_DICT,
+    ) -> float:
         """Calculates the error of the individual."""
-        pass
+        if parameters is DEFAULT_ARGUMENT_DICT:
+            parameters = DEFAULT_ARGUMENT_DICT.copy()
+        return 0.0
 
     @abstractmethod
-    def population_err(self, graph: Graph, population: Population, parameters: Dict[str, Any] = None) -> float:
+    def population_err(
+        self,
+        graph: Graph,
+        population: Population,
+        parameters: dict = DEFAULT_ARGUMENT_DICT,
+    ) -> float:
         """Calculates the population error."""
-        pass
+        if parameters is DEFAULT_ARGUMENT_DICT:
+            parameters = DEFAULT_ARGUMENT_DICT.copy()
+        return 0.0

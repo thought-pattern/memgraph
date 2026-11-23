@@ -188,15 +188,11 @@ class Properties:
     A collection of properties either on a `Vertex` or an `Edge`.
     """
 
-    __slots__ = (
-        "_vertex_or_edge",
-        "_len",
-    )
+    __slots__ = ("_vertex_or_edge",)
 
     def __init__(self, vertex_or_edge):
         if not isinstance(vertex_or_edge, (_mgp.Vertex, _mgp.Edge)):
             raise TypeError("Expected '_mgp.Vertex' or '_mgp.Edge', got {}".format(type(vertex_or_edge)))
-        self._len = None
         self._vertex_or_edge = vertex_or_edge
 
     def __deepcopy__(self, memo):
@@ -369,9 +365,7 @@ class Properties:
         """
         if not self._vertex_or_edge.is_valid():
             raise InvalidContextError()
-        if self._len is None:
-            self._len = sum(1 for item in self.items())
-        return self._len
+        return sum(1 for _ in self.items())
 
     def __iter__(self) -> typing.Iterable[str]:
         """
@@ -1048,6 +1042,8 @@ class Path:
 
     @property
     def length(self) -> int:
+        if not self.is_valid():
+            raise InvalidContextError()
         return self._path.size()
 
 
@@ -1064,13 +1060,12 @@ class Record:
 class Vertices:
     """Iterable over vertices in a graph."""
 
-    __slots__ = ("_graph", "_len")
+    __slots__ = ("_graph",)
 
     def __init__(self, graph):
         if not isinstance(graph, _mgp.Graph):
             raise TypeError("Expected '_mgp.Graph', got '{}'".format(type(graph)))
         self._graph = graph
-        self._len = None
 
     def __deepcopy__(self, memo):
         # This is the same as the shallow copy, because we want to share the
@@ -1136,6 +1131,12 @@ class Vertices:
         Examples:
             ```if vertex in graph.vertices:```
         """
+        if not self.is_valid():
+            raise InvalidContextError()
+        if not isinstance(vertex, Vertex):
+            raise TypeError("Expected 'mgp.Vertex', got '{}'".format(type(vertex)))
+        if not vertex.is_valid():
+            raise InvalidContextError()
         try:
             _ = self._graph.get_vertex_by_id(vertex.id)
             return True
@@ -1156,9 +1157,9 @@ class Vertices:
         Examples:
             ```len(graph.vertices)```
         """
-        if not self._len:
-            self._len = sum(1 for _ in self)
-        return self._len
+        if not self.is_valid():
+            raise InvalidContextError()
+        return sum(1 for _ in self)
 
 
 class Graph:
@@ -1610,9 +1611,13 @@ def _typing_to_cypher_type(type_):
     except KeyError:
         pass
     if sys.version_info >= (3, 8):
+        union_origins = {typing.Union}
+        union_type = getattr(__import__("types"), "UnionType", None)
+        if union_type is not None:
+            union_origins.add(union_type)
         complex_type = typing.get_origin(type_)
         type_args = typing.get_args(type_)
-        if complex_type == typing.Union:
+        if complex_type in union_origins:
             # If we have a Union with NoneType inside, it means we are building
             # a nullable type.
             # isinstance doesn't work here because subscripted generics cannot
@@ -1630,7 +1635,7 @@ def _typing_to_cypher_type(type_):
                     # so Union.__getitem__(types) raises a descriptor TypeError.
                     type_arg = typing.Union[types]
                 return _mgp.type_nullable(_typing_to_cypher_type(type_arg))
-        elif complex_type == list:
+        elif complex_type == list and len(type_args) == 1:
             (type_arg,) = type_args
             return _mgp.type_list(_typing_to_cypher_type(type_arg))
         raise UnsupportedTypingError(type_)
@@ -1724,49 +1729,56 @@ def _is_typing_same(type1_, type2_):
         Point3d: 20,
         Enum: 21,
     }
-    try:
-        return simple_types[type1_] == simple_types[type2_]
-    except KeyError:
-        pass
+    if type1_ in simple_types or type2_ in simple_types:
+        return simple_types.get(type1_) == simple_types.get(type2_)
 
     if sys.version_info < (3, 8):
-        # skip type checks
-        return True
+        return type1_ == type2_
+
+    union_origins = {typing.Union}
+    union_type = getattr(__import__("types"), "UnionType", None)
+    if union_type is not None:
+        union_origins.add(union_type)
 
     complex_type1 = typing.get_origin(type1_)
-    type_args1 = typing.get_args(type2_)
+    type_args1 = typing.get_args(type1_)
 
-    complex_type2 = typing.get_origin(type1_)
+    complex_type2 = typing.get_origin(type2_)
     type_args2 = typing.get_args(type2_)
 
-    if complex_type2 != complex_type1:
+    if complex_type1 in union_origins:
+        complex_type1 = typing.Union
+    if complex_type2 in union_origins:
+        complex_type2 = typing.Union
+
+    if complex_type1 is None or complex_type2 is None or complex_type2 != complex_type1:
         raise UnequalTypesError(type1_, type2_)
 
     if complex_type1 == typing.Union:
         contains_none_arg1 = type(None) in type_args1
         contains_none_arg2 = type(None) in type_args2
 
-        if contains_none_arg1 != contains_none_arg2:
+        if contains_none_arg1 != contains_none_arg2 or not contains_none_arg1:
             raise UnequalTypesError(type1_, type2_)
 
-        if contains_none_arg1:
-            types1 = tuple(t for t in type_args1 if t is not type(None))  # noqa E721
-            types2 = tuple(t for t in type_args2 if t is not type(None))  # noqa E721
-            if len(types1) != len(types2):
-                raise UnequalTypesError(types1, types2)
-            if len(types1) == 1:
-                (type_arg1,) = types1
-                (type_arg2,) = types2
-            else:
-                type_arg1 = typing.Union[types1]
-                type_arg2 = typing.Union[types2]
-            return _is_typing_same(type_arg1, type_arg2)
-    elif complex_type1 == list:
+        types1 = tuple(t for t in type_args1 if t is not type(None))  # noqa E721
+        types2 = tuple(t for t in type_args2 if t is not type(None))  # noqa E721
+        if len(types1) != len(types2):
+            raise UnequalTypesError(types1, types2)
+        if len(types1) == 1:
+            (type_arg1,) = types1
+            (type_arg2,) = types2
+        else:
+            type_arg1 = typing.Union[types1]
+            type_arg2 = typing.Union[types2]
+        return _is_typing_same(type_arg1, type_arg2)
+    if complex_type1 == list:
+        if len(type_args1) != 1 or len(type_args2) != 1:
+            raise UnequalTypesError(type1_, type2_)
         (type_arg1,) = type_args1
         (type_arg2,) = type_args2
         return _is_typing_same(type_arg1, type_arg2)
-    # skip type checks
-    return True
+    raise UnsupportedTypingError(type1_)
 
 
 # Procedure registration
@@ -1932,6 +1944,9 @@ def _register_batch_proc(
     func: typing.Callable[..., Record], initializer: typing.Callable, cleanup: typing.Callable, is_write: bool
 ):
     raise_if_does_not_meet_requirements(func)
+    raise_if_does_not_meet_requirements(initializer)
+    if not callable(cleanup):
+        raise TypeError("Expected a callable object, got an instance of '{}'".format(type(cleanup)))
     register_func = _mgp.Module.add_batch_write_procedure if is_write else _mgp.Module.add_batch_read_procedure
     func_sig = inspect.signature(func)
     func_params = tuple(func_sig.parameters.values())
@@ -1939,18 +1954,48 @@ def _register_batch_proc(
     initializer_sig = inspect.signature(initializer)
     initializer_params = tuple(initializer_sig.parameters.values())
 
-    assert (
-        func_params and initializer_params or not func_params and not initializer_params
-    ), "Both function params and initializer params must exist or not exist"
+    if len(func_params) != len(initializer_params):
+        raise TypeError("Number of params must be same")
 
-    assert len(func_params) == len(initializer_params), "Number of params must be same"
+    if initializer_sig.return_annotation not in (initializer_sig.empty, None):
+        raise TypeError("Initializer can't return anything")
 
-    assert initializer_sig.return_annotation is initializer_sig.empty, "Initializer can't return anything"
+    func_has_ctx = bool(func_params) and func_params[0].annotation is ProcCtx
+    init_has_ctx = bool(initializer_params) and initializer_params[0].annotation is ProcCtx
+    if func_has_ctx != init_has_ctx:
+        raise TypeError("Both function and initializer must either both have mgp.ProcCtx as first parameter or neither")
 
-    if func_params and func_params[0].annotation is ProcCtx:
-        assert (
-            initializer_params and initializer_params[0].annotation is ProcCtx
-        ), "Initializer must have mgp.ProcCtx as first parameter"
+    checked_func_params = func_params[1:] if func_has_ctx else func_params
+    checked_init_params = initializer_params[1:] if init_has_ctx else initializer_params
+
+    validated_args = []
+    for func_param, initializer_param in zip(checked_func_params, checked_init_params):
+        func_param_name = func_param.name
+        func_param_type_ = func_param.annotation
+        if func_param_type_ is func_param.empty:
+            func_param_type_ = object
+        initializer_param_type_ = initializer_param.annotation
+        if initializer_param.annotation is initializer_param.empty:
+            initializer_param_type_ = object
+
+        if not _is_typing_same(func_param_type_, initializer_param_type_):
+            raise UnequalTypesError(func_param_type_, initializer_param_type_)
+
+        func_cypher_type = _typing_to_cypher_type(func_param_type_)
+        validated_args.append((func_param_name, func_cypher_type, func_param.default, func_param.empty))
+
+    validated_results = []
+    if func_sig.return_annotation is not func_sig.empty:
+        record = func_sig.return_annotation
+        if not isinstance(record, Record):
+            raise TypeError("Expected '{}' to return 'mgp.Record', got '{}'".format(func.__name__, type(record)))
+        for name, type_ in record.fields.items():
+            if isinstance(type_, Deprecated):
+                validated_results.append((name, _typing_to_cypher_type(type_.field_type), True))
+            else:
+                validated_results.append((name, _typing_to_cypher_type(type_), False))
+
+    if func_has_ctx:
 
         @wraps(func)
         def wrapper_func(graph, args):
@@ -1960,9 +2005,6 @@ def _register_batch_proc(
         def wrapper_initializer(graph, args):
             return initializer(ProcCtx(graph), *args)
 
-        func_params = func_params[1:]
-        initializer_params = initializer_params[1:]
-        mgp_proc = register_func(_mgp._MODULE, wrapper_func, wrapper_initializer, cleanup)
     else:
 
         @wraps(func)
@@ -1973,36 +2015,17 @@ def _register_batch_proc(
         def wrapper_initializer(graph, args):
             return initializer(*args)
 
-        mgp_proc = register_func(_mgp._MODULE, wrapper_func, wrapper_initializer, cleanup)
-
-    for func_param, initializer_param in zip(func_params, initializer_params):
-        func_param_name = func_param.name
-        func_param_type_ = func_param.annotation
-        if func_param_type_ is func_param.empty:
-            func_param_type_ = object
-        initializer_param_type_ = initializer_param.annotation
-        if initializer_param.annotation is initializer_param.empty:
-            initializer_param_type_ = object
-
-        assert _is_typing_same(
-            func_param_type_, initializer_param_type_
-        ), "Types of initializer and function must be same"
-
-        func_cypher_type = _typing_to_cypher_type(func_param_type_)
-        if func_param.default is func_param.empty:
+    mgp_proc = register_func(_mgp._MODULE, wrapper_func, wrapper_initializer, cleanup)
+    for func_param_name, func_cypher_type, param_default, param_empty in validated_args:
+        if param_default is param_empty:
             mgp_proc.add_arg(func_param_name, func_cypher_type)
         else:
-            mgp_proc.add_opt_arg(func_param_name, func_cypher_type, func_param.default)
-    if func_sig.return_annotation is not func_sig.empty:
-        record = func_sig.return_annotation
-        if not isinstance(record, Record):
-            raise TypeError("Expected '{}' to return 'mgp.Record', got '{}'".format(func.__name__, type(record)))
-        for name, type_ in record.fields.items():
-            if isinstance(type_, Deprecated):
-                cypher_type = _typing_to_cypher_type(type_.field_type)
-                mgp_proc.add_deprecated_result(name, cypher_type)
-            else:
-                mgp_proc.add_result(name, _typing_to_cypher_type(type_))
+            mgp_proc.add_opt_arg(func_param_name, func_cypher_type, param_default)
+    for name, cypher_type, is_deprecated in validated_results:
+        if is_deprecated:
+            mgp_proc.add_deprecated_result(name, cypher_type)
+        else:
+            mgp_proc.add_result(name, cypher_type)
     return func
 
 
@@ -2182,10 +2205,18 @@ def transformation(func: typing.Callable[..., Record]):
     raise_if_does_not_meet_requirements(func)
     sig = inspect.signature(func)
     params = tuple(sig.parameters.values())
-    if not params or not params[0].annotation is Messages:
-        if not len(params) == 2 or not params[1].annotation is Messages:
-            raise NotImplementedError("Valid signatures for transformations are (TransCtx, Messages) or (Messages)")
-    if params[0].annotation is TransCtx:
+    positional_kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    is_messages_only = len(params) == 1 and params[0].kind in positional_kinds and params[0].annotation is Messages
+    is_ctx_and_messages = (
+        len(params) == 2
+        and params[0].kind in positional_kinds
+        and params[1].kind in positional_kinds
+        and params[0].annotation is TransCtx
+        and params[1].annotation is Messages
+    )
+    if not is_messages_only and not is_ctx_and_messages:
+        raise NotImplementedError("Valid signatures for transformations are (TransCtx, Messages) or (Messages)")
+    if is_ctx_and_messages:
 
         @wraps(func)
         def wrapper(graph, messages):
@@ -2295,35 +2326,48 @@ def function(func: typing.Callable):
 
 
 def _wrap_exceptions():
+    native_to_public = (
+        (_mgp.UnknownError, UnknownError),
+        (_mgp.UnableToAllocateError, UnableToAllocateError),
+        (_mgp.InsufficientBufferError, InsufficientBufferError),
+        (_mgp.OutOfRangeError, OutOfRangeError),
+        (_mgp.LogicErrorError, LogicErrorError),
+        (_mgp.DeletedObjectError, DeletedObjectError),
+        (_mgp.InvalidArgumentError, InvalidArgumentError),
+        (_mgp.KeyAlreadyExistsError, KeyAlreadyExistsError),
+        (_mgp.ImmutableObjectError, ImmutableObjectError),
+        (_mgp.ValueConversionError, ValueConversionError),
+        (_mgp.SerializationError, SerializationError),
+        (_mgp.AuthorizationError, AuthorizationError),
+    )
+    native_error_types = tuple(pair[0] for pair in native_to_public)
+
+    def _rethrow_public_error(exc: Exception) -> None:
+        for native_cls, public_cls in native_to_public:
+            if isinstance(exc, native_cls):
+                if isinstance(exc, public_cls):
+                    raise exc
+                raise public_cls(exc)
+        raise exc
+
     def wrap_function(func):
+        if inspect.isgeneratorfunction(func):
+
+            @wraps(func)
+            def wrapped_gen(*args, **kwargs):
+                try:
+                    yield from func(*args, **kwargs)
+                except native_error_types as e:
+                    _rethrow_public_error(e)
+
+            return wrapped_gen
+
         @wraps(func)
         def wrapped_func(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
-            except _mgp.UnknownError as e:
-                raise UnknownError(e)
-            except _mgp.UnableToAllocateError as e:
-                raise UnableToAllocateError(e)
-            except _mgp.InsufficientBufferError as e:
-                raise InsufficientBufferError(e)
-            except _mgp.OutOfRangeError as e:
-                raise OutOfRangeError(e)
-            except _mgp.LogicErrorError as e:
-                raise LogicErrorError(e)
-            except _mgp.DeletedObjectError as e:
-                raise DeletedObjectError(e)
-            except _mgp.InvalidArgumentError as e:
-                raise InvalidArgumentError(e)
-            except _mgp.KeyAlreadyExistsError as e:
-                raise KeyAlreadyExistsError(e)
-            except _mgp.ImmutableObjectError as e:
-                raise ImmutableObjectError(e)
-            except _mgp.ValueConversionError as e:
-                raise ValueConversionError(e)
-            except _mgp.SerializationError as e:
-                raise SerializationError(e)
-            except _mgp.AuthorizationError as e:
-                raise AuthorizationError(e)
+            except native_error_types as e:
+                _rethrow_public_error(e)
 
         return wrapped_func
 

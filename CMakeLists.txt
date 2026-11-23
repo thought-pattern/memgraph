@@ -174,17 +174,46 @@ endif()
 # More details about the contents of the `.git` directory and the specific
 # files used can be seen here:
 # https://git-scm.com/book/en/v2/Git-Internals-Git-References
-set(git_directory "${CMAKE_SOURCE_DIR}/.git")
-# Check for directory because if the repo is cloned as a git submodule, .git is
-# a file and below code doesn't work.
-if (IS_DIRECTORY "${git_directory}")
+set(git_entry "${CMAKE_SOURCE_DIR}/.git")
+set(git_directory "")
+if (IS_DIRECTORY "${git_entry}")
+  set(git_directory "${git_entry}")
+elseif (EXISTS "${git_entry}")
   set_property(DIRECTORY APPEND PROPERTY
-      CMAKE_CONFIGURE_DEPENDS "${git_directory}/HEAD")
-  file(STRINGS "${git_directory}/HEAD" git_head_data)
-  if (git_head_data MATCHES "^ref: ")
-    string(SUBSTRING "${git_head_data}" 5 -1 git_head_ref)
+      CMAKE_CONFIGURE_DEPENDS "${git_entry}")
+  file(STRINGS "${git_entry}" gitfile_lines LIMIT_COUNT 1)
+  if (gitfile_lines MATCHES "^gitdir:[ \t]*(.+)$")
+    get_filename_component(git_directory "${CMAKE_MATCH_1}" ABSOLUTE
+        BASE_DIR "${CMAKE_SOURCE_DIR}")
+  endif()
+endif()
+if (git_directory AND IS_DIRECTORY "${git_directory}")
+  set(git_common_dir "${git_directory}")
+  if (EXISTS "${git_directory}/commondir")
+    file(STRINGS "${git_directory}/commondir" git_commondir_lines LIMIT_COUNT 1)
+    if (git_commondir_lines)
+      get_filename_component(git_common_dir "${git_commondir_lines}" ABSOLUTE
+          BASE_DIR "${git_directory}")
+    endif()
+  endif()
+  if (EXISTS "${git_directory}/HEAD")
     set_property(DIRECTORY APPEND PROPERTY
-        CMAKE_CONFIGURE_DEPENDS "${git_directory}/${git_head_ref}")
+        CMAKE_CONFIGURE_DEPENDS "${git_directory}/HEAD")
+    file(STRINGS "${git_directory}/HEAD" git_head_data LIMIT_COUNT 1)
+    if (git_head_data MATCHES "^ref:[ \t]*(.+)$")
+      set(git_head_ref "${CMAKE_MATCH_1}")
+      if (EXISTS "${git_directory}/${git_head_ref}")
+        set_property(DIRECTORY APPEND PROPERTY
+            CMAKE_CONFIGURE_DEPENDS "${git_directory}/${git_head_ref}")
+      elseif (EXISTS "${git_common_dir}/${git_head_ref}")
+        set_property(DIRECTORY APPEND PROPERTY
+            CMAKE_CONFIGURE_DEPENDS "${git_common_dir}/${git_head_ref}")
+      endif()
+    endif()
+  endif()
+  if (EXISTS "${git_common_dir}/packed-refs")
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${git_common_dir}/packed-refs")
   endif()
 endif()
 

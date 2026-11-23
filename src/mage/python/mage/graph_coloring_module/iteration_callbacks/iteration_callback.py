@@ -1,5 +1,6 @@
+"""Utilities for iteration callback."""
+
 from abc import ABC, abstractmethod
-from typing import Any, Dict
 
 from mage.graph_coloring_module.components.population import Population
 from mage.graph_coloring_module.graph import Graph
@@ -19,9 +20,7 @@ class IterationCallback(ABC):
     """
 
     @abstractmethod
-    def update(self, graph: Graph, population: Population, parameters: Dict[str, Any]):
-        pass
+    def update(self, graph: Graph, population: Population, parameters: dict): ...
 
     @abstractmethod
-    def end(self, graph: Graph, population: Population, parameters: Dict[str, Any]):
-        pass
+    def end(self, graph: Graph, population: Population, parameters: dict): ...

@@ -11,14 +11,16 @@
 
 #pragma once
 
+#include <cstdint>
 #include <expected>
+#include <string>
 
 #include "utils/file.hpp"
 
 namespace memgraph::rpc {
 class FileReplicationHandler final {
  public:
-  FileReplicationHandler() = default;
+  FileReplicationHandler();
   ~FileReplicationHandler();
 
   FileReplicationHandler(const FileReplicationHandler &) = delete;
@@ -49,7 +51,9 @@ class FileReplicationHandler final {
   utils::OutputFile file_{utils::OnNoSpace::kReportError};
   uint64_t file_size_{0};
   uint64_t written_{0};
-  // Files part of the current request
+  // Files created by this transfer
   std::vector<std::filesystem::path> paths_;
+  std::vector<std::filesystem::path> staging_dirs_;
+  std::string transfer_subdir_;
 };
 }  // namespace memgraph::rpc

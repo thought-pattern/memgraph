@@ -813,6 +813,11 @@ void Path::Combine(mgp_list *args, mgp_func_context * /*ctx*/, mgp_func_result *
     auto path1{arguments[0].ValuePath()};
     const auto path2{arguments[1].ValuePath()};
 
+    if (path1.GetNodeAt(path1.Length()) != path2.GetNodeAt(0)) {
+      throw mgp::ValueException(
+          "Cannot combine paths: the second path must start at the node where the first path ends.");
+    }
+
     for (size_t i = 0; i < path2.Length(); ++i) {
       // Expand will throw an exception if it can't connect
       path1.Expand(path2.GetRelationshipAt(i));
@@ -903,21 +908,15 @@ void Path::Create(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result,
       const auto rel = relationship.ValueRelationship();
       auto last_node = path.GetNodeAt(path.Length());
 
-      bool endpoint_is_from = false;
-
-      if (last_node.Id() == rel.From().Id()) {
-        endpoint_is_from = true;
+      if (last_node.Id() != rel.From().Id()) {
+        break;
       }
 
-      auto contains = [](mgp::Relationships relationships, const mgp::Id id) {
-        // NOLINTNEXTLINE(modernize-use-ranges,boost-use-ranges)
-        return std::any_of(relationships.begin(), relationships.end(), [&id](const auto &relationship) {
-          return relationship.To().Id() == id;
-        });
-      };
-
-      if ((endpoint_is_from && !contains(rel.From().OutRelationships(), rel.To().Id())) ||
-          (!endpoint_is_from && !contains(rel.To().OutRelationships(), rel.From().Id()))) {
+      auto out_rels = last_node.OutRelationships();
+      // NOLINTNEXTLINE(modernize-use-ranges,boost-use-ranges)
+      const bool has_rel = std::any_of(
+          out_rels.begin(), out_rels.end(), [&rel](const auto &candidate) { return candidate.Id() == rel.Id(); });
+      if (!has_rel) {
         break;
       }
 
@@ -979,6 +978,9 @@ void Path::PathExpand::ExpandFromRelationships(mgp::Path &path, mgp_vertex *vert
   const bool node_keyed = IsNodeUniqueness(path_data_.helper_.GetUniqueness());
   const RelStep &step = path_data_.helper_.RelStepAt(path_size);
   const bool admits_every_type = PathHelper::AdmitsEveryType(step, outgoing);
+  const int64_t current_id = mgp::vertex_get_id(vertex).as_int;
+  const bool incoming_admitted_at_step = path_data_.helper_.StepAdmitsDirection(path_size, false);
+  const bool incoming_admits_every = incoming_admitted_at_step && PathHelper::AdmitsEveryType(step, false);
 
   const BorrowedEdges edges{vertex, outgoing};
   for (auto *edge = edges.First(); edge != nullptr; edge = edges.Next()) {
@@ -989,13 +991,19 @@ void Path::PathExpand::ExpandFromRelationships(mgp::Path &path, mgp_vertex *vert
     // supernode's whole adjacency list is uninterruptible.
     path_data_.MaybeAbort();
 
+    const char *edge_type = mgp::edge_get_type(edge).name;
     // Only the type name is needed here; everything below this copies.
-    if (!admits_every_type && !PathHelper::RelationshipAdmitted(step, mgp::edge_get_type(edge).name, outgoing)) {
+    if (!admits_every_type && !PathHelper::RelationshipAdmitted(step, edge_type, outgoing)) {
       continue;
     }
 
     auto *next_vertex = outgoing ? mgp::edge_get_to(edge) : mgp::edge_get_from(edge);
-    const int64_t uniqueness_key = node_keyed ? mgp::vertex_get_id(next_vertex).as_int : mgp::edge_get_id(edge).as_int;
+    const int64_t next_id = mgp::vertex_get_id(next_vertex).as_int;
+    if (outgoing && next_id == current_id && incoming_admitted_at_step &&
+        (incoming_admits_every || PathHelper::RelationshipAdmitted(step, edge_type, false))) {
+      continue;
+    }
+    const int64_t uniqueness_key = node_keyed ? next_id : mgp::edge_get_id(edge).as_int;
     if (path_data_.visited_.contains(uniqueness_key)) {
       continue;
     }
@@ -1299,6 +1307,8 @@ const std::vector<Path::PathExpand::AdmittedEdge> &Path::PathExpand::AdmittedNei
 
   const RelStep &step = path_data_.helper_.RelStepAt(depth);
   const bool admits_every_type = PathHelper::AdmitsEveryType(step, outgoing);
+  const bool incoming_admitted_at_step = path_data_.helper_.StepAdmitsDirection(depth, false);
+  const bool incoming_admits_every = incoming_admitted_at_step && PathHelper::AdmitsEveryType(step, false);
   // Reused, so first asks do not allocate.
   std::vector<AdmittedEdge> &admitted = scratch_;
   admitted.clear();
@@ -1308,13 +1318,18 @@ const std::vector<Path::PathExpand::AdmittedEdge> &Path::PathExpand::AdmittedNei
     // supernode's whole adjacency list is uninterruptible.
     path_data_.MaybeAbort();
 
+    const char *edge_type = mgp::edge_get_type(edge).name;
     // Only the type name is needed here; everything below this copies.
-    if (!admits_every_type && !PathHelper::RelationshipAdmitted(step, mgp::edge_get_type(edge).name, outgoing)) {
+    if (!admits_every_type && !PathHelper::RelationshipAdmitted(step, edge_type, outgoing)) {
       continue;
     }
 
     auto *next_vertex = outgoing ? mgp::edge_get_to(edge) : mgp::edge_get_from(edge);
     const int64_t next_id = mgp::vertex_get_id(next_vertex).as_int;
+    if (outgoing && next_id == node_id && incoming_admitted_at_step &&
+        (incoming_admits_every || PathHelper::RelationshipAdmitted(step, edge_type, false))) {
+      continue;
+    }
     const int64_t relationship_id = mgp::edge_get_id(edge).as_int;
     relationships_.Emplace(relationship_id, edge);
     const mgp::Node &next_node = nodes_.Emplace(next_id, next_vertex);
@@ -1592,6 +1607,9 @@ mgp::List Path::PathSubgraph::BFS() {
 
     const Evaluation evaluation = path_data_.helper_.Evaluate(pair.first, pair.second);
     TryInsertNode(pair.first, pair.second, evaluation);
+    if (path_data_.LimitReached()) {
+      break;
+    }
     if (!evaluation.expand || std::cmp_greater(pair.second + 1, path_data_.helper_.MaxHops())) {
       continue;
     }

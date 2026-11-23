@@ -1,37 +1,56 @@
-from collections import defaultdict
-from typing import Any, Dict, Optional
+"""Utilities for graph coloring."""
 
-import mage.graph_coloring_module
-import mgp
-from mage.graph_coloring_module import Graph, IncorrectParametersException, Parameter
+from mgp import (
+    Edge as mgp_Edge,
+    List as mgp_List,
+    Map as mgp_Map,
+    ProcCtx as mgp_ProcCtx,
+    Record as mgp_Record,
+    Vertex as mgp_Vertex,
+    read_proc as mgp_read_proc,
+)
+
+from mage.graph_coloring_module.graph import Graph
+from mage.graph_coloring_module.parameter_boundary import normalize_parameters
+from mage.graph_coloring_module.parameters import Parameter
+
+DEFAULT_ARGUMENT_DICT = {}
 
 
-@mgp.read_proc
 def color_graph(
-    context: mgp.ProcCtx, parameters: mgp.Map = {}, edge_property: str = "weight"
-) -> mgp.Record(node=mgp.Vertex, color=int):
+    context: mgp_ProcCtx,
+    parameters: mgp_Map = DEFAULT_ARGUMENT_DICT,
+    edge_property: str = "weight",
+) -> list:
     """
     Example:
     CALL graph_coloring.color_graph() YIELD *;
     """
-    parameters = _get_parameters(parameters)
-    graph = _convert_to_graph(context, edge_property)
-    algorithm = parameters[Parameter.ALGORITHM]
-    solution = algorithm.run(graph, parameters)
-    return [
-        mgp.Record(node=context.graph.get_vertex_by_id(graph.label(node)), color=color)
+    if parameters is DEFAULT_ARGUMENT_DICT:
+        parameters = DEFAULT_ARGUMENT_DICT.copy()
+    parameters = normalize_parameters(dict(parameters))
+    nodes, adj_list = graph_adjacency(context, edge_property)
+    graph = Graph(nodes, adj_list)
+    algorithm = parameters.get(Parameter.ALGORITHM, False)
+    solution = algorithm.run(graph, parameters, abort_check=context.check_must_abort)
+    computed_return_value = [
+        mgp_Record(node=context.graph.get_vertex_by_id(graph.label(node)), color=color)
         for node, color in enumerate(solution.chromosome)
     ]
+    return computed_return_value
 
 
-@mgp.read_proc
+color_graph.__annotations__["return"] = mgp_Record(node=mgp_Vertex, color=int)
+color_graph = mgp_read_proc(color_graph)
+
+
 def color_subgraph(
-    context: mgp.ProcCtx,
-    vertices: mgp.List[mgp.Vertex],
-    edges: mgp.List[mgp.Edge],
-    parameters: mgp.Map = {},
+    context: mgp_ProcCtx,
+    vertices: mgp_List[mgp_Vertex],
+    edges: mgp_List[mgp_Edge],
+    parameters: mgp_Map = DEFAULT_ARGUMENT_DICT,
     edge_property: str = "weight",
-) -> mgp.Record(node=mgp.Vertex, color=int):
+) -> list:
     """
     Example:
     MATCH (a:Cell)-[e:CLOSE_TO]->(b:Cell)
@@ -40,83 +59,28 @@ def color_subgraph(
     YIELD color, node
     RETURN color, node;
     """
-    parameters = _get_parameters(parameters)
-    graph = _convert_to_subgraph(context, vertices, edges, edge_property)
-    algorithm = parameters[Parameter.ALGORITHM]
-    solution = algorithm.run(graph, parameters)
-    return [
-        mgp.Record(node=context.graph.get_vertex_by_id(graph.label(node)), color=color)
+    if parameters is DEFAULT_ARGUMENT_DICT:
+        parameters = DEFAULT_ARGUMENT_DICT.copy()
+    parameters = normalize_parameters(dict(parameters))
+    nodes, adj_list = subgraph_adjacency(context, vertices, edges, edge_property)
+    graph = Graph(nodes, adj_list)
+    algorithm = parameters.get(Parameter.ALGORITHM, False)
+    solution = algorithm.run(graph, parameters, abort_check=context.check_must_abort)
+    computed_return_value = [
+        mgp_Record(node=context.graph.get_vertex_by_id(graph.label(node)), color=color)
         for node, color in enumerate(solution.chromosome)
     ]
+    return computed_return_value
 
 
-def _str2Class(name: str):
-    if name not in dir(mage.graph_coloring_module):
-        raise IncorrectParametersException(f"Parameter {name} is incorrect.")
-    return getattr(mage.graph_coloring_module, name)
+color_subgraph.__annotations__["return"] = mgp_Record(node=mgp_Vertex, color=int)
+color_subgraph = mgp_read_proc(color_subgraph)
 
 
-def _map_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
-    for key in parameters:
-        if isinstance(parameters[key], str):
-            parameters[key] = _str2Class(parameters[key])()
-        if isinstance(parameters[key], tuple) or isinstance(parameters[key], list):
-            new_list = []
-            for val in parameters[key]:
-                if isinstance(val, str):
-                    new_list.append(_str2Class(val)())
-                else:
-                    new_list.append(val)
-            parameters[key] = new_list
-    return parameters
-
-
-def _get_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
-    params = _map_parameters(
-        {
-            Parameter.ALGORITHM: parameters.get(Parameter.ALGORITHM.value, "QA"),
-            Parameter.NO_OF_COLORS: parameters.get(Parameter.NO_OF_COLORS.value, 10),
-            Parameter.NO_OF_PROCESSES: parameters.get(Parameter.NO_OF_PROCESSES.value, 1),
-            Parameter.POPULATION_SIZE: parameters.get(Parameter.POPULATION_SIZE.value, 15),
-            Parameter.INIT_ALGORITHMS: parameters.get(Parameter.INIT_ALGORITHMS.value, ["SDO", "LDO"]),
-            Parameter.POPULATION_FACTORY: parameters.get(Parameter.POPULATION_FACTORY.value, "ChainChunkFactory"),
-            Parameter.ERROR: parameters.get(Parameter.ERROR.value, "ConflictError"),
-            Parameter.MAX_ITERATIONS: parameters.get(Parameter.MAX_ITERATIONS.value, 10),
-            Parameter.ITERATION_CALLBACKS: parameters.get(Parameter.ITERATION_CALLBACKS.value, []),
-            Parameter.COMMUNICATION_DALAY: parameters.get(Parameter.COMMUNICATION_DALAY.value, 10),
-            Parameter.LOGGING_DELAY: parameters.get(Parameter.LOGGING_DELAY.value, 10),
-            Parameter.QA_TEMPERATURE: parameters.get(Parameter.QA_TEMPERATURE.value, 0.035),
-            Parameter.QA_MAX_STEPS: parameters.get(Parameter.QA_MAX_STEPS.value, 10),
-            Parameter.CONFLICT_ERR_ALPHA: parameters.get(Parameter.CONFLICT_ERR_ALPHA.value, 0.1),
-            Parameter.CONFLICT_ERR_BETA: parameters.get(Parameter.CONFLICT_ERR_BETA.value, 0.001),
-            Parameter.MUTATION: parameters.get(Parameter.MUTATION.value, "SimpleMutation"),
-            Parameter.MULTIPLE_MUTATION_NODES_NO_OF_NODES: parameters.get(
-                Parameter.MULTIPLE_MUTATION_NODES_NO_OF_NODES.value, 2
-            ),
-            Parameter.RANDOM_MUTATION_PROBABILITY: parameters.get(Parameter.RANDOM_MUTATION_PROBABILITY.value, 0.1),
-            Parameter.SIMPLE_TUNNELING_MUTATION: parameters.get(
-                Parameter.SIMPLE_TUNNELING_MUTATION.value, "MultipleMutation"
-            ),
-            Parameter.SIMPLE_TUNNELING_PROBABILITY: parameters.get(Parameter.SIMPLE_TUNNELING_PROBABILITY.value, 0.5),
-            Parameter.SIMPLE_TUNNELING_ERROR_CORRECTION: parameters.get(
-                Parameter.SIMPLE_TUNNELING_ERROR_CORRECTION.value, 2
-            ),
-            Parameter.SIMPLE_TUNNELING_MAX_ATTEMPTS: parameters.get(Parameter.SIMPLE_TUNNELING_MAX_ATTEMPTS.value, 25),
-            Parameter.CONVERGENCE_CALLBACK_TOLERANCE: parameters.get(
-                Parameter.CONVERGENCE_CALLBACK_TOLERANCE.value, 500
-            ),
-            Parameter.CONVERGENCE_CALLBACK_ACTIONS: parameters.get(
-                Parameter.CONVERGENCE_CALLBACK_ACTIONS.value, ["SimpleTunneling"]
-            ),
-        }
-    )
-
-    return params
-
-
-def _convert_to_graph(context: mgp.ProcCtx, edge_property: str) -> Graph:
+def graph_adjacency(context: mgp_ProcCtx, edge_property: str) -> tuple[list, dict]:
+    """Returns the graph's vertex ids and undirected weighted adjacency (edge_property, default weight 1)."""
     nodes = []
-    adj_list = defaultdict(list)
+    adj_list = {}
 
     for v in context.graph.vertices:
         context.check_must_abort()
@@ -126,22 +90,24 @@ def _convert_to_graph(context: mgp.ProcCtx, edge_property: str) -> Graph:
         context.check_must_abort()
         for e in v.out_edges:
             weight = e.properties.get(edge_property, 1)
-            adj_list[e.from_vertex.id].append((e.to_vertex.id, weight))
-            adj_list[e.to_vertex.id].append((e.from_vertex.id, weight))
+            adj_list.setdefault(e.from_vertex.id, []).append((e.to_vertex.id, weight))
+            adj_list.setdefault(e.to_vertex.id, []).append((e.from_vertex.id, weight))
 
-    return Graph(nodes, adj_list)
+    adjacency = (nodes, adj_list)
+    return adjacency
 
 
-def _convert_to_subgraph(
-    context: mgp.ProcCtx,
-    vertices: mgp.List[mgp.Vertex],
-    edges: mgp.List[mgp.Edge],
+def subgraph_adjacency(
+    context: mgp_ProcCtx,
+    vertices: mgp_List[mgp_Vertex],
+    edges: mgp_List[mgp_Edge],
     edge_property: str,
-) -> Optional[Graph]:
+) -> tuple[list, dict]:
+    """Returns the subgraph's vertex ids (edge endpoints included) and its undirected weighted adjacency."""
     vertices, edges = map(set, [vertices, edges])
 
     nodes = []
-    adj_list = defaultdict(list)
+    adj_list = {}
 
     for v in vertices:
         context.check_must_abort()
@@ -154,7 +120,8 @@ def _convert_to_subgraph(
             nodes.append(e.from_vertex.id)
         if e.to_vertex.id not in nodes:
             nodes.append(e.to_vertex.id)
-        adj_list[e.from_vertex.id].append((e.to_vertex.id, weight))
-        adj_list[e.to_vertex.id].append((e.from_vertex.id, weight))
+        adj_list.setdefault(e.from_vertex.id, []).append((e.to_vertex.id, weight))
+        adj_list.setdefault(e.to_vertex.id, []).append((e.from_vertex.id, weight))
 
-    return Graph(nodes, adj_list)
+    adjacency = (nodes, adj_list)
+    return adjacency

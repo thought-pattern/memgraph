@@ -25,15 +25,17 @@ class MyFixture1 : public benchmark::Fixture {
       mgcxx::text_search::init("todo");
       global_init_done = true;
     }
-    index_path = create_temporary_directory("text_search_index_", "_" + std::to_string(cnt.load())).string();
+    const auto idx = cnt.fetch_add(1);
+    index_path = create_temporary_directory("text_search_index_", "_" + std::to_string(idx)).string();
     auto index_config = mgcxx::text_search::IndexConfig{.mappings = dummy_mappings1().dump()};
     context = std::make_unique<mgcxx::text_search::Context>(mgcxx::text_search::create_index(index_path, index_config));
   }
 
   void TearDown(const ::benchmark::State &state) {
-    // NOTE: Dropping index here produces errors probably because of the
-    // concurrent access. Folder delete under the test.sh script.
-    cnt.fetch_add(1);
+    if (context) {
+      mgcxx::text_search::drop_index(std::move(*context));
+      context.reset();
+    }
   }
 
   std::unique_ptr<mgcxx::text_search::Context> context;
@@ -47,15 +49,17 @@ class MyFixture2 : public benchmark::Fixture {
       mgcxx::text_search::init("todo");
       global_init_done = true;
     }
-    index_path = create_temporary_directory("text_search_index_", "_" + std::to_string(cnt.load())).string();
+    const auto idx = cnt.fetch_add(1);
+    index_path = create_temporary_directory("text_search_index_", "_" + std::to_string(idx)).string();
     auto index_config = mgcxx::text_search::IndexConfig{.mappings = dummy_mappings2().dump()};
     context = std::make_unique<mgcxx::text_search::Context>(mgcxx::text_search::create_index(index_path, index_config));
   }
 
   void TearDown(const ::benchmark::State &state) {
-    // NOTE: Dropping index here produces errors probably because of the
-    // concurrent access. Folder delete under the test.sh script.
-    cnt.fetch_add(1);
+    if (context) {
+      mgcxx::text_search::drop_index(std::move(*context));
+      context.reset();
+    }
   }
 
   std::unique_ptr<mgcxx::text_search::Context> context;

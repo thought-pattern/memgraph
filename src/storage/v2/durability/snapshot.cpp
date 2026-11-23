@@ -446,7 +446,7 @@ std::expected<void, SnapshotCreationError> MultiThreadedWorkflow(
     });
   }
 
-  const auto n_workers = std::min(thread_count, tasks.size());
+  const auto n_workers = std::min(std::max<size_t>(1, thread_count), tasks.size());
   std::vector<memory::DbAwareThread> workers;
   workers.reserve(n_workers);
   for (int i = 0; i < n_workers; ++i) {
@@ -1355,14 +1355,23 @@ LoadPartialConnectivityResult LoadPartialConnectivity(
 
 template <typename TFunc>
 void RecoverOnMultipleThreads(size_t thread_count, const TFunc &func, const std::vector<BatchInfo> &batches) {
+  if (batches.empty()) {
+    return;
+  }
+  const auto effective_threads = std::min(std::max<size_t>(1, thread_count), batches.size());
+  if (effective_threads == 1) {
+    for (size_t batch_index = 0; batch_index < batches.size(); ++batch_index) {
+      func(batch_index, batches[batch_index]);
+    }
+    return;
+  }
   utils::Synchronized<std::optional<RecoveryFailure>, utils::SpinLock> maybe_error{};
   {
     std::atomic<uint64_t> batch_counter = 0;
-    thread_count = std::min(thread_count, batches.size());
     std::vector<memory::DbAwareThread> threads;
-    threads.reserve(thread_count);
+    threads.reserve(effective_threads);
 
-    for (auto i{0U}; i < thread_count; ++i) {
+    for (auto i{0U}; i < effective_threads; ++i) {
       threads.emplace_back([&func, &batches, &maybe_error, &batch_counter]() {
         while (!maybe_error.Lock()->has_value()) {
           const auto batch_index = batch_counter++;

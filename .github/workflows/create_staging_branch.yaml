@@ -11,6 +11,10 @@ on:
         type: boolean
         description: "Base master?"
         default: false
+      workflow_scope:
+        type: string
+        description: "Caller scope to isolate concurrent staging branches across workflows."
+        default: ''
     outputs:
       pr_number:
         description: "PR number."
@@ -52,17 +56,23 @@ jobs:
       - name: Get new branch name
         id: get_branch_name
         run: |
-          # Run the script and read the output into variables
-          read pr_number branch_name commit_sha staging_branch short_sha repo_url repo_owner <<< "$(./tools/ci/external-contributions/get_pr_info.sh "${{ github.event.inputs.pr_number }}" "${{ github.token }}" "${{ inputs.base_master }}")"
+          set -euo pipefail
+          scope="${{ inputs.workflow_scope || format('{0}-{1}', github.run_id, github.run_attempt) }}"
+          pr_info_line="$(./tools/ci/external-contributions/get_pr_info.sh \
+            "${{ inputs.pr_number || github.event.inputs.pr_number }}" \
+            "${{ github.token }}" \
+            "${{ inputs.base_master }}" \
+            "$scope")"
+          read -r pr_number branch_name commit_sha staging_branch short_sha repo_url repo_owner <<< "$pr_info_line"
 
           # Set GitHub output variables
-          echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
-          echo "branch_name=$branch_name" >> $GITHUB_OUTPUT
-          echo "commit_sha=$commit_sha" >> $GITHUB_OUTPUT
-          echo "staging_branch=$staging_branch" >> $GITHUB_OUTPUT
-          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
-          echo "repo_url=$repo_url" >> $GITHUB_OUTPUT
-          echo "repo_owner=$repo_owner" >> $GITHUB_OUTPUT
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "staging_branch=$staging_branch" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "repo_url=$repo_url" >> "$GITHUB_OUTPUT"
+          echo "repo_owner=$repo_owner" >> "$GITHUB_OUTPUT"
 
           # Print variables to logs
           echo "pr_number=$pr_number"
@@ -75,11 +85,12 @@ jobs:
 
       - name: Create staging branch
         run: |
+          set -euo pipefail
           git config user.name "GitHub Actions"
           git config user.email "github-actions@github.com"
 
           ./tools/ci/external-contributions/create_staging_branch.sh \
-            "${{ github.event.inputs.base_master }}" \
+            "${{ inputs.base_master }}" \
             "${{ steps.get_branch_name.outputs.branch_name }}" \
             "${{ steps.get_branch_name.outputs.commit_sha }}" \
             "${{ steps.get_branch_name.outputs.staging_branch }}" \
@@ -87,10 +98,10 @@ jobs:
             "${{ steps.get_branch_name.outputs.repo_owner }}"
 
           echo "Created staging branch: ${{ steps.get_branch_name.outputs.staging_branch }}"
-          echo "Based on PR: #${{ github.event.inputs.pr_number }}"
+          echo "Based on PR: #${{ inputs.pr_number || github.event.inputs.pr_number }}"
           echo "Feature branch: ${{ steps.get_branch_name.outputs.branch_name }}"
           echo "Commit SHA: ${{ steps.get_branch_name.outputs.commit_sha }}"
-          echo "Base master: ${{ github.event.inputs.base_master }}"
+          echo "Base master: ${{ inputs.base_master }}"
 
       - name: Create PR comment
         continue-on-error: true  # NOTE: older branches may not have the code to create this comment

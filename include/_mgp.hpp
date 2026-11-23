@@ -16,6 +16,8 @@
 /// their properties are implemented.
 #pragma once
 
+#include <string_view>
+
 #include "mg_exceptions.hpp"
 #include "mg_procedure.h"
 
@@ -24,6 +26,8 @@ namespace mgp {
 namespace {
 inline void MgExceptionHandle(mgp_error result_code) {
   switch (result_code) {
+    case mgp_error::MGP_ERROR_NO_ERROR:
+      return;
     case mgp_error::MGP_ERROR_UNKNOWN_ERROR:
       throw mg_exception::UnknownException();
     case mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE:
@@ -46,10 +50,12 @@ inline void MgExceptionHandle(mgp_error result_code) {
       throw mg_exception::ValueConversionException();
     case mgp_error::MGP_ERROR_SERIALIZATION_ERROR:
       throw mg_exception::SerializationException();
+    case mgp_error::MGP_ERROR_AUTHORIZATION_ERROR:
+      throw mg_exception::AuthorizationException();
     case mgp_error::MGP_ERROR_NOT_YET_IMPLEMENTED:
       throw mg_exception::NotYetImplementedException();
     default:
-      return;
+      throw mg_exception::UnknownException();
   }
 }
 
@@ -90,6 +96,10 @@ inline mgp_value *value_make_double(double val, mgp_memory *memory) {
 
 inline mgp_value *value_make_string(const char *val, mgp_memory *memory) {
   return MgInvoke<mgp_value *>(mgp_value_make_string, val, memory);
+}
+
+inline mgp_value *value_make_string_with_size(const char *val, size_t size, mgp_memory *memory) {
+  return MgInvoke<mgp_value *>(mgp_value_make_string_with_size, val, size, memory);
 }
 
 inline mgp_value *value_make_list(mgp_list *val) { return MgInvoke<mgp_value *>(mgp_value_make_list, val); }
@@ -155,6 +165,12 @@ inline double value_get_numeric(mgp_value *val) {
 }
 
 inline const char *value_get_string(mgp_value *val) { return MgInvoke<const char *>(mgp_value_get_string, val); }
+
+inline size_t value_get_string_size(mgp_value *val) { return MgInvoke<size_t>(mgp_value_get_string_size, val); }
+
+inline std::string_view value_get_string_view(mgp_value *val) {
+  return std::string_view(value_get_string(val), value_get_string_size(val));
+}
 
 inline mgp_list *value_get_list(mgp_value *val) { return MgInvoke<mgp_list *>(mgp_value_get_list, val); }
 
@@ -369,6 +385,10 @@ inline mgp_vertex *graph_get_vertex_by_id(mgp_graph *g, mgp_vertex_id id, mgp_me
   return MgInvoke<mgp_vertex *>(mgp_graph_get_vertex_by_id, g, id, memory);
 }
 
+inline mgp_value *graph_get_database_uuid(mgp_graph *graph, mgp_memory *memory) {
+  return MgInvoke<mgp_value *>(mgp_graph_get_database_uuid, graph, memory);
+}
+
 // text index
 
 inline bool graph_has_text_index(mgp_graph *graph, const char *index_name) {
@@ -527,19 +547,45 @@ inline void map_insert(mgp_map *map, const char *key, mgp_value *value) {
   MgInvokeVoid(mgp_map_insert, map, key, value);
 }
 
+inline void map_insert_with_size(mgp_map *map, const char *key, size_t key_size, mgp_value *value) {
+  MgInvokeVoid(mgp_map_insert_with_size, map, key, key_size, value);
+}
+
 inline void map_update(mgp_map *map, const char *key, mgp_value *value) {
   MgInvokeVoid(mgp_map_update, map, key, value);
 }
 
+inline void map_update_with_size(mgp_map *map, const char *key, size_t key_size, mgp_value *value) {
+  MgInvokeVoid(mgp_map_update_with_size, map, key, key_size, value);
+}
+
 inline void map_erase(mgp_map *map, const char *key) { MgInvokeVoid(mgp_map_erase, map, key); }
+
+inline void map_erase_with_size(mgp_map *map, const char *key, size_t key_size) {
+  MgInvokeVoid(mgp_map_erase_with_size, map, key, key_size);
+}
 
 inline size_t map_size(mgp_map *map) { return MgInvoke<size_t>(mgp_map_size, map); }
 
 inline mgp_value *map_at(mgp_map *map, const char *key) { return MgInvoke<mgp_value *>(mgp_map_at, map, key); }
 
+inline mgp_value *map_at_with_size(mgp_map *map, const char *key, size_t key_size) {
+  return MgInvoke<mgp_value *>(mgp_map_at_with_size, map, key, key_size);
+}
+
 inline bool key_exists(mgp_map *map, const char *key) { return MgInvoke<int>(mgp_key_exists, map, key); }
 
+inline bool key_exists_with_size(mgp_map *map, const char *key, size_t key_size) {
+  return MgInvoke<int>(mgp_key_exists_with_size, map, key, key_size);
+}
+
 inline const char *map_item_key(mgp_map_item *item) { return MgInvoke<const char *>(mgp_map_item_key, item); }
+
+inline size_t map_item_key_size(mgp_map_item *item) { return MgInvoke<size_t>(mgp_map_item_key_size, item); }
+
+inline std::string_view map_item_key_view(mgp_map_item *item) {
+  return std::string_view(map_item_key(item), map_item_key_size(item));
+}
 
 inline mgp_value *map_item_value(mgp_map_item *item) { return MgInvoke<mgp_value *>(mgp_map_item_value, item); }
 

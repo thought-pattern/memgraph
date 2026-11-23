@@ -24,34 +24,76 @@ for script in "$SCRIPT_DIR"/*.sh; do
     SUPPORTED_OS+=("$name")
 done
 
-# Define toolchain download URLs for supported OS and architectures
-declare -A TOOLCHAIN_URLS=(
-    [x86_64]="https://s3.eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-v8/toolchain-v8-binaries-x86_64.tar.gz"
-    [aarch64]="https://s3.eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-v8/toolchain-v8-binaries-aarch64.tar.gz"
-)
+# Define toolchain download URLs and optional pinned SHA-256 digests for supported Linux architectures
+toolchain_url_for_arch() {
+    case "$1" in
+        x86_64) echo "${MG_TOOLCHAIN_URL_x86_64:-https://s3.eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-v8/toolchain-v8-binaries-x86_64.tar.gz}" ;;
+        aarch64) echo "${MG_TOOLCHAIN_URL_aarch64:-https://s3.eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-v8/toolchain-v8-binaries-aarch64.tar.gz}" ;;
+        *) echo "" ;;
+    esac
+}
 
-# Parse command line arguments to extract --set-os flag
+toolchain_sha256_for_arch() {
+    case "$1" in
+        x86_64) echo "${MG_TOOLCHAIN_SHA256_x86_64:-}" ;;
+        aarch64) echo "${MG_TOOLCHAIN_SHA256_aarch64:-}" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Parse command line arguments to extract --set-os and --toolchain-sha256 flags
 SET_OS=""
+TOOLCHAIN_SHA256_OVERRIDE="${MG_TOOLCHAIN_SHA256:-}"
 ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --set-os)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+                echo "Error: --set-os requires an OS argument (e.g. --set-os ubuntu-24.04)" >&2
+                exit 1
+            fi
             SET_OS="$2"
             shift 2
+            ;;
+        --set-os=*)
+            SET_OS="${1#*=}"
+            if [[ -z "$SET_OS" ]]; then
+                echo "Error: --set-os requires an OS argument (e.g. --set-os=ubuntu-24.04)" >&2
+                exit 1
+            fi
+            shift
+            ;;
+        --toolchain-sha256)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+                echo "Error: --toolchain-sha256 requires a 64-character hex SHA-256 digest" >&2
+                exit 1
+            fi
+            TOOLCHAIN_SHA256_OVERRIDE="$2"
+            shift 2
+            ;;
+        --toolchain-sha256=*)
+            TOOLCHAIN_SHA256_OVERRIDE="${1#*=}"
+            if [[ -z "$TOOLCHAIN_SHA256_OVERRIDE" ]]; then
+                echo "Error: --toolchain-sha256 requires a 64-character hex SHA-256 digest" >&2
+                exit 1
+            fi
+            shift
             ;;
         -h|--help)
             cat <<EOF
 Usage:
-    ./install_deps.sh [command] [dependency_set] [--set-os <os>]
+    ./install_deps.sh [command] [dependency_set] [--set-os <os>] [--toolchain-sha256 <sha256>]
 
 Options:
-    --set-os <os>  Override OS detection and use specified OS.
-                   Supported values: ${SUPPORTED_OS[*]}
+    --set-os <os>              Override OS detection and use specified OS.
+                               Supported values: ${SUPPORTED_OS[*]}
+    --toolchain-sha256 <hash>  Expected SHA-256 digest of the toolchain archive
+                               required when running 'prepare TOOLCHAIN_RUN_DEPS'.
 
 Commands:
-    prepare       Downloads and extracts specified dependencies.
-                  Supported only for TOOLCHAIN_RUN_DEPS.
+    prepare       Downloads, verifies, and extracts specified dependencies.
+                  Supported only for Linux TOOLCHAIN_RUN_DEPS.
     install       Install the specified dependencies.
     check         Check the specified dependencies.
 
@@ -63,7 +105,7 @@ Dependency sets:
     MEMGRAPH_RUN_DEPS        Dependencies required to run a Memgraph package.
 
 Examples:
-    sudo ./install_deps.sh prepare TOOLCHAIN_RUN_DEPS
+    sudo ./install_deps.sh prepare TOOLCHAIN_RUN_DEPS --toolchain-sha256 <sha256>
     sudo ./install_deps.sh check TOOLCHAIN_RUN_DEPS
     sudo ./install_deps.sh install TOOLCHAIN_RUN_DEPS
     sudo ./install_deps.sh check MEMGRAPH_BUILD_DEPS
@@ -84,37 +126,89 @@ EOF
 done
 
 # Set the arguments back to $@ for the rest of the script
-set -- "${ARGS[@]}"
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
 # Function to check and install dependencies for a given distribution script
 run_script() {
-    local distro_script=$1
-    echo "Running script for $@"
-    $SCRIPT_DIR/"$@"
+    local distro_script="$1"
+    shift
+    echo "Running script for $distro_script $*"
+    "$SCRIPT_DIR/$distro_script" "$@"
 }
 
-# New function for 'prepare' command to download and extract the toolchain
+verify_sha256_file() {
+    local expected_hash
+    expected_hash="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    local file_path="$2"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s  %s\n' "$expected_hash" "$file_path" | sha256sum -c -
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s  %s\n' "$expected_hash" "$file_path" | shasum -a 256 -c -
+    else
+        echo "Error: Neither sha256sum nor shasum is installed to verify toolchain archive." >&2
+        return 1
+    fi
+}
+
+# Function for 'prepare' command to download, verify, and extract the Linux toolchain
 prepare_toolchain() {
     local os_arch="$1"
-    local toolchain_arch=$([[ "$(uname -m)" == "aarch64" ]] && echo "aarch64" || echo "x86_64")
-    local toolchain_url="${TOOLCHAIN_URLS[$toolchain_arch]}"
-
-    if [ -z "$toolchain_url" ]; then
-        echo "No toolchain URL found for $os_arch. Please ensure your OS and architecture are supported."
+    if [[ "$os_arch" == freebsd-* || ( -z "$SET_OS" && "$(uname -s)" != "Linux" ) ]]; then
+        echo "Error: Bundled Linux toolchain preparation is not supported on '$os_arch' (host kernel: $(uname -s))." >&2
         exit 1
     fi
 
-    echo "Setting up toolchain for $os_arch..."
-    curl -fL --proto '=https' --proto-redir '=https' "$toolchain_url" --output /tmp/toolchain.tar.gz || {
-        echo "Failed to download toolchain. Please check your internet connection or the URL and try again."
-        exit 1
-    }
+    local raw_arch
+    raw_arch="$(uname -m)"
+    local toolchain_arch=""
+    case "$raw_arch" in
+        x86_64) toolchain_arch="x86_64" ;;
+        aarch64) toolchain_arch="aarch64" ;;
+        *)
+            echo "Error: Unsupported architecture '$raw_arch' for toolchain preparation on '$os_arch' (supported: x86_64, aarch64)." >&2
+            exit 1
+            ;;
+    esac
 
-    echo "Extracting toolchain to /opt..."
-    tar xzvf /tmp/toolchain.tar.gz -C /opt && rm -f /tmp/toolchain.tar.gz || {
-        echo "Failed to extract toolchain. Please check the archive and your permissions."
+    local toolchain_url
+    toolchain_url="$(toolchain_url_for_arch "$toolchain_arch")"
+    if [ -z "$toolchain_url" ]; then
+        echo "No toolchain URL found for $os_arch ($toolchain_arch). Please ensure your OS and architecture are supported." >&2
         exit 1
-    }
+    fi
+
+    local expected_sha256="${TOOLCHAIN_SHA256_OVERRIDE:-$(toolchain_sha256_for_arch "$toolchain_arch")}"
+    if [[ ! "$expected_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "Error: A valid 64-character hex SHA-256 digest is required to verify '$toolchain_url' (pass --toolchain-sha256 <sha256> or set MG_TOOLCHAIN_SHA256)." >&2
+        exit 1
+    fi
+
+    local dest_dir="${MG_TOOLCHAIN_DEST_DIR:-/opt}"
+    (
+        set -euo pipefail
+        local tmp_dir
+        tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/memgraph-toolchain.XXXXXX")"
+        trap 'rm -rf "$tmp_dir"' EXIT
+        local archive_path="$tmp_dir/toolchain.tar.gz"
+
+        echo "Setting up toolchain for $os_arch ($toolchain_arch)..."
+        curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 "$toolchain_url" --output "$archive_path" || {
+            echo "Failed to download toolchain. Please check your internet connection or the URL and try again." >&2
+            exit 1
+        }
+
+        echo "Verifying toolchain archive SHA-256 digest..."
+        verify_sha256_file "$expected_sha256" "$archive_path" || {
+            echo "Failed to verify toolchain SHA-256 digest; refusing to extract archive." >&2
+            exit 1
+        }
+
+        echo "Extracting toolchain to $dest_dir..."
+        tar xzvf "$archive_path" -C "$dest_dir" || {
+            echo "Failed to extract toolchain. Please check the archive and your permissions." >&2
+            exit 1
+        }
+    ) || exit 1
 
     echo "Toolchain setup complete."
 }

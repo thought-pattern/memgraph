@@ -296,11 +296,15 @@ class Session final {
             // OpenSSL wants to perform some kind of handshake, we need to
             // ensure that there is data available for the next call to
             // `SSL_write`.
-            socket_.WaitForReadyRead();
+            if (!socket_.WaitForReadyRead()) {
+              return false;
+            }
           } else if (err == SSL_ERROR_WANT_WRITE) {
             // The socket probably returned WOULDBLOCK and we need to wait for
             // the output buffers to clear and reattempt the send.
-            socket_.WaitForReadyWrite();
+            if (!socket_.WaitForReadyWrite()) {
+              return false;
+            }
           } else {
             // This is a fatal error.
             return false;

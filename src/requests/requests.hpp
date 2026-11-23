@@ -54,6 +54,8 @@ bool RequestPostJson(const std::string &url, const nlohmann::json &data, int tim
 enum class DownloadFailure : uint8_t {
   /// Could not reach the server, or lost it part way through.
   Network,
+  /// Permanent local or request configuration problem (malformed URL, unsupported scheme, invalid CA file).
+  Configuration,
   /// The server refused the request as written, and will keep refusing it.
   HttpClientError,
   /// The server turned this attempt away but invited another, such as while it is rate limiting.
@@ -150,5 +152,8 @@ auto DownloadToStream(std::string_view url, std::ostream &os) -> bool;
  * @return std::stringstream containing the content of the fetched file
  */
 auto UrlToStringStream(std::string_view url) -> std::stringstream;
+
+/// Strip embedded credentials and query/fragment tokens from a URL before writing it to logs or error messages.
+auto RedactUrlForLog(std::string_view url) -> std::string;
 
 }  // namespace memgraph::requests

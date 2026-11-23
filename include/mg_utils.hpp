@@ -269,7 +269,7 @@ inline void InsertStringValueResult(mgp_result_record *record, const char *field
 
 /// Inserts an integer of value int_value to the field field_name of
 /// the record mgp_result_record record.
-inline void InsertIntValueResult(mgp_result_record *record, const char *field_name, const int int_value,
+inline void InsertIntValueResult(mgp_result_record *record, const char *field_name, const std::int64_t int_value,
                                  mgp_memory *memory) {
   auto value = mgp::value_make_int(int_value, memory);
   InsertRecord(record, field_name, value);
@@ -307,8 +307,8 @@ inline void InsertListValueResult(mgp_result_record *record, const char *field_n
 /// @param graph
 /// @param memory
 /// @return
-inline mgp_vertex *GetNodeForInsertion(const int node_id, mgp_graph *graph, mgp_memory *memory) {
-  auto *vertex = mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = static_cast<int64_t>(node_id)}, memory);
+inline mgp_vertex *GetNodeForInsertion(const std::int64_t node_id, mgp_graph *graph, mgp_memory *memory) {
+  auto *vertex = mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = node_id}, memory);
   if (!vertex && mgp::graph_is_transactional(graph)) {
     throw mg_exception::InvalidIDException();
   }
@@ -319,7 +319,7 @@ inline mgp_vertex *GetNodeForInsertion(const int node_id, mgp_graph *graph, mgp_
 /// the node to the field field_name of the record mgp_result_record record.
 /// Returns true is insert is successful, false otherwise
 inline bool InsertNodeValueResult(mgp_graph *graph, mgp_result_record *record, const char *field_name,
-                                  const int node_id, mgp_memory *memory) {
+                                  const std::int64_t node_id, mgp_memory *memory) {
   auto *vertex = mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = node_id}, memory);
   if (!vertex) {
     return false;
@@ -340,7 +340,26 @@ inline void InsertRelationshipValueResult(mgp_result_record *record, const char 
 /// insert the edge to the field field_name of the record mgp_result_record
 /// record.
 inline void InsertRelationshipValueResult(mgp_graph *graph, mgp_result_record *record, const char *field_name,
-                                          const int edge_id, mgp_memory *memory);
+                                          const std::int64_t edge_id, mgp_memory *memory) {
+  auto *vertices_it = mgp::graph_iter_vertices(graph, memory);
+  mg_utility::OnScopeExit delete_vertices_it([&vertices_it] { mgp::vertices_iterator_destroy(vertices_it); });
+  for (auto *source = mgp::vertices_iterator_get(vertices_it); source != nullptr;
+       source = mgp::vertices_iterator_next(vertices_it)) {
+    auto *edges_it = mgp::vertex_iter_out_edges(source, memory);
+    mg_utility::OnScopeExit delete_edges_it([&edges_it] { mgp::edges_iterator_destroy(edges_it); });
+    for (auto *edge = mgp::edges_iterator_get(edges_it); edge != nullptr;
+         edge = mgp::edges_iterator_next(edges_it)) {
+      if (mgp::edge_get_id(edge).as_int == edge_id) {
+        auto *edge_copy = mgp::edge_copy(edge, memory);
+        InsertRelationshipValueResult(record, field_name, edge_copy, memory);
+        return;
+      }
+    }
+  }
+  if (mgp::graph_is_transactional(graph)) {
+    throw mg_exception::InvalidIDException();
+  }
+}
 
 /// Handles non-double weights for GetWeight().
 /// If the weight property is an integer, mgp::value_get_double() returns 0.0.

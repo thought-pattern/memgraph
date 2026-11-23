@@ -1,9 +1,11 @@
-from abc import ABC, abstractmethod
-from typing import List, Tuple
+"""Utilities for vrp cp solver."""
 
-import numpy as np
+from abc import ABC, abstractmethod
+
 from gekko import GEKKO
-from mage.geography import InvalidDepotException, VRPPath, VRPResult, VRPSolver
+from numpy import ndarray as np_ndarray
+
+from mage.geography.vehicle_routing import InvalidDepotException, VRPSolver
 
 
 class VRPConstraintProgrammingSolver(VRPSolver):
@@ -14,221 +16,195 @@ class VRPConstraintProgrammingSolver(VRPSolver):
     SOURCE_INDEX = -1
     SINK_INDEX = -2
 
-    def __init__(self, no_vehicles: int, distance_matrix: np.array, depot_index: int):
+    def __init__(self, no_vehicles: int, distance_matrix: np_ndarray, depot_index: int):
         if depot_index < 0 or depot_index >= len(distance_matrix):
             raise InvalidDepotException("Depot index outside the range of locations!")
 
-        self._model = GEKKO(remote=False)
+        self.internal_model = GEKKO(remote=False)
 
         self.no_vehicles = no_vehicles
         self.distance_matrix = distance_matrix
         self.depot_index = depot_index
 
-        self._edge_chosen_vars = dict()
-        self._time_vars = dict()
-        self._location_node_ids = [x for x in range(len(distance_matrix)) if x != self.depot_index]
+        self.edge_chosen_vars = dict()
+        self.internal_time_vars = dict()
+        self.location_node_ids = [x for x in range(len(distance_matrix)) if x != self.depot_index]
 
-        self._constraints: List[VRPConstraint] = [
+        self.internal_constraints: list[VRPConstraint] = [
             TimeIncreasesWithPassingFromOneNodeToAnotherConstraint(
-                self._model,
-                self._edge_chosen_vars,
-                self._time_vars,
-                self.distance_matrix,
-            ),
-            No3NodeCyclesConstraint(
-                self._model,
-                self._edge_chosen_vars,
-                self._location_node_ids,
+                self.internal_model,
+                self.edge_chosen_vars,
+                self.internal_time_vars,
             ),
             StartInSourceNodeConstraint(
-                self._model,
-                self._edge_chosen_vars,
-                self._location_node_ids,
+                self.internal_model,
+                self.edge_chosen_vars,
+                self.location_node_ids,
                 self.no_vehicles,
                 self.SOURCE_INDEX,
             ),
             EndInSinkNodeConstraint(
-                self._model,
-                self._edge_chosen_vars,
-                self._location_node_ids,
+                self.internal_model,
+                self.edge_chosen_vars,
+                self.location_node_ids,
                 self.no_vehicles,
                 self.SINK_INDEX,
             ),
             MaximumEdgesActivatedConstraint(
-                self._model,
-                self._edge_chosen_vars,
-                self._location_node_ids,
+                self.internal_model,
+                self.edge_chosen_vars,
+                self.location_node_ids,
                 self.no_vehicles,
             ),
-            NoBacktrackingConstraint(self._model, self._edge_chosen_vars),
+            NoBacktrackingConstraint(self.internal_model, self.edge_chosen_vars),
         ]
 
-        self._initialize()
-        self._add_constraints()
-        self._add_objective()
-        self._add_options()
+        self.initialize()
+        self.add_constraints()
+        self.add_objective()
+        self.add_options()
 
     def solve(self):
-        self._model.solve()
+        self.internal_model.solve()
+        return False
 
-    def get_result(self) -> VRPResult:
-        return VRPResult(
-            [
-                VRPPath(
-                    key[0] if key[0] >= 0 else self.depot_index,
-                    key[1] if key[1] >= 0 else self.depot_index,
-                )
-                for key, var in self._edge_chosen_vars.items()
-                if int(var.value[0]) == 1
-            ]
-        )
+    def get_result(self) -> list:
+        vrp_paths = [
+            {
+                "from_vertex": node_from if node_from >= 0 else self.depot_index,
+                "to_vertex": node_to if node_to >= 0 else self.depot_index,
+            }
+            for (node_from, node_to), var in self.edge_chosen_vars.items()
+            if int(var.value[0]) == 1
+        ]
+        return vrp_paths
 
-    def get_distance(self, edge: Tuple[int, int]) -> float:
+    def get_distance(self, edge: tuple[int, int]) -> float:
+        # Source and sink are the depot's departure and return copies; they are priced from the depot's matrix row and
+        # column by the same mapping get_result applies, so the objective is the length of the returned routes.
         node_from, node_to = edge
+        matrix_from = node_from if node_from >= 0 else self.depot_index
+        matrix_to = node_to if node_to >= 0 else self.depot_index
 
-        if any(node in [self.SOURCE_INDEX, self.SINK_INDEX] for node in [node_from, node_to]):
-            return 0
+        computed_return_value = self.distance_matrix[matrix_from][matrix_to]
+        return computed_return_value
 
-        return self.distance_matrix[node_from][node_to]
-
-    def _initialize(self):
+    def initialize(self):
         for node_index in range(len(self.distance_matrix)):
-            if node_index in self._location_node_ids:
-                self._initialize_location_node(node_index)
+            if node_index in self.location_node_ids:
+                self.initialize_location_node(node_index)
+        return False
 
-    def _initialize_location_node(self, node_index: int):
-        self._time_vars[node_index] = self._model.Var(value=0, lb=0, integer=False)
+    def initialize_location_node(self, node_index: int):
+        # Visit position along the node's route, from 1 to the number of locations (see the ordering constraint).
+        self.internal_time_vars[node_index] = self.internal_model.Var(value=1, lb=1, ub=len(self.location_node_ids))
 
         # Initialize starting point and sinking point for every vehicle
-        self._add_variable((self.SOURCE_INDEX, node_index))
-        self._add_variable((node_index, self.SINK_INDEX))
+        self.add_variable((self.SOURCE_INDEX, node_index))
+        self.add_variable((node_index, self.SINK_INDEX))
 
         # For every node, draw lengths from and to it, with duration of edges
-        out_vars = self._add_adjacent_output_edge_variables(node_index)
-        in_vars = self._add_adjacent_input_edge_variables(node_index)
+        out_vars = self.add_adjacent_output_edge_variables(node_index)
+        in_vars = self.add_adjacent_input_edge_variables(node_index)
 
         # Either it was a beginning node, or a vehicle has visited it in the drive.
         if len(out_vars) > 0:
-            self._model.Equation(self._edge_chosen_vars[(node_index, self.SINK_INDEX)] + sum(out_vars) == 1)
+            self.internal_model.Equation(self.edge_chosen_vars.get((node_index, self.SINK_INDEX), 0.0) + sum(out_vars) == 1)
 
         if len(in_vars) > 0:
-            self._model.Equation(self._edge_chosen_vars[(self.SOURCE_INDEX, node_index)] + sum(in_vars) == 1)
+            self.internal_model.Equation(self.edge_chosen_vars.get((self.SOURCE_INDEX, node_index), 0.0) + sum(in_vars) == 1)
+        return False
 
-    def _add_adjacent_output_edge_variables(self, node_index: int) -> List[Tuple[int, int]]:
+    def add_adjacent_output_edge_variables(self, node_index: int):
         edges_vars = []
 
         for adjacent_node in range(len(self.distance_matrix)):
-            if adjacent_node == self.depot_index:
+            if adjacent_node in (self.depot_index, node_index):
                 continue
 
             edge = (node_index, adjacent_node)
-            var = self._add_variable(edge)
+            var = self.add_variable(edge)
             edges_vars.append(var)
 
         return edges_vars
 
-    def _add_adjacent_input_edge_variables(self, node_index: int) -> List[Tuple[int, int]]:
+    def add_adjacent_input_edge_variables(self, node_index: int):
         edges_vars = []
 
         for adjacent_node in range(len(self.distance_matrix)):
-            if adjacent_node == self.depot_index:
+            if adjacent_node in (self.depot_index, node_index):
                 continue
 
             edge = (adjacent_node, node_index)
-            var = self._add_variable(edge)
+            var = self.add_variable(edge)
             edges_vars.append(var)
 
         return edges_vars
 
-    def _add_variable(self, edge: Tuple[int, int]) -> GEKKO.Var:
-        var = self._edge_chosen_vars.get(edge)
+    def add_variable(self, edge: tuple[int, int]):
+        if edge not in self.edge_chosen_vars:
+            self.edge_chosen_vars[edge] = self.internal_model.Var(value=0, lb=0, ub=1, integer=True)
 
-        if var is None:
-            var = self._model.Var(value=0, lb=0, ub=1, integer=True)
-            self._edge_chosen_vars[edge] = var
-
+        var = self.edge_chosen_vars.get(edge, 0)
         return var
 
-    def _add_constraints(self):
+    def add_constraints(self):
         """
         Add global constraints to the solver.
         """
-        for constraint in self._constraints:
+        for constraint in self.internal_constraints:
             constraint.apply_constraint()
+        return False
 
-    def _add_objective(self):
+    def add_objective(self):
         intermediate_sum = 0
-        for edge, variable in self._edge_chosen_vars.items():
+        for edge, variable in self.edge_chosen_vars.items():
             duration = self.get_distance(edge)
-            intermediate_sum += self._model.Intermediate(duration * variable)
+            intermediate_sum += self.internal_model.Intermediate(duration * variable)
 
-        self._model.Obj(intermediate_sum)
+        self.internal_model.Obj(intermediate_sum)
+        return False
 
-    def _add_options(self):
+    def add_options(self):
         # The SOLVER option specifies the type of solver that solves the
         # VRP problem. More on solver options and other parameters can be found on
         # https://gekko.readthedocs.io/en/latest/global.html
-        self._model.options.SOLVER = 1
+        self.internal_model.options.SOLVER = 1
+        return False
 
 
 class VRPConstraint(ABC):
     def __init__(self, model: GEKKO):
-        self._model = model
+        self.internal_model = model
 
     @abstractmethod
-    def apply_constraint(self):
-        pass
+    def apply_constraint(self): ...
 
 
 class TimeIncreasesWithPassingFromOneNodeToAnotherConstraint(VRPConstraint):
     """
-    Allow progression in time when passing from one node to another.
+    Complete subtour elimination (Miller-Tucker-Zemlin). Time is the visit position along a route: every chosen
+    location-to-location edge advances it by one step, so no cycle that avoids the depot can be chosen, whatever its
+    distances, zero-distance co-located locations included. Positions lie in [1, number of locations], which makes
+    that span an exact big-M for unchosen edges, and the formulation stays at one row per ordered location pair.
     """
 
-    def __init__(self, model: GEKKO, variables, time_vars, distance_matrix: np.array):
+    def __init__(self, model: GEKKO, variables, time_vars):
         super().__init__(model)
 
-        self._variables = variables
-        self._time_variables = time_vars
-        self._distance_matrix = distance_matrix
+        self.internal_variables = variables
+        self.time_variables = time_vars
 
     def apply_constraint(self):
-        for edge in self._variables:
-            (from_node, to_node) = edge
-            if from_node < 0 or to_node < 0:
-                continue
-
-            self._model.Equation(
-                (self._time_variables[from_node] + self._distance_matrix[from_node][to_node]) * self._variables[edge]
-                <= self._time_variables[to_node]
-            )
-
-
-class No3NodeCyclesConstraint(VRPConstraint):
-    """
-    Do not allow 3 node loops
-    """
-
-    def __init__(self, model: GEKKO, variables, node_ids: List[int]):
-        super().__init__(model)
-
-        self._variables = variables
-        self._node_ids = node_ids
-
-    def apply_constraint(self):
-        """
-        Do not allow 3 node loops
-        """
-        for a in self._node_ids:
-            for b in self._node_ids:
-                if a == b:
+        position_span = len(self.time_variables)
+        for from_node, from_position in self.time_variables.items():
+            for to_node, to_position in self.time_variables.items():
+                if from_node == to_node:
                     continue
-                for c in self._node_ids:
-                    if c == a or c == b:
-                        continue
-                    self._model.Equation(
-                        self._variables[(a, b)] + self._variables[(b, c)] + self._variables[(c, a)] <= 2
-                    )
+
+                edge_chosen = self.internal_variables.get((from_node, to_node), 0)
+                self.internal_model.Equation(to_position >= from_position + 1 - position_span * (1 - edge_chosen))
+        return False
 
 
 class StartInSourceNodeConstraint(VRPConstraint):
@@ -240,19 +216,27 @@ class StartInSourceNodeConstraint(VRPConstraint):
         self,
         model: GEKKO,
         variables,
-        node_ids: List[int],
+        node_ids: list[int],
         no_vehicles: int,
         source_id: int,
     ):
         super().__init__(model)
 
-        self._variables = variables
-        self._node_ids = node_ids
-        self._no_vehicles = no_vehicles
-        self._source_id = source_id
+        self.internal_variables = variables
+        self.internal_node_ids = node_ids
+        self.internal_no_vehicles = no_vehicles
+        self.internal_source_id = source_id
 
     def apply_constraint(self):
-        self._model.Equation(sum(self._variables[(self._source_id, n)] for n in self._node_ids) == self._no_vehicles)
+        departure_vars = []
+        for node_id in self.internal_node_ids:
+            edge = (self.internal_source_id, node_id)
+            if edge not in self.internal_variables:
+                raise KeyError(f"no departure edge variable for location {node_id}")
+            departure_vars.append(self.internal_variables.get(edge, 0))
+
+        self.internal_model.Equation(sum(departure_vars) == self.internal_no_vehicles)
+        return False
 
 
 class EndInSinkNodeConstraint(VRPConstraint):
@@ -264,19 +248,27 @@ class EndInSinkNodeConstraint(VRPConstraint):
         self,
         model: GEKKO,
         variables,
-        node_ids: List[int],
+        node_ids: list[int],
         no_vehicles: int,
         sink_id: int,
     ):
         super().__init__(model)
 
-        self._variables = variables
-        self._node_ids = node_ids
-        self._no_vehicles = no_vehicles
-        self._sink_id = sink_id
+        self.internal_variables = variables
+        self.internal_node_ids = node_ids
+        self.internal_no_vehicles = no_vehicles
+        self.internal_sink_id = sink_id
 
     def apply_constraint(self):
-        self._model.Equation(sum(self._variables[(n, self._sink_id)] for n in self._node_ids) == self._no_vehicles)
+        return_vars = []
+        for node_id in self.internal_node_ids:
+            edge = (node_id, self.internal_sink_id)
+            if edge not in self.internal_variables:
+                raise KeyError(f"no return edge variable for location {node_id}")
+            return_vars.append(self.internal_variables.get(edge, 0))
+
+        self.internal_model.Equation(sum(return_vars) == self.internal_no_vehicles)
+        return False
 
 
 class MaximumEdgesActivatedConstraint(VRPConstraint):
@@ -288,22 +280,26 @@ class MaximumEdgesActivatedConstraint(VRPConstraint):
         self,
         model: GEKKO,
         variables,
-        node_ids: List[int],
+        node_ids: list[int],
         no_vehicles: int,
     ):
         super().__init__(model)
 
-        self._variables = variables
-        self._node_ids = node_ids
-        self._no_vehicles = no_vehicles
+        self.internal_variables = variables
+        self.internal_node_ids = node_ids
+        self.internal_no_vehicles = no_vehicles
 
     def apply_constraint(self):
-        self._model.Equation(sum(self._variables.values()) == len(self._node_ids) + self._no_vehicles)
+        self.internal_model.Equation(
+            sum(self.internal_variables.values()) == len(self.internal_node_ids) + self.internal_no_vehicles
+        )
+        return False
 
 
 class NoBacktrackingConstraint(VRPConstraint):
     """
-    Add no backtracking from one node to another.
+    Add no backtracking from one node to another. The ordering constraint already excludes these 2-node cycles; the
+    explicit inequality is kept because it tightens the relaxation the branch-and-bound solver works from.
     """
 
     def __init__(
@@ -312,12 +308,13 @@ class NoBacktrackingConstraint(VRPConstraint):
         variables,
     ):
         super().__init__(model)
-        self._variables = variables
+        self.internal_variables = variables
 
     def apply_constraint(self):
-        for edge in self._variables:
-            (from_node, to_node) = edge
-            if from_node < 0 or to_node < 0:
+        for (from_node, to_node), edge_chosen in self.internal_variables.items():
+            # Each unordered location pair is one 2-node cycle, so its inequality is emitted once.
+            if from_node < 0 or to_node < 0 or from_node > to_node:
                 continue
 
-            self._model.Equation(self._variables[(from_node, to_node)] + self._variables[(to_node, from_node)] <= 1)
+            self.internal_model.Equation(edge_chosen + self.internal_variables.get((to_node, from_node), 0) <= 1)
+        return False

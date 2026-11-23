@@ -11,6 +11,8 @@
 
 #include "system/state.hpp"
 
+#include <charconv>
+#include <limits>
 #include <utility>
 
 #include "utils/file.hpp"
@@ -37,25 +39,46 @@ auto InitializeSystemDurability(std::optional<std::filesystem::path> storage, bo
   // TODO: migration schemes here in the future
   if (!version || *version != kVersionV1) {
     // ensure we start out with V1
-    durability.Put(kVersion, kVersionV1);
+    if (!durability.Put(kVersion, kVersionV1)) {
+      throw kvstore::KVStoreError("Failed to write system store version marker");
+    }
   }
 
   if (!recovery_on_startup) {
     // reset last_committed_system_ts
-    durability.Delete(kLastCommitedSystemTsKey);
+    if (!durability.Delete(kLastCommitedSystemTsKey)) {
+      throw kvstore::KVStoreError("Failed to clear last_committed_system_ts when recovery is disabled");
+    }
   }
 
   return durability;
 }
 
-auto LoadLastCommittedSystemTimestamp(std::optional<kvstore::KVStore> const &store) -> uint64_t {
-  auto lcst = store ? store->Get(kLastCommitedSystemTsKey) : std::nullopt;
-  return lcst ? std::stoul(*lcst) : 0U;
+auto LoadLastCommittedSystemTimestamp(std::optional<kvstore::KVStore> const &store, bool recovery_on_startup)
+    -> uint64_t {
+  if (!recovery_on_startup || !store) {
+    return 0U;
+  }
+  auto lcst = store->Get(kLastCommitedSystemTsKey);
+  if (!lcst) {
+    return 0U;
+  }
+  if (lcst->empty()) {
+    throw kvstore::KVStoreError("Corrupted empty last_committed_system_ts in system store");
+  }
+  uint64_t parsed = 0;
+  const auto *begin = lcst->data();
+  const auto *end = lcst->data() + lcst->size();
+  const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+  if (ec != std::errc{} || ptr != end || parsed == std::numeric_limits<uint64_t>::max()) {
+    throw kvstore::KVStoreError("Corrupted last_committed_system_ts '{}' in system store", *lcst);
+  }
+  return parsed;
 }
 
 }  // namespace
 
 State::State(std::optional<std::filesystem::path> storage, bool recovery_on_startup)
     : durability_{InitializeSystemDurability(std::move(storage), recovery_on_startup)},
-      last_committed_system_timestamp_{LoadLastCommittedSystemTimestamp(durability_)} {}
+      last_committed_system_timestamp_{LoadLastCommittedSystemTimestamp(durability_, recovery_on_startup)} {}
 }  // namespace memgraph::system

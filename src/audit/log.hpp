@@ -11,6 +11,9 @@
 #include <atomic>
 #include <filesystem>
 #include <optional>
+#include <string>
+#include <thread>
+#include <utility>
 
 #include "communication/bolt/v1/value.hpp"
 #include "data_structures/ring_buffer.hpp"
@@ -18,6 +21,9 @@
 #include "utils/scheduler.hpp"
 
 namespace memgraph::audit {
+
+std::pair<std::string, memgraph::communication::bolt::map_t> RedactAuditQueryAndParams(
+    const std::string &query, const memgraph::communication::bolt::map_t &params);
 
 /// This class implements an audit log. Functions used for logging are
 /// thread-safe, functions used for setup aren't thread-safe.
@@ -27,6 +33,7 @@ class Log {
     int64_t timestamp;
     std::string address;
     std::string username;
+    std::string impersonator;
     std::string query;
     memgraph::communication::bolt::map_t params;
     std::string db;
@@ -49,18 +56,29 @@ class Log {
 
   /// Adds an entry to the audit log. Thread-safe.
   void Record(const std::string &address, const std::string &username, const std::string &query,
-              const memgraph::communication::bolt::map_t &params, const std::string &db);
+              const memgraph::communication::bolt::map_t &params, const std::string &db,
+              const std::string &impersonator = "");
 
   /// Reopens the log file. Used for log file rotation. Thread-safe.
   bool ReopenLog();
 
+  /// Async-signal-safe notification asking the background reopen worker to reopen the audit log.
+  void RequestReopen() noexcept;
+
  private:
+  bool ReopenLogLocked();
+  void ReopenLoop();
+  void CloseReopenPipe() noexcept;
   void Flush();
 
   std::filesystem::path storage_directory_;
   int32_t buffer_size_;
   int32_t buffer_flush_interval_millis_;
   std::atomic<bool> started_;
+  std::atomic<bool> reopen_requested_{false};
+  std::atomic<bool> stop_reopen_{false};
+  int reopen_pipe_[2]{-1, -1};
+  std::thread reopen_thread_;
 
   std::optional<RingBuffer<Item>> buffer_;
   utils::Scheduler scheduler_;

@@ -153,7 +153,7 @@ bool Converged(std::set<std::uint64_t> &active_nodes, std::uint64_t k, double ep
 
   // Partially sort the centralities. Keep only the first `k` sorted
   std::partial_sort(active_centrality.begin(),
-                    active_centrality.begin() + std::min(k, active_centrality.size()),
+                    active_centrality.begin() + std::min<std::size_t>(static_cast<std::size_t>(k), active_centrality.size()),
                     active_centrality.end(),
                     [](std::pair<std::uint64_t, double> a, std::pair<std::uint64_t, double> b) -> bool {
                       return a.second > b.second;
@@ -173,7 +173,7 @@ bool Converged(std::set<std::uint64_t> &active_nodes, std::uint64_t k, double ep
   }
 
   // Next step is checking whether the top of the partial list has converged too
-  auto size = std::min(active_centrality.size(), k);
+  auto size = std::min<std::size_t>(active_centrality.size(), static_cast<std::size_t>(k));
   for (std::size_t i = 1; i < size; i++) {
     double u = ur.at(active_centrality[i].first);
     double l = lr.at(active_centrality[i - 1].first);

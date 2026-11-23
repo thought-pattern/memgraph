@@ -71,17 +71,20 @@ namespace betweenness_centrality_alg {
 std::vector<double> BetweennessCentrality(const mg_graph::GraphView<> &graph, bool directed, bool normalize,
                                           int threads) {
   const auto number_of_nodes = graph.Nodes().size();
+  if (number_of_nodes == 0) {
+    return {};
+  }
+  const int effective_threads = std::max(1, threads);
   std::vector<std::atomic<double>> betweenness_centrality(number_of_nodes);
   for (auto &bc : betweenness_centrality) bc.store(0.0, std::memory_order_relaxed);
 
   auto process_nodes = [&](std::uint64_t start, std::uint64_t end) {
-    // Thread-local BFS resources
-    static thread_local std::vector<std::uint64_t> shortest_paths_counter(number_of_nodes, 0);
-    static thread_local std::vector<int> distance(number_of_nodes, -1);
-    static thread_local std::vector<std::vector<std::uint64_t>> predecessors(number_of_nodes,
-                                                                             std::vector<std::uint64_t>{});
-    static thread_local std::vector<double> dependency(number_of_nodes, 0.0);
-    static thread_local std::stack<std::uint64_t> visited;
+    // Per-worker BFS resources sized to the current graph
+    std::vector<std::uint64_t> shortest_paths_counter(number_of_nodes, 0);
+    std::vector<int> distance(number_of_nodes, -1);
+    std::vector<std::vector<std::uint64_t>> predecessors(number_of_nodes);
+    std::vector<double> dependency(number_of_nodes, 0.0);
+    std::stack<std::uint64_t> visited;
 
     for (auto node_id = start; node_id < end; ++node_id) {
       shortest_paths_counter[node_id] = 1;
@@ -113,11 +116,12 @@ std::vector<double> BetweennessCentrality(const mg_graph::GraphView<> &graph, bo
     }
   };
 
-  const auto nodes_per_thread = (number_of_nodes + threads - 1) / threads;
+  const auto thread_count = static_cast<std::size_t>(effective_threads);
+  const auto nodes_per_thread = (number_of_nodes + thread_count - 1) / thread_count;
   std::vector<std::future<void>> futures;
-  futures.reserve(threads);
+  futures.reserve(thread_count);
 
-  for (int i = 0; i < threads; ++i) {
+  for (std::size_t i = 0; i < thread_count; ++i) {
     const auto start = i * nodes_per_thread;
     const auto end = std::min((i + 1) * nodes_per_thread, number_of_nodes);
     if (start >= number_of_nodes) break;
@@ -125,8 +129,20 @@ std::vector<double> BetweennessCentrality(const mg_graph::GraphView<> &graph, bo
     futures.emplace_back(std::async(std::launch::async, process_nodes, start, end));
   }
 
-  // Wait for completion
-  for (auto &future : futures) future.wait();
+  // Wait for every worker to finish and rethrow any worker exception instead of returning partial totals
+  std::exception_ptr first_exception;
+  for (auto &future : futures) {
+    try {
+      future.get();
+    } catch (...) {
+      if (!first_exception) {
+        first_exception = std::current_exception();
+      }
+    }
+  }
+  if (first_exception) {
+    std::rethrow_exception(first_exception);
+  }
 
   // Convert to the result vector
   std::vector<double> result;

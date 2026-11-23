@@ -13,7 +13,9 @@
 
 #include "auth/auth.hpp"
 #include "dbms/dbms_handler.hpp"
+#include "parameters/parameters.hpp"
 #include "system/state.hpp"
+#include "system/system.hpp"
 
 namespace memgraph::replication {
 

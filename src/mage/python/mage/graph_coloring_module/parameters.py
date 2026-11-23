@@ -1,14 +1,17 @@
+"""Utilities for parameters."""
+
 from enum import Enum
 
 
 class Parameter(Enum):
+    """Names of the graph coloring algorithm parameters."""
+
     ALGORITHM = "algorithm"
     NO_OF_COLORS = "no_of_colors"
 
     NO_OF_PROCESSES = "no_of_processes"
 
     POPULATION_SIZE = "population_size"
-    POPULATION_FACTORY = "population_factory"
     INIT_ALGORITHMS = "init_algorithms"
 
     ERROR = "error"

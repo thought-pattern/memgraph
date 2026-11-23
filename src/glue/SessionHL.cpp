@@ -319,6 +319,9 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
       interpreter_.SetUser(session_user_or_role_);
 #endif
       interpreter_.SetSessionInfo(UUID(), std::string{auth::kInternalSystemUsername}, GetLoginTimestamp());
+#ifdef MG_ENTERPRISE
+      impersonated_ = false;
+#endif
       TryDefaultDB();
       return {};
     case auth::InternalSystemUserLogin::kRejected:
@@ -326,7 +329,13 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
     case auth::InternalSystemUserLogin::kNotInternal:
       break;
   }
-  bool const access_controlled = auth_->ReadLock()->AccessControlled();
+  bool access_controlled = true;
+  try {
+    access_controlled = auth_->ReadLock()->AccessControlled();
+  } catch (const std::exception &e) {
+    spdlog::error("Failed to verify authentication store state during login: {}", e.what());
+    return std::unexpected{communication::bolt::AuthFailure::kGeneric};
+  }
   // Auth lock is not held past this point; bcrypt and module calls run outside the lock.
   if (access_controlled) {
     auto const user_or_role = std::invoke([&]() -> std::optional<auth::UserOrRole> {
@@ -363,6 +372,9 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
     interpreter_.SetSessionInfo(UUID(), "", GetLoginTimestamp());
   }
 
+#ifdef MG_ENTERPRISE
+  impersonated_ = false;
+#endif
   TryDefaultDB();
   return {};
 }
@@ -370,6 +382,9 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
 std::expected<void, communication::bolt::AuthFailure> SessionHL::SSOAuthenticate(
     const std::string &scheme, const std::string &identity_provider_response) {
   interpreter_.ResetUser();
+#ifdef MG_ENTERPRISE
+  impersonated_ = false;
+#endif
 
   const auto user_or_role = auth::SSOAuthenticate(*auth_, scheme, identity_provider_response);
   if (!user_or_role) {
@@ -467,6 +482,7 @@ std::expected<void, std::string_view> SessionHL::CoordinatorSSOAuthenticate(
   // coordinator authorizes by Raft-replicated role, not by a kvstore user), so the module's username is the only thing
   // that ties a control-plane query -- FORCE RESET CLUSTER STATE, SET INSTANCE TO MAIN -- back to a person.
   interpreter_.SetSessionInfo(UUID(), std::move(auth_result->username), GetLoginTimestamp());
+  impersonated_ = false;
   return {};
 }
 
@@ -485,6 +501,7 @@ std::optional<bool> SessionHL::CoordinatorInternalSystemUserAuthenticate(const s
                                         static_cast<uint64_t>(auth::Permission::COORDINATOR_WRITE));
   interpreter_.SetCoordinatorRoles({});
   interpreter_.SetSessionInfo(UUID(), std::string{auth::kInternalSystemUsername}, GetLoginTimestamp());
+  impersonated_ = false;
   return true;
 }
 
@@ -496,6 +513,7 @@ void SessionHL::CoordinatorPassthroughAuthenticate() {
   // SHOW CURRENT USER reports null. Set unconditionally so a LOGOFF -> passthrough LOGON can't leave the previous SSO
   // session's principal behind, in the same way the privileges above are re-established.
   interpreter_.SetSessionInfo(UUID(), "", GetLoginTimestamp());
+  impersonated_ = false;
 }
 
 std::optional<bool> SessionHL::CoordinatorHasWritableRole() const {
@@ -531,6 +549,7 @@ void SessionHL::LogOff() {
   // A LOGON without a stored user (the internal system user, or no access control) doesn't set it, and Configure would
   // otherwise charge that session to the previous user's limits.
   user_resource_.reset();
+  impersonated_ = false;
 #endif
   interpreter_.ResetUser();
   session_user_or_role_.reset();
@@ -586,13 +605,17 @@ void SessionHL::InterpretParse(const std::string &query, bolt_map_t params, cons
     const auto &user_or_role = interpreter_.user_or_role_;
     // Coordinator sessions authorize by Raft-replicated role and never build a QueryUserOrRole, so fall back to the
     // principal recorded at login; without it every control-plane query would be audited with an empty username.
+    const auto authenticated_username = session_user_or_role_ && session_user_or_role_->username()
+                                            ? *session_user_or_role_->username()
+                                            : interpreter_.session_info_.username;
     const auto username =
         user_or_role && user_or_role->username() ? *user_or_role->username() : interpreter_.session_info_.username;
-    audit_log_->Record(fmt::format("{}:{}", endpoint_.address().to_string(), std::to_string(endpoint_.port())),
-                       username,
-                       query,
-                       params,
-                       db ? db->get()->name() : "");
+    const auto impersonator = impersonated_ ? authenticated_username : std::string{};
+    const auto peer_address =
+        remote_endpoint_ ? fmt::format("{}:{}", remote_endpoint_->address().to_string(), remote_endpoint_->port())
+                         : std::string{};
+    auto const [audit_query, audit_params] = audit::RedactAuditQueryAndParams(query, params);
+    audit_log_->Record(peer_address, username, audit_query, audit_params, db ? db->get()->name() : "", impersonator);
   }
 #endif
 
@@ -750,7 +773,8 @@ void SessionHL::Configure(const bolt_map_t &run_time_info) {
 }
 
 SessionHL::SessionHL(Context context, memgraph::communication::v2::InputStream *input_stream,
-                     memgraph::communication::v2::OutputStream *output_stream)
+                     memgraph::communication::v2::OutputStream *output_stream,
+                     std::optional<memgraph::communication::v2::ServerEndpoint> remote_endpoint)
     : Session<memgraph::communication::v2::InputStream, memgraph::communication::v2::OutputStream>(input_stream,
                                                                                                    output_stream),
       interpreter_context_(context.ic),
@@ -760,7 +784,7 @@ SessionHL::SessionHL(Context context, memgraph::communication::v2::InputStream *
       runtime_config_{this},
 #endif
       auth_(context.auth),
-      endpoint_(std::move(context.endpoint)) {
+      remote_endpoint_(std::move(remote_endpoint)) {
   bolt_session_gauge_ = metrics::ScopedGauge{metrics::Metrics().global.active_bolt_sessions};
 #ifdef MG_ENTERPRISE
   interpreter_.OnChangeCB([&](std::string_view db_name) {
@@ -887,6 +911,7 @@ void RuntimeConfig::Configure(const bolt_map_t &run_time_info, bool in_explicit_
   auto resource =
       user ? ResourceAtLogin(*user, session_->interpreter_context_->resource_monitoring) : session_->user_resource_;
   session_->interpreter_.SetUser(target, std::move(resource));
+  session_->impersonated_ = static_cast<bool>(user);
   // The session changes from here on; a failure below must not leave the old entry cached.
   previous_run_time_info_.reset();
   session_->interpreter_.SetCurrentDB(std::move(*db_acc), db_explicit);

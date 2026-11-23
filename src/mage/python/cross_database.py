@@ -12,8 +12,10 @@ import io
 import json
 import os
 import re
+import threading
 from decimal import Decimal
 from typing import Any, Dict, List
+from urllib.parse import urljoin, urlparse
 
 import boto3
 import duckdb as duckDB
@@ -75,9 +77,41 @@ def _check_enterprise_license() -> None:
         raise RuntimeError(Constants.ENTERPRISE_LICENSE_ERROR)
 
 
-def _get_cache_key(start_ts: int, query: str, config: mgp.Map, params: mgp.Nullable[mgp.Any] = None) -> str:
-    """Cache key from per-query start_timestamp (stable across PERIODIC COMMIT) + query/config/params hash."""
-    config_dict = dict(config)
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+_state_lock = threading.Lock()
+
+
+def _push_active_key(stacks: Dict[int, List[str]], cache_key: str) -> None:
+    tid = threading.get_ident()
+    with _state_lock:
+        stacks.setdefault(tid, []).append(cache_key)
+
+
+def _pop_cleanup_key(stacks: Dict[int, List[str]], state_dict: dict, cleanup_fn) -> None:
+    tid = threading.get_ident()
+    target_key = None
+    with _state_lock:
+        thread_stack = stacks.get(tid)
+        if thread_stack:
+            target_key = thread_stack.pop()
+            if not thread_stack:
+                stacks.pop(tid, None)
+        elif state_dict:
+            target_key = next(reversed(state_dict))
+    if target_key is not None:
+        cleanup_fn(target_key)
+
+
+def _get_cache_key(
+    start_ts: int,
+    query: str,
+    config: mgp.Map,
+    params: mgp.Nullable[mgp.Any] = None,
+    config_path: str = "",
+) -> str:
+    """Cache key from per-query start_timestamp + caller query/config/config_path/params hash (stable across file rotation)."""
+    config_dict = dict(config) if config is not None else {}
     config_str = json.dumps(config_dict, sort_keys=True, default=str)
 
     params_str = ""
@@ -89,7 +123,7 @@ def _get_cache_key(start_ts: int, query: str, config: mgp.Map, params: mgp.Nulla
         else:
             params_str = str(params)
 
-    hash_input = f"{start_ts}|{query}|{config_str}|{params_str}"
+    hash_input = f"{start_ts}|{query}|{config_str}|{config_path}|{params_str}"
     return hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
 
 
@@ -100,22 +134,59 @@ def _query_is_table(table_or_sql: str) -> bool:
 def _combine_config(config: mgp.Map, config_path: str) -> Dict[str, Any]:
     assert len(config_path), "Path must not be empty"
 
-    file_config = None
     try:
-        with open(config_path, "r") as file:
+        with open(config_path, "r", encoding="utf-8") as file:
             file_config = json.load(file)
-    except Exception:
-        raise OSError("Could not open/read file.")
+    except Exception as err:
+        raise OSError("Could not open/read file.") from err
 
-    config.update(file_config)
-    return config
+    merged = dict(config) if config is not None else {}
+    merged.update(file_config)
+    return merged
+
+
+def _validate_column_names(column_names) -> List[str]:
+    seen = set()
+    normalized: List[str] = []
+    for column in column_names:
+        if column in seen:
+            raise ValueError(
+                f"Duplicate column name {column!r} in result set; alias repeated columns so every field name is distinct."
+            )
+        seen.add(column)
+        normalized.append(column)
+    return normalized
+
+
+def _convert_decimal(value: Decimal) -> Any:
+    if not value.is_finite():
+        return str(value)
+    exp = value.as_tuple().exponent
+    if isinstance(exp, int) and exp >= 0 and value == value.to_integral_value():
+        as_int = int(value)
+        if _INT64_MIN <= as_int <= _INT64_MAX:
+            return as_int
+    return format(value, "f")
+
+
+def _convert_generic_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return _convert_decimal(value)
+    if isinstance(value, list):
+        return [_convert_generic_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_convert_generic_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _convert_generic_value(v) for k, v in value.items()}
+    return value
 
 
 def _name_row_cells(row_cells, column_names) -> Dict[str, Any]:
-    return {
-        column: (value if not isinstance(value, Decimal) else float(value))
-        for column, value in zip(column_names, row_cells)
-    }
+    cols = _validate_column_names(column_names)
+    cells = list(row_cells)
+    if len(cells) != len(cols):
+        raise ValueError(f"Row width ({len(cells)}) does not match column header width ({len(cols)}).")
+    return {column: _convert_generic_value(value) for column, value in zip(cols, cells)}
 
 
 def _name_row_cells_mysql(row_cells, column_names) -> Dict[str, Any]:
@@ -123,7 +194,11 @@ def _name_row_cells_mysql(row_cells, column_names) -> Dict[str, Any]:
     Convert MySQL row cells to Memgraph-compatible types.
     Handles MySQL-specific types that might cause PyObject conversion errors.
     """
-    return {column: _convert_mysql_value(value) for column, value in zip(column_names, row_cells)}
+    cols = _validate_column_names(column_names)
+    cells = list(row_cells)
+    if len(cells) != len(cols):
+        raise ValueError(f"Row width ({len(cells)}) does not match column header width ({len(cols)}).")
+    return {column: _convert_mysql_value(value) for column, value in zip(cols, cells)}
 
 
 def _convert_mysql_value(value: Any) -> Any:
@@ -135,7 +210,7 @@ def _convert_mysql_value(value: Any) -> Any:
         return None
 
     if isinstance(value, Decimal):
-        return float(value)
+        return _convert_decimal(value)
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         try:
             return value.isoformat()
@@ -173,7 +248,7 @@ def _convert_mysql_value(value: Any) -> Any:
 
 
 def _convert_row_types(row_cells) -> Dict[str, Any]:
-    return {column: (value if not isinstance(value, Decimal) else float(value)) for column, value in row_cells.items()}
+    return {column: _convert_generic_value(value) for column, value in row_cells.items()}
 
 
 def _check_params_type(params: Any, types=(dict, list, tuple)) -> None:
@@ -189,12 +264,9 @@ def _check_params_type(params: Any, types=(dict, list, tuple)) -> None:
 
 
 def _formulate_cypher_query(label_or_rel_or_query: str) -> str:
-    words = label_or_rel_or_query.split()
-    if len(words) > 1:
-        return label_or_rel_or_query
-
-    node_match = re.match(r"^\(\s*:(\w+)\s*\)$", label_or_rel_or_query)
-    rel_match = re.match(r"^\[\s*:(\w+)\s*\]$", label_or_rel_or_query)
+    stripped = label_or_rel_or_query.strip()
+    node_match = re.match(r"^\(\s*:\s*(\w+)\s*\)$", stripped)
+    rel_match = re.match(r"^\[\s*:\s*(\w+)\s*\]$", stripped)
 
     if node_match:
         label = node_match.group(1)
@@ -240,6 +312,9 @@ def _convert_bolt_value(value):
     if isinstance(value, list):
         return [_convert_bolt_value(item) for item in value]
 
+    if isinstance(value, Decimal):
+        return _convert_decimal(value)
+
     if isinstance(value, dict):
         if value.get("__type") == "mg_enum":
             raise ValueError(f"Enum type is not yet supported in cross-database queries: {value.get('__value')}")
@@ -250,6 +325,12 @@ def _convert_bolt_value(value):
 
 def _convert_bolt_record(record):
     """Convert a Bolt protocol record to a Python dict with proper type conversion."""
+    if hasattr(record, "keys") and not isinstance(record, dict):
+        keys = _validate_column_names(list(record.keys()))
+        values = list(record.values())
+        if len(values) != len(keys):
+            raise ValueError(f"Row width ({len(values)}) does not match column header width ({len(keys)}).")
+        return {key: _convert_bolt_value(val) for key, val in zip(keys, values)}
     return {key: _convert_bolt_value(value) for key, value in record.items()}
 
 
@@ -262,6 +343,7 @@ def _build_uri(config: mgp.Map) -> str:
 
 def _bolt_init_state(
     state_dict: dict,
+    stacks: Dict[int, List[str]],
     start_ts: int,
     label_or_rel_or_query: str,
     config: mgp.Map,
@@ -270,35 +352,44 @@ def _bolt_init_state(
     default_username: str = "",
     default_password: str = "",
 ):
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
     query = _formulate_cypher_query(label_or_rel_or_query)
-    cache_key = _get_cache_key(start_ts, query, config, params)
+    cache_key = _get_cache_key(start_ts, query, config, params, config_path=config_path)
 
     if cache_key in state_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    uri = _build_uri(config)
-    username = config.get(Constants.USERNAME, default_username)
-    password = config.get(Constants.PASSWORD, default_password)
-    database = config.get(Constants.DATABASE, None)
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    uri = _build_uri(effective_config)
+    username = effective_config.get(Constants.USERNAME, default_username)
+    password = effective_config.get(Constants.PASSWORD, default_password)
+    database = effective_config.get(Constants.DATABASE, None)
 
-    driver = GraphDatabase.driver(uri, auth=(username, password))
-
-    if database:
-        session = driver.session(database=database)
-    else:
-        session = driver.session()
-
-    cypher_params = params if params is not None else {}
-    result = session.run(query, parameters=cypher_params)
+    driver = None
+    session = None
+    try:
+        driver = GraphDatabase.driver(uri, auth=(username, password))
+        session = driver.session(database=database) if database else driver.session()
+        cypher_params = params if params is not None else {}
+        result = session.run(query, parameters=cypher_params)
+    except Exception:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:
+                pass
+        raise
 
     state_dict[cache_key] = {
         Constants.DRIVER: driver,
         Constants.SESSION: session,
         Constants.RESULT: result,
     }
+    _push_active_key(stacks, cache_key)
 
 
 def _bolt_fetch_batch(
@@ -309,18 +400,19 @@ def _bolt_fetch_batch(
     config_path: str,
     params: mgp.Nullable[mgp.Any],
 ):
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
     query = _formulate_cypher_query(label_or_rel_or_query)
-    cache_key = _get_cache_key(start_ts, query, config, params)
+    cache_key = _get_cache_key(start_ts, query, config, params, config_path=config_path)
     result = state_dict[cache_key][Constants.RESULT]
 
     batch = []
-    for record in result:
-        batch.append(mgp.Record(row=_convert_bolt_record(record)))
-        if len(batch) >= Constants.BATCH_SIZE:
-            break
+    try:
+        for record in result:
+            batch.append(mgp.Record(row=_convert_bolt_record(record)))
+            if len(batch) >= Constants.BATCH_SIZE:
+                break
+    except Exception:
+        _bolt_cleanup_by_key(state_dict, cache_key)
+        raise
 
     if not batch:
         _bolt_cleanup_by_key(state_dict, cache_key)
@@ -329,14 +421,16 @@ def _bolt_fetch_batch(
 
 
 def _bolt_cleanup_by_key(state_dict: dict, cache_key: str):
-    if cache_key in state_dict:
-        session = state_dict[cache_key].get(Constants.SESSION)
-        driver = state_dict[cache_key].get(Constants.DRIVER)
-        if session:
-            session.close()
-        if driver:
-            driver.close()
-        state_dict.pop(cache_key, None)
+    entry = state_dict.pop(cache_key, None)
+    if entry is not None:
+        session = entry.get(Constants.SESSION)
+        driver = entry.get(Constants.DRIVER)
+        try:
+            if session is not None:
+                session.close()
+        finally:
+            if driver is not None:
+                driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +438,7 @@ def _bolt_cleanup_by_key(state_dict: dict, cache_key: str):
 # ---------------------------------------------------------------------------
 
 _bolt_state = {}
+_bolt_stacks: Dict[int, List[str]] = {}
 
 
 def _init_bolt(
@@ -354,7 +449,15 @@ def _init_bolt(
     params: mgp.Nullable[mgp.Any] = None,
 ):
     _check_enterprise_license()
-    _bolt_init_state(_bolt_state, ctx.graph.start_timestamp, label_or_rel_or_query, config, config_path, params)
+    _bolt_init_state(
+        _bolt_state,
+        _bolt_stacks,
+        ctx.graph.start_timestamp,
+        label_or_rel_or_query,
+        config,
+        config_path,
+        params,
+    )
 
 
 def bolt(
@@ -377,8 +480,8 @@ def bolt(
 
 
 def _cleanup_bolt():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a Bolt stream ends or aborts early."""
+    _pop_cleanup_key(_bolt_stacks, _bolt_state, lambda key: _bolt_cleanup_by_key(_bolt_state, key))
 
 
 mgp.add_batch_read_proc(bolt, _init_bolt, _cleanup_bolt)
@@ -389,6 +492,7 @@ mgp.add_batch_read_proc(bolt, _init_bolt, _cleanup_bolt)
 # ---------------------------------------------------------------------------
 
 _neo4j_state = {}
+_neo4j_stacks: Dict[int, List[str]] = {}
 
 
 def _init_neo4j(
@@ -401,6 +505,7 @@ def _init_neo4j(
     _check_enterprise_license()
     _bolt_init_state(
         _neo4j_state,
+        _neo4j_stacks,
         ctx.graph.start_timestamp,
         label_or_rel_or_query,
         config,
@@ -433,11 +538,33 @@ def neo4j(
 
 
 def _cleanup_neo4j():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a Neo4j stream ends or aborts early."""
+    _pop_cleanup_key(_neo4j_stacks, _neo4j_state, lambda key: _bolt_cleanup_by_key(_neo4j_state, key))
 
 
 mgp.add_batch_read_proc(neo4j, _init_neo4j, _cleanup_neo4j)
+
+
+def _close_sql_entry(state_dict: dict, cache_key: str) -> None:
+    entry = state_dict.pop(cache_key, None)
+    if entry is None:
+        return
+    cursor = entry.get(Constants.CURSOR)
+    connection = entry.get(Constants.CONNECTION)
+    try:
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+    finally:
+        if connection is not None:
+            try:
+                if hasattr(connection, "commit"):
+                    connection.commit()
+            except Exception:
+                pass
+            connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +572,7 @@ mgp.add_batch_read_proc(neo4j, _init_neo4j, _cleanup_neo4j)
 # ---------------------------------------------------------------------------
 
 mysql_dict = {}
+_mysql_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_mysql(
@@ -460,26 +588,40 @@ def init_migrate_mysql(
 
     if params:
         _check_params_type(params)
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
 
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql};"
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    sql_query = f"SELECT * FROM {table_or_sql};" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, params, config_path=config_path)
 
     if cache_key in mysql_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    mysql_dict[cache_key] = {}
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    connection = None
+    cursor = None
+    try:
+        connection = mysql_connector.connect(**effective_config)
+        cursor = connection.cursor()
+        cursor.execute(sql_query, params)
+        column_names = _validate_column_names([column[Constants.I_COLUMN_NAME] for column in cursor.description])
+    except Exception:
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise
 
-    connection = mysql_connector.connect(**config)
-    cursor = connection.cursor()
-    cursor.execute(table_or_sql, params)
-
-    mysql_dict[cache_key][Constants.CONNECTION] = connection
-    mysql_dict[cache_key][Constants.CURSOR] = cursor
-    mysql_dict[cache_key][Constants.COLUMN_NAMES] = [column[Constants.I_COLUMN_NAME] for column in cursor.description]
+    mysql_dict[cache_key] = {
+        Constants.CONNECTION: connection,
+        Constants.CURSOR: cursor,
+        Constants.COLUMN_NAMES: column_names,
+    }
+    _push_active_key(_mysql_stacks, cache_key)
 
 
 def mysql(
@@ -507,19 +649,17 @@ def mysql(
     """
     global mysql_dict
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql};"
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    sql_query = f"SELECT * FROM {table_or_sql};" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, params, config_path=config_path)
     cursor = mysql_dict[cache_key][Constants.CURSOR]
     column_names = mysql_dict[cache_key][Constants.COLUMN_NAMES]
 
-    rows = cursor.fetchmany(Constants.BATCH_SIZE)
-
-    result = [mgp.Record(row=_name_row_cells_mysql(row, column_names)) for row in rows]
+    try:
+        rows = cursor.fetchmany(Constants.BATCH_SIZE)
+        result = [mgp.Record(row=_name_row_cells_mysql(row, column_names)) for row in rows]
+    except Exception:
+        _cleanup_mysql_by_key(cache_key)
+        raise
 
     if not result:
         _cleanup_mysql_by_key(cache_key)
@@ -528,20 +668,12 @@ def mysql(
 
 
 def _cleanup_mysql_by_key(cache_key: str):
-    global mysql_dict
-
-    if cache_key in mysql_dict:
-        mysql_dict[cache_key][Constants.CURSOR] = None
-        mysql_dict[cache_key][Constants.CONNECTION].commit()
-        mysql_dict[cache_key][Constants.CONNECTION].close()
-        mysql_dict[cache_key][Constants.CONNECTION] = None
-        mysql_dict[cache_key][Constants.COLUMN_NAMES] = None
-        mysql_dict.pop(cache_key, None)
+    _close_sql_entry(mysql_dict, cache_key)
 
 
 def cleanup_migrate_mysql():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a MySQL stream ends or aborts early."""
+    _pop_cleanup_key(_mysql_stacks, mysql_dict, _cleanup_mysql_by_key)
 
 
 mgp.add_batch_read_proc(mysql, init_migrate_mysql, cleanup_migrate_mysql)
@@ -552,6 +684,7 @@ mgp.add_batch_read_proc(mysql, init_migrate_mysql, cleanup_migrate_mysql)
 # ---------------------------------------------------------------------------
 
 sql_server_dict = {}
+_sql_server_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_sql_server(
@@ -567,31 +700,43 @@ def init_migrate_sql_server(
 
     if params:
         _check_params_type(params, (list, tuple))
+        exec_params = params
     else:
-        params = []
+        exec_params = []
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql};"
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    sql_query = f"SELECT * FROM {table_or_sql};" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, exec_params, config_path=config_path)
 
     if cache_key in sql_server_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    sql_server_dict[cache_key] = {}
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    connection = None
+    cursor = None
+    try:
+        connection = pyodbc.connect(**effective_config)
+        cursor = connection.cursor()
+        cursor.execute(sql_query, *exec_params)
+        column_names = _validate_column_names([column[Constants.I_COLUMN_NAME] for column in cursor.description])
+    except Exception:
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise
 
-    connection = pyodbc.connect(**config)
-    cursor = connection.cursor()
-    cursor.execute(table_or_sql, *params)
-
-    sql_server_dict[cache_key][Constants.CONNECTION] = connection
-    sql_server_dict[cache_key][Constants.CURSOR] = cursor
-    sql_server_dict[cache_key][Constants.COLUMN_NAMES] = [
-        column[Constants.I_COLUMN_NAME] for column in cursor.description
-    ]
+    sql_server_dict[cache_key] = {
+        Constants.CONNECTION: connection,
+        Constants.CURSOR: cursor,
+        Constants.COLUMN_NAMES: column_names,
+    }
+    _push_active_key(_sql_server_stacks, cache_key)
 
 
 def sql_server(
@@ -618,21 +763,18 @@ def sql_server(
     """
     global sql_server_dict
 
-    if not params:
-        params = []
-
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql};"
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    exec_params = params if params else []
+    sql_query = f"SELECT * FROM {table_or_sql};" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, exec_params, config_path=config_path)
     cursor = sql_server_dict[cache_key][Constants.CURSOR]
     column_names = sql_server_dict[cache_key][Constants.COLUMN_NAMES]
-    rows = cursor.fetchmany(Constants.BATCH_SIZE)
 
-    result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    try:
+        rows = cursor.fetchmany(Constants.BATCH_SIZE)
+        result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    except Exception:
+        _cleanup_sql_server_by_key(cache_key)
+        raise
 
     if not result:
         _cleanup_sql_server_by_key(cache_key)
@@ -641,20 +783,12 @@ def sql_server(
 
 
 def _cleanup_sql_server_by_key(cache_key: str):
-    global sql_server_dict
-
-    if cache_key in sql_server_dict:
-        sql_server_dict[cache_key][Constants.CURSOR] = None
-        sql_server_dict[cache_key][Constants.CONNECTION].commit()
-        sql_server_dict[cache_key][Constants.CONNECTION].close()
-        sql_server_dict[cache_key][Constants.CONNECTION] = None
-        sql_server_dict[cache_key][Constants.COLUMN_NAMES] = None
-        sql_server_dict.pop(cache_key, None)
+    _close_sql_entry(sql_server_dict, cache_key)
 
 
 def cleanup_migrate_sql_server():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a SQL Server stream ends or aborts early."""
+    _pop_cleanup_key(_sql_server_stacks, sql_server_dict, _cleanup_sql_server_by_key)
 
 
 mgp.add_batch_read_proc(sql_server, init_migrate_sql_server, cleanup_migrate_sql_server)
@@ -665,6 +799,7 @@ mgp.add_batch_read_proc(sql_server, init_migrate_sql_server, cleanup_migrate_sql
 # ---------------------------------------------------------------------------
 
 oracle_db_dict = {}
+_oracle_db_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_oracle_db(
@@ -681,39 +816,46 @@ def init_migrate_oracle_db(
     if params:
         _check_params_type(params)
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql}"
-
-    if not config:
-        config = {}
-
-    config["disable_oob"] = True
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    sql_query = f"SELECT * FROM {table_or_sql}" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, params, config_path=config_path)
 
     if cache_key in oracle_db_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    oracle_db_dict[cache_key] = {}
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    effective_config["disable_oob"] = True
 
-    connection = oracledb.connect(**config)
-    cursor = connection.cursor()
+    connection = None
+    cursor = None
+    try:
+        connection = oracledb.connect(**effective_config)
+        cursor = connection.cursor()
+        if not params:
+            cursor.execute(sql_query)
+        elif isinstance(params, (list, tuple)):
+            cursor.execute(sql_query, params)
+        else:
+            cursor.execute(sql_query, **params)
+        column_names = _validate_column_names([column[Constants.I_COLUMN_NAME] for column in cursor.description])
+    except Exception:
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise
 
-    if not params:
-        cursor.execute(table_or_sql)
-    elif isinstance(params, (list, tuple)):
-        cursor.execute(table_or_sql, params)
-    else:
-        cursor.execute(table_or_sql, **params)
-
-    oracle_db_dict[cache_key][Constants.CONNECTION] = connection
-    oracle_db_dict[cache_key][Constants.CURSOR] = cursor
-    oracle_db_dict[cache_key][Constants.COLUMN_NAMES] = [
-        column[Constants.I_COLUMN_NAME] for column in cursor.description
-    ]
+    oracle_db_dict[cache_key] = {
+        Constants.CONNECTION: connection,
+        Constants.CURSOR: cursor,
+        Constants.COLUMN_NAMES: column_names,
+    }
+    _push_active_key(_oracle_db_stacks, cache_key)
 
 
 def oracle_db(
@@ -740,22 +882,17 @@ def oracle_db(
     """
     global oracle_db_dict
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql}"
-
-    if not config:
-        config = {}
-    config["disable_oob"] = True
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    sql_query = f"SELECT * FROM {table_or_sql}" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, params, config_path=config_path)
     cursor = oracle_db_dict[cache_key][Constants.CURSOR]
     column_names = oracle_db_dict[cache_key][Constants.COLUMN_NAMES]
-    rows = cursor.fetchmany(Constants.BATCH_SIZE)
 
-    result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    try:
+        rows = cursor.fetchmany(Constants.BATCH_SIZE)
+        result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    except Exception:
+        _cleanup_oracle_db_by_key(cache_key)
+        raise
 
     if not result:
         _cleanup_oracle_db_by_key(cache_key)
@@ -764,20 +901,12 @@ def oracle_db(
 
 
 def _cleanup_oracle_db_by_key(cache_key: str):
-    global oracle_db_dict
-
-    if cache_key in oracle_db_dict:
-        oracle_db_dict[cache_key][Constants.CURSOR] = None
-        oracle_db_dict[cache_key][Constants.CONNECTION].commit()
-        oracle_db_dict[cache_key][Constants.CONNECTION].close()
-        oracle_db_dict[cache_key][Constants.CONNECTION] = None
-        oracle_db_dict[cache_key][Constants.COLUMN_NAMES] = None
-        oracle_db_dict.pop(cache_key, None)
+    _close_sql_entry(oracle_db_dict, cache_key)
 
 
 def cleanup_migrate_oracle_db():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when an Oracle DB stream ends or aborts early."""
+    _pop_cleanup_key(_oracle_db_stacks, oracle_db_dict, _cleanup_oracle_db_by_key)
 
 
 mgp.add_batch_read_proc(oracle_db, init_migrate_oracle_db, cleanup_migrate_oracle_db)
@@ -788,6 +917,7 @@ mgp.add_batch_read_proc(oracle_db, init_migrate_oracle_db, cleanup_migrate_oracl
 # ---------------------------------------------------------------------------
 
 postgres_dict = {}
+_postgres_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_postgresql(
@@ -803,29 +933,43 @@ def init_migrate_postgresql(
 
     if params:
         _check_params_type(params, (list, tuple))
+        exec_params = params
     else:
-        params = []
+        exec_params = []
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql};"
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    sql_query = f"SELECT * FROM {table_or_sql};" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, exec_params, config_path=config_path)
 
     if cache_key in postgres_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    postgres_dict[cache_key] = {}
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    connection = None
+    cursor = None
+    try:
+        connection = psycopg2.connect(**effective_config)
+        cursor = connection.cursor()
+        cursor.execute(sql_query, exec_params)
+        column_names = _validate_column_names([column.name for column in cursor.description])
+    except Exception:
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise
 
-    connection = psycopg2.connect(**config)
-    cursor = connection.cursor()
-    cursor.execute(table_or_sql, params)
-
-    postgres_dict[cache_key][Constants.CONNECTION] = connection
-    postgres_dict[cache_key][Constants.CURSOR] = cursor
-    postgres_dict[cache_key][Constants.COLUMN_NAMES] = [column.name for column in cursor.description]
+    postgres_dict[cache_key] = {
+        Constants.CONNECTION: connection,
+        Constants.CURSOR: cursor,
+        Constants.COLUMN_NAMES: column_names,
+    }
+    _push_active_key(_postgres_stacks, cache_key)
 
 
 def postgresql(
@@ -852,22 +996,18 @@ def postgresql(
     """
     global postgres_dict
 
-    if not params:
-        params = []
-
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    if _query_is_table(table_or_sql):
-        table_or_sql = f"SELECT * FROM {table_or_sql};"
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, table_or_sql, config, params)
+    exec_params = params if params else []
+    sql_query = f"SELECT * FROM {table_or_sql};" if _query_is_table(table_or_sql) else table_or_sql
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, sql_query, config, exec_params, config_path=config_path)
     cursor = postgres_dict[cache_key][Constants.CURSOR]
     column_names = postgres_dict[cache_key][Constants.COLUMN_NAMES]
 
-    rows = cursor.fetchmany(Constants.BATCH_SIZE)
-
-    result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    try:
+        rows = cursor.fetchmany(Constants.BATCH_SIZE)
+        result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    except Exception:
+        _cleanup_postgresql_by_key(cache_key)
+        raise
 
     if not result:
         _cleanup_postgresql_by_key(cache_key)
@@ -876,20 +1016,12 @@ def postgresql(
 
 
 def _cleanup_postgresql_by_key(cache_key: str):
-    global postgres_dict
-
-    if cache_key in postgres_dict:
-        postgres_dict[cache_key][Constants.CURSOR] = None
-        postgres_dict[cache_key][Constants.CONNECTION].commit()
-        postgres_dict[cache_key][Constants.CONNECTION].close()
-        postgres_dict[cache_key][Constants.CONNECTION] = None
-        postgres_dict[cache_key][Constants.COLUMN_NAMES] = None
-        postgres_dict.pop(cache_key, None)
+    _close_sql_entry(postgres_dict, cache_key)
 
 
 def cleanup_migrate_postgresql():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a PostgreSQL stream ends or aborts early."""
+    _pop_cleanup_key(_postgres_stacks, postgres_dict, _cleanup_postgresql_by_key)
 
 
 mgp.add_batch_read_proc(postgresql, init_migrate_postgresql, cleanup_migrate_postgresql)
@@ -900,6 +1032,7 @@ mgp.add_batch_read_proc(postgresql, init_migrate_postgresql, cleanup_migrate_pos
 # ---------------------------------------------------------------------------
 
 s3_dict = {}
+_s3_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_s3(
@@ -923,48 +1056,62 @@ def init_migrate_s3(
 
     _check_enterprise_license()
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
     if not file_path.startswith("s3://"):
         raise ValueError("Invalid S3 path format. " "Expected 's3://bucket-name/path'.")
 
-    file_path_no_protocol = file_path[5:]
-    bucket_name, *key_parts = file_path_no_protocol.split("/")
-    s3_key = "/".join(key_parts)
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, file_path, config)
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, file_path, config, config_path=config_path)
 
     if cache_key in s3_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    file_path_no_protocol = file_path[5:]
+    bucket_name, *key_parts = file_path_no_protocol.split("/")
+    s3_key = "/".join(key_parts)
+
     s3_client = boto3.client(
         "s3",
-        aws_access_key_id=config.get("aws_access_key_id", os.getenv("AWS_ACCESS_KEY_ID", None)),
-        aws_secret_access_key=config.get("aws_secret_access_key", os.getenv("AWS_SECRET_ACCESS_KEY", None)),
-        aws_session_token=config.get("aws_session_token", os.getenv("AWS_SESSION_TOKEN", None)),
-        region_name=config.get("region_name", os.getenv("AWS_REGION", None)),
+        aws_access_key_id=effective_config.get("aws_access_key_id", os.getenv("AWS_ACCESS_KEY_ID", None)),
+        aws_secret_access_key=effective_config.get("aws_secret_access_key", os.getenv("AWS_SECRET_ACCESS_KEY", None)),
+        aws_session_token=effective_config.get("aws_session_token", os.getenv("AWS_SESSION_TOKEN", None)),
+        region_name=effective_config.get("region_name", os.getenv("AWS_REGION", None)),
     )
 
-    # The bucket is user-chosen, so its owner can only be verified when the caller supplies it.
-    # When set, S3 rejects the request (403) if the bucket is owned by a different account.
     get_object_kwargs = {"Bucket": bucket_name, "Key": s3_key}
-    expected_bucket_owner = config.get("bucket_owner", None)
+    expected_bucket_owner = effective_config.get("bucket_owner", None)
     if expected_bucket_owner:
         expected_bucket_owner = str(expected_bucket_owner)
         if not re.fullmatch(r"[0-9]{12}", expected_bucket_owner):
             raise ValueError("Invalid 'bucket_owner'. Expected a 12-digit AWS account ID.")
         get_object_kwargs["ExpectedBucketOwner"] = expected_bucket_owner
 
-    response = s3_client.get_object(**get_object_kwargs)
-    text_stream = io.TextIOWrapper(response["Body"], encoding="utf-8")
+    body_stream = None
+    text_stream = None
+    try:
+        response = s3_client.get_object(**get_object_kwargs)
+        body_stream = response.get("Body")
+        text_stream = io.TextIOWrapper(body_stream, encoding="utf-8")
+        csv_reader = csv.reader(text_stream)
+        column_names = _validate_column_names(next(csv_reader))
+    except Exception:
+        if text_stream is not None:
+            try:
+                text_stream.close()
+            except Exception:
+                pass
+        elif body_stream is not None and hasattr(body_stream, "close"):
+            try:
+                body_stream.close()
+            except Exception:
+                pass
+        raise
 
-    csv_reader = csv.reader(text_stream)
-    column_names = next(csv_reader)
-
-    s3_dict[cache_key] = {}
-    s3_dict[cache_key][Constants.CURSOR] = csv_reader
-    s3_dict[cache_key][Constants.COLUMN_NAMES] = column_names
+    s3_dict[cache_key] = {
+        Constants.CONNECTION: text_stream,
+        Constants.CURSOR: csv_reader,
+        Constants.COLUMN_NAMES: column_names,
+    }
+    _push_active_key(_s3_stacks, cache_key)
 
 
 def s3(
@@ -985,20 +1132,21 @@ def s3(
     """
     global s3_dict
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, file_path, config)
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, file_path, config, config_path=config_path)
     csv_reader = s3_dict[cache_key][Constants.CURSOR]
     column_names = s3_dict[cache_key][Constants.COLUMN_NAMES]
 
     batch_rows = []
-    for _ in range(Constants.BATCH_SIZE):
-        try:
-            row = next(csv_reader)
+    try:
+        for _ in range(Constants.BATCH_SIZE):
+            try:
+                row = next(csv_reader)
+            except StopIteration:
+                break
             batch_rows.append(mgp.Record(row=_name_row_cells(row, column_names)))
-        except StopIteration:
-            break
+    except Exception:
+        _cleanup_s3_by_key(cache_key)
+        raise
 
     if not batch_rows:
         _cleanup_s3_by_key(cache_key)
@@ -1007,15 +1155,19 @@ def s3(
 
 
 def _cleanup_s3_by_key(cache_key: str):
-    global s3_dict
-
-    if cache_key in s3_dict:
-        s3_dict.pop(cache_key, None)
+    entry = s3_dict.pop(cache_key, None)
+    if entry is not None:
+        stream = entry.get(Constants.CONNECTION)
+        if stream is not None and hasattr(stream, "close"):
+            try:
+                stream.close()
+            except Exception:
+                pass
 
 
 def cleanup_migrate_s3():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when an S3 stream ends or aborts early."""
+    _pop_cleanup_key(_s3_stacks, s3_dict, _cleanup_s3_by_key)
 
 
 mgp.add_batch_read_proc(s3, init_migrate_s3, cleanup_migrate_s3)
@@ -1026,6 +1178,7 @@ mgp.add_batch_read_proc(s3, init_migrate_s3, cleanup_migrate_s3)
 # ---------------------------------------------------------------------------
 
 flight_dict = {}
+_flight_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_arrow_flight(
@@ -1038,31 +1191,75 @@ def init_migrate_arrow_flight(
 
     _check_enterprise_license()
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, query, config)
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, query, config, config_path=config_path)
 
     if cache_key in flight_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    host = config.get(Constants.HOST, None)
-    port = config.get(Constants.PORT, None)
-    username = config.get(Constants.USERNAME, "")
-    password = config.get(Constants.PASSWORD, "")
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    host = effective_config.get(Constants.HOST, None)
+    port = effective_config.get(Constants.PORT, None)
+    username = effective_config.get(Constants.USERNAME, "")
+    password = effective_config.get(Constants.PASSWORD, "")
 
-    auth_string = f"{username}:{password}".encode("utf-8")
-    encoded_auth = base64.b64encode(auth_string).decode("utf-8")
+    raw_tls = effective_config.get("tls", effective_config.get("encrypted", True))
+    if not isinstance(raw_tls, bool):
+        raise TypeError("Arrow Flight config 'tls' / 'encrypted' must be a boolean.")
+    raw_scheme = effective_config.get(Constants.URI_SCHEME)
+    if raw_scheme is not None:
+        if raw_scheme not in ("grpc+tls", "grpc"):
+            raise ValueError(f"Unsupported Arrow Flight uri_scheme {raw_scheme!r}; expected 'grpc+tls' or 'grpc'.")
+        use_tls = raw_scheme == "grpc+tls"
+    else:
+        use_tls = raw_tls
 
-    client = flight.connect(f"grpc://{host}:{port}")
+    has_credentials = bool(username or password)
+    if has_credentials and not use_tls:
+        raise ValueError(
+            "Arrow Flight credentials require TLS (tls=True); refusing to send Basic authorization over plaintext grpc://."
+        )
 
-    options = flight.FlightCallOptions(headers=[(b"authorization", f"Basic {encoded_auth}".encode("utf-8"))])
+    scheme = "grpc+tls" if use_tls else "grpc"
+    connect_kwargs: Dict[str, Any] = {}
+    if use_tls:
+        tls_root_certs = effective_config.get("tls_root_certs")
+        tls_root_certs_path = effective_config.get("tls_root_certs_path")
+        if tls_root_certs_path and tls_root_certs is None:
+            with open(tls_root_certs_path, "rb") as cert_file:
+                tls_root_certs = cert_file.read()
+        elif isinstance(tls_root_certs, str):
+            tls_root_certs = tls_root_certs.encode("utf-8")
+        if tls_root_certs is not None:
+            connect_kwargs["tls_root_certs"] = tls_root_certs
+        if effective_config.get("cert_chain") is not None:
+            connect_kwargs["cert_chain"] = effective_config.get("cert_chain")
+        if effective_config.get("private_key") is not None:
+            connect_kwargs["private_key"] = effective_config.get("private_key")
 
-    flight_info = client.get_flight_info(flight.FlightDescriptor.for_command(query), options)
+    headers = []
+    if has_credentials:
+        auth_string = f"{username}:{password}".encode("utf-8")
+        encoded_auth = base64.b64encode(auth_string).decode("utf-8")
+        headers.append((b"authorization", f"Basic {encoded_auth}".encode("utf-8")))
 
-    flight_dict[cache_key] = {}
-    flight_dict[cache_key][Constants.CONNECTION] = client
-    flight_dict[cache_key][Constants.CURSOR] = iter(_fetch_flight_data(client, flight_info, options))
+    client = None
+    try:
+        client = flight.connect(f"{scheme}://{host}:{port}", **connect_kwargs)
+        options = flight.FlightCallOptions(headers=headers) if headers else flight.FlightCallOptions()
+        flight_info = client.get_flight_info(flight.FlightDescriptor.for_command(query), options)
+    except Exception:
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                pass
+        raise
+
+    flight_dict[cache_key] = {
+        Constants.CONNECTION: client,
+        Constants.CURSOR: iter(_fetch_flight_data(client, flight_info, options)),
+    }
+    _push_active_key(_flight_stacks, cache_key)
 
 
 def _fetch_flight_data(client, flight_info, options):
@@ -1072,8 +1269,12 @@ def _fetch_flight_data(client, flight_info, options):
     """
     for endpoint in flight_info.endpoints:
         reader = client.do_get(endpoint.ticket, options)
+        if hasattr(reader, "schema") and reader.schema is not None and hasattr(reader.schema, "names"):
+            _validate_column_names(list(reader.schema.names))
         for chunk in reader:
             batch = chunk.data
+            if hasattr(batch, "schema") and batch.schema is not None and hasattr(batch.schema, "names"):
+                _validate_column_names(list(batch.schema.names))
             yield from batch.to_pylist()
 
 
@@ -1087,24 +1288,26 @@ def arrow_flight(
     Execute a SQL query on Arrow Flight and stream results into Memgraph.
 
     :param query: SQL query to execute
-    :param config: Arrow Flight connection configuration
+    :param config: Arrow Flight connection configuration (TLS enabled by default)
     :param config_path: Path to a JSON config file
     :return: Stream of rows from Arrow Flight
     """
     global flight_dict
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, query, config)
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, query, config, config_path=config_path)
     cursor = flight_dict[cache_key][Constants.CURSOR]
     batch = []
-    for _ in range(Constants.BATCH_SIZE):
-        try:
-            row = _convert_row_types(next(cursor))
+    try:
+        for _ in range(Constants.BATCH_SIZE):
+            try:
+                raw_row = next(cursor)
+            except StopIteration:
+                break
+            row = _convert_row_types(raw_row)
             batch.append(mgp.Record(row=row))
-        except StopIteration:
-            break
+    except Exception:
+        _cleanup_arrow_flight_by_key(cache_key)
+        raise
 
     if not batch:
         _cleanup_arrow_flight_by_key(cache_key)
@@ -1113,15 +1316,25 @@ def arrow_flight(
 
 
 def _cleanup_arrow_flight_by_key(cache_key: str):
-    global flight_dict
-
-    if cache_key in flight_dict:
-        flight_dict.pop(cache_key, None)
+    entry = flight_dict.pop(cache_key, None)
+    if entry is not None:
+        cursor = entry.get(Constants.CURSOR)
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        client = entry.get(Constants.CONNECTION)
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def cleanup_migrate_arrow_flight():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when an Arrow Flight stream ends or aborts early."""
+    _pop_cleanup_key(_flight_stacks, flight_dict, _cleanup_arrow_flight_by_key)
 
 
 mgp.add_batch_read_proc(arrow_flight, init_migrate_arrow_flight, cleanup_migrate_arrow_flight)
@@ -1132,6 +1345,7 @@ mgp.add_batch_read_proc(arrow_flight, init_migrate_arrow_flight, cleanup_migrate
 # ---------------------------------------------------------------------------
 
 duckdb_dict = {}
+_duckdb_stacks: Dict[int, List[str]] = {}
 
 
 def init_migrate_duckdb(ctx: mgp.ProcCtx, query: str, setup_queries: mgp.Nullable[List[str]] = None):
@@ -1151,18 +1365,36 @@ def init_migrate_duckdb(ctx: mgp.ProcCtx, query: str, setup_queries: mgp.Nullabl
     if cache_key in duckdb_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    connection = duckDB.connect()
-    cursor = connection.cursor()
-    if setup_queries is not None:
-        for setup_query in setup_queries:
-            cursor.execute(setup_query)
+    connection = None
+    cursor = None
+    try:
+        connection = duckDB.connect()
+        cursor = connection.cursor()
+        if setup_queries is not None:
+            for setup_query in setup_queries:
+                cursor.execute(setup_query)
 
-    cursor.execute(query)
+        cursor.execute(query)
+        column_names = _validate_column_names([desc[0] for desc in cursor.description])
+    except Exception:
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise
 
-    duckdb_dict[cache_key] = {}
-    duckdb_dict[cache_key][Constants.CONNECTION] = connection
-    duckdb_dict[cache_key][Constants.CURSOR] = cursor
-    duckdb_dict[cache_key][Constants.COLUMN_NAMES] = [desc[0] for desc in cursor.description]
+    duckdb_dict[cache_key] = {
+        Constants.CONNECTION: connection,
+        Constants.CURSOR: cursor,
+        Constants.COLUMN_NAMES: column_names,
+    }
+    _push_active_key(_duckdb_stacks, cache_key)
 
 
 def duckdb(ctx: mgp.ProcCtx, query: str, setup_queries: mgp.Nullable[List[str]] = None) -> mgp.Record(row=mgp.Map):
@@ -1180,8 +1412,12 @@ def duckdb(ctx: mgp.ProcCtx, query: str, setup_queries: mgp.Nullable[List[str]] 
     cursor = duckdb_dict[cache_key][Constants.CURSOR]
     column_names = duckdb_dict[cache_key][Constants.COLUMN_NAMES]
 
-    rows = cursor.fetchmany(Constants.BATCH_SIZE)
-    result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    try:
+        rows = cursor.fetchmany(Constants.BATCH_SIZE)
+        result = [mgp.Record(row=_name_row_cells(row, column_names)) for row in rows]
+    except Exception:
+        _cleanup_duckdb_by_key(cache_key)
+        raise
 
     if not result:
         _cleanup_duckdb_by_key(cache_key)
@@ -1190,17 +1426,22 @@ def duckdb(ctx: mgp.ProcCtx, query: str, setup_queries: mgp.Nullable[List[str]] 
 
 
 def _cleanup_duckdb_by_key(cache_key: str):
-    global duckdb_dict
-
-    if cache_key in duckdb_dict:
-        if Constants.CONNECTION in duckdb_dict[cache_key]:
-            duckdb_dict[cache_key][Constants.CONNECTION].close()
-        duckdb_dict.pop(cache_key, None)
+    entry = duckdb_dict.pop(cache_key, None)
+    if entry is not None:
+        cursor = entry.get(Constants.CURSOR)
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        connection = entry.get(Constants.CONNECTION)
+        if connection is not None:
+            connection.close()
 
 
 def cleanup_migrate_duckdb():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a DuckDB stream ends or aborts early."""
+    _pop_cleanup_key(_duckdb_stacks, duckdb_dict, _cleanup_duckdb_by_key)
 
 
 mgp.add_batch_read_proc(duckdb, init_migrate_duckdb, cleanup_migrate_duckdb)
@@ -1211,6 +1452,67 @@ mgp.add_batch_read_proc(duckdb, init_migrate_duckdb, cleanup_migrate_duckdb)
 # ---------------------------------------------------------------------------
 
 servicenow_dict = {}
+_servicenow_stacks: Dict[int, List[str]] = {}
+
+
+def _extract_servicenow_page(response, origin_endpoint: str):
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("ServiceNow response body must be a JSON object.")
+    raw_rows = payload.get(Constants.RESULT, [])
+    if raw_rows is None:
+        raw_rows = []
+    if not isinstance(raw_rows, list):
+        raise ValueError("ServiceNow response 'result' field must be a list.")
+
+    next_url = None
+    resp_links = getattr(response, "links", None)
+    if isinstance(resp_links, dict):
+        next_entry = resp_links.get("next")
+        if isinstance(next_entry, dict) and isinstance(next_entry.get("url"), str):
+            next_url = next_entry.get("url")
+    if not next_url:
+        body_next = payload.get("next")
+        if isinstance(body_next, str) and body_next:
+            next_url = body_next
+        else:
+            body_links = payload.get("links")
+            if isinstance(body_links, dict):
+                cand = body_links.get("next")
+                if isinstance(cand, str) and cand:
+                    next_url = cand
+                elif isinstance(cand, dict):
+                    url_val = cand.get("url") or cand.get("href")
+                    if isinstance(url_val, str) and url_val:
+                        next_url = url_val
+
+    if next_url:
+        resolved_next = urljoin(origin_endpoint, next_url)
+        origin_parts = urlparse(origin_endpoint)
+        next_parts = urlparse(resolved_next)
+        if (next_parts.scheme, next_parts.netloc) != (origin_parts.scheme, origin_parts.netloc):
+            raise ValueError(
+                f"ServiceNow pagination link {resolved_next!r} leaves origin {origin_parts.scheme}://{origin_parts.netloc}."
+            )
+        next_url = resolved_next
+
+    return raw_rows, next_url
+
+
+def _iter_servicenow_rows(session, first_rows: list, first_next_url, origin_endpoint: str, headers: dict):
+    for row in first_rows:
+        yield _convert_generic_value(row)
+    seen_urls = {origin_endpoint}
+    next_url = first_next_url
+    while next_url:
+        if next_url in seen_urls:
+            raise RuntimeError(f"ServiceNow pagination repeated next-page URL {next_url!r}.")
+        seen_urls.add(next_url)
+        response = session.get(next_url, headers=headers)
+        response.raise_for_status()
+        page_rows, next_url = _extract_servicenow_page(response, origin_endpoint)
+        for row in page_rows:
+            yield _convert_generic_value(row)
 
 
 def init_migrate_servicenow(
@@ -1221,7 +1523,7 @@ def init_migrate_servicenow(
     params: mgp.Nullable[mgp.Any] = None,
 ):
     """
-    Initialize the connection to the ServiceNow REST API and fetch the JSON data.
+    Initialize the connection to the ServiceNow REST API and fetch the first page of JSON data.
 
     :param endpoint: ServiceNow API endpoint (full URL)
     :param config: Configuration map containing authentication details (username, password, instance URL, etc.)
@@ -1232,26 +1534,31 @@ def init_migrate_servicenow(
 
     _check_enterprise_license()
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, endpoint, config, params)
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, endpoint, config, params, config_path=config_path)
 
     if cache_key in servicenow_dict:
         raise RuntimeError(Constants.ALREADY_RUNNING_ERROR)
 
-    auth = (config.get(Constants.USERNAME), config.get(Constants.PASSWORD))
+    effective_config = _combine_config(config=config, config_path=config_path) if len(config_path) > 0 else dict(config)
+    auth = (effective_config.get(Constants.USERNAME), effective_config.get(Constants.PASSWORD))
     headers = {"Accept": "application/json"}
 
-    response = requests.get(endpoint, auth=auth, headers=headers, params=params)
-    response.raise_for_status()
+    session = requests.Session()
+    session.auth = auth
+    try:
+        response = session.get(endpoint, headers=headers, params=params)
+        response.raise_for_status()
+        first_rows, first_next_url = _extract_servicenow_page(response, endpoint)
+        row_iter = _iter_servicenow_rows(session, first_rows, first_next_url, endpoint, headers)
+    except Exception:
+        session.close()
+        raise
 
-    data = response.json().get(Constants.RESULT, [])
-    if not data:
-        raise ValueError("No data found in ServiceNow response")
-
-    servicenow_dict[cache_key] = {}
-    servicenow_dict[cache_key][Constants.CURSOR] = iter(data)
+    servicenow_dict[cache_key] = {
+        Constants.CONNECTION: session,
+        Constants.CURSOR: row_iter,
+    }
+    _push_active_key(_servicenow_stacks, cache_key)
 
 
 def servicenow(
@@ -1262,7 +1569,7 @@ def servicenow(
     params: mgp.Nullable[mgp.Any] = None,
 ) -> mgp.Record(row=mgp.Map):
     """
-    Fetch rows from the ServiceNow REST API in batches.
+    Fetch rows from the ServiceNow REST API in batches across all pages.
 
     :param endpoint: ServiceNow API endpoint (full URL)
     :param config: Authentication details (username, password, instance URL, etc.)
@@ -1272,19 +1579,20 @@ def servicenow(
     """
     global servicenow_dict
 
-    if len(config_path) > 0:
-        config = _combine_config(config=config, config_path=config_path)
-
-    cache_key = _get_cache_key(ctx.graph.start_timestamp, endpoint, config, params)
+    cache_key = _get_cache_key(ctx.graph.start_timestamp, endpoint, config, params, config_path=config_path)
     data_iter = servicenow_dict[cache_key][Constants.CURSOR]
 
     batch_rows = []
-    for _ in range(Constants.BATCH_SIZE):
-        try:
-            row = next(data_iter)
+    try:
+        for _ in range(Constants.BATCH_SIZE):
+            try:
+                row = next(data_iter)
+            except StopIteration:
+                break
             batch_rows.append(mgp.Record(row=row))
-        except StopIteration:
-            break
+    except Exception:
+        _cleanup_servicenow_by_key(cache_key)
+        raise
 
     if not batch_rows:
         _cleanup_servicenow_by_key(cache_key)
@@ -1293,15 +1601,25 @@ def servicenow(
 
 
 def _cleanup_servicenow_by_key(cache_key: str):
-    global servicenow_dict
-
-    if cache_key in servicenow_dict:
-        servicenow_dict.pop(cache_key, None)
+    entry = servicenow_dict.pop(cache_key, None)
+    if entry is not None:
+        cursor = entry.get(Constants.CURSOR)
+        if cursor is not None and hasattr(cursor, "close"):
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        session = entry.get(Constants.CONNECTION)
+        if session is not None and hasattr(session, "close"):
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def cleanup_migrate_servicenow():
-    """Cleanup function called by mgp framework (no parameters)."""
-    pass
+    """Cleanup function called by mgp framework when a ServiceNow stream ends or aborts early."""
+    _pop_cleanup_key(_servicenow_stacks, servicenow_dict, _cleanup_servicenow_by_key)
 
 
 mgp.add_batch_read_proc(servicenow, init_migrate_servicenow, cleanup_migrate_servicenow)

@@ -70,7 +70,7 @@ def node_boundary(
 @mgp.read_proc
 def bridges(ctx: mgp.ProcCtx, root: mgp.Nullable[mgp.Vertex] = None) -> mgp.Record(bridges=mgp.List[mgp.Edge]):
     g = MemgraphMultiGraph(ctx=ctx)
-    return mgp.Record(bridges=[next(iter(g[u][v])) for u, v in nx.bridges(MemgraphGraph(ctx=ctx), root=root)])
+    return mgp.Record(bridges=[next(iter(g[u][v])) for u, v in nx.bridges(g, root=root) if len(g[u][v]) == 1])
 
 
 # networkx.algorithms.centrality.betweenness_centrality
@@ -174,7 +174,7 @@ def k_clique_communities(
 def k_components(
     ctx: mgp.ProcCtx, density: mgp.Number = 0.95
 ) -> mgp.Record(k=int, components=mgp.List[mgp.List[mgp.Vertex]]):
-    kcomps = nx.k_components(MemgraphMultiGraph(ctx=ctx), density)
+    kcomps = nx.algorithms.approximation.k_components(MemgraphGraph(ctx=ctx), min_density=density)
 
     return [mgp.Record(k=k, components=[list(s) for s in comps]) for k, comps in kcomps.items()]
 
@@ -228,7 +228,9 @@ def find_cycle(
     orientation: mgp.Nullable[str] = None,
 ) -> mgp.Record(cycle=mgp.Nullable[mgp.List[mgp.Edge]]):
     try:
-        return mgp.Record(cycle=[e for _, _, e in nx.find_cycle(MemgraphMultiDiGraph(ctx=ctx), source, orientation)])
+        return mgp.Record(
+            cycle=[edge_tuple[2] for edge_tuple in nx.find_cycle(MemgraphMultiDiGraph(ctx=ctx), source, orientation)]
+        )
     except nx.NetworkXNoCycle:
         return mgp.Record(cycle=None)
 
@@ -290,13 +292,13 @@ def diameter(ctx: mgp.ProcCtx) -> mgp.Record(diameter=int):
 # networkx.algorithms.distance_regular.is_distance_regular
 @mgp.read_proc
 def is_distance_regular(ctx: mgp.ProcCtx) -> mgp.Record(is_distance_regular=bool):
-    return mgp.Record(is_distance_regular=nx.is_distance_regular(MemgraphMultiGraph(ctx=ctx)))
+    return mgp.Record(is_distance_regular=nx.is_distance_regular(MemgraphGraph(ctx=ctx)))
 
 
 # networkx.algorithms.strongly_regular.is_strongly_regular
 @mgp.read_proc
 def is_strongly_regular(ctx: mgp.ProcCtx) -> mgp.Record(is_strongly_regular=bool):
-    return mgp.Record(is_strongly_regular=nx.is_strongly_regular(MemgraphMultiGraph(ctx=ctx)))
+    return mgp.Record(is_strongly_regular=nx.is_strongly_regular(MemgraphGraph(ctx=ctx)))
 
 
 # networkx.algorithms.dominance.dominance_frontiers
@@ -391,8 +393,8 @@ def is_isomorphic(
 ) -> mgp.Record(is_isomorphic=bool):
     nodes1, edges1, nodes2, edges2 = map(set, [nodes1, edges1, nodes2, edges2])
     g = MemgraphMultiDiGraph(ctx=ctx)
-    g1 = nx.subgraph_view(g, lambda n: n in nodes1, lambda n1, n2, e: e in edges1)
-    g2 = nx.subgraph_view(g, lambda n: n in nodes2, lambda n1, n2, e: e in edges2)
+    g1 = nx.subgraph_view(g, filter_node=lambda n: n in nodes1, filter_edge=lambda n1, n2, e: e in edges1)
+    g2 = nx.subgraph_view(g, filter_node=lambda n: n in nodes2, filter_edge=lambda n1, n2, e: e in edges2)
     return mgp.Record(is_isomorphic=nx.is_isomorphic(g1, g2))
 
 
@@ -444,8 +446,9 @@ def lowest_common_ancestor(
 # networkx.algorithms.matching.maximal_matching
 @mgp.read_proc
 def maximal_matching(ctx: mgp.ProcCtx) -> mgp.Record(edges=mgp.List[mgp.Edge]):
-    g = MemgraphMultiDiGraph(ctx=ctx)
-    return mgp.Record(edges=list(next(iter(g[u][v])) for u, v in nx.maximal_matching(g)))
+    matching = nx.maximal_matching(MemgraphGraph(ctx=ctx))
+    host_edges = MemgraphMultiGraph(ctx=ctx)
+    return mgp.Record(edges=[next(iter(host_edges[u][v])) for u, v in matching])
 
 
 # networkx.algorithms.planarity.check_planarity
@@ -526,11 +529,11 @@ def shortest_path_length(
     elif source and not target:
         sp = {source: sp}
     elif not source and target:
-        sp = {source: {target: l} for source, l in sp.items()}
+        sp = {source: {target: length} for source, length in sp.items()}
     else:
         sp = dict(sp)
 
-    return [mgp.Record(source=s, target=t, length=l) for s, d in sp.items() for t, l in d.items()]
+    return [mgp.Record(source=s, target=t, length=length) for s, d in sp.items() for t, length in d.items()]
 
 
 # networkx.algorithms.shortest_paths.generic.all_shortest_paths
@@ -586,8 +589,8 @@ def multi_source_dijkstra_path_length(
     weight: str = "weight",
 ) -> mgp.Record(target=mgp.Vertex, length=mgp.Number):
     return [
-        mgp.Record(target=t, length=l)
-        for t, l in nx.multi_source_dijkstra_path_length(
+        mgp.Record(target=t, length=length)
+        for t, length in nx.multi_source_dijkstra_path_length(
             MemgraphMultiDiGraph(ctx=ctx), sources, cutoff=cutoff, weight=weight
         ).items()
     ]
@@ -624,15 +627,17 @@ def bfs_edges(
     reverse: bool = False,
     depth_limit: mgp.Nullable[int] = None,
 ) -> mgp.Record(edges=mgp.List[mgp.Edge]):
+    g = MemgraphMultiDiGraph(ctx=ctx)
     return mgp.Record(
-        edges=list(
-            nx.bfs_edges(
-                MemgraphMultiDiGraph(ctx=ctx),
+        edges=[
+            next(iter(g[v][u] if reverse else g[u][v]))
+            for u, v in nx.bfs_edges(
+                g,
                 source,
                 reverse=reverse,
                 depth_limit=depth_limit,
             )
-        )
+        ]
     )
 
 
@@ -734,7 +739,10 @@ def edge_bfs(
     orientation: mgp.Nullable[str] = None,
 ) -> mgp.Record(edges=mgp.List[mgp.Edge]):
     return mgp.Record(
-        edges=list(e for _, _, e in nx.edge_bfs(MemgraphMultiDiGraph(ctx=ctx), source=source, orientation=orientation))
+        edges=[
+            edge_tuple[2]
+            for edge_tuple in nx.edge_bfs(MemgraphMultiDiGraph(ctx=ctx), source=source, orientation=orientation)
+        ]
     )
 
 
@@ -746,7 +754,10 @@ def edge_dfs(
     orientation: mgp.Nullable[str] = None,
 ) -> mgp.Record(edges=mgp.List[mgp.Edge]):
     return mgp.Record(
-        edges=list(e for _, _, e in nx.edge_dfs(MemgraphMultiDiGraph(ctx=ctx), source=source, orientation=orientation))
+        edges=[
+            edge_tuple[2]
+            for edge_tuple in nx.edge_dfs(MemgraphMultiDiGraph(ctx=ctx), source=source, orientation=orientation)
+        ]
     )
 
 

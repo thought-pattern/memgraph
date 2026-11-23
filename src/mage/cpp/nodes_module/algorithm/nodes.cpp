@@ -16,25 +16,35 @@
 #include "mgp.hpp"
 
 bool Nodes::RelationshipExist(const mgp::Node &node, std::string &rel_type) {
+  if (rel_type.empty()) {
+    return node.OutRelationships().cbegin() != node.OutRelationships().cend() ||
+           node.InRelationships().cbegin() != node.InRelationships().cend();
+  }
   char direction{' '};
-  if (rel_type[0] == '<' && rel_type[rel_type.size() - 1] == '>') {
+  if (rel_type.front() == '<' && rel_type.back() == '>') {
     throw mgp::ValueException("Invalid relationship specification!");
   }
-  if (rel_type[rel_type.size() - 1] == '>') {
-    direction = rel_type[rel_type.size() - 1];
+  if (rel_type.back() == '>') {
+    direction = rel_type.back();
     rel_type.pop_back();
-  } else if (rel_type[0] == '<') {
-    direction = rel_type[0];
+  } else if (rel_type.front() == '<') {
+    direction = rel_type.front();
     rel_type.erase(0, 1);
   }
+  if (rel_type.empty()) {
+    if (direction == '>') {
+      return node.OutRelationships().cbegin() != node.OutRelationships().cend();
+    }
+    return node.InRelationships().cbegin() != node.InRelationships().cend();
+  }
   for (const auto rel : node.OutRelationships()) {
-    if (std::string(rel.Type()) == rel_type && direction != '<') {
+    if (rel.Type() == rel_type && direction != '<') {
       return true;
     }
   }
   return std::any_of(
       node.InRelationships().begin(), node.InRelationships().end(), [&rel_type, &direction](const auto &rel) {
-        return std::string(rel.Type()) == rel_type && direction != '>';
+        return rel.Type() == rel_type && direction != '>';
       });
 }
 

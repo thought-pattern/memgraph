@@ -24,6 +24,8 @@
 
 #if USE_JEMALLOC
 #include "jemalloc/jemalloc.h"
+#elif defined(__APPLE__)
+#include <malloc/malloc.h>
 #else
 #include <malloc.h>
 #endif
@@ -146,14 +148,12 @@ void UnsetHooks() {
 #endif
 }
 
-void PurgeUnusedMemory() {
+bool PurgeUnusedMemory() {
 #if USE_JEMALLOC
   // A forced purge skips an arena that another thread is already purging, and a background thread
   // purges only down to the decay limit, so purging while one is mid-pass leaves pages behind.
   // Stopping the background threads joins them, so none is mid-pass when the purge runs. Callers
-  // are serialised so that one cannot restart the threads while another is still purging. Each call
-  // joins and recreates the threads, which is acceptable for a purge a user's query asks for but not
-  // for one run periodically.
+  // are serialised so that one cannot restart the threads while another is still purging.
   static std::mutex purge_mutex;
   const std::scoped_lock lock(purge_mutex);
 
@@ -163,7 +163,10 @@ void PurgeUnusedMemory() {
   if (const int err = je_mallctl("background_thread", &was_enabled, &len, &disable, sizeof(disable)); err != 0) {
     spdlog::warn("Failed to stop jemalloc background threads before a purge: {} ({})", strerror(err), err);
   }
-  je_mallctl("arena." STRINGIFY(MALLCTL_ARENAS_ALL) ".purge", nullptr, nullptr, nullptr, 0);
+  const int purge_err = je_mallctl("arena." STRINGIFY(MALLCTL_ARENAS_ALL) ".purge", nullptr, nullptr, nullptr, 0);
+  if (purge_err != 0) {
+    spdlog::error("Failed to purge jemalloc arenas: {} ({})", strerror(purge_err), purge_err);
+  }
   if (was_enabled) {
     if (const int err = je_mallctl("background_thread", nullptr, nullptr, &was_enabled, sizeof(was_enabled));
         err != 0) {
@@ -174,8 +177,13 @@ void PurgeUnusedMemory() {
           err);
     }
   }
+  return purge_err == 0;
+#elif defined(__APPLE__)
+  malloc_zone_pressure_relief(nullptr, 0);
+  return true;
 #else
-  malloc_trim(0);
+  (void)malloc_trim(0);
+  return true;
 #endif
 }
 

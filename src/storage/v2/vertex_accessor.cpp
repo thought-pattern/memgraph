@@ -486,7 +486,7 @@ Result<PropertyValue> VertexAccessor::SetProperty(PropertyId property, const Pro
   if (vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
   PropertyValue old_value;
-  const bool skip_duplicate_write = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_write = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   auto const set_property_impl = [this,
                                   transaction = transaction_,
                                   vertex = vertex_,
@@ -640,7 +640,7 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> Vertex
 
   if (vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
-  const bool skip_duplicate_update = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_update = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   using ReturnType = decltype(vertex_->properties.UpdateProperties(properties));
   std::optional<ReturnType> id_old_new_change;
   utils::AtomicMemoryBlock([storage = storage_,

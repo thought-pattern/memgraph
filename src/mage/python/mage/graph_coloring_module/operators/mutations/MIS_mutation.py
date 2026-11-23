@@ -1,9 +1,12 @@
-import random
-from typing import Any, Dict, List, Tuple
+"""Utilities for MIS mutation."""
+
+from random import shuffle as random_shuffle
 
 from mage.graph_coloring_module.components.individual import Individual
 from mage.graph_coloring_module.graph import Graph
 from mage.graph_coloring_module.operators.mutations.mutation import Mutation
+
+DEFAULT_ARGUMENT_DICT = {}
 
 
 class MISMutation(Mutation):
@@ -15,12 +18,17 @@ class MISMutation(Mutation):
         return "MISMutation"
 
     def mutate(
-        self, graph: Graph, individual: Individual, parameters: Dict[str, Any] = None
-    ) -> Tuple[Individual, List[int]]:
+        self,
+        graph: Graph,
+        individual: Individual,
+        parameters: dict = DEFAULT_ARGUMENT_DICT,
+    ) -> tuple[Individual, list[int]]:
         """A function that mutates the given individual and
         returns the new individual and nodes that were changed."""
 
-        maximal_independent_set = self._MIS(graph)
+        if parameters is DEFAULT_ARGUMENT_DICT:
+            parameters = DEFAULT_ARGUMENT_DICT.copy()
+        maximal_independent_set = self.INTERNAL_MIS(graph)
         if len(maximal_independent_set) > 0:
             color = individual[maximal_independent_set[0]]
             colors = [color for _ in range(len(maximal_independent_set))]
@@ -28,25 +36,25 @@ class MISMutation(Mutation):
             return mutated_individual, maximal_independent_set
         return individual, []
 
-    def _MIS(self, graph: Graph) -> List[int]:
+    def INTERNAL_MIS(self, graph: Graph) -> list[int]:
         """A function that finds the maximal independent set. The first step
         is to shuffle nodes and add the first node to the maximal independent set.
         After that, all those nodes that do not have neighbors in the MIS are
         sequentially added to the MIS. ."""
 
         nodes = list(graph.nodes)
-        random.shuffle(nodes)
-        MIS_flags = [False for _ in range(len(graph))]
-        MIS = []
+        random_shuffle(nodes)
+        mis_flags = [False for _ in range(len(graph))]
+        maximal_independent_set = []
 
         for node in nodes:
             include = True
             for neigh in graph[node]:
-                if MIS_flags[neigh]:
+                if mis_flags[neigh]:
                     include = False
                     break
             if include:
-                MIS.append(node)
-                MIS_flags[node] = True
+                maximal_independent_set.append(node)
+                mis_flags[node] = True
 
-        return MIS
+        return maximal_independent_set

@@ -38,10 +38,8 @@ def test_admin():
 def test_wrong_credentials():
     AUTH = ("admin", "testpassword")
 
-    with pytest.raises(Exception):
-        assert "admin" == execute_query("SHOW CURRENT USER;", AUTH)[0]["user"]
-        print("Authentication failed. Error: ", e)
-        assert False
+    with pytest.raises(AuthError):
+        execute_query("SHOW CURRENT USER;", AUTH)
 
 
 def test_right_credentials():
@@ -70,9 +68,8 @@ def test_user():
 def test_wrong_credentials_user():
     AUTH = ("user", "testpassword")
 
-    with pytest.raises(Exception):
-        assert "user" == execute_query("SHOW CURRENT USER;", AUTH)[0]["user"]
-        print("Authentication failed")
+    with pytest.raises(AuthError):
+        execute_query("SHOW CURRENT USER;", AUTH)
 
 
 def test_right_credentials_user():

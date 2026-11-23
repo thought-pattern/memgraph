@@ -230,6 +230,8 @@ class Client {
   class StreamHandler {
    private:
     friend class Client;
+    template <class U>
+    friend class StreamHandler;
 
     StreamHandler(std::shared_ptr<Connection> conn, std::shared_ptr<communication::Client> sock,
                   std::unique_lock<utils::ResourceLock> &&guard,
@@ -242,6 +244,16 @@ class Client {
           req_builder_(GenBuilderCallback(conn_.get(), this, timeout_ms_)),
           res_load_(res_load) {}
 
+    void RetireIncompleteStream() noexcept {
+      if (wire_bytes_sent_ && !exchange_completed_ && !defunct_ && conn_ != nullptr) {
+        defunct_ = true;
+        if (sock_ != nullptr) {
+          sock_->ClearData();
+        }
+        conn_->Shutdown();
+      }
+    }
+
    public:
     // NOLINTNEXTLINE
     StreamHandler(StreamHandler &&other) noexcept
@@ -249,6 +261,8 @@ class Client {
           sock_{std::exchange(other.sock_, nullptr)},
           timeout_ms_{other.timeout_ms_},
           defunct_{std::exchange(other.defunct_, true)},
+          wire_bytes_sent_{std::exchange(other.wire_bytes_sent_, false)},
+          exchange_completed_{std::exchange(other.exchange_completed_, true)},
           guard_{std::move(other.guard_)},
           req_builder_{std::move(other.req_builder_), GenBuilderCallback(conn_.get(), this, timeout_ms_)},
           res_load_{std::move(other.res_load_)} {}
@@ -256,10 +270,17 @@ class Client {
     // NOLINTNEXTLINE
     StreamHandler &operator=(StreamHandler &&other) noexcept {
       if (&other != this) {
-        conn_ = std::exchange(other.conn_, nullptr);
+        RetireIncompleteStream();
+        // Unlock the old connection's mutex BEFORE dropping `conn_`, in case `*this` holds the last reference.
+        if (guard_.owns_lock()) {
+          guard_.unlock();
+        }
         sock_ = std::exchange(other.sock_, nullptr);
+        conn_ = std::exchange(other.conn_, nullptr);
         timeout_ms_ = other.timeout_ms_;
         defunct_ = std::exchange(other.defunct_, true);
+        wire_bytes_sent_ = std::exchange(other.wire_bytes_sent_, false);
+        exchange_completed_ = std::exchange(other.exchange_completed_, true);
         guard_ = std::move(other.guard_);
         req_builder_ = slk::Builder(std::move(other.req_builder_), GenBuilderCallback(conn_.get(), this, timeout_ms_));
         res_load_ = std::move(other.res_load_);
@@ -270,7 +291,7 @@ class Client {
     StreamHandler(const StreamHandler &) = delete;
     StreamHandler &operator=(const StreamHandler &) = delete;
 
-    ~StreamHandler() = default;
+    ~StreamHandler() noexcept { RetireIncompleteStream(); }
 
     slk::Builder *GetBuilder() { return &req_builder_; }
 
@@ -295,8 +316,10 @@ class Client {
           // Even if in progress RPC message was sent, the stream will be complete
           auto const ret = slk::CheckStreamStatus(sock_->GetData(), sock_->GetDataSize());
           if (ret.status == slk::StreamStatus::INVALID) {
-            // Logically invalid state, connection is still up, defunct stream and release
+            // Invalid framing leaves unparseable bytes in the buffer; clear and retire the socket so later calls reconnect.
             defunct_ = true;
+            sock_->ClearData();
+            conn_->Shutdown();
             guard_.unlock();
             throw GenericRpcFailedException();
           }
@@ -333,7 +356,10 @@ class Client {
         });
 
         if (!maybe_message_header) {
+          defunct_ = true;
           sock_->ShiftData(response_data_size);
+          conn_->Shutdown();
+          guard_.unlock();
           throw SlkRpcFailedException();
         }
 
@@ -364,7 +390,8 @@ class Client {
                       maybe_message_header->message_version,
                       conn_->endpoint_.GetAddress(),
                       conn_->endpoint_.GetPort());
-        sock_->ShiftData(response_data_size);
+        exchange_completed_ = true;
+        utils::OnScopeExit const shift_final([&, response_data_size] { sock_->ShiftData(response_data_size); });
         return res_load_(&res_reader);
       }
     }
@@ -389,8 +416,10 @@ class Client {
       while (true) {
         auto ret = slk::CheckStreamStatus(sock_->GetData(), sock_->GetDataSize());
         if (ret.status == slk::StreamStatus::INVALID) {
-          // Logically invalid state, connection is still up, defunct stream and release
+          // Invalid framing leaves unparseable bytes in the buffer; clear and retire the socket so later calls reconnect.
           defunct_ = true;
+          sock_->ClearData();
+          conn_->Shutdown();
           guard_.unlock();
           throw GenericRpcFailedException();
         }
@@ -428,8 +457,12 @@ class Client {
       });
 
       if (!maybe_message_header) {
+        defunct_ = true;
+        sock_->ShiftData(response_data_size);
+        res_cleanup.Disable();
+        conn_->Shutdown();
+        guard_.unlock();
         throw SlkRpcFailedException();
-        ;
       }
 
       // Check the response ID.
@@ -454,6 +487,7 @@ class Client {
                     conn_->endpoint_.GetAddress(),
                     conn_->endpoint_.GetPort());
 
+      exchange_completed_ = true;
       return res_load_(&res_reader);
     }
 
@@ -465,6 +499,7 @@ class Client {
     static auto GenBuilderCallback(Connection *conn, StreamHandler *self, std::optional<int> timeout_ms) {
       return [conn, self, timeout_ms](const uint8_t *data, size_t size, bool have_more) {
         if (self->defunct_) throw GenericRpcFailedException();
+        self->wire_bytes_sent_ = true;
         if (auto const res = self->sock_->Write(data, size, have_more, timeout_ms); !res.has_value()) {
           self->defunct_ = true;
           conn->Shutdown();
@@ -487,6 +522,8 @@ class Client {
     std::shared_ptr<communication::Client> sock_;
     std::optional<int> timeout_ms_;
     bool defunct_ = false;
+    bool wire_bytes_sent_ = false;
+    bool exchange_completed_ = false;
     std::unique_lock<utils::ResourceLock> guard_;
     slk::Builder req_builder_;
     std::function<typename TRequestResponse::Response(slk::Reader *)> res_load_;
@@ -520,6 +557,7 @@ class Client {
   template <class TRequestResponseNew, class TRequestResponseOld, class... Args>
   StreamHandler<TRequestResponseNew> UpgradeStream(StreamHandler<TRequestResponseOld> &&old_stream_handler,
                                                    Args &&...args) {
+    old_stream_handler.RetireIncompleteStream();
     return StreamWithLoad<TRequestResponseNew>(
         [](auto *reader) {
           typename TRequestResponseNew::Response response;
@@ -591,7 +629,7 @@ class Client {
   template <class TRequestResponse, class... Args>
   typename TRequestResponse::Response CallWithLoad(
       std::function<typename TRequestResponse::Response(slk::Reader *)> load, Args &&...args) {
-    auto stream = StreamWithLoad(load, std::forward<Args>(args)...);
+    auto stream = StreamWithLoad<TRequestResponse>(std::move(load), std::nullopt, std::forward<Args>(args)...);
     return stream.SendAndWait();
   }
 

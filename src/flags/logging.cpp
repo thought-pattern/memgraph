@@ -89,7 +89,7 @@ DEFINE_string(log_file, "", "Path to where the log should be stored.");
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_VALIDATED_string(logger_type, "sync",
                         "Controls whether synchronous or asynchronous logger will be used. Options: sync, async", {
-                          auto const logger_lower = memgraph::utils::ToLowerCase(value);
+                          auto const logger_lower = memgraph::utils::ToLowerCase(memgraph::utils::Trim(value));
                           if (logger_lower != kSync && logger_lower != kAsync) {
                             std::cerr << "Expected --" << flagname << " to be 'sync' or 'async' string\n";
                             return false;
@@ -111,7 +111,61 @@ inline constexpr std::array log_level_mappings{std::pair{"TRACE"sv, spdlog::leve
 
 namespace memgraph::flags {
 
+namespace {
+
+std::pair<std::string_view, std::string_view> SplitLogFilenameByExtension(std::string_view fname) {
+  const auto ext_index = fname.rfind('.');
+  if (ext_index == std::string_view::npos || ext_index == 0 || ext_index == fname.size() - 1) {
+    return {fname, std::string_view{}};
+  }
+  return {fname.substr(0, ext_index), fname.substr(ext_index)};
+}
+
+bool IsValidIsoDateComponent(std::string_view date_part) {
+  if (date_part.size() != 10 || date_part[4] != '-' || date_part[7] != '-') {
+    return false;
+  }
+  for (size_t idx : {0UZ, 1UZ, 2UZ, 3UZ, 5UZ, 6UZ, 8UZ, 9UZ}) {
+    if (date_part[idx] < '0' || date_part[idx] > '9') {
+      return false;
+    }
+  }
+  const int month = (date_part[5] - '0') * 10 + (date_part[6] - '0');
+  const int day = (date_part[8] - '0') * 10 + (date_part[9] - '0');
+  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+}  // namespace
+
 auto LogRetentionDays() -> uint64_t { return FLAGS_log_retention_days; }
+
+bool IsAsyncLoggerType(std::string_view logger_type) {
+  return memgraph::utils::ToLowerCase(memgraph::utils::Trim(logger_type)) == kAsync;
+}
+
+bool IsRotatedLogFileFor(const std::filesystem::path &candidate_path,
+                         const std::filesystem::path &configured_log_path) {
+  const auto configured_name = configured_log_path.filename().string();
+  const auto candidate_name = candidate_path.filename().string();
+  if (configured_name.empty() || candidate_name.empty()) {
+    return false;
+  }
+  if (candidate_path.has_parent_path() && configured_log_path.has_parent_path() &&
+      candidate_path.parent_path() != configured_log_path.parent_path()) {
+    return false;
+  }
+  const auto [base, ext] = SplitLogFilenameByExtension(configured_name);
+  const size_t expected_len = base.size() + 1 + 10 + ext.size();
+  if (candidate_name.size() != expected_len) {
+    return false;
+  }
+  const std::string_view cand_sv{candidate_name};
+  if (!cand_sv.starts_with(base) || cand_sv[base.size()] != '_' || !cand_sv.ends_with(ext)) {
+    return false;
+  }
+  const auto date_part = cand_sv.substr(base.size() + 1, 10);
+  return IsValidIsoDateComponent(date_part);
+}
 
 const std::string &GetAllowedLogLevels() {
   static const std::string allowed_levels = memgraph::utils::GetAllowedEnumValuesString(log_level_mappings);
@@ -175,18 +229,21 @@ void InitializeLogger() {
 
   auto dist_sink = std::make_shared<spdlog::sinks::dist_sink_mt>(std::move(sub_sinks));
 
-  auto logger = std::invoke([dist_sink_local = std::move(dist_sink)]() mutable -> std::shared_ptr<spdlog::logger> {
-    if (FLAGS_logger_type == kAsync) {
-      // 8k size of the buffer
-      spdlog::init_thread_pool(8192, 1);
-      return std::make_shared<spdlog::async_logger>("memgraph_log",
-                                                    std::move(dist_sink_local),
-                                                    spdlog::thread_pool(),
-                                                    spdlog::async_overflow_policy::overrun_oldest);
-    } else {
-      return std::make_shared<spdlog::logger>("memgraph_log", std::move(dist_sink_local));
-    }
-  });
+  FLAGS_logger_type = memgraph::utils::ToLowerCase(memgraph::utils::Trim(FLAGS_logger_type));
+  const bool use_async_logger = IsAsyncLoggerType(FLAGS_logger_type);
+  auto logger = std::invoke(
+      [dist_sink_local = std::move(dist_sink), use_async_logger]() mutable -> std::shared_ptr<spdlog::logger> {
+        if (use_async_logger) {
+          // 8k size of the buffer
+          spdlog::init_thread_pool(8192, 1);
+          return std::make_shared<spdlog::async_logger>("memgraph_log",
+                                                        std::move(dist_sink_local),
+                                                        spdlog::thread_pool(),
+                                                        spdlog::async_overflow_policy::overrun_oldest);
+        } else {
+          return std::make_shared<spdlog::logger>("memgraph_log", std::move(dist_sink_local));
+        }
+      });
 
   logger->set_level(ParseLogLevel());
   logger->flush_on(spdlog::level::trace);
@@ -221,14 +278,19 @@ void CleanLogsDir() {
   if (FLAGS_log_file.empty()) return;
 
   auto const log_path = std::filesystem::path{FLAGS_log_file};
-  auto const log_directory = log_path.parent_path();
+  if (!log_path.has_filename()) return;
+  auto const log_directory = log_path.has_parent_path() ? log_path.parent_path() : std::filesystem::path{"."};
   auto const cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::days(LogRetentionDays());
 
   // Logs error only at the end, doesn't log for each file
   std::error_code ec;
   for (auto const &entry : std::filesystem::directory_iterator(log_directory, ec)) {
-    if (!entry.is_regular_file(ec)) continue;
-    if (entry.last_write_time(ec) < cutoff) {
+    std::error_code entry_ec;
+    if (entry.is_symlink(entry_ec) || entry_ec) continue;
+    if (!entry.is_regular_file(entry_ec) || entry_ec) continue;
+    if (!IsRotatedLogFileFor(entry.path(), log_path)) continue;
+    const auto mtime = entry.last_write_time(entry_ec);
+    if (!entry_ec && mtime < cutoff) {
       memgraph::utils::DeleteFile(entry.path());
     }
   }

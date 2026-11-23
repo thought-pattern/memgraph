@@ -375,6 +375,20 @@ std::optional<UserProfiles::Profile> UserProfiles::Merge(const std::optional<Pro
   return merged;
 }
 
+UserProfiles::MemorySnapshot UserProfiles::CaptureMemorySnapshot() const {
+  const std::shared_lock lk(mtx_);
+  return MemorySnapshot{.profiles = std::vector<Profile>{profiles_.begin(), profiles_.end()}, .stale = stale_};
+}
+
+void UserProfiles::RestoreMemorySnapshot(MemorySnapshot snapshot) {
+  const std::unique_lock lk(mtx_);
+  profiles_.clear();
+  for (auto &profile : snapshot.profiles) {
+    profiles_.insert(std::move(profile));
+  }
+  stale_ = std::move(snapshot.stale);
+}
+
 }  // namespace memgraph::auth
 
 namespace memgraph::slk {

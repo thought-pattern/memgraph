@@ -44,6 +44,8 @@ ReplicationServer::~ReplicationServer() { Shutdown(); }
 
 bool ReplicationServer::Start() { return rpc_server_.Start(); }
 
+bool ReplicationServer::IsRunning() const { return rpc_server_.IsRunning(); }
+
 bool ReplicationServer::Shutdown() const {
   // if I am the thread which did the shutdown
   if (rpc_server_.Shutdown()) {

@@ -119,6 +119,6 @@ struct RWSpinLock {
 
   // TODO: ATM not atomic, just used via atomic_ref, because the type needs to be movable into skip_list
   //       fix the design flaw and then make RWSpinLock a non-copy/non-move type
-  status_t lock_status_ = 0;
+  mutable status_t lock_status_ = 0;
 };
 }  // namespace memgraph::utils

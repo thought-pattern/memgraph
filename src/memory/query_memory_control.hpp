@@ -84,10 +84,10 @@ struct CrossThreadMemoryTracking {
   ArenaPool *db_arena_pool{nullptr};
 
   explicit CrossThreadMemoryTracking(ArenaPool *arena_pool = nullptr);
-  ~CrossThreadMemoryTracking() = default;
+  ~CrossThreadMemoryTracking() noexcept;
 
   void StartTracking();
-  void StopTracking();
+  void StopTracking() noexcept;
 
   CrossThreadMemoryTracking(CrossThreadMemoryTracking &) = delete;
   CrossThreadMemoryTracking &operator=(CrossThreadMemoryTracking &) = delete;

@@ -40,11 +40,16 @@ class OnlineBC {
   /// Maps nodes (i.e. Memgraph IDs) to their betweenness centrality scores
   std::unordered_map<std::uint64_t, double> node_bc_scores;
 
+  /// Canonical sorted undirected neighbor pairs (min_id, max_id) of the cached graph state
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> cached_edges;
+
   /// Betweenness centrality score initialization flag
   bool initialized = false;
 
   /// Avoids counting edges twice in case of undirected graphs
   static constexpr double NO_DOUBLE_COUNT = 2.0;
+
+  static std::vector<std::pair<std::uint64_t, std::uint64_t>> CanonicalEdges(const mg_graph::GraphView<> &graph);
 
   ///@brief Returns whether previously calculated betweenness centrality scores are inconsistent with the current graph,
   /// i.e. if the nodes which have associated betweenness centrality scores are not the same as the graph’s nodes.

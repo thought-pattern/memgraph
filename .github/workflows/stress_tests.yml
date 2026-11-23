@@ -90,6 +90,7 @@ jobs:
       memgraph_image: ${{ inputs.memgraph_image != '' && inputs.memgraph_image || needs.BuildMageImage.outputs.s3_package_url }}
       arch: ${{ inputs.arch }}
       workload: ${{ inputs.workload }}
+      replication_mode: ${{ inputs.replication_mode }}
     secrets: inherit
 
   stress_test_eks_ha:
@@ -102,4 +103,5 @@ jobs:
       memgraph_image: ${{ inputs.memgraph_image != '' && inputs.memgraph_image || needs.BuildMageImage.outputs.s3_package_url }}
       arch: ${{ inputs.arch }}
       workload: ${{ inputs.workload }}
+      replication_mode: ${{ inputs.replication_mode }}
     secrets: inherit

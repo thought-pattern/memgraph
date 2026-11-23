@@ -20,14 +20,20 @@ MARKER = "<!-- pr-conflicts -->"
 REPO = "memgraph/memgraph"
 
 
-def load_pr_files(json_path: str) -> dict[int, set[str]]:
+def load_pr_files(json_path: str, target_pr_json_path: str = "") -> dict[int, set[str]]:
     """
     Map each PR number in the `gh pr list` JSON to the set of paths it touches.
     """
-    with open(json_path, "r") as f:
+    with open(json_path, "r", encoding="utf-8") as f:
         prs = json.load(f)
 
-    return {pr["number"]: {file["path"] for file in pr.get("files") or []} for pr in prs}
+    mapping = {pr["number"]: {file["path"] for file in pr.get("files") or []} for pr in prs}
+    if target_pr_json_path:
+        with open(target_pr_json_path, "r", encoding="utf-8") as tf:
+            target_pr = json.load(tf)
+        if isinstance(target_pr, dict) and "number" in target_pr:
+            mapping[target_pr["number"]] = {file["path"] for file in target_pr.get("files") or []}
+    return mapping
 
 
 def find_conflicts(pr_files: dict[int, set[str]], pr_number: int) -> list[tuple[int, int]]:
@@ -35,7 +41,9 @@ def find_conflicts(pr_files: dict[int, set[str]], pr_number: int) -> list[tuple[
     Return (other PR number, shared file count) for every other PR sharing at
     least one file with `pr_number`, most shared files first.
     """
-    own_files = pr_files.get(pr_number, set())
+    if pr_number not in pr_files:
+        raise ValueError(f"PR #{pr_number} is absent from the open PR file inventory")
+    own_files = pr_files[pr_number]
 
     conflicts = []
     for other, files in pr_files.items():
@@ -74,9 +82,20 @@ def main():
     parser.add_argument("json_path", type=str, help="Path to the `gh pr list --json number,files` output.")
     parser.add_argument("pr_number", type=int, help="Number of the PR to check.")
     parser.add_argument("output_path", type=str, help="Where to write the message, if there are conflicts.")
+    parser.add_argument(
+        "--target-pr-json",
+        type=str,
+        default="",
+        help="Optional `gh pr view <num> --json number,files` payload to ensure target PR coverage beyond list limits.",
+    )
     args = parser.parse_args()
 
-    conflicts = find_conflicts(load_pr_files(args.json_path), args.pr_number)
+    pr_files = load_pr_files(args.json_path, args.target_pr_json)
+    if args.pr_number not in pr_files:
+        raise SystemExit(
+            f"Error: PR #{args.pr_number} is missing from {args.json_path}; refusing to clear existing conflict warnings."
+        )
+    conflicts = find_conflicts(pr_files, args.pr_number)
     if not conflicts:
         print(f"No open PRs share files with #{args.pr_number}.")
         return

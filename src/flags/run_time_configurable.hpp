@@ -164,5 +164,6 @@ bool IsSessionSettable(std::string_view key);
 // Validate a raw string `value` for `key`. Returns an error message if invalid,
 // std::nullopt if valid. Precondition: IsSessionSettable(key).
 std::optional<std::string> ValidateSessionSettingValue(std::string_view key, std::string_view value);
+std::string NormalizeSessionSettingValue(std::string_view key, std::string_view value);
 
 }  // namespace memgraph::flags::run_time

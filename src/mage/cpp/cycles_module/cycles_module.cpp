@@ -20,8 +20,8 @@ constexpr char const *kProcedureGet = "get";
 constexpr char const *kFieldCycleId = "cycle_id";
 constexpr char const *kFieldNode = "node";
 
-void InsertCycleRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const int cycle_id,
-                       const int node_id) {
+void InsertCycleRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const std::int64_t cycle_id,
+                       const std::int64_t node_id) {
   auto *node = mg_utility::GetNodeForInsertion(node_id, graph, memory);
   if (!node) return;
 
@@ -44,8 +44,8 @@ void GetCycles(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mg
         InsertCycleRecord(memgraph_graph,
                           result,
                           memory,
-                          static_cast<int>(cycle_id),
-                          static_cast<int>(graph->GetMemgraphNodeId(node.id)));
+                          static_cast<std::int64_t>(cycle_id),
+                          static_cast<std::int64_t>(graph->GetMemgraphNodeId(node.id)));
       }
     }
   } catch (const std::exception &e) {

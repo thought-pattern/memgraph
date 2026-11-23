@@ -780,8 +780,8 @@ std::optional<UserProfiles::Profile> Auth::UpdateProfile(const std::string &prof
                                                          system::Transaction *system_tx) {
   const auto res = user_profiles_.Update(profile_name, updated_limits);
   if (res) {
-    // Update user resources
-    if (user_resources_) {
+    // Update user resources outside buffered transactions; transactional callers refresh after Flush.
+    if (user_resources_ && !storage_.IsTransactional()) {
       for (const auto &user : UsersConnectedToProfile(*this, profile_name)) {
         UpdateProfileLimits(user, res, *user_resources_);
       }
@@ -825,13 +825,13 @@ bool Auth::CreateOrUpdateProfile(const std::string &profile_name, UserProfiles::
 
 UserProfiles::DropResult Auth::DropProfile(const std::string &profile_name, system::Transaction *system_tx) {
   std::unordered_set<std::string> users;
-  if (user_resources_) {
+  if (user_resources_ && !storage_.IsTransactional()) {
     users = UsersConnectedToProfile(*this, profile_name);
   }
   const auto res = user_profiles_.Drop(profile_name);
   if (res == UserProfiles::DropResult::kDropped) {
     // Update user resources
-    if (user_resources_) {
+    if (user_resources_ && !storage_.IsTransactional()) {
       for (const auto &user : users) {
         UpdateProfileLimits(user, {}, *user_resources_);
       }
@@ -853,7 +853,7 @@ std::optional<UserProfiles::Profile> Auth::SetProfile(const std::string &profile
     throw AuthException("Couldn't set profile '{}' for user '{}'!", profile_name, name);
   }
 
-  if (user_resources_) {
+  if (user_resources_ && !storage_.IsTransactional()) {
     UpdateProfileLimits(name, profile, *user_resources_);
   }
 
@@ -881,12 +881,23 @@ void Auth::RevokeProfile(const std::string &name, system::Transaction *system_tx
       break;
   }
 
-  if (user_resources_) {
+  if (user_resources_ && !storage_.IsTransactional()) {
     UpdateProfileLimits(name, std::nullopt, *user_resources_);
   }
 
   if (auto const profile = user_profiles_.Get(*profile_name)) {
     AddAuthAction(system_tx, [&] { return replication::AuthUpdateOp{*profile}; });
+  }
+}
+
+void Auth::RefreshAllUserProfileResources() {
+  if (!user_resources_) return;
+  for (const auto &username : AllUsernames()) {
+    std::optional<UserProfiles::Profile> effective;
+    if (const auto prof_name = user_profiles_.GetProfileForUsername(username)) {
+      effective = user_profiles_.Get(*prof_name);
+    }
+    UpdateProfileLimits(username, effective, *user_resources_);
   }
 }
 

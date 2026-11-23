@@ -1,6 +1,10 @@
 {% set current_dir = os.getcwd() %}
 {% set ubsan_ignore_path = os.path.join(current_dir, 'tools', 'ubsan.ignore') %}
-{% set ubsan_ignore_hash = os.popen("md5sum " + ubsan_ignore_path + " | cut -c1-8").read().strip() %}
+{% set ubsan_ignore_escaped = '"' + ubsan_ignore_path.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`') + '"' %}
+{% set ubsan_ignore_hash = os.popen("md5sum -- " + ubsan_ignore_escaped + " 2>/dev/null | cut -c1-8").read().strip() %}
+{% if not ubsan_ignore_hash %}
+{% set ubsan_ignore_hash = os.popen("md5 -q -- " + ubsan_ignore_escaped + " 2>/dev/null | cut -c1-8").read().strip() %}
+{% endif %}
 
 [settings]
 compiler.ubsan=True

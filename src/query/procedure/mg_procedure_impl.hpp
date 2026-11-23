@@ -63,6 +63,8 @@ struct mgp_value {
   mgp_value(double, allocator_type) noexcept;
   /// @throw std::bad_alloc
   mgp_value(const char *, allocator_type);
+  /// @throw std::bad_alloc
+  mgp_value(std::string_view, allocator_type);
   /// Take ownership of the mgp_list, MemoryResource must match.
   mgp_value(mgp_list *, allocator_type) noexcept;
   /// Take ownership of the mgp_map, MemoryResource must match.
@@ -610,6 +612,7 @@ struct mgp_map {
 
 struct mgp_map_item {
   const char *key;
+  size_t key_size{0};
   mgp_value *value;
 };
 
@@ -621,8 +624,15 @@ struct mgp_map_items_iterator {
     std::visit(
         [this](auto &items) {
           auto itr = items.begin();
-          current.key = itr->first.c_str();
-          current.value = &itr->second;
+          if (itr != items.end()) {
+            current.key = itr->first.c_str();
+            current.key_size = itr->first.size();
+            current.value = &itr->second;
+          } else {
+            current.key = nullptr;
+            current.key_size = 0;
+            current.value = nullptr;
+          }
           current_it = itr;
         },
         map->items);

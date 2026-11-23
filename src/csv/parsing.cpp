@@ -18,7 +18,9 @@ module;
 #include "utils/pmr/vector.hpp"
 #include "utils/string.hpp"
 
+#include <cstddef>
 #include <string_view>
+#include <unordered_set>
 
 #include <boost/iostreams/filter/bzip2.hpp>
 #include <boost/iostreams/filter/gzip.hpp>
@@ -40,8 +42,11 @@ enum class CompressionMethod : uint8_t {
 
 /// Detect compression based on magic sequences
 auto DetectCompressionMethod(std::istream &is) -> CompressionMethod {
-  // Ensure stream is reset
-  auto const on_exit = memgraph::utils::OnScopeExit{[&]() { is.seekg(std::ios::beg); }};
+  // Ensure stream state and position are both restored even if probing reaches EOF on a 1- or 2-byte CSV.
+  auto const on_exit = memgraph::utils::OnScopeExit{[&]() {
+    is.clear();
+    is.seekg(0, std::ios::beg);
+  }};
 
   // Note we must use bytes for comparison, not char
   //
@@ -107,8 +112,10 @@ struct Reader::impl {
   PlainStream csv_stream_;
   Config read_config_;
   uint64_t line_count_{1};
-  uint16_t number_of_columns_{0};
+  size_t number_of_columns_{0};
   uint64_t estimated_number_of_columns_{0};
+  bool stream_error_{false};
+  bool reached_eof_{false};
   utils::pmr::string line_buffer_{memory_};
   Reader::Header header_{memory_};
 };
@@ -148,7 +155,14 @@ void Reader::impl::InitializeStream() {
 
 bool Reader::impl::GetNextLine() {
   if (!std::getline(csv_stream_, line_buffer_)) {
-    // reached end of file or an I/0 error occurred
+    // Distinguish an underlying stream/decompressor read error from genuine end-of-file before resetting the chain.
+    const bool underlying_bad = source_.GetStream().bad();
+    const bool filter_io_error = csv_stream_.bad() || (csv_stream_.fail() && !csv_stream_.eof());
+    if (underlying_bad || filter_io_error) {
+      stream_error_ = true;
+    } else {
+      reached_eof_ = true;
+    }
     if (!csv_stream_.good()) {
       csv_stream_.reset();  // this will close the file_stream_ and clear the chain
     }
@@ -176,6 +190,14 @@ void Reader::impl::TryInitializeHeader() {
 
   if (header->empty()) {
     throw CsvReadException("CSV file {} empty!", path_);
+  }
+
+  std::unordered_set<std::string_view> seen_columns;
+  seen_columns.reserve(header->size());
+  for (const auto &col_name : *header) {
+    if (!seen_columns.emplace(col_name).second) {
+      throw CsvReadException("CSV header contains duplicate column name '{}'", col_name);
+    }
   }
 
   number_of_columns_ = header->size();
@@ -207,6 +229,10 @@ Reader::ParsingResult Reader::impl::ParseRow(utils::MemoryResource *mem) {
 
   do {
     if (!GetNextLine()) {
+      if (stream_error_) {
+        return std::unexpected{ParseError(ParseError::ErrorCode::IO_ERROR,
+                                          fmt::format("CSV: Stream read error at line {:d}", line_count_))};
+      }
       // The whole file was processed.
       break;
     }
@@ -214,8 +240,13 @@ Reader::ParsingResult Reader::impl::ParseRow(utils::MemoryResource *mem) {
     std::string_view line_string_view = line_buffer_;
 
     // remove '\r' from the end in case we have dos file format
-    if (line_string_view.back() == '\r') {
+    if (!line_string_view.empty() && line_string_view.back() == '\r') {
       line_string_view.remove_suffix(1);
+    }
+
+    // Skip blank physical lines outside quoted strings rather than treating them as prematurely ending the file.
+    if (state == CsvParserState::INITIAL_FIELD && line_string_view.empty()) {
+      continue;
     }
 
     while (state != CsvParserState::DONE && !line_string_view.empty()) {
@@ -247,7 +278,12 @@ Reader::ParsingResult Reader::impl::ParseRow(utils::MemoryResource *mem) {
           } else {
             // The current field is a regular field.
             const auto delimiter_idx = line_string_view.find(*read_config_.delimiter);
-            row.emplace_back(line_string_view.substr(0, delimiter_idx));
+            const auto field_view = line_string_view.substr(0, delimiter_idx);
+            if (field_view.find('\0') != std::string_view::npos) {
+              return std::unexpected{ParseError(ParseError::ErrorCode::NULL_BYTE,
+                                                fmt::format("CSV: Line {:d} contains NULL byte", line_count_ - 1))};
+            }
+            row.emplace_back(field_view);
             if (delimiter_idx == std::string_view::npos) {
               state = CsvParserState::DONE;
             } else {
@@ -298,7 +334,7 @@ Reader::ParsingResult Reader::impl::ParseRow(utils::MemoryResource *mem) {
         }
       }
     }
-  } while (state == CsvParserState::QUOTING);
+  } while (state == CsvParserState::QUOTING || (state == CsvParserState::INITIAL_FIELD && row.empty() && !reached_eof_));
 
   switch (state) {
     case CsvParserState::INITIAL_FIELD:
@@ -349,21 +385,27 @@ std::optional<Reader::Row> Reader::impl::GetNextRow(utils::MemoryResource *mem) 
   auto row = ParseRow(mem);
 
   if (!row) [[unlikely]] {
-    if (!read_config_.ignore_bad) {
+    if (row.error().code == ParseError::ErrorCode::IO_ERROR || !read_config_.ignore_bad) {
       throw CsvReadException("CSV Reader: Bad row at line {:d}: {}", line_count_ - 1, row.error().message);
     }
     // try to parse as many times as necessary to reach a valid row
     do {
       spdlog::debug("CSV Reader: Bad row at line {:d}: {}", line_count_ - 1, row.error().message);
-      if (!csv_stream_.good()) {
+      if (stream_error_) {
+        throw CsvReadException("CSV Reader: Bad row at line {:d}: {}", line_count_ - 1, row.error().message);
+      }
+      if (reached_eof_ || !csv_stream_.good()) {
         return std::nullopt;
       }
       row = ParseRow(mem);
+      if (!row && row.error().code == ParseError::ErrorCode::IO_ERROR) {
+        throw CsvReadException("CSV Reader: Bad row at line {:d}: {}", line_count_ - 1, row.error().message);
+      }
     } while (!row.has_value());
   }
 
   if (row->empty()) [[unlikely]] {
-    // reached end of file
+    // reached genuine end of file
     return std::nullopt;
   }
   return std::move(*row);

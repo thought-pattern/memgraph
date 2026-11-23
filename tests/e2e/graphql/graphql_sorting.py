@@ -66,7 +66,7 @@ def test_sorting_in_relationship(query_server):
     query = dedent(
         """\
         query {
-        movies {
+        movies(sort: [{ runtime: ASC }]) {
             title
             runtime
             actors(sort: [{ surname: ASC }]) {
@@ -84,17 +84,20 @@ def test_sorting_in_relationship(query_server):
             "data": {
                 "movies": [
                     {
-                        "title": "Inception",
-                        "runtime": 148,
+                        "title": "Spirited Away",
+                        "runtime": 125,
                         "actors": [
                             {
-                                "surname": "DiCaprio"
-                            },
+                                "surname": "Hiiragi"
+                            }
+                        ]
+                    },
+                    {
+                        "title": "Parasite",
+                        "runtime": 132,
+                        "actors": [
                             {
-                                "surname": "Gordon-Levitt"
-                            },
-                            {
-                                "surname": "Page"
+                                "surname": "Song"
                             }
                         ]
                     },
@@ -110,6 +113,30 @@ def test_sorting_in_relationship(query_server):
                             },
                             {
                                 "surname": "Reeves"
+                            }
+                        ]
+                    },
+                    {
+                        "title": "Inception",
+                        "runtime": 148,
+                        "actors": [
+                            {
+                                "surname": "DiCaprio"
+                            },
+                            {
+                                "surname": "Gordon-Levitt"
+                            },
+                            {
+                                "surname": "Page"
+                            }
+                        ]
+                    },
+                    {
+                        "title": "Interstellar",
+                        "runtime": 169,
+                        "actors": [
+                            {
+                                "surname": "McConaughey"
                             }
                         ]
                     }

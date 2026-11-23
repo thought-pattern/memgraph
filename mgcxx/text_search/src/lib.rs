@@ -972,11 +972,9 @@ fn search_get_fields(
 }
 
 // Adaptive candidate paging for fuzzy_phrase_search. The post-filter discards candidates, so the first page
-// over-fetches the effective limit by FUZZY_PHRASE_OVERFETCH_FACTOR and doubles each round when starved.
-// FUZZY_PHRASE_MAX_CANDIDATES caps how many score-ranked candidates one query will ever scan.
-// (Future scalability lever: a str/bytes fast field + columnar collector would filter without the store.)
+// over-fetches the effective limit by FUZZY_PHRASE_OVERFETCH_FACTOR and doubles each round when starved
+// until the requested limit is satisfied or the Tantivy candidate stream is exhausted.
 const FUZZY_PHRASE_OVERFETCH_FACTOR: usize = 8;
-const FUZZY_PHRASE_MAX_CANDIDATES: usize = 50_000;
 
 // Parses `data.<property>:<terms>` into (property, terms); the field side is trimmed. fuzzy_phrase_search
 // is single-property only, so any other form (no colon, non-`data` prefix, or blank property) is rejected.
@@ -1204,7 +1202,13 @@ fn regex_search_gids_pinned(
     let index_path = &context.tantivyContext.index_path;
     let schema = &context.tantivyContext.schema;
 
-    let search_field = search_get_fields(&input.search_fields, schema, index_path)?[0];
+    let search_fields = search_get_fields(&input.search_fields, schema, index_path)?;
+    let search_field = search_fields.first().copied().ok_or_else(|| {
+        Error::new(
+            ErrorKind::Other,
+            format!("regex_search requires at least one search field inside {:?} text search index", index_path),
+        )
+    })?;
     let regex = compiled_regex(context, &input.search_query)?;
 
     let limit = input.effective_limit();
@@ -1365,13 +1369,24 @@ fn fuzzy_phrase_matched_docs(
 
     // Page through score-ranked candidates, post-filtering each page, until we've collected
     // `result_limit` matches or the candidate stream runs out. Selective queries fill the first page;
-    // we widen only when the post-filter is starved, capped at FUZZY_PHRASE_MAX_CANDIDATES.
+    // we widen only when the post-filter is starved, without silently truncating before exhaustion.
     let result_limit = input.effective_limit();
+    if result_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let total_docs = searcher_ctx.searcher.num_docs() as usize;
+    if total_docs == 0 {
+        return Ok(Vec::new());
+    }
     let mut matched: Vec<(f32, TantivyDocument)> = Vec::new();
     let mut scanned = 0usize;
-    let mut page = result_limit.saturating_mul(FUZZY_PHRASE_OVERFETCH_FACTOR).min(FUZZY_PHRASE_MAX_CANDIDATES);
-    while matched.len() < result_limit && scanned < FUZZY_PHRASE_MAX_CANDIDATES {
-        let page_limit = page.min(FUZZY_PHRASE_MAX_CANDIDATES - scanned);
+    let mut page = result_limit
+        .saturating_mul(FUZZY_PHRASE_OVERFETCH_FACTOR)
+        .max(1)
+        .min(total_docs);
+    while matched.len() < result_limit && scanned < total_docs {
+        let remaining_docs = total_docs - scanned;
+        let page_limit = page.min(remaining_docs).max(1);
         let top_docs = searcher_ctx
             .searcher
             .search(&query, &TopDocs::with_limit(page_limit).and_offset(scanned))
@@ -1399,13 +1414,6 @@ fn fuzzy_phrase_matched_docs(
             break; // candidate stream exhausted -- no more docs to page into
         }
         page = page.saturating_mul(2);
-    }
-    if matched.len() < result_limit && scanned >= FUZZY_PHRASE_MAX_CANDIDATES {
-        log::warn!(
-            "fuzzy_phrase_search hit the {} candidate scan cap in {:?}; results may be truncated",
-            FUZZY_PHRASE_MAX_CANDIDATES,
-            index_path
-        );
     }
     Ok(matched)
 }
@@ -1467,7 +1475,13 @@ fn regex_search_edge_gids_pinned(
     let index_path = &context.tantivyContext.index_path;
     let schema = &context.tantivyContext.schema;
 
-    let search_field = search_get_fields(&input.search_fields, schema, index_path)?[0];
+    let search_fields = search_get_fields(&input.search_fields, schema, index_path)?;
+    let search_field = search_fields.first().copied().ok_or_else(|| {
+        Error::new(
+            ErrorKind::Other,
+            format!("regex_search requires at least one search field inside {:?} text search index", index_path),
+        )
+    })?;
     let regex = compiled_regex(context, &input.search_query)?;
 
     let limit = input.effective_limit();

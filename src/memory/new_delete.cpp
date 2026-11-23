@@ -17,6 +17,8 @@
 
 #if USE_JEMALLOC
 #include <jemalloc/jemalloc.h>
+#elif defined(__APPLE__)
+#include <malloc/malloc.h>
 #else
 #include <malloc.h>
 #endif
@@ -26,50 +28,132 @@
 #if !__has_feature(thread_sanitizer)
 
 namespace {
-inline void *newImpl(const std::size_t size) {
-  auto *ptr = [size] {
-    const memgraph::utils::MemoryTracker::RefusalHandledScope refusal_handled;
-    return malloc(size);
-  }();
-  if (ptr != nullptr) [[likely]] {
-    return ptr;
-  }
-
+[[noreturn]] inline void ThrowAllocationFailure() {
   [[maybe_unused]] auto blocker = memgraph::utils::MemoryTracker::OutOfMemoryExceptionBlocker{};
   auto maybe_msg = memgraph::utils::MemoryErrorStatus().msg();
   if (maybe_msg) {
     throw memgraph::utils::OutOfMemoryException{std::move(*maybe_msg)};
   }
-
   throw std::bad_alloc{};
 }
 
-inline void *newImpl(const std::size_t size, const std::align_val_t align) {
+#if !USE_JEMALLOC
+inline std::size_t PlatformMallocUsableSize(void *ptr) noexcept {
+  if (ptr == nullptr) [[unlikely]] {
+    return 0;
+  }
+#if defined(__APPLE__)
+  return malloc_size(ptr);
+#else
+  return malloc_usable_size(ptr);
+#endif
+}
+
+inline void *AllocRaw(const std::size_t size, const std::optional<std::align_val_t> align) noexcept {
+  if (!align.has_value()) {
+    return malloc(size);
+  }
+  const std::size_t a = static_cast<std::size_t>(*align);
+  if (a < sizeof(void *)) {
+    return malloc(size);
+  }
+  const std::size_t rounded = (size + a - 1) & ~(a - 1);
+  return aligned_alloc(a, rounded);
+}
+#endif
+
+inline void *newImpl(const std::size_t size, const std::optional<std::align_val_t> align = std::nullopt) {
+#if USE_JEMALLOC
   auto *ptr = [size, align] {
     const memgraph::utils::MemoryTracker::RefusalHandledScope refusal_handled;
-    return aligned_alloc(static_cast<std::size_t>(align), size);
+    return align ? aligned_alloc(static_cast<std::size_t>(*align), size) : malloc(size);
   }();
   if (ptr != nullptr) [[likely]] {
     return ptr;
   }
-
-  [[maybe_unused]] auto blocker = memgraph::utils::MemoryTracker::OutOfMemoryExceptionBlocker{};
-  auto maybe_msg = memgraph::utils::MemoryErrorStatus().msg();
-  if (maybe_msg) {
-    throw memgraph::utils::OutOfMemoryException{std::move(*maybe_msg)};
+  ThrowAllocationFailure();
+#else
+  const bool accepted = [size] {
+    const memgraph::utils::MemoryTracker::RefusalHandledScope refusal_handled;
+    return memgraph::utils::graph_memory_tracker.Alloc(static_cast<int64_t>(size));
+  }();
+  if (!accepted) [[unlikely]] {
+    ThrowAllocationFailure();
   }
 
-  throw std::bad_alloc{};
+  void *ptr = AllocRaw(size, align);
+  if (ptr == nullptr) [[unlikely]] {
+    memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size));
+    ThrowAllocationFailure();
+  }
+
+  const std::size_t usable = PlatformMallocUsableSize(ptr);
+  if (usable > size) {
+    const int64_t slack = static_cast<int64_t>(usable - size);
+    const bool slack_accepted = [slack] {
+      const memgraph::utils::MemoryTracker::RefusalHandledScope refusal_handled;
+      return memgraph::utils::graph_memory_tracker.Alloc(slack);
+    }();
+    if (!slack_accepted) [[unlikely]] {
+      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size));
+      free(ptr);
+      ThrowAllocationFailure();
+    }
+  } else if (usable < size) {
+    memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size - usable));
+  }
+  return ptr;
+#endif
 }
 
-inline void *newNoExcept(const std::size_t size) noexcept {
+inline void *newNoExcept(const std::size_t size,
+                         const std::optional<std::align_val_t> align = std::nullopt) noexcept {
+#if USE_JEMALLOC
   [[maybe_unused]] auto blocker = memgraph::utils::MemoryTracker::OutOfMemoryExceptionBlocker{};
-  return malloc(size);
-}
+  return align ? aligned_alloc(static_cast<std::size_t>(*align), size) : malloc(size);
+#else
+  const bool accepted = [size]() noexcept {
+    try {
+      const memgraph::utils::MemoryTracker::RefusalHandledScope refusal_handled;
+      return memgraph::utils::graph_memory_tracker.Alloc(static_cast<int64_t>(size));
+    } catch (...) {
+      return false;
+    }
+  }();
+  if (!accepted) [[unlikely]] {
+    return nullptr;
+  }
 
-inline void *newNoExcept(const std::size_t size, const std::align_val_t align) noexcept {
-  [[maybe_unused]] auto blocker = memgraph::utils::MemoryTracker::OutOfMemoryExceptionBlocker{};
-  return aligned_alloc(static_cast<std::size_t>(align), size);
+  void *ptr = [&]() noexcept {
+    [[maybe_unused]] auto blocker = memgraph::utils::MemoryTracker::OutOfMemoryExceptionBlocker{};
+    return AllocRaw(size, align);
+  }();
+  if (ptr == nullptr) [[unlikely]] {
+    memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size));
+    return nullptr;
+  }
+
+  const std::size_t usable = PlatformMallocUsableSize(ptr);
+  if (usable > size) {
+    const int64_t slack = static_cast<int64_t>(usable - size);
+    const bool slack_accepted = [slack]() noexcept {
+      try {
+        const memgraph::utils::MemoryTracker::RefusalHandledScope refusal_handled;
+        return memgraph::utils::graph_memory_tracker.Alloc(slack);
+      } catch (...) {
+        return false;
+      }
+    }();
+    if (!slack_accepted) [[unlikely]] {
+      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size));
+      free(ptr);
+      return nullptr;
+    }
+  } else if (usable < size) {
+    memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size - usable));
+  }
+  return ptr;
+#endif
 }
 
 #if USE_JEMALLOC
@@ -120,64 +204,20 @@ inline void deleteSized(void *ptr, const std::size_t /*unused*/, const std::alig
 }
 #endif
 
-inline void TrackMemory(std::size_t size) {
-#if !USE_JEMALLOC
-  memgraph::utils::graph_memory_tracker.Alloc(static_cast<int64_t>(size));
-#endif
-}
-
-inline void TrackMemory(std::size_t size, const std::align_val_t align) {
-#if !USE_JEMALLOC
-  memgraph::utils::graph_memory_tracker.Alloc(static_cast<int64_t>(size));
-#endif
-}
-
-inline bool TrackMemoryNoExcept(const std::size_t size) {
-  try {
-    TrackMemory(size);
-  } catch (...) {
-    return false;
-  }
-
-  return true;
-}
-
-inline bool TrackMemoryNoExcept(const std::size_t size, const std::align_val_t align) {
-  try {
-    TrackMemory(size, align);
-  } catch (...) {
-    return false;
-  }
-
-  return true;
-}
-
 inline void UntrackMemory([[maybe_unused]] void *ptr, [[maybe_unused]] std::size_t size = 0) noexcept {
   try {
 #if !USE_JEMALLOC
-    if (size) {
-      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size));
-    } else {
-      // Innaccurate because malloc_usable_size() result is greater or equal to allocated size.
-      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(malloc_usable_size(ptr)));
+    if (ptr != nullptr) [[likely]] {
+      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(PlatformMallocUsableSize(ptr)));
     }
 #endif
   } catch (...) {
   }
 }
 
-inline void UntrackMemory(void *ptr, const std::align_val_t align, [[maybe_unused]] std::size_t size = 0) noexcept {
-  try {
-#if !USE_JEMALLOC
-    if (size) {
-      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(size));
-    } else {
-      // Innaccurate because malloc_usable_size() result is greater or equal to allocated size.
-      memgraph::utils::graph_memory_tracker.Free(static_cast<int64_t>(malloc_usable_size(ptr)));
-    }
-#endif
-  } catch (...) {
-  }
+inline void UntrackMemory([[maybe_unused]] void *ptr, const std::align_val_t /*align*/,
+                          [[maybe_unused]] std::size_t size = 0) noexcept {
+  UntrackMemory(ptr, size);
 }
 
 }  // namespace
@@ -194,14 +234,7 @@ __attribute__((visibility("default"))) void *JeNew(size_t size, int flags) {
   if (ptr != nullptr) [[likely]] {
     return ptr;
   }
-
-  [[maybe_unused]] auto blocker = memgraph::utils::MemoryTracker::OutOfMemoryExceptionBlocker{};
-  auto maybe_msg = memgraph::utils::MemoryErrorStatus().msg();
-  if (maybe_msg) {
-    throw memgraph::utils::OutOfMemoryException{std::move(*maybe_msg)};
-  }
-
-  throw std::bad_alloc{};
+  ThrowAllocationFailure();
 }
 
 void JeDealloc(void *ptr, size_t size, int flags) noexcept;
@@ -214,56 +247,36 @@ __attribute__((visibility("default"))) void JeFree(void *ptr, size_t size, int f
 }
 #endif
 
-__attribute__((visibility("default"))) void *operator new(const std::size_t size) {
-  TrackMemory(size);
-  return newImpl(size);
-}
+__attribute__((visibility("default"))) void *operator new(const std::size_t size) { return newImpl(size); }
 
-__attribute__((visibility("default"))) void *operator new[](const std::size_t size) {
-  TrackMemory(size);
-  return newImpl(size);
-}
+__attribute__((visibility("default"))) void *operator new[](const std::size_t size) { return newImpl(size); }
 
 __attribute__((visibility("default"))) void *operator new(const std::size_t size, const std::align_val_t align) {
-  TrackMemory(size, align);
   return newImpl(size, align);
 }
 
 __attribute__((visibility("default"))) void *operator new[](const std::size_t size, const std::align_val_t align) {
-  TrackMemory(size, align);
   return newImpl(size, align);
 }
 
 __attribute__((visibility("default"))) void *operator new(const std::size_t size,
                                                           const std::nothrow_t & /*unused*/) noexcept {
-  if (TrackMemoryNoExcept(size)) [[likely]] {
-    return newNoExcept(size);
-  }
-  return nullptr;
+  return newNoExcept(size);
 }
 
 __attribute__((visibility("default"))) void *operator new[](const std::size_t size,
                                                             const std::nothrow_t & /*unused*/) noexcept {
-  if (TrackMemoryNoExcept(size)) [[likely]] {
-    return newNoExcept(size);
-  }
-  return nullptr;
+  return newNoExcept(size);
 }
 
 __attribute__((visibility("default"))) void *operator new(const std::size_t size, const std::align_val_t align,
                                                           const std::nothrow_t & /*unused*/) noexcept {
-  if (TrackMemoryNoExcept(size, align)) [[likely]] {
-    return newNoExcept(size, align);
-  }
-  return nullptr;
+  return newNoExcept(size, align);
 }
 
 __attribute__((visibility("default"))) void *operator new[](const std::size_t size, const std::align_val_t align,
                                                             const std::nothrow_t & /*unused*/) noexcept {
-  if (TrackMemoryNoExcept(size, align)) [[likely]] {
-    return newNoExcept(size, align);
-  }
-  return nullptr;
+  return newNoExcept(size, align);
 }
 
 __attribute__((visibility("default"))) void operator delete(void *ptr) noexcept {

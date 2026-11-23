@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "auth/atomic_auth_overlay.hpp"
+#include "auth/exceptions.hpp"
 #include "kvstore/kvstore.hpp"
 
 namespace memgraph::auth {
@@ -133,8 +134,21 @@ class Repository {
     return std::visit(
         [&prefix_str, &pred](auto *target) {
           auto const end = target->end(prefix_str);
-          for (auto it = target->begin(prefix_str); it != end; ++it) {
-            if (pred(*it)) return true;
+          auto it = target->begin(prefix_str);
+          for (; it != end; ++it) {
+            if (pred(*it)) {
+              if constexpr (requires { it.HasError(); }) {
+                if (it.HasError()) {
+                  throw AuthException("Failed to read authentication store: {}", it.ErrorMessage());
+                }
+              }
+              return true;
+            }
+          }
+          if constexpr (requires { it.HasError(); }) {
+            if (it.HasError()) {
+              throw AuthException("Failed to read authentication store: {}", it.ErrorMessage());
+            }
           }
           return false;
         },

@@ -1,17 +1,16 @@
-import abc
-import random
-import sys
+"""Utilities for solver."""
+
+from abc import ABC as abc_ABC, abstractmethod as abc_abstractmethod
+from sys import stderr as sys_stderr
 
 try:
     from gekko import GEKKO
-except ImportError as import_error:
-    sys.stderr.write(
-        (f"NOTE: Please install gekko in order to be " f"able to use set-cover solver. Using Python: {sys.version}")
-    )
-    raise import_error
+except ImportError:
+    sys_stderr.write("NOTE: Please install gekko in order to be able to use set-cover solver.")
+    raise
 
 
-class MatchingProblem(abc.ABC):
+class MatchingProblem:
     """
     Definition for matching problem of set cover
     """
@@ -38,19 +37,18 @@ class GekkoMatchingProblem(MatchingProblem):
         self.sets_by_elements = sets_by_elements
 
 
-class MatchingProblemSolver(abc.ABC):
+class MatchingProblemSolver(abc_ABC):
     """
     Solver of set cover matching problem
     """
 
-    @abc.abstractmethod
+    @abc_abstractmethod
     def solve(self, matching_problem: MatchingProblem):
         """
         Solves the matching problem and returns the set indices
         :param matching_problem: matching problem
         :return: set indices
         """
-        pass
 
 
 class GekkoMPSolver(MatchingProblemSolver):
@@ -70,25 +68,30 @@ class GekkoMPSolver(MatchingProblemSolver):
         containing_const = m.Const(1, name="const")
 
         set_list = list(matching_problem.containing_sets)
-        vars = [m.Var(lb=0, ub=1, integer=True, name=GekkoMPSolver.get_variable_name(i)) for i in range(len(set_list))]
+        variables = [m.Var(lb=0, ub=1, integer=True, name=GekkoMPSolver.get_variable_name(i)) for i in range(len(set_list))]
 
         set_ordinal_map = {value: i for i, value in enumerate(set_list)}
 
-        for element in matching_problem.sets_by_elements.keys():
-            containing_sets = matching_problem.sets_by_elements[element]
-            contained_sets_eq = 0
+        for element, containing_sets in matching_problem.sets_by_elements.items():
+            contained_set_variables = []
 
             for contained_set in containing_sets:
-                ordinal_number = set_ordinal_map[contained_set]
-                contained_sets_eq = contained_sets_eq + vars[ordinal_number]
+                if contained_set not in set_ordinal_map:
+                    raise KeyError(f"unknown containing set {contained_set!r}")
+                contained_set_variables.append(variables[set_ordinal_map.get(contained_set, 0)])
 
-            m.Equation(equation=contained_sets_eq >= containing_const)
+            if not contained_set_variables:
+                raise ValueError(f"element {element!r} is not contained by any set")
+            contained_sets_equation = contained_set_variables[0]
+            for contained_set_variable in contained_set_variables[1:]:
+                contained_sets_equation += contained_set_variable
+            m.Equation(equation=contained_sets_equation >= containing_const)
 
-        m.Obj(sum(vars))
+        m.Obj(sum(variables))
         m.solve()
 
         resulting_sets = []
-        for idx, var in enumerate(vars):
+        for idx, var in enumerate(variables):
             if var.value[0] == 1.0:
                 resulting_sets.append(set_list[idx])
 
@@ -102,12 +105,15 @@ class GekkoMPSolver(MatchingProblemSolver):
         :return: set variable name
         """
 
-        return f"containing_set_{set_no}"
+        computed_return_value = f"containing_set_{set_no}"
+        return computed_return_value
 
 
 class GreedyMPSolver(MatchingProblemSolver):
     """
-    Solver of set cover with greedy method
+    Solver of set cover with the classic greedy method: repeatedly pick the set covering the most still-uncovered
+    elements. This is a heuristic with the H(n) <= ln(n) + 1 approximation bound (n = largest set size), not an exact
+    minimum; GekkoMPSolver is the exact solver.
     """
 
     def solve(self, matching_problem: GreedyMatchingProblem):
@@ -117,19 +123,25 @@ class GreedyMPSolver(MatchingProblemSolver):
         :return: set indices
         """
 
-        universe = matching_problem.elements
+        uncovered = set(matching_problem.elements)
+        # Sorted candidates make ties explicit and deterministic: among equally useful sets the lowest id is taken.
+        candidate_sets = sorted(matching_problem.containing_sets)
 
-        possible_sets = list(matching_problem.containing_sets)
-        random.shuffle(possible_sets)
+        picked_sets = []
+        while uncovered and candidate_sets:
+            picked_set = max(
+                candidate_sets,
+                key=lambda candidate: len(uncovered & matching_problem.elements_by_sets.get(candidate, set())),
+            )
+            newly_covered = uncovered & matching_problem.elements_by_sets.get(picked_set, set())
+            if not newly_covered:
+                break
 
-        picked_sets = list()
-        covered_universe = set()
-
-        while len(universe) != len(covered_universe):
-            picked_set = possible_sets[0]
             picked_sets.append(picked_set)
-            possible_sets = possible_sets[1:]
+            candidate_sets.remove(picked_set)
+            uncovered -= newly_covered
 
-            covered_universe |= matching_problem.elements_by_sets[picked_set]
+        if uncovered:
+            raise ValueError(f"elements {sorted(uncovered)!r} are not contained by any set")
 
         return picked_sets

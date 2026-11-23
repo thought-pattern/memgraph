@@ -45,7 +45,7 @@ func main() {
 
   defer session.Close()
 
-  session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
+  _, err = session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
     fmt.Println(create_person(tx, "mirko"))
     result, err := tx.Run("CREATE (", map[string]interface{}{})
     if err != nil {
@@ -60,12 +60,18 @@ func main() {
 
     return nil, nil
   })
+  if err != nil {
+    handle_error(err)
+  }
 
-  session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
+  _, err = session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
     fmt.Println(create_person(tx, "mirko"))
     fmt.Println(create_person(tx, "slavko"))
     return nil, nil
   })
+  if err != nil {
+    handle_error(err)
+  }
 
   result, err := session.Run("UNWIND range(1, 100000) AS x CREATE ()", map[string]interface{}{})
   if err != nil {
@@ -75,7 +81,7 @@ func main() {
   if err != nil {
     handle_error(err)
   }
-  session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
+  _, err = session.WriteTransaction(func(tx neo4j.Transaction) (interface{}, error) {
     result, err := tx.Run("MATCH (a), (b), (c), (d), (e), (f) RETURN COUNT(*) AS cnt", map[string]interface{}{})
     if err != nil {
       handle_error(err)
@@ -89,6 +95,9 @@ func main() {
     }
     return nil, nil
   })
+  if err != nil {
+    handle_error(err)
+  }
 
   fmt.Println("All ok!")
 }

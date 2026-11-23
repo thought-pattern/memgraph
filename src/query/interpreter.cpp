@@ -2447,9 +2447,8 @@ Callback HandleReplicationInfoQuery(ReplicationInfoQuery *repl_query,
 
             auto const sys_info_to_tv = [&](ReplicaSystemInfoState orig) {
               auto info = std::map<std::string, TypedValue>{};
-              info.emplace("ts", TypedValue{static_cast<int64_t>(orig.ts_)});
-              // TODO: behind not implemented
-              info.emplace("behind", TypedValue{/*orig.behind_*/});
+              info.emplace("ts", orig.ts_.has_value() ? TypedValue{static_cast<int64_t>(*orig.ts_)} : TypedValue{});
+              info.emplace("behind", orig.behind_.has_value() ? TypedValue{*orig.behind_} : TypedValue{});
               info.emplace("status", replica_sys_state_to_tv(orig.state_));
               return TypedValue{std::move(info)};
             };
@@ -3431,7 +3430,7 @@ Callback HandleSettingQuery(SettingQuery *setting_query, const Parameters &param
         if (!settings) {
           throw QueryRuntimeException("Settings are not available");
         }
-        auto maybe_value = settings->GetValue(setting_name);
+        auto maybe_value = settings->GetRedactedValue(setting_name);
         if (!maybe_value) {
           throw utils::BasicException("Unknown setting name '{}'", setting_name);
         }
@@ -3453,7 +3452,7 @@ Callback HandleSettingQuery(SettingQuery *setting_query, const Parameters &param
         if (!settings) {
           throw QueryRuntimeException("Settings are not available");
         }
-        auto all_settings = settings->AllSettings();
+        auto all_settings = settings->AllSettingsRedacted();
         std::vector<std::vector<TypedValue>> results;
         results.reserve(all_settings.size());
 
@@ -6291,7 +6290,9 @@ PreparedQuery PrepareFreeMemoryQuery(ParsedQuery parsed_query, bool in_explicit_
                        .query_handler = [storage](AnyStream * /*stream*/,
                                                   std::optional<int> /*n*/) -> std::optional<QueryHandlerResult> {
                          storage->FreeMemory();
-                         memory::PurgeUnusedMemory();
+                         if (!memory::PurgeUnusedMemory()) {
+                           throw QueryRuntimeException("Failed to purge unused allocator memory.");
+                         }
                          return QueryHandlerResult::COMMIT;
                        },
                        .rw_type = RWType::NONE};
@@ -9599,6 +9600,7 @@ PreparedQuery PrepareSessionSettingQuery(ParsedQuery parsed_query, Interpreter *
     if (auto err = flags::run_time::ValidateSessionSettingValue(name, value); err.has_value()) {
       throw utils::BasicException(*err);
     }
+    value = flags::run_time::NormalizeSessionSettingValue(name, value);
   }
 
   auto handler = [interpreter, action = query->action_, name = std::move(name), value = std::move(value)]() mutable {
@@ -10760,7 +10762,7 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
 
     SetupInterpreterTransaction(extras);
     memgraph::logging::EmitSessionTraceEvent(
-        "Query [{}] associated with transaction [{}]", parsed_query.query_string, current_transaction_.value_or(0));
+        "Query [{}] associated with transaction [{}]", transaction_queries_->back(), current_transaction_.value_or(0));
   }
 
   auto *const cypher_query = utils::Downcast<CypherQuery>(parsed_query.query);

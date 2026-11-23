@@ -33,8 +33,12 @@ documentation and/or software.
 #ifndef BZF_MD5_H
 #define BZF_MD5_H
 
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <string>
+#include <string_view>
 
 // a small class for calculating MD5 hashes of strings or byte arrays
 // it is not meant to be fast or secure
@@ -48,10 +52,10 @@ documentation and/or software.
 // assumes that char is 8 bit and int is 32 bit
 class MD5 {
  public:
-  typedef unsigned int size_type;  // must be 32bit
+  typedef std::size_t size_type;
 
   MD5();
-  MD5(const std::string &text);
+  MD5(std::string_view text);
   void update(const unsigned char *buf, size_type length);
   void update(const char *buf, size_type length);
   MD5 &finalize();
@@ -61,13 +65,14 @@ class MD5 {
  private:
   void init();
   typedef unsigned char uint1;  //  8bit
-  typedef unsigned int uint4;   // 32bit
+  typedef std::uint32_t uint4;  // 32bit
 
   enum { blocksize = 64 };  // VC6 won't eat a const static int here
 
+  void update_chunk(const uint1 *input, uint4 length);
   void transform(const uint1 block[blocksize]);
-  static void decode(uint4 output[], const uint1 input[], size_type len);
-  static void encode(uint1 output[], const uint4 input[], size_type len);
+  static void decode(uint4 output[], const uint1 input[], uint4 len);
+  static void encode(uint1 output[], const uint4 input[], uint4 len);
 
   bool finalized;
   uint1 buffer[blocksize];  // bytes that didn't fit in last 64 byte chunk
@@ -87,6 +92,6 @@ class MD5 {
   static inline void II(uint4 &a, uint4 b, uint4 c, uint4 d, uint4 x, uint4 s, uint4 ac);
 };
 
-std::string md5(const std::string str);
+std::string md5(std::string_view str);
 
 #endif

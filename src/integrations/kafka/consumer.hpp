@@ -70,6 +70,9 @@ class Message final {
   /// can be implemented knowing that.
   int64_t Timestamp() const;
 
+  /// Returns the partition of the message
+  int32_t Partition() const;
+
   /// Returns the offset of the message
   int64_t Offset() const;
 

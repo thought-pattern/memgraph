@@ -103,8 +103,15 @@ Parameters::Parameters(const std::filesystem::path &storage_path) : storage_(sto
 
 SetParameterResult Parameters::SetParameter(std::string_view name, std::string_view value, std::string_view scope,
                                             system::Transaction *txn) {
-  if (!storage_.Put(MakeKey(name, scope), value)) return SetParameterResult::StorageError;
-  if (txn) txn->AddAction<SetParameterAction>(name, value, scope);
+  const auto key = MakeKey(name, scope);
+  std::list<std::unique_ptr<system::ISystemAction>> staged;
+  if (txn) {
+    staged.emplace_back(std::make_unique<SetParameterAction>(name, value, scope));
+  }
+  if (!storage_.Put(key, value)) return SetParameterResult::StorageError;
+  if (txn) {
+    txn->AppendPreparedActions(staged);
+  }
   return SetParameterResult::Success;
 }
 
@@ -113,17 +120,29 @@ std::optional<std::string> Parameters::GetParameter(std::string_view name, std::
 }
 
 bool Parameters::UnsetParameter(std::string_view name, std::string_view scope, system::Transaction *txn) {
-  if (!storage_.Delete(MakeKey(name, scope))) return false;
-  if (txn) txn->AddAction<UnsetParameterAction>(name, scope);
+  const auto key = MakeKey(name, scope);
+  std::list<std::unique_ptr<system::ISystemAction>> staged;
+  if (txn) {
+    staged.emplace_back(std::make_unique<UnsetParameterAction>(name, scope));
+  }
+  if (!storage_.Delete(key)) return false;
+  if (txn) {
+    txn->AppendPreparedActions(staged);
+  }
   return true;
 }
 
 std::vector<ParameterInfo> Parameters::GetGlobalParameters() const {
   std::vector<ParameterInfo> parameters;
   const auto prefix = fmt::format("{}/", kGlobalScope);
-  for (auto it = storage_.begin(prefix); it != storage_.end(prefix); ++it) {
+  auto it = storage_.begin(prefix);
+  const auto end_it = storage_.end(prefix);
+  for (; it != end_it; ++it) {
     parameters.emplace_back(ParameterInfo{
         .name = it->first.substr(prefix.size()), .value = it->second, .scope_context = std::string(kGlobalScope)});
+  }
+  if (it.HasError()) {
+    throw kvstore::KVStoreError("Failed while reading global parameters: {}", it.ErrorMessage());
   }
   return parameters;
 }
@@ -131,9 +150,14 @@ std::vector<ParameterInfo> Parameters::GetGlobalParameters() const {
 std::vector<ParameterInfo> Parameters::GetParameters(std::string_view database_uuid) const {
   auto parameters = GetGlobalParameters();
   const auto prefix = fmt::format("{}/", database_uuid);
-  for (auto it = storage_.begin(prefix); it != storage_.end(prefix); ++it) {
+  auto it = storage_.begin(prefix);
+  const auto end_it = storage_.end(prefix);
+  for (; it != end_it; ++it) {
     parameters.emplace_back(ParameterInfo{
         .name = it->first.substr(prefix.size()), .value = it->second, .scope_context = std::string(database_uuid)});
+  }
+  if (it.HasError()) {
+    throw kvstore::KVStoreError("Failed while reading parameters for scope '{}': {}", database_uuid, it.ErrorMessage());
   }
   return parameters;
 }
@@ -141,8 +165,14 @@ std::vector<ParameterInfo> Parameters::GetParameters(std::string_view database_u
 size_t Parameters::CountParameters() const { return storage_.Size(); }
 
 bool Parameters::DeleteAllParameters(system::Transaction *txn) {
+  std::list<std::unique_ptr<system::ISystemAction>> staged;
+  if (txn) {
+    staged.emplace_back(std::make_unique<DeleteAllParametersAction>());
+  }
   if (!storage_.DeletePrefix()) return false;
-  if (txn) txn->AddAction<DeleteAllParametersAction>();
+  if (txn) {
+    txn->AppendPreparedActions(staged);
+  }
   return true;
 }
 
@@ -161,20 +191,30 @@ bool Parameters::ApplyRecovery(const std::vector<ParameterInfo> &params) {
   // or a $placeholder here resolves to a value that exists nowhere on main.
   std::vector<std::string> stale;
   stale.reserve(params.size());
-  for (auto it = storage_.begin(); it != storage_.end(); ++it) {
+  auto it = storage_.begin();
+  const auto end_it = storage_.end();
+  for (; it != end_it; ++it) {
     if (!items.contains(it->first)) stale.push_back(it->first);
+  }
+  if (it.HasError()) {
+    return false;
   }
   return storage_.PutAndDeleteMultiple(items, stale);
 }
 
 std::vector<ParameterInfo> Parameters::GetSnapshotForRecovery() const {
   std::vector<ParameterInfo> out;
-  for (auto it = storage_.begin(); it != storage_.end(); ++it) {
+  auto it = storage_.begin();
+  const auto end_it = storage_.end();
+  for (; it != end_it; ++it) {
     const auto &key = it->first;
     auto slash = key.find('/');
     DMG_ASSERT(slash != std::string::npos, "Corrupted parameter key: {}", key);
     out.emplace_back(
         ParameterInfo{.name = key.substr(slash + 1), .value = it->second, .scope_context = key.substr(0, slash)});
+  }
+  if (it.HasError()) {
+    throw kvstore::KVStoreError("Failed while snapshotting parameters for recovery: {}", it.ErrorMessage());
   }
   return out;
 }

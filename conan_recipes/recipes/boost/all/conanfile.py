@@ -840,7 +840,27 @@ class BoostConan(ConanFile):
         del self.info.options.i18n_backend
 
         if self.info.options.header_only:
-            self.info.clear()
+            compiler_name = str(self.settings.get_safe("compiler") or "")
+            compiler_ver = self.settings.get_safe("compiler.version")
+            tls_stripped = compiler_name == "apple-clang" or (
+                compiler_name == "clang" and compiler_ver is not None and Version(compiler_ver) < 6
+            )
+            custom_ns = str(self.options.get_safe("namespace") or "boost")
+            keep_opts = {"header_only", "namespace"}
+            if custom_ns != "boost":
+                keep_opts.add("namespace_alias")
+            for opt_name in list(BoostConan.options.keys()):
+                if opt_name not in keep_opts:
+                    self.info.options.rm_safe(opt_name)
+            for setting_name in ("os", "arch", "build_type"):
+                self.info.settings.rm_safe(setting_name)
+            if tls_stripped:
+                for sub_setting in ("cppstd", "libcxx", "runtime", "runtime_type", "version"):
+                    self.info.settings.rm_safe(f"compiler.{sub_setting}")
+                self.info.settings.compiler = "apple-clang"
+            else:
+                self.info.settings.rm_safe("compiler")
+            self.info.requires.clear()
         else:
             del self.info.options.debug_level
             del self.info.options.filesystem_version
@@ -852,7 +872,7 @@ class BoostConan(ConanFile):
                 del self.info.options.system_use_utf8
 
     def build_requirements(self):
-        if not self.options.header_only:
+        if not self.options.header_only or self._use_bcp:
             self.tool_requires("b2/[>=5.4 <6]")
 
     def source(self):
@@ -1084,7 +1104,7 @@ class BoostConan(ConanFile):
             mkdir(self, self._bcp_dir)
             namespace = f"--namespace={self.options.namespace}"
             alias = "--namespace-alias" if self.options.namespace_alias else ""
-            boostdir = f"--boost={self.source_folder}"
+            boostdir = f'--boost="{self.source_folder}"'
             libraries = {"build", "boost-build.jam", "boostcpp.jam", "boost_install", "headers"}
             for d in os.listdir(os.path.join(self.source_folder, "boost")):
                 if os.path.isdir(os.path.join(self.source_folder, "boost", d)):
@@ -1093,12 +1113,24 @@ class BoostConan(ConanFile):
                 if os.path.isdir(os.path.join(self.source_folder, "libs", d)):
                     libraries.add(d)
             libraries = " ".join(libraries)
-            command = f"{self._bcp_exe} {namespace} {alias} {boostdir} {libraries} {self._bcp_dir}"
+            command = f'"{self._bcp_exe}" {namespace} {alias} {boostdir} {libraries} "{self._bcp_dir}"'
             self.output.warning(command)
             self.run(command)
 
     def build(self):
         stacktrace_jamfile = os.path.join(self.source_folder, "libs", "stacktrace", "build", "Jamfile.v2")
+        if os.path.isfile(stacktrace_jamfile):
+            with open(stacktrace_jamfile, "r", encoding="utf-8") as jf:
+                jam_text = jf.read()
+            jam_restored = jam_text.replace('echo "" > $(<)', "$(>) > $(<)")
+            jam_restored = re.sub(
+                r'(?:DYLD_LIBRARY_PATH|LD_LIBRARY_PATH)=(?:"[^"]*"|\S+)\s+\$\(>\) > \$\(<\)',
+                "$(>) > $(<)",
+                jam_restored,
+            )
+            if jam_restored != jam_text:
+                with open(stacktrace_jamfile, "w", encoding="utf-8") as jf:
+                    jf.write(jam_restored)
         if cross_building(self, skip_x64_x86=True):
             # When cross building, do not attempt to run the test-executable (assume they work)
             replace_in_file(self, stacktrace_jamfile, "$(>) > $(<)", "echo \"\" > $(<)", strict=False)
@@ -1106,10 +1138,12 @@ class BoostConan(ConanFile):
             # When libbacktrace is shared, give extra help to the test-executable
             linker_var = "DYLD_LIBRARY_PATH" if self.settings.os == "Macos" else "LD_LIBRARY_PATH"
             libbacktrace_libdir = self.dependencies["libbacktrace"].cpp_info.aggregated_components().libdirs[0]
-            patched_run_rule = f"{linker_var}={libbacktrace_libdir} $(>) > $(<)"
+            patched_run_rule = f'{linker_var}="{libbacktrace_libdir}" $(>) > $(<)'
             replace_in_file(self, stacktrace_jamfile, "$(>) > $(<)", patched_run_rule, strict=False)
             if self.dependencies["libbacktrace"].options.shared:
                 replace_in_file(self, stacktrace_jamfile, "<link>static", "<link>shared", strict=False)
+            else:
+                replace_in_file(self, stacktrace_jamfile, "<link>shared", "<link>static", strict=False)
 
         # Older clang releases require a thread_local variable to be initialized by a constant value
         replace_in_file(self, os.path.join(self.source_folder, "boost", "stacktrace", "detail", "libbacktrace_impls.hpp"),
@@ -1142,7 +1176,13 @@ class BoostConan(ConanFile):
                             strict=False)
 
         if self.options.header_only:
-            self.output.warning("Header only package, skipping build")
+            if self._use_bcp:
+                self._clean()
+                self._create_user_config_jam(self._boost_build_dir)
+                self._build_bcp()
+                self._run_bcp()
+            else:
+                self.output.warning("Header only package, skipping build")
             return
 
         self._clean()
@@ -1234,6 +1274,8 @@ class BoostConan(ConanFile):
             return "sysv"
         if str(self.settings.arch).startswith("arm"):
             return "aapcs"
+        if str(self.settings.arch).startswith("mips64"):
+            return "n64"
         if str(self.settings.arch).startswith("mips"):
             return "o32"
         if str(self.settings.arch).startswith("riscv"):
@@ -1281,7 +1323,7 @@ class BoostConan(ConanFile):
             flags.append(f"abi={self._b2_abi}")
 
         flags.append(f"--layout={self.options.layout}")
-        flags.append(f"--user-config={os.path.join(self._boost_build_dir, 'user-config.jam')}")
+        flags.append(f'--user-config="{os.path.join(self._boost_build_dir, "user-config.jam")}"')
         flags.append(f"-sNO_ZLIB={'0' if self._with_zlib else '1'}")
         flags.append(f"-sNO_BZIP2={'0' if self._with_bzip2 else '1'}")
         flags.append(f"-sNO_LZMA={'0' if self._with_lzma else '1'}")
@@ -1458,7 +1500,7 @@ class BoostConan(ConanFile):
         njobs = f"-j{njobs}" if njobs else ""  # boost.build doesn't take -j0 as valid
         flags.extend([
             "install",
-            f"--prefix={self.package_folder}",
+            f'--prefix="{self.package_folder}"',
             njobs,
             "--abbreviate-paths",
             f"-d{self.options.debug_level}",
@@ -1706,7 +1748,12 @@ class BoostConan(ConanFile):
         copy(self, "LICENSE_1_0.txt", src=self.source_folder, dst=os.path.join(self.package_folder, "licenses"))
         rmdir(self, os.path.join(self.package_folder, "lib", "cmake"))
         if self.options.header_only:
-            copy(self, "*", src=os.path.join(self.source_folder, "boost"),
+            header_src = (
+                os.path.join(self.source_folder, self._bcp_dir, "boost")
+                if self._use_bcp
+                else os.path.join(self.source_folder, "boost")
+            )
+            copy(self, "*", src=header_src,
                             dst=os.path.join(self.package_folder, "include", "boost"))
 
         if self.settings.os == "Emscripten" and not self.options.header_only:
@@ -1905,7 +1952,7 @@ class BoostConan(ConanFile):
                 "toolset": f"-{self._toolset_tag}",
                 "threading": "-mt" if self.options.multithreading else "",
                 "abi": "",
-                "ach": "",
+                "arch": "",
                 "version": "",
             }
             if is_msvc(self):  # FIXME: mingw?

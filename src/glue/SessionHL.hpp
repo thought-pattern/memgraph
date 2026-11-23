@@ -58,9 +58,14 @@ class SessionHL final : public memgraph::communication::bolt::Session<memgraph::
                                                                       memgraph::communication::v2::OutputStream> {
  public:
   SessionHL(Context context, memgraph::communication::v2::InputStream *input_stream,
-            memgraph::communication::v2::OutputStream *output_stream);
+            memgraph::communication::v2::OutputStream *output_stream,
+            std::optional<memgraph::communication::v2::ServerEndpoint> remote_endpoint = std::nullopt);
 
   ~SessionHL();
+
+  void SetRemoteEndpoint(std::optional<memgraph::communication::v2::ServerEndpoint> remote_endpoint) {
+    remote_endpoint_ = std::move(remote_endpoint);
+  }
 
   SessionHL(const SessionHL &) = delete;
   SessionHL &operator=(const SessionHL &) = delete;
@@ -182,9 +187,10 @@ class SessionHL final : public memgraph::communication::bolt::Session<memgraph::
   memgraph::audit::Log *audit_log_;
   RuntimeConfig runtime_config_;  // Run-time configurable database started used by the interpreter
   std::shared_ptr<memgraph::utils::UserResources> user_resource_;  // User-related resource monitoring
+  bool impersonated_{false};
 #endif
   memgraph::auth::SynchedAuth *auth_;
-  memgraph::communication::v2::ServerEndpoint endpoint_;
+  std::optional<memgraph::communication::v2::ServerEndpoint> remote_endpoint_;
   metrics::ScopedGauge bolt_session_gauge_;
   std::optional<ParseRes> parsed_res_;  // SessionHL corresponds to a single connection (we do not support out of order
                                         // execution, so a single query can be prepared/executed)

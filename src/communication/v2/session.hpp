@@ -232,6 +232,9 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
                                    socket.lowest_layer().non_blocking(false);
                                  }},
                socket_);
+    if constexpr (requires { session_.SetRemoteEndpoint(remote_endpoint_); }) {
+      session_.SetRemoteEndpoint(remote_endpoint_);
+    }
     spdlog::info("Accepted a connection from {}: {}", service_name_, remote_endpoint_);
   }
 

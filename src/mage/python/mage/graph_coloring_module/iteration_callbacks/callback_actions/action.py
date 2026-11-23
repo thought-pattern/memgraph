@@ -1,8 +1,11 @@
+"""Utilities for action."""
+
 from abc import ABC, abstractmethod
-from typing import Any, Dict
 
 from mage.graph_coloring_module.components.population import Population
 from mage.graph_coloring_module.graph import Graph
+
+DEFAULT_ARGUMENT_DICT = {}
 
 
 class Action(ABC):
@@ -11,5 +14,10 @@ class Action(ABC):
     callback are met."""
 
     @abstractmethod
-    def execute(self, graph: Graph, population: Population, parameters: Dict[str, Any] = None) -> None:
-        pass
+    def execute(
+        self,
+        graph: Graph,
+        population: Population,
+        parameters: dict = DEFAULT_ARGUMENT_DICT,
+    ) -> bool:
+        """Performs the action on the population of the graph with the given parameters."""

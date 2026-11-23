@@ -53,6 +53,9 @@ struct SalientConfig {
     bool storage_light_edge{false};
     bool delta_on_identical_property_update{true};
     bool property_store_compression_enabled{false};
+    [[nodiscard]] constexpr bool ShouldSkipDuplicatePropertyUpdate() const noexcept {
+      return !delta_on_identical_property_update;
+    }
     friend bool operator==(const Items &lrh, const Items &rhs) = default;
     friend void to_json(nlohmann::json &data, Items const &items);
     friend void from_json(const nlohmann::json &data, Items &items);

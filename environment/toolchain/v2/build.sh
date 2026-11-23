@@ -83,16 +83,19 @@ fi
 if [ ! -f cppcheck-$CPPCHECK_VERSION.tar.gz ]; then
     wget https://github.com/danmar/cppcheck/archive/$CPPCHECK_VERSION.tar.gz -O cppcheck-$CPPCHECK_VERSION.tar.gz
 fi
-if [ ! -f llvm-$LLVM_VERSION.src.tar.xz ]; then
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/llvm-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/lld-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-tools-extra-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/compiler-rt-$LLVM_VERSION.src.tar.xz
-fi
+for llvm_comp in llvm clang lld clang-tools-extra compiler-rt; do
+    llvm_archive="${llvm_comp}-${LLVM_VERSION}.src.tar.xz"
+    if [ ! -f "$llvm_archive" ]; then
+        wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$llvm_archive" -O "$llvm_archive.tmp"
+        mv -f "$llvm_archive.tmp" "$llvm_archive"
+    fi
+done
+PAHOLE_SHA256="7abd613e4dfabeb46d8ef312ef85b280808a369301db21cb7c2b76a6660b53de"
 if [ ! -f pahole-gdb-master.zip ]; then
-    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip
+    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip.tmp
+    mv -f pahole-gdb-master.zip.tmp pahole-gdb-master.zip
 fi
+echo "$PAHOLE_SHA256  pahole-gdb-master.zip" | sha256sum -c -
 
 # verify all archives
 # NOTE: Verification can fail if the archive is signed by another developer. I
@@ -123,24 +126,25 @@ fi
 $GPG --keyserver $KEYSERVER --recv-keys 0xFF325CF3
 $GPG --verify gdb-$GDB_VERSION.tar.gz.sig gdb-$GDB_VERSION.tar.gz
 # verify cmake
-if [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt ] || [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt.asc ]; then
-    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt
-    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt.asc
-    # Because CentOS 7 doesn't have the `--ignore-missing` flag for `sha256sum`
-    # we filter out the missing files from the sums here manually.
-    cat cmake-$CMAKE_VERSION-SHA-256.txt | grep "cmake-$CMAKE_VERSION.tar.gz" > cmake-$CMAKE_VERSION-SHA-256-filtered.txt
+if [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt ]; then
+    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt -O cmake-$CMAKE_VERSION-SHA-256.txt.tmp
+    mv -f cmake-$CMAKE_VERSION-SHA-256.txt.tmp cmake-$CMAKE_VERSION-SHA-256.txt
+fi
+if [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt.asc ]; then
+    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt.asc -O cmake-$CMAKE_VERSION-SHA-256.txt.asc.tmp
+    mv -f cmake-$CMAKE_VERSION-SHA-256.txt.asc.tmp cmake-$CMAKE_VERSION-SHA-256.txt.asc
 fi
 $GPG --keyserver $KEYSERVER --recv-keys 0xC6C265324BBEBDC350B513D02D2CEF1034921684
-sha256sum -c cmake-$CMAKE_VERSION-SHA-256-filtered.txt
 $GPG --verify cmake-$CMAKE_VERSION-SHA-256.txt.asc cmake-$CMAKE_VERSION-SHA-256.txt
-# verify llvm, cfe, lld, clang-tools-extra
-if [ ! -f llvm-$LLVM_VERSION.src.tar.xz.sig ]; then
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/llvm-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/lld-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-tools-extra-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/compiler-rt-$LLVM_VERSION.src.tar.xz.sig
-fi
+grep " cmake-$CMAKE_VERSION\.tar\.gz\$" cmake-$CMAKE_VERSION-SHA-256.txt | sha256sum -c -
+# verify llvm, clang, lld, clang-tools-extra, compiler-rt
+for llvm_comp in llvm clang lld clang-tools-extra compiler-rt; do
+    llvm_sig="${llvm_comp}-${LLVM_VERSION}.src.tar.xz.sig"
+    if [ ! -f "$llvm_sig" ]; then
+        wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$llvm_sig" -O "$llvm_sig.tmp"
+        mv -f "$llvm_sig.tmp" "$llvm_sig"
+    fi
+done
 # list of valid llvm gnupg keys: https://releases.llvm.org/download.html
 $GPG --keyserver $KEYSERVER --recv-keys 0x345AD05D
 $GPG --verify llvm-$LLVM_VERSION.src.tar.xz.sig llvm-$LLVM_VERSION.src.tar.xz
@@ -505,8 +509,17 @@ EOF
 fi
 
 # create toolchain archive
-if [ ! -f $NAME-binaries-$DISTRO.tar.gz ]; then
-    tar --owner=root --group=root -cpvzf $NAME-binaries-$DISTRO.tar.gz -C /opt $NAME
+ARCHIVE_FILE="$NAME-binaries-$DISTRO.tar.gz"
+if [ -f "$ARCHIVE_FILE" ] && ! (gzip -t "$ARCHIVE_FILE" >/dev/null 2>&1 && tar -tzf "$ARCHIVE_FILE" >/dev/null 2>&1); then
+    echo "Removing unreadable toolchain archive '$ARCHIVE_FILE' before rebuilding..."
+    rm -f "$ARCHIVE_FILE"
+fi
+if [ ! -f "$ARCHIVE_FILE" ]; then
+    rm -f "$ARCHIVE_FILE.tmp."*
+    tar --owner=root --group=root -cpvzf "$ARCHIVE_FILE.tmp.$$" -C /opt "$NAME"
+    gzip -t "$ARCHIVE_FILE.tmp.$$"
+    tar -tzf "$ARCHIVE_FILE.tmp.$$" >/dev/null
+    mv -f "$ARCHIVE_FILE.tmp.$$" "$ARCHIVE_FILE"
 fi
 
 # output final instructions
@@ -515,7 +528,7 @@ echo "All tools have been built. They are installed in '$PREFIX'."
 echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'build' directory."
 echo "If you want to install the packed tools you should execute the following command:"
 echo
-echo "    tar -xvzf build/$NAME-binaries.tar.gz -C /opt"
+echo "    tar -xvzf build/$ARCHIVE_FILE -C /opt"
 echo
 echo "Because the tools were built on this machine, you should probably change the permissions of the installation directory using:"
 echo

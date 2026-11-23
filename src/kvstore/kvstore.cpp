@@ -92,12 +92,19 @@ bool KVStore::PutMultiple(const std::map<std::string, std::string> &items) {
   return s.ok();
 }
 
-std::optional<std::string> KVStore::Get(std::string_view key) const noexcept {
+std::expected<std::string, KVStore::GetError> KVStore::GetStrict(std::string_view key) const noexcept {
   const OomBlocker oom_blocker;
   std::string value;
   auto s = pimpl_->db->Get(rocksdb::ReadOptions(), key, &value);
-  if (!s.ok()) return std::nullopt;
-  return value;
+  if (s.ok()) return value;
+  if (s.IsNotFound()) return std::unexpected{GetError::kNotFound};
+  return std::unexpected{GetError::kReadError};
+}
+
+std::optional<std::string> KVStore::Get(std::string_view key) const noexcept {
+  auto res = GetStrict(key);
+  if (!res) return std::nullopt;
+  return std::move(*res);
 }
 
 bool KVStore::Delete(std::string_view key) {
@@ -122,6 +129,9 @@ bool KVStore::DeletePrefix(const std::string &prefix) {
   const IteratorPtr iter(pimpl_->db->NewIterator(rocksdb::ReadOptions()));
   for (iter->Seek(prefix); iter->Valid() && iter->key().starts_with(prefix); iter->Next()) {
     batch.Delete(iter->key());
+  }
+  if (!iter->status().ok()) {
+    return false;
   }
   auto s = pimpl_->db->Write(rocksdb::WriteOptions(), &batch);
   return s.ok();
@@ -156,6 +166,8 @@ struct KVStore::iterator::impl {
   std::string prefix;
   IteratorPtr it;
   std::pair<std::string, std::string> disk_prop;
+  bool had_error{false};
+  std::string error_message;
 };
 
 KVStore::iterator::iterator(const KVStore *kvstore, const std::string &prefix, bool at_end)
@@ -163,9 +175,18 @@ KVStore::iterator::iterator(const KVStore *kvstore, const std::string &prefix, b
   const OomBlocker oom_blocker;
   pimpl_->kvstore = kvstore;
   pimpl_->prefix = prefix;
+  if (at_end) {
+    return;
+  }
   pimpl_->it = IteratorPtr(pimpl_->kvstore->pimpl_->db->NewIterator(rocksdb::ReadOptions()));
   pimpl_->it->Seek(pimpl_->prefix);
-  if (!pimpl_->it->Valid() || !pimpl_->it->key().starts_with(pimpl_->prefix) || at_end) pimpl_->it = nullptr;
+  if (!pimpl_->it->Valid() || !pimpl_->it->key().starts_with(pimpl_->prefix)) {
+    if (!pimpl_->it->status().ok()) {
+      pimpl_->had_error = true;
+      pimpl_->error_message = pimpl_->it->status().ToString();
+    }
+    pimpl_->it = nullptr;
+  }
 }
 
 KVStore::iterator::iterator(KVStore::iterator &&other) { pimpl_ = std::move(other.pimpl_); }
@@ -180,7 +201,13 @@ KVStore::iterator &KVStore::iterator::operator=(KVStore::iterator &&other) {
 KVStore::iterator &KVStore::iterator::operator++() {
   const OomBlocker oom_blocker;
   pimpl_->it->Next();
-  if (!pimpl_->it->Valid() || !pimpl_->it->key().starts_with(pimpl_->prefix)) pimpl_->it = nullptr;
+  if (!pimpl_->it->Valid() || !pimpl_->it->key().starts_with(pimpl_->prefix)) {
+    if (!pimpl_->it->status().ok()) {
+      pimpl_->had_error = true;
+      pimpl_->error_message = pimpl_->it->status().ToString();
+    }
+    pimpl_->it = nullptr;
+  }
   return *this;
 }
 
@@ -202,11 +229,22 @@ void KVStore::iterator::SetInvalid() { pimpl_->it = nullptr; }
 
 bool KVStore::iterator::IsValid() { return pimpl_->it != nullptr; }
 
-// TODO(ipaljak) The complexity of the size function should be at most
-//               logarithmic.
+bool KVStore::iterator::HasError() const noexcept { return pimpl_ != nullptr && pimpl_->had_error; }
+
+std::string_view KVStore::iterator::ErrorMessage() const noexcept {
+  return pimpl_ != nullptr ? std::string_view{pimpl_->error_message} : std::string_view{};
+}
+
 size_t KVStore::Size(const std::string &prefix) const {
   size_t size = 0;
-  for (auto it = this->begin(prefix); it != this->end(prefix); ++it) ++size;
+  auto it = this->begin(prefix);
+  const auto end_it = this->end(prefix);
+  for (; it != end_it; ++it) {
+    ++size;
+  }
+  if (it.HasError()) {
+    throw KVStoreError("Failed while scanning KVStore size for prefix '{}': {}", prefix, it.ErrorMessage());
+  }
   return size;
 }
 

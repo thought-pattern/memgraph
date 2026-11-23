@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "license/license_crypto.hpp"
 #include "utils/scheduler.hpp"
 #include "utils/settings.hpp"
 #include "utils/spin_lock.hpp"
@@ -114,7 +115,8 @@ using LicenseCheckResult = std::expected<void, LicenseCheckError>;
 
 struct LicenseChecker {
  public:
-  explicit LicenseChecker() = default;
+  explicit LicenseChecker(crypto::Rsa2048Modulus issuer_modulus = crypto::kDefaultIssuerRsaModulus)
+      : issuer_modulus_{issuer_modulus} {}
   ~LicenseChecker();
 
   LicenseChecker(const LicenseChecker &) = delete;
@@ -143,7 +145,11 @@ struct LicenseChecker {
   void Finalize() { scheduler_.Stop(); }
 
  private:
+  std::optional<License> GetLicense(std::string_view license_key) const;
   void RevalidateLicense(utils::Settings &settings);
+
+  crypto::Rsa2048Modulus issuer_modulus_;
+  mutable utils::Synchronized<std::pair<std::string, License>, utils::SpinLock> cached_license_;
 
   // Written once at startup (SetCliLicense/CheckEnvLicense on the main thread) before the background
   // scheduler and the Bolt server exist; thread creation publishes them to every later reader. This
@@ -168,8 +174,10 @@ struct LicenseChecker {
 
 void RegisterLicenseSettings(LicenseChecker &license_checker, utils::Settings &settings);
 
-std::optional<License> Decode(std::string_view license_key);
-std::string Encode(const License &license);
+std::optional<License> Decode(std::string_view license_key,
+                              const crypto::Rsa2048Modulus &issuer_modulus = crypto::kDefaultIssuerRsaModulus);
+std::string Encode(const License &license, const crypto::Rsa2048Exponent &private_exponent,
+                   const crypto::Rsa2048Modulus &issuer_modulus);
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 extern LicenseChecker global_license_checker;

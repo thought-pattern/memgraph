@@ -119,17 +119,44 @@ endif()
 endif() # MG_PYTHON_SUPPORT
 
 # Generate the configuration file under the build directory.
-add_custom_command(TARGET memgraph POST_BUILD
+if(NOT DEFINED MG_CAN_RUN_TARGET)
+        if(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+                set(MG_CAN_RUN_TARGET OFF)
+        else()
+                set(MG_CAN_RUN_TARGET ON)
+        endif()
+endif()
+set(_mg_generate_conf_args --source-dir "${CMAKE_SOURCE_DIR}/src")
+if(NOT MG_CAN_RUN_TARGET)
+        list(APPEND _mg_generate_conf_args --no-exec)
+elseif(CMAKE_CROSSCOMPILING AND CMAKE_CROSSCOMPILING_EMULATOR)
+        list(APPEND _mg_generate_conf_args --emulator "${CMAKE_CROSSCOMPILING_EMULATOR}")
+endif()
+add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/config/memgraph.conf
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/config
         COMMAND ${CMAKE_SOURCE_DIR}/config/generate.py
-        ${CMAKE_BINARY_DIR}/memgraph
-        ${CMAKE_BINARY_DIR}/config/memgraph.conf
-        BYPRODUCTS ${CMAKE_BINARY_DIR}/config/memgraph.conf
-        COMMENT "Generating memgraph configuration file")
-# Copy the mappings file to the build directory.
-add_custom_command(TARGET memgraph POST_BUILD
+                $<TARGET_FILE:memgraph>
+                ${CMAKE_BINARY_DIR}/config/memgraph.conf
+                ${_mg_generate_conf_args}
+        DEPENDS memgraph
+                ${CMAKE_SOURCE_DIR}/config/generate.py
+                ${CMAKE_SOURCE_DIR}/config/flags.yaml
+        COMMENT "Generating memgraph configuration file"
+        VERBATIM)
+# Copy the mappings file to the build directory whenever mappings.json changes.
+add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/config/apoc_compatibility_mappings.json
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/config
         COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_SOURCE_DIR}/config/mappings.json
-        ${CMAKE_BINARY_DIR}/config/apoc_compatibility_mappings.json)
+                ${CMAKE_SOURCE_DIR}/config/mappings.json
+                ${CMAKE_BINARY_DIR}/config/apoc_compatibility_mappings.json
+        DEPENDS ${CMAKE_SOURCE_DIR}/config/mappings.json
+        COMMENT "Copying APOC compatibility mappings"
+        VERBATIM)
+add_custom_target(memgraph_config ALL
+        DEPENDS ${CMAKE_BINARY_DIR}/config/memgraph.conf
+                ${CMAKE_BINARY_DIR}/config/apoc_compatibility_mappings.json)
 
 # TODO: Default directory permissions to 755
 # NOTE: This is added in CMake 3.11, so enable it then
@@ -166,9 +193,9 @@ function(collect_symlink_chain START_PATH RESULT_LIST)
             OUTPUT_STRIP_TRAILING_WHITESPACE
         )
 
-        # Construct the full path to the target file
+        # Construct the full path to the target file without prefixing absolute targets
         get_filename_component(CURRENT_DIR "${CURRENT_PATH}" DIRECTORY)
-        set(CURRENT_PATH "${CURRENT_DIR}/${SYMLINK_TARGET}")
+        cmake_path(ABSOLUTE_PATH SYMLINK_TARGET BASE_DIRECTORY "${CURRENT_DIR}" NORMALIZE OUTPUT_VARIABLE CURRENT_PATH)
 
         # Safety check to prevent infinite loops
         if(CURRENT_PATH IN_LIST COLLECTED_FILES)

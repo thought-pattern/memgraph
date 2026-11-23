@@ -52,14 +52,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh pr list --state open --limit 200 --json number,files > "$RUNNER_TEMP/open_prs.json"
+          gh pr list --state open --limit 1000 --json number,files > "$RUNNER_TEMP/open_prs.json"
+          gh pr view "$PR_NUMBER" --json number,files > "$RUNNER_TEMP/target_pr.json"
 
       - name: Find conflicting PRs
         run: |
           python3 tools/ci/pr-conflicts/find_pr_conflicts.py \
             "$RUNNER_TEMP/open_prs.json" \
             "$PR_NUMBER" \
-            "$RUNNER_TEMP/pr_conflicts.md"
+            "$RUNNER_TEMP/pr_conflicts.md" \
+            --target-pr-json "$RUNNER_TEMP/target_pr.json"
 
       - name: Comment on PR
         env:

@@ -3,6 +3,7 @@
 import argparse
 import os
 import subprocess
+import sys
 
 WORK_DIRECTORY = os.getcwd()
 E2E_DIRECTORY = f"{WORK_DIRECTORY}/e2e"
@@ -20,16 +21,17 @@ def parse_arguments():
 #################################################
 
 
-def main(test_filter: str = None):
+def main(test_filter: str = None) -> int:
     os.environ["PYTHONPATH"] = E2E_DIRECTORY
     os.chdir(E2E_DIRECTORY)
     command = ["python3", "-m", "pytest", ".", "-vv"]
     if test_filter:
         command.extend(["-k", test_filter])
-    subprocess.run(command)
+    completed = subprocess.run(command, check=False)
+    return completed.returncode
 
 
 if __name__ == "__main__":
     args = parse_arguments()
     test_filter = args.k
-    main(test_filter=test_filter)
+    sys.exit(main(test_filter=test_filter))

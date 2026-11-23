@@ -34,7 +34,14 @@ function(mage_add_rust_module crate_dir lib_name)
         ${_src}/Cargo.toml
         ${CMAKE_CURRENT_SOURCE_DIR}/rsmgp-sys/Cargo.toml
         ${CMAKE_CURRENT_SOURCE_DIR}/rsmgp-sys/build.rs
-        ${CMAKE_CURRENT_SOURCE_DIR}/rsmgp-sys/mgp/mg_procedure.h)
+        ${CMAKE_CURRENT_SOURCE_DIR}/rsmgp-sys/mgp/mg_procedure.h
+        ${CMAKE_SOURCE_DIR}/include/mg_procedure.h)
+    if(EXISTS "${_src}/Cargo.lock")
+        list(APPEND _rs_sources ${_src}/Cargo.lock)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rsmgp-sys/Cargo.lock")
+        list(APPEND _rs_sources ${CMAKE_CURRENT_SOURCE_DIR}/rsmgp-sys/Cargo.lock)
+    endif()
 
     add_custom_command(
         OUTPUT ${_dist}

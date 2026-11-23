@@ -37,14 +37,14 @@ const std::uint64_t kDefaultMaxIterations = std::numeric_limits<std::uint64_t>::
 
 void InsertLeidenRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const std::uint64_t node_id,
                         const std::vector<std::uint64_t> &community) {
-  auto *vertex = mg_utility::GetNodeForInsertion(static_cast<int>(node_id), graph, memory);
+  auto *vertex = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(node_id), graph, memory);
   if (!vertex) return;
 
   mgp_result_record *record = mgp::result_new_record(result);
   if (record == nullptr) throw mg_exception::NotEnoughMemoryException();
 
   mg_utility::InsertNodeValueResult(record, kFieldNode, vertex, memory);
-  mg_utility::InsertIntValueResult(record, kFieldCommunity, static_cast<int>(community.back()), memory);
+  mg_utility::InsertIntValueResult(record, kFieldCommunity, static_cast<std::int64_t>(community.back()), memory);
 
   auto *community_list = mgp::list_make_empty(0, memory);
   for (const auto &community_id : community) {

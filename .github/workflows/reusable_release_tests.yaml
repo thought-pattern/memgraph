@@ -1402,18 +1402,28 @@ jobs:
       - name: Aggregate test results
         id: aggregate
         run: |
-          # Check if any of the dependent jobs failed.
-          if [ "${{ needs.community_build.result }}" == "failure" ] || \
-             [ "${{ needs.coverage_build.result }}" == "failure" ] || \
-             [ "${{ needs.debug_build.result }}" == "failure" ] || \
-             [ "${{ needs.debug_integration_test.result }}" == "failure" ] || \
-             [ "${{ needs.malloc_build.result }}" == "failure" ] || \
-             [ "${{ needs.release_build.result }}" == "failure" ] || \
-             [ "${{ needs.release_benchmark_tests.result }}" == "failure" ] || \
-             [ "${{ needs.release_e2e_test.result }}" == "failure" ] || \
-             [ "${{ needs.release_durability_stress_tests.result }}" == "failure" ] || \
-             [ "${{ needs.release_jepsen_test.result }}" == "failure" ] || \
-             [ "${{ needs.stress_test_large.result }}" == "failure" ]; then
+          # Every required release-test job must complete with 'success' (never
+          # 'failure', 'cancelled', or 'skipped'); stress_test_large must succeed
+          # when run_stress_large == 'true' and may be 'skipped' only when disabled.
+          stress_large_ok=false
+          if [ "${{ inputs.run_stress_large }}" == "true" ]; then
+            [ "${{ needs.stress_test_large.result }}" == "success" ] && stress_large_ok=true
+          else
+            if [ "${{ needs.stress_test_large.result }}" == "skipped" ] || [ "${{ needs.stress_test_large.result }}" == "success" ]; then
+              stress_large_ok=true
+            fi
+          fi
+          if [ "${{ needs.community_build.result }}" != "success" ] || \
+             [ "${{ needs.coverage_build.result }}" != "success" ] || \
+             [ "${{ needs.debug_build.result }}" != "success" ] || \
+             [ "${{ needs.debug_integration_test.result }}" != "success" ] || \
+             [ "${{ needs.malloc_build.result }}" != "success" ] || \
+             [ "${{ needs.release_build.result }}" != "success" ] || \
+             [ "${{ needs.release_benchmark_tests.result }}" != "success" ] || \
+             [ "${{ needs.release_e2e_test.result }}" != "success" ] || \
+             [ "${{ needs.release_durability_stress_tests.result }}" != "success" ] || \
+             [ "${{ needs.release_jepsen_test.result }}" != "success" ] || \
+             [ "$stress_large_ok" != "true" ]; then
             echo "test_status=fail" >> $GITHUB_OUTPUT
           else
             echo "test_status=pass" >> $GITHUB_OUTPUT

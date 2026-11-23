@@ -59,17 +59,32 @@ class Epoll {
    * @param ptr pointer to the associated event handler
    * @param modify modify an existing file descriptor
    */
-  void Add(int fd, uint32_t events, void *ptr, bool modify = false) {
-    Event event;
+  bool TryAdd(int fd, uint32_t events, void *ptr) {
+    Event event{};
     event.events = events;
     event.data.ptr = ptr;
-    int status = epoll_ctl(epoll_fd_, (modify ? EPOLL_CTL_MOD : EPOLL_CTL_ADD), fd, &event);
-    // epoll_ctl can return an error on our logical error or on irrecoverable
-    // error. There is a third possibility that some system limit is reached. In
-    // that case we could return an erorr and close connection. Chances of
-    // reaching system limit in normally working memgraph is extremely unlikely,
-    // so it is correct to terminate even in that case.
-    MG_ASSERT(!status, "Error on epoll {}: ({}) {}", (modify ? "modify" : "add"), errno, strerror(errno));
+    int status = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event);
+    if (status == 0) {
+      return true;
+    }
+    const int err = errno;
+    if (err == ENOSPC || err == ENOMEM) {
+      spdlog::error("Epoll watch limit reached while registering fd {}: ({}) {}", fd, err, strerror(err));
+      return false;
+    }
+    MG_ASSERT(false, "Error on epoll add: ({}) {}", err, strerror(err));
+  }
+
+  void Add(int fd, uint32_t events, void *ptr, bool modify = false) {
+    if (!modify) {
+      MG_ASSERT(TryAdd(fd, events, ptr), "Error on epoll add for fd {}", fd);
+      return;
+    }
+    Event event{};
+    event.events = events;
+    event.data.ptr = ptr;
+    int status = epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &event);
+    MG_ASSERT(!status, "Error on epoll modify: ({}) {}", errno, strerror(errno));
   }
 
   /**

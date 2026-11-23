@@ -101,6 +101,10 @@ struct SerializationException : public std::exception {
   const char *what() const noexcept override { return "Error in serialization!"; }
 };
 
+struct AuthorizationException : public std::exception {
+  const char *what() const noexcept override { return "Authorization error!"; }
+};
+
 struct NotYetImplementedException : public std::exception {
   const char *what() const noexcept override { return "Not yet implemented!"; }
 };

@@ -74,6 +74,8 @@ jobs:
       arch: "${{ inputs.arch }}"
       version: "${{ inputs.version }}"
       malloc: ${{ inputs.malloc }}
+      cuda: ${{ inputs.cuda }}
+      relwithdebinfo: ${{ inputs.relwithdebinfo }}
       image_type: "${{ inputs.image_type }}"
     secrets: inherit
 
@@ -90,6 +92,9 @@ jobs:
     with:
       arch: "${{ matrix.arch }}"
       version: "${{ inputs.version }}"
+      malloc: ${{ inputs.malloc }}
+      cuda: ${{ inputs.cuda }}
+      relwithdebinfo: ${{ inputs.relwithdebinfo }}
       image_type: "memgraph"
     secrets: inherit
 
@@ -111,5 +116,7 @@ jobs:
       arch: "${{ matrix.arch }}"
       version: "${{ inputs.version }}"
       malloc: ${{ matrix.malloc }}
+      cuda: ${{ inputs.cuda }}
+      relwithdebinfo: ${{ inputs.relwithdebinfo }}
       image_type: "mage"
     secrets: inherit

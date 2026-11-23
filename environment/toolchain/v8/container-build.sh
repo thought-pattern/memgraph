@@ -17,12 +17,13 @@ DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 REPO_ROOT=$(cd "$DIR/../../.." >/dev/null 2>&1 && pwd)
 
 IMAGE=mg-toolchain-v8-builder
-CONTAINER=mg-toolchain-v8-build
+CONTAINER="mg-toolchain-v8-build-$$-${RANDOM}"
+CONTAINER_CREATED=false
 OUTPUT_DIR="$DIR/output"
 
 on_exit() {
     local rc=$?
-    if [[ $rc -ne 0 ]]; then
+    if [[ $rc -ne 0 && "$CONTAINER_CREATED" == true ]]; then
         echo >&2
         echo "Build failed (exit $rc). Container '$CONTAINER' left running:" >&2
         echo "    docker exec -it $CONTAINER bash" >&2
@@ -36,19 +37,28 @@ echo "==> Building image $IMAGE"
 docker build -t "$IMAGE" "$DIR"
 
 echo "==> Starting container $CONTAINER"
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" "$IMAGE" sleep infinity >/dev/null
+CONTAINER_CREATED=true
 
 echo "==> Copying repo into container"
 docker exec "$CONTAINER" mkdir -p /workspace/memgraph
 docker cp "$REPO_ROOT/." "$CONTAINER:/workspace/memgraph"
+docker exec "$CONTAINER" rm -rf /workspace/memgraph/environment/toolchain/v8/output
 
 echo "==> Running build.sh inside container"
-if [[ "$(arch)" == "aarch64" ]]; then
-  docker exec -w /workspace/memgraph "$CONTAINER" ./environment/toolchain/v8/build.sh --for-arm
-else
-  docker exec -w /workspace/memgraph "$CONTAINER" ./environment/toolchain/v8/build.sh
-fi
+container_arch="$(docker exec "$CONTAINER" uname -m | tr -d '\r\n')"
+case "$container_arch" in
+  aarch64|arm64)
+    docker exec -w /workspace/memgraph "$CONTAINER" ./environment/toolchain/v8/build.sh --for-arm
+    ;;
+  x86_64|amd64)
+    docker exec -w /workspace/memgraph "$CONTAINER" ./environment/toolchain/v8/build.sh
+    ;;
+  *)
+    echo "Unsupported container architecture: $container_arch" >&2
+    exit 1
+    ;;
+esac
 
 echo "==> Copying output back to $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"

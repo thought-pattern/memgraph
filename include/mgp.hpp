@@ -12,6 +12,8 @@
 #pragma once
 
 #include <chrono>
+#include <cmath>
+#include <compare>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -158,9 +160,17 @@ inline mgp_memory *Register(mgp_memory *mem) noexcept {
   return nullptr;
 }
 
-inline void UnRegister(mgp_memory *mem) noexcept { current_memory = mem; }
+inline void UnRegister(mgp_memory *mem) noexcept {
+  if (mem == nullptr) {
+    current_memory.reset();
+  } else {
+    current_memory = mem;
+  }
+}
 
-inline bool IsThisThreadRegistered() noexcept { return current_memory.has_value(); }
+inline bool IsThisThreadRegistered() noexcept {
+  return current_memory.has_value() && *current_memory != nullptr;
+}
 };  // namespace MemoryDispatcher
 
 // Leaving "memory" variable here in order to generate a better module compilation error.
@@ -299,7 +309,14 @@ class Graph {
 /// @brief View of graph nodes; wrapper class for @ref mgp_vertices_iterator.
 class Nodes {
  public:
+  friend class Graph;
+
   explicit Nodes(mgp_vertices_iterator *nodes_iterator);
+  Nodes(const Nodes &other);
+  Nodes(Nodes &&other) noexcept;
+  Nodes &operator=(const Nodes &other);
+  Nodes &operator=(Nodes &&other) noexcept;
+  ~Nodes();
 
   class Iterator {
    public:
@@ -312,23 +329,29 @@ class Nodes {
     using reference = value_type &;
 
     explicit Iterator(std::shared_ptr<mgp_vertices_iterator> nodes_iterator);
+    explicit Iterator(mgp_vertices_iterator *nodes_iterator);
 
     Iterator(const Iterator &other);
-    Iterator &operator=(const Iterator &other) = delete;
+    Iterator(Iterator &&other) noexcept;
+    Iterator &operator=(const Iterator &other);
+    Iterator &operator=(Iterator &&other) noexcept;
 
-    ~Iterator() = default;
+    ~Iterator();
 
     Iterator &operator++();
 
     Iterator operator++(int);
 
-    bool operator==(Iterator other) const;
-    bool operator!=(Iterator other) const;
+    bool operator==(const Iterator &other) const;
+    bool operator!=(const Iterator &other) const;
 
     Node operator*() const;
 
    private:
-    std::shared_ptr<mgp_vertices_iterator> nodes_iterator_;
+    struct CursorState;
+    explicit Iterator(std::shared_ptr<CursorState> state);
+
+    std::shared_ptr<CursorState> state_;
     size_t index_ = 0;
   };
 
@@ -339,7 +362,10 @@ class Nodes {
   Iterator cend() const;
 
  private:
-  std::shared_ptr<mgp_vertices_iterator> nodes_iterator_;
+  Nodes(mgp_vertices_iterator *nodes_iterator, mgp_graph *graph);
+
+  mgp_graph *graph_ = nullptr;
+  mutable std::shared_ptr<Iterator::CursorState> shared_state_;
 };
 
 /// @brief View of graph relationships.
@@ -363,21 +389,23 @@ class GraphRelationships {
     explicit Iterator(mgp_vertices_iterator *nodes_iterator);
 
     Iterator(const Iterator &other);
-    Iterator &operator=(const Iterator &other) = delete;
+    Iterator(Iterator &&other) noexcept;
+    Iterator &operator=(const Iterator &other);
+    Iterator &operator=(Iterator &&other) noexcept;
 
     ~Iterator();
 
     Iterator &operator++();
     Iterator operator++(int);
 
-    bool operator==(Iterator other) const;
-    bool operator!=(Iterator other) const;
+    bool operator==(const Iterator &other) const;
+    bool operator!=(const Iterator &other) const;
 
     Relationship operator*() const;
 
    private:
-    mgp_vertices_iterator *nodes_iterator_ = nullptr;
-    mgp_edges_iterator *out_relationships_iterator_ = nullptr;
+    struct CursorState;
+    std::shared_ptr<CursorState> state_;
     size_t index_ = 0;
   };
 
@@ -394,7 +422,14 @@ class GraphRelationships {
 /// @brief Wrapper class for @ref mgp_edges_iterator.
 class Relationships {
  public:
+  friend class Node;
+
   explicit Relationships(mgp_edges_iterator *relationships_iterator);
+  Relationships(const Relationships &other);
+  Relationships(Relationships &&other) noexcept;
+  Relationships &operator=(const Relationships &other);
+  Relationships &operator=(Relationships &&other) noexcept;
+  ~Relationships();
 
   class Iterator {
    public:
@@ -407,22 +442,28 @@ class Relationships {
     using reference = value_type &;
 
     explicit Iterator(std::shared_ptr<mgp_edges_iterator> relationships_iterator);
+    explicit Iterator(mgp_edges_iterator *relationships_iterator);
 
     Iterator(const Iterator &other);
-    Iterator &operator=(const Iterator &other) = delete;
+    Iterator(Iterator &&other) noexcept;
+    Iterator &operator=(const Iterator &other);
+    Iterator &operator=(Iterator &&other) noexcept;
 
-    ~Iterator() = default;
+    ~Iterator();
 
     Iterator &operator++();
     Iterator operator++(int);
 
-    bool operator==(Iterator other) const;
-    bool operator!=(Iterator other) const;
+    bool operator==(const Iterator &other) const;
+    bool operator!=(const Iterator &other) const;
 
     Relationship operator*() const;
 
    private:
-    std::shared_ptr<mgp_edges_iterator> relationships_iterator_{};
+    struct CursorState;
+    explicit Iterator(std::shared_ptr<CursorState> state);
+
+    std::shared_ptr<CursorState> state_;
     size_t index_ = 0;
   };
 
@@ -433,7 +474,11 @@ class Relationships {
   Iterator cend() const;
 
  private:
-  std::shared_ptr<mgp_edges_iterator> relationships_iterator_{};
+  Relationships(mgp_edges_iterator *relationships_iterator, mgp_vertex *vertex, bool inbound);
+
+  mgp_vertex *vertex_ = nullptr;
+  bool inbound_ = false;
+  mutable std::shared_ptr<Iterator::CursorState> shared_state_;
 };
 
 /// @brief View of node labels.
@@ -684,20 +729,24 @@ class Map {
     explicit Iterator(mgp_map_items_iterator *map_items_iterator);
 
     Iterator(const Iterator &other);
-    Iterator &operator=(const Iterator &other) = delete;
+    Iterator(Iterator &&other) noexcept;
+    Iterator &operator=(const Iterator &other);
+    Iterator &operator=(Iterator &&other) noexcept;
 
     ~Iterator();
 
     Iterator &operator++();
     Iterator operator++(int);
 
-    bool operator==(Iterator other) const;
-    bool operator!=(Iterator other) const;
+    bool operator==(const Iterator &other) const;
+    bool operator!=(const Iterator &other) const;
 
     MapItem operator*() const;
 
    private:
-    mgp_map_items_iterator *map_items_iterator_ = nullptr;
+    struct CursorState;
+    std::shared_ptr<CursorState> state_;
+    size_t index_ = 0;
   };
 
   Iterator begin() const;
@@ -1912,7 +1961,6 @@ class QueryExecution {
  public:
   QueryExecution(mgp_graph *graph);
   ExecutionResult ExecuteQuery(std::string_view query, Map params = Map()) const;
-  ExecutionResult ExecuteQuery(std::string query, Map params = Map()) const;
 
  private:
   mgp_graph *graph_;
@@ -1946,6 +1994,10 @@ class ExecutionRow {
 class ExecutionResult {
  public:
   ExecutionResult(mgp_execution_result *result, mgp_graph *graph);
+  ExecutionResult(const ExecutionResult &) = delete;
+  ExecutionResult &operator=(const ExecutionResult &) = delete;
+  ExecutionResult(ExecutionResult &&other) noexcept;
+  ExecutionResult &operator=(ExecutionResult &&other) noexcept;
   ~ExecutionResult();
   ExecutionHeaders Headers() const;
   std::optional<ExecutionRow> PullOne() const;
@@ -2112,6 +2164,36 @@ inline bool ListsEqual(mgp_list *list1, mgp_list *list2) {
   return true;
 }
 
+/// @brief Exact three-way comparison between a 64-bit signed integer and an IEEE-754 double.
+inline std::partial_ordering CompareIntDouble(int64_t lhs, double rhs) noexcept {
+  if (std::isnan(rhs)) {
+    return std::partial_ordering::unordered;
+  }
+  constexpr double kTwoPow63 = 9223372036854775808.0;
+  if (rhs >= kTwoPow63) {
+    return std::partial_ordering::less;
+  }
+  if (rhs < -kTwoPow63) {
+    return std::partial_ordering::greater;
+  }
+  const double rhs_trunc = std::trunc(rhs);
+  const auto rhs_int = static_cast<int64_t>(rhs_trunc);
+  if (lhs < rhs_int) {
+    return std::partial_ordering::less;
+  }
+  if (lhs > rhs_int) {
+    return std::partial_ordering::greater;
+  }
+  const double frac = rhs - rhs_trunc;
+  if (frac > 0.0) {
+    return std::partial_ordering::less;
+  }
+  if (frac < 0.0) {
+    return std::partial_ordering::greater;
+  }
+  return std::partial_ordering::equivalent;
+}
+
 /// @brief Returns whether two MGP API maps are equal.
 inline bool MapsEqual(mgp_map *map1, mgp_map *map2) {
   if (map1 == map2) {
@@ -2129,7 +2211,8 @@ inline bool MapsEqual(mgp_map *map1, mgp_map *map2) {
   bool equal = true;
   for (auto *item = mgp::map_items_iterator_get(items_it); item != nullptr && equal;
        item = mgp::map_items_iterator_next(items_it)) {
-    auto *other_value = mgp::map_at(map2, mgp::map_item_key(item));
+    const auto key_view = mgp::map_item_key_view(item);
+    auto *other_value = mgp::map_at_with_size(map2, key_view.data(), key_view.size());
     equal = other_value != nullptr && util::ValuesEqual(mgp::map_item_value(item), other_value);
   }
   mgp::map_items_iterator_destroy(items_it);
@@ -2218,9 +2301,20 @@ inline bool ValuesEqual(mgp_value *value1, mgp_value *value2) {
   if (value1 == value2) {
     return true;
   }
-  // Make int and double comparable, (ex. this is true -> 1.0 == 1)
+  // Compare int and double with exact integer precision so distinct int64 values > 2^53 never alias.
   if (mgp::value_is_numeric(value1) && mgp::value_is_numeric(value2)) {
-    return mgp::value_get_numeric(value1) == mgp::value_get_numeric(value2);
+    if (mgp::value_is_int(value1) && mgp::value_is_int(value2)) {
+      return mgp::value_get_int(value1) == mgp::value_get_int(value2);
+    }
+    if (mgp::value_is_double(value1) && mgp::value_is_double(value2)) {
+      return mgp::value_get_double(value1) == mgp::value_get_double(value2);
+    }
+    if (mgp::value_is_int(value1)) {
+      return CompareIntDouble(mgp::value_get_int(value1), mgp::value_get_double(value2)) ==
+             std::partial_ordering::equivalent;
+    }
+    return CompareIntDouble(mgp::value_get_int(value2), mgp::value_get_double(value1)) ==
+           std::partial_ordering::equivalent;
   }
   if (mgp::value_get_type(value1) != mgp::value_get_type(value2)) {
     return false;
@@ -2235,7 +2329,7 @@ inline bool ValuesEqual(mgp_value *value1, mgp_value *value2) {
     case MGP_VALUE_TYPE_DOUBLE:
       return mgp::value_get_double(value1) == mgp::value_get_double(value2);
     case MGP_VALUE_TYPE_STRING:
-      return std::string_view(mgp::value_get_string(value1)) == std::string_view(mgp::value_get_string(value2));
+      return mgp::value_get_string_view(value1) == mgp::value_get_string_view(value2);
     case MGP_VALUE_TYPE_LIST:
       return util::ListsEqual(mgp::value_get_list(value1), mgp::value_get_list(value2));
     case MGP_VALUE_TYPE_MAP:
@@ -2432,7 +2526,7 @@ inline GraphNodes Graph::Nodes() const {
   if (nodes_it == nullptr) {
     throw mg_exception::NotEnoughMemoryException();
   }
-  return GraphNodes(nodes_it);
+  return GraphNodes(nodes_it, graph_);
 }
 
 inline GraphRelationships Graph::Relationships() const { return GraphRelationships(graph_); }
@@ -2496,8 +2590,9 @@ inline void Graph::DeleteNode(const Node &node) { mgp::graph_delete_vertex(graph
 inline void Graph::DetachDeleteNode(const Node &node) { mgp::graph_detach_delete_vertex(graph_, node.ptr_); };
 
 inline Relationship Graph::CreateRelationship(const Node &from, const Node &to, const std::string_view type) {
+  const std::string type_str{type};
   auto *edge =
-      mgp::MemHandlerCallback(graph_create_edge, graph_, from.ptr_, to.ptr_, mgp_edge_type{.name = type.data()});
+      mgp::MemHandlerCallback(graph_create_edge, graph_, from.ptr_, to.ptr_, mgp_edge_type{.name = type_str.c_str()});
   auto relationship = Relationship(edge);
 
   mgp::edge_destroy(edge);
@@ -2511,188 +2606,360 @@ inline void Graph::DeleteRelationship(const Relationship &relationship) {
 
 // Nodes:
 
-inline Nodes::Nodes(mgp_vertices_iterator *nodes_iterator)
-    : nodes_iterator_{nodes_iterator, [](mgp_vertices_iterator *ptr) {
-                        if (ptr != nullptr) {
-                          mgp::vertices_iterator_destroy(ptr);
-                        }
-                      }} {}
+struct Nodes::Iterator::CursorState {
+  mgp_vertices_iterator *raw_cursor = nullptr;
+  std::shared_ptr<mgp_vertices_iterator> external_cursor{};
+  size_t base_index = 0;
+  std::vector<Node> history{};
+  bool keep_all = false;
 
-inline Nodes::Iterator::Iterator(std::shared_ptr<mgp_vertices_iterator> nodes_iterator)
-    : nodes_iterator_(std::move(nodes_iterator)) {  // COPY
-  if (nodes_iterator_ == nullptr) {
-    return;
+  explicit CursorState(mgp_vertices_iterator *it, bool retain_all) : raw_cursor(it), keep_all(retain_all) {
+    if (raw_cursor != nullptr) {
+      auto *first = mgp::vertices_iterator_get(raw_cursor);
+      if (first != nullptr) {
+        history.emplace_back(first);
+      } else {
+        mgp::vertices_iterator_destroy(raw_cursor);
+        raw_cursor = nullptr;
+      }
+    }
   }
 
-  if (mgp::vertices_iterator_get(nodes_iterator_.get()) == nullptr) {
-    nodes_iterator_.reset();
+  explicit CursorState(std::shared_ptr<mgp_vertices_iterator> it) : external_cursor(std::move(it)) {
+    if (external_cursor != nullptr) {
+      auto *first = mgp::vertices_iterator_get(external_cursor.get());
+      if (first != nullptr) {
+        history.emplace_back(first);
+      } else {
+        external_cursor.reset();
+      }
+    }
+  }
+
+  ~CursorState() {
+    if (raw_cursor != nullptr) {
+      mgp::vertices_iterator_destroy(raw_cursor);
+      raw_cursor = nullptr;
+    }
+  }
+
+  mgp_vertices_iterator *ActiveCursor() const noexcept {
+    return raw_cursor != nullptr ? raw_cursor : external_cursor.get();
+  }
+
+  void CloseCursor() noexcept {
+    if (raw_cursor != nullptr) {
+      mgp::vertices_iterator_destroy(raw_cursor);
+      raw_cursor = nullptr;
+    }
+    external_cursor.reset();
+  }
+
+  bool AdvanceTo(size_t target, bool single_owner) {
+    if (target < base_index + history.size()) {
+      return true;
+    }
+    auto *cur = ActiveCursor();
+    if (cur == nullptr) {
+      return false;
+    }
+    while (base_index + history.size() <= target) {
+      auto *next = mgp::vertices_iterator_next(cur);
+      if (next == nullptr) {
+        CloseCursor();
+        return false;
+      }
+      if (single_owner && !keep_all) {
+        base_index = target;
+        history[0] = Node(next);
+        return true;
+      }
+      history.emplace_back(next);
+    }
+    return true;
+  }
+};
+
+inline Nodes::Nodes(mgp_vertices_iterator *nodes_iterator) {
+  if (nodes_iterator != nullptr) {
+    auto state = std::make_shared<Iterator::CursorState>(nodes_iterator, true);
+    if (!state->history.empty()) {
+      shared_state_ = std::move(state);
+    }
   }
 }
 
-inline Nodes::Iterator::Iterator(const Iterator &other) : Iterator(other.nodes_iterator_) {}
+inline Nodes::Nodes(mgp_vertices_iterator *nodes_iterator, mgp_graph *graph) : graph_(graph) {
+  if (nodes_iterator != nullptr) {
+    auto state = std::make_shared<Iterator::CursorState>(nodes_iterator, false);
+    if (!state->history.empty()) {
+      shared_state_ = std::move(state);
+    }
+  }
+}
+
+inline Nodes::Nodes(const Nodes &other)
+    : graph_(other.graph_), shared_state_(other.graph_ != nullptr ? nullptr : other.shared_state_) {}
+
+inline Nodes::Nodes(Nodes &&other) noexcept : graph_(other.graph_), shared_state_(std::move(other.shared_state_)) {
+  other.graph_ = nullptr;
+}
+
+inline Nodes &Nodes::operator=(const Nodes &other) {
+  if (this != &other) {
+    graph_ = other.graph_;
+    shared_state_ = (other.graph_ != nullptr) ? nullptr : other.shared_state_;
+  }
+  return *this;
+}
+
+inline Nodes &Nodes::operator=(Nodes &&other) noexcept {
+  if (this != &other) {
+    graph_ = other.graph_;
+    shared_state_ = std::move(other.shared_state_);
+    other.graph_ = nullptr;
+  }
+  return *this;
+}
+
+inline Nodes::~Nodes() = default;
+
+inline Nodes::Iterator::Iterator(std::shared_ptr<CursorState> state) : state_(std::move(state)), index_(0) {
+  if (state_ != nullptr && state_->history.empty()) {
+    state_.reset();
+  }
+}
+
+inline Nodes::Iterator::Iterator(std::shared_ptr<mgp_vertices_iterator> nodes_iterator) {
+  if (nodes_iterator != nullptr) {
+    auto state = std::make_shared<CursorState>(std::move(nodes_iterator));
+    if (!state->history.empty()) {
+      state_ = std::move(state);
+    }
+  }
+}
+
+inline Nodes::Iterator::Iterator(mgp_vertices_iterator *nodes_iterator) {
+  if (nodes_iterator != nullptr) {
+    auto state = std::make_shared<CursorState>(nodes_iterator, false);
+    if (!state->history.empty()) {
+      state_ = std::move(state);
+    }
+  }
+}
+
+inline Nodes::Iterator::Iterator(const Iterator &other) = default;
+inline Nodes::Iterator::Iterator(Iterator &&other) noexcept = default;
+inline Nodes::Iterator &Nodes::Iterator::operator=(const Iterator &other) = default;
+inline Nodes::Iterator &Nodes::Iterator::operator=(Iterator &&other) noexcept = default;
+inline Nodes::Iterator::~Iterator() = default;
 
 inline Nodes::Iterator &Nodes::Iterator::operator++() {
-  if (nodes_iterator_ != nullptr) {
-    auto *next = mgp::vertices_iterator_next(nodes_iterator_.get());
-
-    if (next == nullptr) {
-      nodes_iterator_.reset();
+  if (state_ != nullptr) {
+    const size_t target = index_ + 1;
+    const bool single_owner = (state_.use_count() == 1);
+    if (!state_->AdvanceTo(target, single_owner)) {
+      state_.reset();
+      index_ = 0;
       return *this;
     }
-    index_++;
+    index_ = target;
   }
   return *this;
 }
 
 inline Nodes::Iterator Nodes::Iterator::operator++(int) {
   auto retval = *this;
-  ++*this;
+  ++(*this);
   return retval;
 }
 
-inline bool Nodes::Iterator::operator==(Iterator other) const {
-  if (nodes_iterator_ == nullptr && other.nodes_iterator_ == nullptr) {
+inline bool Nodes::Iterator::operator==(const Iterator &other) const {
+  if (state_ == nullptr && other.state_ == nullptr) {
     return true;
   }
-  if (nodes_iterator_ == nullptr || other.nodes_iterator_ == nullptr) {
+  if (state_ == nullptr || other.state_ == nullptr) {
     return false;
   }
-  return mgp::vertex_equal(mgp::vertices_iterator_get(nodes_iterator_.get()),
-                           mgp::vertices_iterator_get(other.nodes_iterator_.get())) &&
-         index_ == other.index_;
+  if (state_ == other.state_) {
+    return index_ == other.index_;
+  }
+  return index_ == other.index_ &&
+         state_->history[index_ - state_->base_index] == other.state_->history[other.index_ - other.state_->base_index];
 }
 
-inline bool Nodes::Iterator::operator!=(Iterator other) const { return !(*this == other); }
+inline bool Nodes::Iterator::operator!=(const Iterator &other) const { return !(*this == other); }
 
 inline Node Nodes::Iterator::operator*() const {
-  if (nodes_iterator_ == nullptr) {
+  if (state_ == nullptr) {
     return Node((const mgp_vertex *)nullptr);
   }
-
-  return Node(mgp::vertices_iterator_get(nodes_iterator_.get()));
+  return state_->history[index_ - state_->base_index];
 }
 
-inline Nodes::Iterator Nodes::begin() const { return Iterator(nodes_iterator_); }
+inline Nodes::Iterator Nodes::begin() const {
+  if (graph_ != nullptr) {
+    if (shared_state_ != nullptr) {
+      return Iterator(std::move(shared_state_));
+    }
+    auto *nodes_it = mgp::MemHandlerCallback(graph_iter_vertices, graph_);
+    if (nodes_it == nullptr) {
+      throw mg_exception::NotEnoughMemoryException();
+    }
+    return Iterator(nodes_it);
+  }
+  return Iterator(shared_state_);
+}
 
-inline Nodes::Iterator Nodes::end() const { return Iterator(nullptr); }
+inline Nodes::Iterator Nodes::end() const { return Iterator(static_cast<mgp_vertices_iterator *>(nullptr)); }
 
-inline Nodes::Iterator Nodes::cbegin() const { return Iterator(nodes_iterator_); }
+inline Nodes::Iterator Nodes::cbegin() const { return begin(); }
 
-inline Nodes::Iterator Nodes::cend() const { return Iterator(nullptr); }
+inline Nodes::Iterator Nodes::cend() const { return end(); }
 
 // GraphRelationships:
 
+struct GraphRelationships::Iterator::CursorState {
+  mgp_vertices_iterator *nodes_cursor = nullptr;
+  mgp_edges_iterator *edges_cursor = nullptr;
+  size_t base_index = 0;
+  std::vector<Relationship> history{};
+
+  explicit CursorState(mgp_vertices_iterator *nodes_it) : nodes_cursor(nodes_it) {
+    if (nodes_cursor == nullptr) {
+      return;
+    }
+    for (auto *node = mgp::vertices_iterator_get(nodes_cursor); node != nullptr;
+         node = mgp::vertices_iterator_next(nodes_cursor)) {
+      edges_cursor = mgp::MemHandlerCallback(vertex_iter_out_edges, node);
+      auto *rel = mgp::edges_iterator_get(edges_cursor);
+      if (rel != nullptr) {
+        history.emplace_back(rel);
+        return;
+      }
+      mgp::edges_iterator_destroy(edges_cursor);
+      edges_cursor = nullptr;
+    }
+    mgp::vertices_iterator_destroy(nodes_cursor);
+    nodes_cursor = nullptr;
+  }
+
+  ~CursorState() { CloseCursors(); }
+
+  void CloseCursors() noexcept {
+    if (edges_cursor != nullptr) {
+      mgp::edges_iterator_destroy(edges_cursor);
+      edges_cursor = nullptr;
+    }
+    if (nodes_cursor != nullptr) {
+      mgp::vertices_iterator_destroy(nodes_cursor);
+      nodes_cursor = nullptr;
+    }
+  }
+
+  mgp_edge *PullNextEdge() {
+    if (edges_cursor != nullptr) {
+      auto *next = mgp::edges_iterator_next(edges_cursor);
+      if (next != nullptr) {
+        return next;
+      }
+      mgp::edges_iterator_destroy(edges_cursor);
+      edges_cursor = nullptr;
+    }
+    if (nodes_cursor != nullptr) {
+      for (auto *node = mgp::vertices_iterator_next(nodes_cursor); node != nullptr;
+           node = mgp::vertices_iterator_next(nodes_cursor)) {
+        edges_cursor = mgp::MemHandlerCallback(vertex_iter_out_edges, node);
+        auto *rel = mgp::edges_iterator_get(edges_cursor);
+        if (rel != nullptr) {
+          return rel;
+        }
+        mgp::edges_iterator_destroy(edges_cursor);
+        edges_cursor = nullptr;
+      }
+      mgp::vertices_iterator_destroy(nodes_cursor);
+      nodes_cursor = nullptr;
+    }
+    return nullptr;
+  }
+
+  bool AdvanceTo(size_t target, bool single_owner) {
+    if (target < base_index + history.size()) {
+      return true;
+    }
+    while (base_index + history.size() <= target) {
+      auto *next = PullNextEdge();
+      if (next == nullptr) {
+        return false;
+      }
+      if (single_owner) {
+        base_index = target;
+        history[0] = Relationship(next);
+        return true;
+      }
+      history.emplace_back(next);
+    }
+    return true;
+  }
+};
+
 inline GraphRelationships::GraphRelationships(mgp_graph *graph) : graph_(graph) {}
 
-inline GraphRelationships::Iterator::Iterator(mgp_vertices_iterator *nodes_iterator) : nodes_iterator_(nodes_iterator) {
-  // Positions the iterator over the first existing relationship
-
-  if (nodes_iterator_ == nullptr) {
-    return;
-  }
-
-  // Go through each graph node’s adjacent nodes
-  for (auto *node = mgp::vertices_iterator_get(nodes_iterator_); node;
-       node = mgp::vertices_iterator_next(nodes_iterator_)) {
-    // Check if node exists
-    if (node == nullptr) {
-      mgp::vertices_iterator_destroy(nodes_iterator_);
-      nodes_iterator_ = nullptr;
-      return;
+inline GraphRelationships::Iterator::Iterator(mgp_vertices_iterator *nodes_iterator) {
+  if (nodes_iterator != nullptr) {
+    auto state = std::make_shared<CursorState>(nodes_iterator);
+    if (!state->history.empty()) {
+      state_ = std::move(state);
     }
-
-    // Check if node has out-relationships
-    out_relationships_iterator_ = mgp::MemHandlerCallback(vertex_iter_out_edges, node);
-    auto *relationship = mgp::edges_iterator_get(out_relationships_iterator_);
-    if (relationship != nullptr) {
-      return;
-    }
-
-    mgp::edges_iterator_destroy(out_relationships_iterator_);
-    out_relationships_iterator_ = nullptr;
   }
 }
 
-inline GraphRelationships::Iterator::Iterator(const Iterator &other) : Iterator(other.nodes_iterator_) {}
-
-inline GraphRelationships::Iterator::~Iterator() {
-  if (nodes_iterator_ != nullptr) {
-    mgp::vertices_iterator_destroy(nodes_iterator_);
-  }
-  if (out_relationships_iterator_ != nullptr) {
-    mgp::edges_iterator_destroy(out_relationships_iterator_);
-  }
-}
+inline GraphRelationships::Iterator::Iterator(const Iterator &other) = default;
+inline GraphRelationships::Iterator::Iterator(Iterator &&other) noexcept = default;
+inline GraphRelationships::Iterator &GraphRelationships::Iterator::operator=(const Iterator &other) = default;
+inline GraphRelationships::Iterator &GraphRelationships::Iterator::operator=(Iterator &&other) noexcept = default;
+inline GraphRelationships::Iterator::~Iterator() = default;
 
 inline GraphRelationships::Iterator &GraphRelationships::Iterator::operator++() {
-  // Moves the iterator onto the next existing relationship
-
-  // 1. Check if the current node has remaining relationships to iterate over
-
-  if (out_relationships_iterator_ != nullptr) {
-    auto *next = mgp::edges_iterator_next(out_relationships_iterator_);
-
-    if (next != nullptr) {
+  if (state_ != nullptr) {
+    const size_t target = index_ + 1;
+    const bool single_owner = (state_.use_count() == 1);
+    if (!state_->AdvanceTo(target, single_owner)) {
+      state_.reset();
+      index_ = 0;
       return *this;
     }
-
-    mgp::edges_iterator_destroy(out_relationships_iterator_);
-    out_relationships_iterator_ = nullptr;
+    index_ = target;
   }
-
-  // 2. Move onto the next nodes
-
-  if (nodes_iterator_ != nullptr) {
-    for (auto *node = mgp::vertices_iterator_next(nodes_iterator_); node;
-         node = mgp::vertices_iterator_next(nodes_iterator_)) {
-      // Check if node exists - if it doesn’t, we’ve reached the end of the iterator
-      if (node == nullptr) {
-        mgp::vertices_iterator_destroy(nodes_iterator_);
-        nodes_iterator_ = nullptr;
-        return *this;
-      }
-
-      // Check if node has out-relationships
-      out_relationships_iterator_ = mgp::MemHandlerCallback(vertex_iter_out_edges, node);
-      auto *relationship = mgp::edges_iterator_get(out_relationships_iterator_);
-      if (relationship != nullptr) {
-        return *this;
-      }
-
-      mgp::edges_iterator_destroy(out_relationships_iterator_);
-      out_relationships_iterator_ = nullptr;
-    }
-  }
-  mgp::vertices_iterator_destroy(nodes_iterator_);
-  nodes_iterator_ = nullptr;
   return *this;
 }
 
 inline GraphRelationships::Iterator GraphRelationships::Iterator::operator++(int) {
   auto retval = *this;
-  ++*this;
+  ++(*this);
   return retval;
 }
 
-inline bool GraphRelationships::Iterator::operator==(Iterator other) const {
-  if (out_relationships_iterator_ == nullptr && other.out_relationships_iterator_ == nullptr) {
+inline bool GraphRelationships::Iterator::operator==(const Iterator &other) const {
+  if (state_ == nullptr && other.state_ == nullptr) {
     return true;
   }
-  if (out_relationships_iterator_ == nullptr || other.out_relationships_iterator_ == nullptr) {
+  if (state_ == nullptr || other.state_ == nullptr) {
     return false;
   }
-  return mgp::edge_equal(mgp::edges_iterator_get(out_relationships_iterator_),
-                         mgp::edges_iterator_get(other.out_relationships_iterator_)) &&
-         index_ == other.index_;
+  if (state_ == other.state_) {
+    return index_ == other.index_;
+  }
+  return index_ == other.index_ &&
+         state_->history[index_ - state_->base_index] == other.state_->history[other.index_ - other.state_->base_index];
 }
 
-inline bool GraphRelationships::Iterator::operator!=(Iterator other) const { return !(*this == other); }
+inline bool GraphRelationships::Iterator::operator!=(const Iterator &other) const { return !(*this == other); }
 
 inline Relationship GraphRelationships::Iterator::operator*() const {
-  if (out_relationships_iterator_ != nullptr) {
-    return Relationship(mgp::edges_iterator_get(out_relationships_iterator_));
+  if (state_ != nullptr) {
+    return state_->history[index_ - state_->base_index];
   }
-
   return Relationship((mgp_edge *)nullptr);
 }
 
@@ -2710,73 +2977,223 @@ inline GraphRelationships::Iterator GraphRelationships::cend() const { return It
 
 // Relationships:
 
-inline Relationships::Relationships(mgp_edges_iterator *relationships_iterator)
-    : relationships_iterator_(relationships_iterator, [](mgp_edges_iterator *ptr) {
-        if (ptr != nullptr) {
-          mgp::edges_iterator_destroy(ptr);
-        }
-      }) {}
+struct Relationships::Iterator::CursorState {
+  mgp_edges_iterator *raw_cursor = nullptr;
+  std::shared_ptr<mgp_edges_iterator> external_cursor{};
+  size_t base_index = 0;
+  std::vector<Relationship> history{};
+  bool keep_all = false;
 
-inline Relationships::Iterator::Iterator(std::shared_ptr<mgp_edges_iterator> relationships_iterator)
-    : relationships_iterator_(std::move(relationships_iterator)) {
-  if (relationships_iterator_ == nullptr) {
-    return;
+  explicit CursorState(mgp_edges_iterator *it, bool retain_all) : raw_cursor(it), keep_all(retain_all) {
+    if (raw_cursor != nullptr) {
+      auto *first = mgp::edges_iterator_get(raw_cursor);
+      if (first != nullptr) {
+        history.emplace_back(first);
+      } else {
+        mgp::edges_iterator_destroy(raw_cursor);
+        raw_cursor = nullptr;
+      }
+    }
   }
-  if (mgp::edges_iterator_get(relationships_iterator_.get()) == nullptr) {
-    relationships_iterator_.reset();
+
+  explicit CursorState(std::shared_ptr<mgp_edges_iterator> it) : external_cursor(std::move(it)) {
+    if (external_cursor != nullptr) {
+      auto *first = mgp::edges_iterator_get(external_cursor.get());
+      if (first != nullptr) {
+        history.emplace_back(first);
+      } else {
+        external_cursor.reset();
+      }
+    }
+  }
+
+  ~CursorState() {
+    if (raw_cursor != nullptr) {
+      mgp::edges_iterator_destroy(raw_cursor);
+      raw_cursor = nullptr;
+    }
+  }
+
+  mgp_edges_iterator *ActiveCursor() const noexcept {
+    return raw_cursor != nullptr ? raw_cursor : external_cursor.get();
+  }
+
+  void CloseCursor() noexcept {
+    if (raw_cursor != nullptr) {
+      mgp::edges_iterator_destroy(raw_cursor);
+      raw_cursor = nullptr;
+    }
+    external_cursor.reset();
+  }
+
+  bool AdvanceTo(size_t target, bool single_owner) {
+    if (target < base_index + history.size()) {
+      return true;
+    }
+    auto *cur = ActiveCursor();
+    if (cur == nullptr) {
+      return false;
+    }
+    while (base_index + history.size() <= target) {
+      auto *next = mgp::edges_iterator_next(cur);
+      if (next == nullptr) {
+        CloseCursor();
+        return false;
+      }
+      if (single_owner && !keep_all) {
+        base_index = target;
+        history[0] = Relationship(next);
+        return true;
+      }
+      history.emplace_back(next);
+    }
+    return true;
+  }
+};
+
+inline Relationships::Relationships(mgp_edges_iterator *relationships_iterator) {
+  if (relationships_iterator != nullptr) {
+    auto state = std::make_shared<Iterator::CursorState>(relationships_iterator, true);
+    if (!state->history.empty()) {
+      shared_state_ = std::move(state);
+    }
   }
 }
 
-inline Relationships::Iterator::Iterator(const Iterator &other) : Iterator(other.relationships_iterator_) {}
+inline Relationships::Relationships(mgp_edges_iterator *relationships_iterator, mgp_vertex *vertex, bool inbound)
+    : vertex_(vertex), inbound_(inbound) {
+  if (relationships_iterator != nullptr) {
+    auto state = std::make_shared<Iterator::CursorState>(relationships_iterator, false);
+    if (!state->history.empty()) {
+      shared_state_ = std::move(state);
+    }
+  }
+}
+
+inline Relationships::Relationships(const Relationships &other)
+    : vertex_(other.vertex_),
+      inbound_(other.inbound_),
+      shared_state_(other.vertex_ != nullptr ? nullptr : other.shared_state_) {}
+
+inline Relationships::Relationships(Relationships &&other) noexcept
+    : vertex_(other.vertex_), inbound_(other.inbound_), shared_state_(std::move(other.shared_state_)) {
+  other.vertex_ = nullptr;
+}
+
+inline Relationships &Relationships::operator=(const Relationships &other) {
+  if (this != &other) {
+    vertex_ = other.vertex_;
+    inbound_ = other.inbound_;
+    shared_state_ = (other.vertex_ != nullptr) ? nullptr : other.shared_state_;
+  }
+  return *this;
+}
+
+inline Relationships &Relationships::operator=(Relationships &&other) noexcept {
+  if (this != &other) {
+    vertex_ = other.vertex_;
+    inbound_ = other.inbound_;
+    shared_state_ = std::move(other.shared_state_);
+    other.vertex_ = nullptr;
+  }
+  return *this;
+}
+
+inline Relationships::~Relationships() = default;
+
+inline Relationships::Iterator::Iterator(std::shared_ptr<CursorState> state) : state_(std::move(state)), index_(0) {
+  if (state_ != nullptr && state_->history.empty()) {
+    state_.reset();
+  }
+}
+
+inline Relationships::Iterator::Iterator(std::shared_ptr<mgp_edges_iterator> relationships_iterator) {
+  if (relationships_iterator != nullptr) {
+    auto state = std::make_shared<CursorState>(std::move(relationships_iterator));
+    if (!state->history.empty()) {
+      state_ = std::move(state);
+    }
+  }
+}
+
+inline Relationships::Iterator::Iterator(mgp_edges_iterator *relationships_iterator) {
+  if (relationships_iterator != nullptr) {
+    auto state = std::make_shared<CursorState>(relationships_iterator, false);
+    if (!state->history.empty()) {
+      state_ = std::move(state);
+    }
+  }
+}
+
+inline Relationships::Iterator::Iterator(const Iterator &other) = default;
+inline Relationships::Iterator::Iterator(Iterator &&other) noexcept = default;
+inline Relationships::Iterator &Relationships::Iterator::operator=(const Iterator &other) = default;
+inline Relationships::Iterator &Relationships::Iterator::operator=(Iterator &&other) noexcept = default;
+inline Relationships::Iterator::~Iterator() = default;
 
 inline Relationships::Iterator &Relationships::Iterator::operator++() {
-  if (relationships_iterator_ != nullptr) {
-    auto *next = mgp::edges_iterator_next(relationships_iterator_.get());
-
-    if (next == nullptr) {
-      relationships_iterator_.reset();
+  if (state_ != nullptr) {
+    const size_t target = index_ + 1;
+    const bool single_owner = (state_.use_count() == 1);
+    if (!state_->AdvanceTo(target, single_owner)) {
+      state_.reset();
+      index_ = 0;
       return *this;
     }
-    index_++;
+    index_ = target;
   }
   return *this;
 }
 
 inline Relationships::Iterator Relationships::Iterator::operator++(int) {
   auto retval = *this;
-  ++*this;
+  ++(*this);
   return retval;
 }
 
-inline bool Relationships::Iterator::operator==(Iterator other) const {
-  if (relationships_iterator_ == nullptr && other.relationships_iterator_ == nullptr) {
+inline bool Relationships::Iterator::operator==(const Iterator &other) const {
+  if (state_ == nullptr && other.state_ == nullptr) {
     return true;
   }
-  if (relationships_iterator_ == nullptr || other.relationships_iterator_ == nullptr) {
+  if (state_ == nullptr || other.state_ == nullptr) {
     return false;
   }
-  return mgp::edge_equal(mgp::edges_iterator_get(relationships_iterator_.get()),
-                         mgp::edges_iterator_get(other.relationships_iterator_.get())) &&
-         index_ == other.index_;
+  if (state_ == other.state_) {
+    return index_ == other.index_;
+  }
+  return index_ == other.index_ &&
+         state_->history[index_ - state_->base_index] == other.state_->history[other.index_ - other.state_->base_index];
 }
 
-inline bool Relationships::Iterator::operator!=(Iterator other) const { return !(*this == other); }
+inline bool Relationships::Iterator::operator!=(const Iterator &other) const { return !(*this == other); }
 
 inline Relationship Relationships::Iterator::operator*() const {
-  if (relationships_iterator_ == nullptr) {
+  if (state_ == nullptr) {
     return Relationship((mgp_edge *)nullptr);
   }
-
-  return Relationship(mgp::edges_iterator_get(relationships_iterator_.get()));
+  return state_->history[index_ - state_->base_index];
 }
 
-inline Relationships::Iterator Relationships::begin() const { return Iterator(relationships_iterator_); }
+inline Relationships::Iterator Relationships::begin() const {
+  if (vertex_ != nullptr) {
+    if (shared_state_ != nullptr) {
+      return Iterator(std::move(shared_state_));
+    }
+    auto *rel_it = inbound_ ? mgp::MemHandlerCallback(vertex_iter_in_edges, vertex_)
+                            : mgp::MemHandlerCallback(vertex_iter_out_edges, vertex_);
+    if (rel_it == nullptr) {
+      throw mg_exception::NotEnoughMemoryException();
+    }
+    return Iterator(rel_it);
+  }
+  return Iterator(shared_state_);
+}
 
-inline Relationships::Iterator Relationships::end() const { return Iterator(nullptr); }
+inline Relationships::Iterator Relationships::end() const { return Iterator(static_cast<mgp_edges_iterator *>(nullptr)); }
 
-inline Relationships::Iterator Relationships::cbegin() const { return Iterator(relationships_iterator_); }
+inline Relationships::Iterator Relationships::cbegin() const { return begin(); }
 
-inline Relationships::Iterator Relationships::cend() const { return Iterator(nullptr); }
+inline Relationships::Iterator Relationships::cend() const { return end(); }
 
 // Labels:
 
@@ -2788,17 +3205,20 @@ inline Labels::Labels(Labels &&other) noexcept : node_ptr_(other.node_ptr_) { ot
 
 inline Labels &Labels::operator=(const Labels &other) {
   if (this != &other) {
-    mgp::vertex_destroy(node_ptr_);
-
-    node_ptr_ = mgp::MemHandlerCallback(vertex_copy, other.node_ptr_);
+    auto *copied = mgp::MemHandlerCallback(vertex_copy, other.node_ptr_);
+    if (node_ptr_ != nullptr) {
+      mgp::vertex_destroy(node_ptr_);
+    }
+    node_ptr_ = copied;
   }
   return *this;
 }
 
 inline Labels &Labels::operator=(Labels &&other) noexcept {
   if (this != &other) {
-    mgp::vertex_destroy(node_ptr_);
-
+    if (node_ptr_ != nullptr) {
+      mgp::vertex_destroy(node_ptr_);
+    }
     node_ptr_ = other.node_ptr_;
     other.node_ptr_ = nullptr;
   }
@@ -2882,17 +3302,20 @@ inline List::List(List &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullp
 
 inline List &List::operator=(const List &other) {
   if (this != &other) {
-    mgp::list_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(list_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(list_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::list_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline List &List::operator=(List &&other) noexcept {
   if (this != &other) {
-    mgp::list_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::list_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3009,17 +3432,20 @@ inline Map::Map(Map &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr;
 
 inline Map &Map::operator=(const Map &other) {
   if (this != &other) {
-    mgp::map_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(map_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(map_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::map_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Map &Map::operator=(Map &&other) noexcept {
   if (this != &other) {
-    mgp::map_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::map_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3038,78 +3464,128 @@ inline size_t Map::Size() const { return mgp::map_size(ptr_); }
 
 inline bool Map::Empty() const { return Size() == 0; }
 
-inline Value Map::operator[](std::string_view key) const { return Value(ref_type, mgp::map_at(ptr_, key.data())); }
+inline Value Map::operator[](std::string_view key) const { return At(key); }
 
-inline Value Map::operator[](std::string_view key) { return Value(ref_type, mgp::map_at(ptr_, key.data())); }
+inline Value Map::operator[](std::string_view key) { return At(key); }
 
 inline Value Map::At(std::string_view key) const {
-  auto *ptr = mgp::map_at(ptr_, key.data());
+  auto *ptr = mgp::map_at_with_size(ptr_, key.data(), key.size());
   if (ptr) {
     return Value(ref_type, ptr);
   }
   return Value();
 }
 
-inline bool Map::KeyExists(std::string_view key) const { return mgp::key_exists(ptr_, key.data()); }
+inline bool Map::KeyExists(std::string_view key) const {
+  return mgp::key_exists_with_size(ptr_, key.data(), key.size());
+}
 
-inline Map::Iterator::Iterator(mgp_map_items_iterator *map_items_iterator) : map_items_iterator_(map_items_iterator) {
-  if (map_items_iterator_ == nullptr) return;
-  if (mgp::map_items_iterator_get(map_items_iterator_) == nullptr) {
-    mgp::map_items_iterator_destroy(map_items_iterator_);
-    map_items_iterator_ = nullptr;
+struct Map::Iterator::CursorState {
+  mgp_map_items_iterator *cursor = nullptr;
+  size_t base_index = 0;
+  std::vector<std::pair<std::string, Value>> entries{};
+
+  explicit CursorState(mgp_map_items_iterator *it) : cursor(it) {
+    if (cursor != nullptr) {
+      auto *first = mgp::map_items_iterator_get(cursor);
+      if (first != nullptr) {
+        entries.emplace_back(std::string(mgp::map_item_key_view(first)), Value(mgp::map_item_value(first)));
+      } else {
+        mgp::map_items_iterator_destroy(cursor);
+        cursor = nullptr;
+      }
+    }
+  }
+
+  ~CursorState() {
+    if (cursor != nullptr) {
+      mgp::map_items_iterator_destroy(cursor);
+      cursor = nullptr;
+    }
+  }
+
+  bool AdvanceTo(size_t target, bool single_owner) {
+    if (target < base_index + entries.size()) {
+      return true;
+    }
+    if (cursor == nullptr) {
+      return false;
+    }
+    while (base_index + entries.size() <= target) {
+      auto *next = mgp::map_items_iterator_next(cursor);
+      if (next == nullptr) {
+        mgp::map_items_iterator_destroy(cursor);
+        cursor = nullptr;
+        return false;
+      }
+      if (single_owner) {
+        base_index = target;
+        entries[0] = {std::string(mgp::map_item_key_view(next)), Value(mgp::map_item_value(next))};
+        return true;
+      }
+      entries.emplace_back(std::string(mgp::map_item_key_view(next)), Value(mgp::map_item_value(next)));
+    }
+    return true;
+  }
+};
+
+inline Map::Iterator::Iterator(mgp_map_items_iterator *map_items_iterator) {
+  if (map_items_iterator != nullptr) {
+    auto state = std::make_shared<CursorState>(map_items_iterator);
+    if (!state->entries.empty()) {
+      state_ = std::move(state);
+    }
   }
 }
 
-inline Map::Iterator::Iterator(const Iterator &other) : Iterator(other.map_items_iterator_) {}
-
-inline Map::Iterator::~Iterator() {
-  if (map_items_iterator_ != nullptr) {
-    mgp::map_items_iterator_destroy(map_items_iterator_);
-  }
-}
+inline Map::Iterator::Iterator(const Iterator &other) = default;
+inline Map::Iterator::Iterator(Iterator &&other) noexcept = default;
+inline Map::Iterator &Map::Iterator::operator=(const Iterator &other) = default;
+inline Map::Iterator &Map::Iterator::operator=(Iterator &&other) noexcept = default;
+inline Map::Iterator::~Iterator() = default;
 
 inline Map::Iterator &Map::Iterator::operator++() {
-  if (map_items_iterator_ != nullptr) {
-    auto *next = mgp::map_items_iterator_next(map_items_iterator_);
-
-    if (next == nullptr) {
-      mgp::map_items_iterator_destroy(map_items_iterator_);
-      map_items_iterator_ = nullptr;
+  if (state_ != nullptr) {
+    const size_t target = index_ + 1;
+    const bool single_owner = (state_.use_count() == 1);
+    if (!state_->AdvanceTo(target, single_owner)) {
+      state_.reset();
+      index_ = 0;
       return *this;
     }
+    index_ = target;
   }
   return *this;
 }
 
 inline Map::Iterator Map::Iterator::operator++(int) {
   auto retval = *this;
-  ++*this;
+  ++(*this);
   return retval;
 }
 
-inline bool Map::Iterator::operator==(Iterator other) const {
-  if (map_items_iterator_ == nullptr && other.map_items_iterator_ == nullptr) {
+inline bool Map::Iterator::operator==(const Iterator &other) const {
+  if (state_ == nullptr && other.state_ == nullptr) {
     return true;
   }
-  if (map_items_iterator_ == nullptr || other.map_items_iterator_ == nullptr) {
+  if (state_ == nullptr || other.state_ == nullptr) {
     return false;
   }
-  return mgp::map_items_iterator_get(map_items_iterator_) == mgp::map_items_iterator_get(other.map_items_iterator_);
+  if (state_ == other.state_) {
+    return index_ == other.index_;
+  }
+  return state_->entries[index_ - state_->base_index].second ==
+         other.state_->entries[other.index_ - other.state_->base_index].second;
 }
 
-inline bool Map::Iterator::operator!=(Iterator other) const { return !(*this == other); }
+inline bool Map::Iterator::operator!=(const Iterator &other) const { return !(*this == other); }
 
 inline MapItem Map::Iterator::operator*() const {
-  if (map_items_iterator_ == nullptr) {
+  if (state_ == nullptr) {
     throw ValueException("Empty map item!");
   }
-
-  auto *raw_map_item = mgp::map_items_iterator_get(map_items_iterator_);
-
-  const auto *map_key = mgp::map_item_key(raw_map_item);
-  auto map_value = Value(mgp::map_item_value(raw_map_item));
-
-  return MapItem{.key = map_key, .value = map_value};
+  const auto &[map_key, map_val] = state_->entries[index_ - state_->base_index];
+  return MapItem{.key = map_key, .value = map_val};
 }
 
 inline Map::Iterator Map::begin() const { return Iterator(mgp::MemHandlerCallback(map_iter_items, ptr_)); }
@@ -3120,11 +3596,15 @@ inline Map::Iterator Map::cbegin() const { return Iterator(mgp::MemHandlerCallba
 
 inline Map::Iterator Map::cend() const { return Iterator(nullptr); }
 
-inline void Map::Insert(std::string_view key, const Value &value) { mgp::map_insert(ptr_, key.data(), value.ptr()); }
+inline void Map::Insert(std::string_view key, const Value &value) {
+  mgp::map_insert_with_size(ptr_, key.data(), key.size(), value.ptr());
+}
 
-inline void Map::Update(std::string_view key, const Value &value) { mgp::map_update(ptr_, key.data(), value.ptr()); }
+inline void Map::Update(std::string_view key, const Value &value) {
+  mgp::map_update_with_size(ptr_, key.data(), key.size(), value.ptr());
+}
 
-inline void Map::Erase(std::string_view key) { mgp::map_erase(ptr_, key.data()); }
+inline void Map::Erase(std::string_view key) { mgp::map_erase_with_size(ptr_, key.data(), key.size()); }
 
 inline bool Map::operator==(const Map &other) const { return util::MapsEqual(ptr_, other.ptr_); }
 
@@ -3165,17 +3645,20 @@ inline Node::Node(Node &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullp
 
 inline Node &Node::operator=(const Node &other) {
   if (this != &other) {
-    mgp::vertex_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(vertex_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(vertex_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::vertex_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Node &Node::operator=(Node &&other) noexcept {
   if (this != &other) {
-    mgp::vertex_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::vertex_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3210,7 +3693,7 @@ inline Relationships Node::InRelationships() const {
   if (relationship_iterator == nullptr) {
     throw mg_exception::NotEnoughMemoryException();
   }
-  return Relationships(relationship_iterator);
+  return Relationships(relationship_iterator, ptr_, true);
 }
 
 inline Relationships Node::OutRelationships() const {
@@ -3218,15 +3701,17 @@ inline Relationships Node::OutRelationships() const {
   if (relationship_iterator == nullptr) {
     throw mg_exception::NotEnoughMemoryException();
   }
-  return Relationships(relationship_iterator);
+  return Relationships(relationship_iterator, ptr_, false);
 }
 
 inline void Node::AddLabel(const std::string_view label) {
-  mgp::vertex_add_label(this->ptr_, mgp_label{.name = label.data()});
+  const std::string label_str{label};
+  mgp::vertex_add_label(this->ptr_, mgp_label{.name = label_str.c_str()});
 }
 
 inline void Node::RemoveLabel(const std::string_view label) {
-  mgp::vertex_remove_label(this->ptr_, mgp_label{.name = label.data()});
+  const std::string label_str{label};
+  mgp::vertex_remove_label(this->ptr_, mgp_label{.name = label_str.c_str()});
 }
 
 inline std::unordered_map<std::string, Value> Node::Properties() const {
@@ -3248,7 +3733,7 @@ inline void Node::SetProperties(std::unordered_map<std::string_view, Value> prop
   mgp_map *map = mgp::MemHandlerCallback(map_make_empty);
 
   for (auto const &[k, v] : properties) {
-    mgp::map_insert(map, k.data(), v.ptr());
+    mgp::map_insert_with_size(map, k.data(), k.size(), v.ptr());
   }
 
   mgp::vertex_set_properties(ptr_, map);
@@ -3320,17 +3805,20 @@ inline Relationship::Relationship(Relationship &&other) noexcept : ptr_(other.pt
 
 inline Relationship &Relationship::operator=(const Relationship &other) {
   if (this != &other) {
-    mgp::edge_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(edge_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(edge_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::edge_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Relationship &Relationship::operator=(Relationship &&other) noexcept {
   if (this != &other) {
-    mgp::edge_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::edge_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3368,7 +3856,7 @@ inline void Relationship::SetProperties(std::unordered_map<std::string_view, Val
   mgp_map *map = mgp::MemHandlerCallback(map_make_empty);
 
   for (auto const &[k, v] : properties) {
-    mgp::map_insert(map, k.data(), v.ptr());
+    mgp::map_insert_with_size(map, k.data(), k.size(), v.ptr());
   }
 
   mgp::edge_set_properties(ptr_, map);
@@ -3428,17 +3916,20 @@ inline Path::Path(Path &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullp
 
 inline Path &Path::operator=(const Path &other) {
   if (this != &other) {
-    mgp::path_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(path_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(path_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::path_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Path &Path::operator=(Path &&other) noexcept {
   if (this != &other) {
-    mgp::path_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::path_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3516,7 +4007,10 @@ inline Date::Date(mgp_date *ptr) : ptr_(mgp::MemHandlerCallback(date_copy, ptr))
 inline Date::Date(const mgp_date *const_ptr)
     : ptr_(mgp::MemHandlerCallback(date_copy, const_cast<mgp_date *>(const_ptr))) {}
 
-inline Date::Date(std::string_view string) : ptr_(mgp::MemHandlerCallback(date_from_string, string.data())) {}
+inline Date::Date(std::string_view string) {
+  const std::string str{string};
+  ptr_ = mgp::MemHandlerCallback(date_from_string, str.c_str());
+}
 
 inline Date::Date(int year, int month, int day) {
   mgp_date_parameters params{.year = year, .month = month, .day = day};
@@ -3529,17 +4023,20 @@ inline Date::Date(Date &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullp
 
 inline Date &Date::operator=(const Date &other) {
   if (this != &other) {
-    mgp::date_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(date_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(date_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::date_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Date &Date::operator=(Date &&other) noexcept {
   if (this != &other) {
-    mgp::date_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::date_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3579,7 +4076,7 @@ inline Date Date::operator+(const Duration &dur) const {
 }
 
 inline Date Date::operator-(const Duration &dur) const {
-  auto *mgp_difference = mgp::MemHandlerCallback(date_add_duration, ptr_, dur.ptr_);
+  auto *mgp_difference = mgp::MemHandlerCallback(date_sub_duration, ptr_, dur.ptr_);
   auto difference = Date(mgp_difference);
   mgp::date_destroy(mgp_difference);
 
@@ -3611,8 +4108,10 @@ inline LocalTime::LocalTime(mgp_local_time *ptr) : ptr_(mgp::MemHandlerCallback(
 inline LocalTime::LocalTime(const mgp_local_time *const_ptr)
     : ptr_(mgp::MemHandlerCallback(local_time_copy, const_cast<mgp_local_time *>(const_ptr))) {}
 
-inline LocalTime::LocalTime(std::string_view string)
-    : ptr_(mgp::MemHandlerCallback(local_time_from_string, string.data())) {}
+inline LocalTime::LocalTime(std::string_view string) {
+  const std::string str{string};
+  ptr_ = mgp::MemHandlerCallback(local_time_from_string, str.c_str());
+}
 
 inline LocalTime::LocalTime(int hour, int minute, int second, int millisecond, int microsecond) {
   mgp_local_time_parameters params{
@@ -3626,17 +4125,20 @@ inline LocalTime::LocalTime(LocalTime &&other) noexcept : ptr_(other.ptr_) { oth
 
 inline LocalTime &LocalTime::operator=(const LocalTime &other) {
   if (this != &other) {
-    mgp::local_time_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(local_time_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(local_time_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::local_time_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline LocalTime &LocalTime::operator=(LocalTime &&other) noexcept {
   if (this != &other) {
-    mgp::local_time_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::local_time_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3715,8 +4217,10 @@ inline LocalDateTime::LocalDateTime(mgp_local_date_time *ptr)
 inline LocalDateTime::LocalDateTime(const mgp_local_date_time *const_ptr)
     : ptr_(mgp::MemHandlerCallback(local_date_time_copy, const_cast<mgp_local_date_time *>(const_ptr))) {}
 
-inline LocalDateTime::LocalDateTime(std::string_view string)
-    : ptr_(mgp::MemHandlerCallback(local_date_time_from_string, string.data())) {}
+inline LocalDateTime::LocalDateTime(std::string_view string) {
+  const std::string str{string};
+  ptr_ = mgp::MemHandlerCallback(local_date_time_from_string, str.c_str());
+}
 
 inline LocalDateTime::LocalDateTime(int year, int month, int day, int hour, int minute, int second, int millisecond,
                                     int microsecond) {
@@ -3745,29 +4249,33 @@ inline ZonedDateTime::ZonedDateTime(int year, int month, int day, int hour, int 
 
 inline ZonedDateTime::ZonedDateTime(int year, int month, int day, int hour, int minute, int second, int millisecond,
                                     int microsecond, std::string_view timezone_name) {
+  const std::string tz{timezone_name};
   struct mgp_date_parameters date_params{.year = year, .month = month, .day = day};
   struct mgp_local_time_parameters local_time_params{
       .hour = hour, .minute = minute, .second = second, .millisecond = millisecond, .microsecond = microsecond};
   mgp_zoned_date_time_parameters params{.date_parameters = &date_params,
                                         .local_time_parameters = &local_time_params,
-                                        .timezone_info = {.timezone_name = timezone_name.data()},
+                                        .timezone_info = {.timezone_name = tz.c_str()},
                                         .is_named_timezone = 1};
   ptr_ = mgp::MemHandlerCallback(zoned_date_time_from_parameters, &params);
 }
 
 inline LocalDateTime &LocalDateTime::operator=(const LocalDateTime &other) {
   if (this != &other) {
-    mgp::local_date_time_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(local_date_time_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(local_date_time_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::local_date_time_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline LocalDateTime &LocalDateTime::operator=(LocalDateTime &&other) noexcept {
   if (this != &other) {
-    mgp::local_date_time_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::local_date_time_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3861,8 +4369,10 @@ inline Duration::Duration(mgp_duration *ptr) : ptr_(mgp::MemHandlerCallback(dura
 inline Duration::Duration(const mgp_duration *const_ptr)
     : ptr_(mgp::MemHandlerCallback(duration_copy, const_cast<mgp_duration *>(const_ptr))) {}
 
-inline Duration::Duration(std::string_view string)
-    : ptr_(mgp::MemHandlerCallback(duration_from_string, string.data())) {}
+inline Duration::Duration(std::string_view string) {
+  const std::string str{string};
+  ptr_ = mgp::MemHandlerCallback(duration_from_string, str.c_str());
+}
 
 inline Duration::Duration(int64_t microseconds)
     : ptr_(mgp::MemHandlerCallback(duration_from_microseconds, microseconds)) {}
@@ -3884,17 +4394,20 @@ inline Duration::Duration(Duration &&other) noexcept : ptr_(other.ptr_) { other.
 
 inline Duration &Duration::operator=(const Duration &other) {
   if (this != &other) {
-    mgp::duration_destroy(ptr_);
-
-    ptr_ = mgp::MemHandlerCallback(duration_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(duration_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::duration_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Duration &Duration::operator=(Duration &&other) noexcept {
   if (this != &other) {
-    mgp::duration_destroy(ptr_);
-
+    if (ptr_ != nullptr) {
+      mgp::duration_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -3943,7 +4456,7 @@ inline bool Duration::operator<(const Duration &other) const {
   return is_less;
 }
 
-inline std::string Duration::ToString() const { return std::format("{}ms", Microseconds()); }
+inline std::string Duration::ToString() const { return std::format("{}us", Microseconds()); }
 
 // ZonedDateTime:
 
@@ -3953,12 +4466,36 @@ inline ZonedDateTime::ZonedDateTime(mgp_zoned_date_time *ptr)
 inline ZonedDateTime::ZonedDateTime(const mgp_zoned_date_time *const_ptr)
     : ptr_(mgp::MemHandlerCallback(zoned_date_time_copy, const_cast<mgp_zoned_date_time *>(const_ptr))) {}
 
-inline ZonedDateTime::ZonedDateTime(std::string_view string)
-    : ptr_(mgp::MemHandlerCallback(zoned_date_time_from_string, string.data())) {}
+inline ZonedDateTime::ZonedDateTime(std::string_view string) {
+  const std::string str{string};
+  ptr_ = mgp::MemHandlerCallback(zoned_date_time_from_string, str.c_str());
+}
 
 inline ZonedDateTime::ZonedDateTime(const ZonedDateTime &other) : ZonedDateTime(other.ptr_) {}
 
-inline ZonedDateTime::ZonedDateTime(ZonedDateTime &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; };
+inline ZonedDateTime::ZonedDateTime(ZonedDateTime &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; }
+
+inline ZonedDateTime &ZonedDateTime::operator=(const ZonedDateTime &other) {
+  if (this != &other) {
+    auto *copied = mgp::MemHandlerCallback(zoned_date_time_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::zoned_date_time_destroy(ptr_);
+    }
+    ptr_ = copied;
+  }
+  return *this;
+}
+
+inline ZonedDateTime &ZonedDateTime::operator=(ZonedDateTime &&other) noexcept {
+  if (this != &other) {
+    if (ptr_ != nullptr) {
+      mgp::zoned_date_time_destroy(ptr_);
+    }
+    ptr_ = other.ptr_;
+    other.ptr_ = nullptr;
+  }
+  return *this;
+}
 
 inline ZonedDateTime::~ZonedDateTime() {
   if (ptr_ != nullptr) {
@@ -3992,19 +4529,39 @@ inline bool ZonedDateTime::operator==(const ZonedDateTime &other) const {
   return util::ZonedDateTimesEqual(ptr_, other.ptr_);
 }
 
+inline bool ZonedDateTime::operator<(const ZonedDateTime &other) const {
+  const auto ts_lhs = Timestamp();
+  const auto ts_rhs = other.Timestamp();
+  if (ts_lhs != ts_rhs) {
+    return ts_lhs < ts_rhs;
+  }
+  const auto off_lhs = Offset();
+  const auto off_rhs = other.Offset();
+  if (off_lhs != off_rhs) {
+    return off_lhs < off_rhs;
+  }
+  const char *tz_lhs = Timezone();
+  const char *tz_rhs = other.Timezone();
+  return std::string_view{tz_lhs != nullptr ? tz_lhs : ""} < std::string_view{tz_rhs != nullptr ? tz_rhs : ""};
+}
+
 inline std::string ZonedDateTime::ToString() const {
   auto tp = std::chrono::sys_time<std::chrono::microseconds>{std::chrono::microseconds{Timestamp()}};
-  if (!std::string_view{Timezone()}.empty()) {
-    auto tz_ptr = std::chrono::locate_zone(Timezone());
+  const char *tz_cstr = Timezone();
+  const std::string_view tz_sv{tz_cstr != nullptr ? tz_cstr : ""};
+  if (!tz_sv.empty()) {
+    auto tz_ptr = std::chrono::locate_zone(tz_sv);
     auto zt = std::chrono::zoned_time{tz_ptr, tp};
-    return std::format("{0:%Y}-{0:%m}-{0:%d}T{0:%H}:{0:%M}:{0:%S}{0:%Ez}[{1}]", zt, Timezone());
+    return std::format("{0:%Y}-{0:%m}-{0:%d}T{0:%H}:{0:%M}:{0:%S}{0:%Ez}[{1}]", zt, tz_sv);
   } else {
     auto local_tp = std::chrono::sys_time<std::chrono::microseconds>{std::chrono::microseconds{Timestamp()} +
                                                                      std::chrono::minutes{Offset()}};
-    auto offset_mins = Offset();
-    auto hours = offset_mins / 60;
-    auto mins = std::abs(offset_mins % 60);
-    auto offset_str = std::format("{:+03d}:{:02d}", hours, mins);
+    const auto offset_mins = Offset();
+    const char sign = offset_mins < 0 ? '-' : '+';
+    const auto abs_mins = offset_mins < 0 ? -static_cast<int64_t>(offset_mins) : static_cast<int64_t>(offset_mins);
+    const auto hours = abs_mins / 60;
+    const auto mins = abs_mins % 60;
+    const auto offset_str = std::format("{}{:02d}:{:02d}", sign, hours, mins);
     return std::format("{0:%Y}-{0:%m}-{0:%d}T{0:%H}:{0:%M}:{0:%S}{1}", local_tp, offset_str);
   }
 }
@@ -4058,15 +4615,20 @@ inline Point2d::Point2d(Point2d &&other) noexcept : ptr_(other.ptr_) { other.ptr
 
 inline Point2d &Point2d::operator=(const Point2d &other) {
   if (this != &other) {
-    mgp::point_2d_destroy(ptr_);
-    ptr_ = mgp::MemHandlerCallback(point_2d_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(point_2d_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::point_2d_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Point2d &Point2d::operator=(Point2d &&other) noexcept {
   if (this != &other) {
-    mgp::point_2d_destroy(ptr_);
+    if (ptr_ != nullptr) {
+      mgp::point_2d_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -4110,15 +4672,20 @@ inline Point3d::Point3d(Point3d &&other) noexcept : ptr_(other.ptr_) { other.ptr
 
 inline Point3d &Point3d::operator=(const Point3d &other) {
   if (this != &other) {
-    mgp::point_3d_destroy(ptr_);
-    ptr_ = mgp::MemHandlerCallback(point_3d_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(point_3d_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::point_3d_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Point3d &Point3d::operator=(Point3d &&other) noexcept {
   if (this != &other) {
-    mgp::point_3d_destroy(ptr_);
+    if (ptr_ != nullptr) {
+      mgp::point_3d_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -4166,15 +4733,20 @@ inline Enum::Enum(Enum &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullp
 
 inline Enum &Enum::operator=(const Enum &other) {
   if (this != &other) {
-    mgp::enum_destroy(ptr_);
-    ptr_ = mgp::MemHandlerCallback(enum_copy, other.ptr_);
+    auto *copied = mgp::MemHandlerCallback(enum_copy, other.ptr_);
+    if (ptr_ != nullptr) {
+      mgp::enum_destroy(ptr_);
+    }
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Enum &Enum::operator=(Enum &&other) noexcept {
   if (this != &other) {
-    mgp::enum_destroy(ptr_);
+    if (ptr_ != nullptr) {
+      mgp::enum_destroy(ptr_);
+    }
     ptr_ = other.ptr_;
     other.ptr_ = nullptr;
   }
@@ -4214,7 +4786,8 @@ inline Value::Value(mgp_value *ptr) : ptr_(mgp::MemHandlerCallback(value_copy, p
 inline Value::Value(StealType /*steal*/, mgp_value *ptr) : ptr_{ptr} {}
 
 inline Value::Value(RefType /*ref*/, mgp_value *ptr)
-    : ptr_(reinterpret_cast<mgp_value *>(reinterpret_cast<uintptr_t>(ptr) | uintptr_t{1})) {}
+    : ptr_(ptr == nullptr ? mgp::MemHandlerCallback(value_make_null)
+                          : reinterpret_cast<mgp_value *>(reinterpret_cast<uintptr_t>(ptr) | uintptr_t{1})) {}
 
 inline Value::Value() : ptr_(mgp::MemHandlerCallback(value_make_null)) {}
 
@@ -4226,7 +4799,8 @@ inline Value::Value(const double value) : ptr_(mgp::MemHandlerCallback(value_mak
 
 inline Value::Value(const char *value) : ptr_(mgp::MemHandlerCallback(value_make_string, value)) {}
 
-inline Value::Value(const std::string_view value) : ptr_(mgp::MemHandlerCallback(value_make_string, value.data())) {}
+inline Value::Value(const std::string_view value)
+    : ptr_(mgp::MemHandlerCallback(value_make_string_with_size, value.data(), value.size())) {}
 
 inline Value::Value(const List &list) : ptr_(mgp::value_make_list(mgp::MemHandlerCallback(list_copy, list.ptr_))) {}
 
@@ -4332,18 +4906,18 @@ inline Value::Value(Value &&other) noexcept : ptr_(other.ptr_) { other.ptr_ = nu
 
 inline Value &Value::operator=(const Value &other) {
   if (this != &other) {
-    if (!IsRef()) {
+    auto *copied = mgp::MemHandlerCallback(value_copy, other.ptr());
+    if (ptr_ != nullptr && !IsRef()) {
       mgp::value_destroy(ptr_);
     }
-
-    ptr_ = mgp::MemHandlerCallback(value_copy, other.ptr());
+    ptr_ = copied;
   }
   return *this;
 }
 
 inline Value &Value::operator=(Value &&other) noexcept {
   if (this != &other) {
-    if (!IsRef()) {
+    if (ptr_ != nullptr && !IsRef()) {
       mgp::value_destroy(ptr_);
     }
 
@@ -4433,14 +5007,14 @@ inline std::string_view Value::ValueString() const {
   if (Type() != Type::String) {
     throw ValueException("Type of value is wrong: expected String.");
   }
-  return mgp::value_get_string(this->ptr());
+  return mgp::value_get_string_view(this->ptr());
 }
 
 inline std::string_view Value::ValueString() {
   if (Type() != Type::String) {
     throw ValueException("Type of value is wrong: expected String.");
   }
-  return mgp::value_get_string(this->ptr());
+  return mgp::value_get_string_view(this->ptr());
 }
 
 inline List Value::ValueList() const {
@@ -4669,7 +5243,8 @@ inline bool Value::operator!=(const Value &other) const { return !(*this == othe
 
 inline bool Value::operator<(const Value &other) const {
   const mgp::Type &type = Type();
-  if (type != other.Type() && !(IsNumeric() && other.IsNumeric())) {
+  const mgp::Type &other_type = other.Type();
+  if (type != other_type && !(IsNumeric() && other.IsNumeric())) {
     throw ValueException("Values have to be of the same type");
   }
 
@@ -4679,9 +5254,15 @@ inline bool Value::operator<(const Value &other) const {
     case Type::Bool:
       return ValueBool() < other.ValueBool();
     case Type::Int:
-      return ValueNumeric() < other.ValueNumeric();
+      if (other_type == Type::Int) {
+        return ValueInt() < other.ValueInt();
+      }
+      return util::CompareIntDouble(ValueInt(), other.ValueDouble()) == std::partial_ordering::less;
     case Type::Double:
-      return ValueNumeric() < other.ValueNumeric();
+      if (other_type == Type::Double) {
+        return ValueDouble() < other.ValueDouble();
+      }
+      return util::CompareIntDouble(other.ValueInt(), ValueDouble()) == std::partial_ordering::greater;
     case Type::String:
       return ValueString() < other.ValueString();
     case Type::Node:
@@ -4696,6 +5277,8 @@ inline bool Value::operator<(const Value &other) const {
       return ValueLocalDateTime() < other.ValueLocalDateTime();
     case Type::Duration:
       return ValueDuration() < other.ValueDuration();
+    case Type::ZonedDateTime:
+      return ValueZonedDateTime() < other.ValueZonedDateTime();
     case Type::Path:
     case Type::List:
     case Type::Map:
@@ -4715,8 +5298,10 @@ inline std::ostream &operator<<(std::ostream &os, const mgp::Value &value) {
       return os << (value.ValueBool() ? "true" : "false");
     case mgp::Type::Int:
       return os << std::to_string(value.ValueInt());
-    case mgp::Type::Double:
-      return os << std::to_string(value.ValueDouble());
+    case mgp::Type::Double: {
+      const double d = value.ValueDouble();
+      return os << std::format("{}", d == 0.0 ? 0.0 : d);
+    }
     case mgp::Type::String:
       return os << std::string(value.ValueString());
     case mgp::Type::List:
@@ -4802,8 +5387,10 @@ inline std::string Value::ToString() const {
       return ValueBool() ? "true" : "false";
     case Type::Int:
       return std::to_string(ValueInt());
-    case Type::Double:
-      return std::to_string(ValueDouble());
+    case Type::Double: {
+      const double d = ValueDouble();
+      return std::format("{}", d == 0.0 ? 0.0 : d);
+    }
     case Type::String:
       return std::string(ValueString());
     case Type::Node:
@@ -4869,7 +5456,7 @@ inline void Record::Insert(const char *field_name, double value) {
 }
 
 inline void Record::Insert(const char *field_name, std::string_view value) {
-  auto *mgp_val = mgp::MemHandlerCallback(value_make_string, value.data());
+  auto *mgp_val = mgp::MemHandlerCallback(value_make_string_with_size, value.data(), value.size());
   {
     mgp::result_record_insert(record_, field_name, mgp_val);
   }
@@ -5043,7 +5630,8 @@ inline Record RecordFactory::NewRecord() const {
 }
 
 inline void RecordFactory::SetErrorMessage(const std::string_view error_msg) const {
-  mgp::result_set_error_msg(result_, error_msg.data());
+  const std::string msg{error_msg};
+  mgp::result_set_error_msg(result_, msg.c_str());
 }
 
 inline void RecordFactory::SetErrorMessage(const char *error_msg) const {
@@ -5087,7 +5675,7 @@ inline void Result::SetValue(double value) {
 }
 
 inline void Result::SetValue(std::string_view value) {
-  auto *mgp_val = mgp::MemHandlerCallback(value_make_string, value.data());
+  auto *mgp_val = mgp::MemHandlerCallback(value_make_string_with_size, value.data(), value.size());
   {
     mgp::MemHandlerCallback(func_result_set_value, result_, mgp_val);
   }
@@ -5111,10 +5699,9 @@ inline void Result::SetValue(const List &list) {
 }
 
 inline void Result::SetValue(List &&list) {
-  auto *mgp_val = mgp::value_make_list(list.ptr_);
-  mgp::MemHandlerCallback(func_result_set_value, result_, mgp_val);
-  mgp::value_destroy(mgp_val);
+  Value owned(steal_type, mgp::value_make_list(list.ptr_));
   list.ptr_ = nullptr;
+  mgp::MemHandlerCallback(func_result_set_value, result_, owned.ptr());
 }
 
 inline void Result::SetValue(const Map &map) {
@@ -5126,10 +5713,9 @@ inline void Result::SetValue(const Map &map) {
 }
 
 inline void Result::SetValue(Map &&map) {
-  auto *mgp_val = mgp::value_make_map(map.ptr_);
-  mgp::MemHandlerCallback(func_result_set_value, result_, mgp_val);
-  mgp::value_destroy(mgp_val);
+  Value owned(steal_type, mgp::value_make_map(map.ptr_));
   map.ptr_ = nullptr;
+  mgp::MemHandlerCallback(func_result_set_value, result_, owned.ptr());
 }
 
 inline void Result::SetValue(const Node &node) {
@@ -5226,7 +5812,8 @@ inline void Result::SetValue(const Value &value) {
 }
 
 inline void Result::SetErrorMessage(const std::string_view error_msg) const {
-  mgp::MemHandlerCallback(func_result_set_error_msg, result_, error_msg.data());
+  const std::string msg{error_msg};
+  mgp::MemHandlerCallback(func_result_set_error_msg, result_, msg.c_str());
 }
 
 inline void Result::SetErrorMessage(const char *error_msg) const {
@@ -5303,17 +5890,37 @@ inline std::string ExecutionHeaders::At(size_t index) const {
 inline QueryExecution::QueryExecution(mgp_graph *graph) : graph_(graph) {}
 
 inline ExecutionResult QueryExecution::ExecuteQuery(std::string_view query, mgp::Map params) const {
-  return ExecuteQuery(std::string(query), params);
-}
-
-inline ExecutionResult QueryExecution::ExecuteQuery(std::string query, mgp::Map params) const {
-  return ExecutionResult(mgp::MemHandlerCallback(execute_query, graph_, query.data(), params.ptr_), graph_);
+  const std::string query_str{query};
+  return ExecutionResult(mgp::MemHandlerCallback(execute_query, graph_, query_str.c_str(), params.ptr_), graph_);
 }
 
 inline ExecutionResult::ExecutionResult(mgp_execution_result *result, mgp_graph *graph)
     : result_(result), graph_(graph) {}
 
-inline ExecutionResult::~ExecutionResult() { mgp::execution_result_destroy(result_); }
+inline ExecutionResult::ExecutionResult(ExecutionResult &&other) noexcept
+    : result_(other.result_), graph_(other.graph_) {
+  other.result_ = nullptr;
+  other.graph_ = nullptr;
+}
+
+inline ExecutionResult &ExecutionResult::operator=(ExecutionResult &&other) noexcept {
+  if (this != &other) {
+    if (result_ != nullptr) {
+      mgp::execution_result_destroy(result_);
+    }
+    result_ = other.result_;
+    graph_ = other.graph_;
+    other.result_ = nullptr;
+    other.graph_ = nullptr;
+  }
+  return *this;
+}
+
+inline ExecutionResult::~ExecutionResult() {
+  if (result_ != nullptr) {
+    mgp::execution_result_destroy(result_);
+  }
+}
 
 inline ExecutionHeaders ExecutionResult::Headers() const { return mgp::fetch_execution_headers(result_); };
 
@@ -5354,7 +5961,7 @@ inline ExecutionHeaders::Iterator ExecutionHeaders::cbegin() { return Iterator(t
 
 inline ExecutionHeaders::Iterator ExecutionHeaders::cend() { return Iterator(this, Size()); }
 
-inline ExecutionRow::ExecutionRow(mgp_map *row) : row_(row) {}
+inline ExecutionRow::ExecutionRow(mgp_map *row) : row_(row, steal_type) {}
 
 inline size_t ExecutionRow::Size() const { return row_.Size(); }
 
@@ -5373,27 +5980,29 @@ namespace detail {
 inline void AddParamsReturnsToProc(mgp_proc *proc, std::vector<Parameter> &parameters,
                                    const std::vector<Return> &returns) {
   for (const auto &parameter : parameters) {
-    const auto *parameter_name = parameter.name.data();
+    const std::string parameter_name{parameter.name};
     if (!parameter.optional) {
-      mgp::proc_add_arg(proc, parameter_name, parameter.GetMGPType());
+      mgp::proc_add_arg(proc, parameter_name.c_str(), parameter.GetMGPType());
     } else {
-      mgp::proc_add_opt_arg(proc, parameter_name, parameter.GetMGPType(), parameter.default_value.ptr());
+      mgp::proc_add_opt_arg(proc, parameter_name.c_str(), parameter.GetMGPType(), parameter.default_value.ptr());
     }
   }
 
   for (const auto return_ : returns) {
-    const auto *return_name = return_.name.data();
-    mgp::proc_add_result(proc, return_name, return_.GetMGPType());
+    const std::string return_name{return_.name};
+    mgp::proc_add_result(proc, return_name.c_str(), return_.GetMGPType());
   }
 }
 }  // namespace detail
 
 inline bool CreateLabelIndex(mgp_graph *memgraph_graph, const std::string_view label) {
-  return create_label_index(memgraph_graph, label.data());
+  const std::string label_str{label};
+  return create_label_index(memgraph_graph, label_str.c_str());
 }
 
 inline bool DropLabelIndex(mgp_graph *memgraph_graph, const std::string_view label) {
-  return drop_label_index(memgraph_graph, label.data());
+  const std::string label_str{label};
+  return drop_label_index(memgraph_graph, label_str.c_str());
 }
 
 inline List ListAllLabelIndices(mgp_graph *memgraph_graph) {
@@ -5406,12 +6015,16 @@ inline List ListAllLabelIndices(mgp_graph *memgraph_graph) {
 
 inline bool CreateLabelPropertyIndex(mgp_graph *memgraph_graph, const std::string_view label,
                                      const std::string_view property) {
-  return create_label_property_index(memgraph_graph, label.data(), property.data());
+  const std::string label_str{label};
+  const std::string prop_str{property};
+  return create_label_property_index(memgraph_graph, label_str.c_str(), prop_str.c_str());
 }
 
 inline bool DropLabelPropertyIndex(mgp_graph *memgraph_graph, const std::string_view label,
                                    const std::string_view property) {
-  return drop_label_property_index(memgraph_graph, label.data(), property.data());
+  const std::string label_str{label};
+  const std::string prop_str{property};
+  return drop_label_property_index(memgraph_graph, label_str.c_str(), prop_str.c_str());
 }
 
 inline List ListAllLabelPropertyIndices(mgp_graph *memgraph_graph) {
@@ -5422,12 +6035,27 @@ inline List ListAllLabelPropertyIndices(mgp_graph *memgraph_graph) {
   return List(label_property_indices, StealType{});
 }
 
+inline std::string GetDatabaseUuid(mgp_graph *memgraph_graph) {
+  if (memgraph_graph == nullptr) {
+    return {};
+  }
+  auto *uuid_val = mgp::MemHandlerCallback(graph_get_database_uuid, memgraph_graph);
+  if (uuid_val == nullptr) {
+    throw ValueException("Couldn't get database UUID");
+  }
+  std::string out(mgp::value_get_string_view(uuid_val));
+  mgp::value_destroy(uuid_val);
+  return out;
+}
+
 inline bool CreateVertexPropertyIndex(mgp_graph *memgraph_graph, const std::string_view property) {
-  return create_vertex_property_index(memgraph_graph, property.data());
+  const std::string prop_str{property};
+  return create_vertex_property_index(memgraph_graph, prop_str.c_str());
 }
 
 inline bool DropVertexPropertyIndex(mgp_graph *memgraph_graph, const std::string_view property) {
-  return drop_vertex_property_index(memgraph_graph, property.data());
+  const std::string prop_str{property};
+  return drop_vertex_property_index(memgraph_graph, prop_str.c_str());
 }
 
 inline List ListAllVertexPropertyIndices(mgp_graph *memgraph_graph) {
@@ -5444,10 +6072,12 @@ inline constexpr std::string_view kAggregationResultsKey = "aggregation_results"
 
 inline List SearchTextIndex(mgp_graph *memgraph_graph, std::string_view index_name, std::string_view search_query,
                             text_search_mode search_mode, const TextSearchConfig &config) {
+  const std::string idx_str{index_name};
+  const std::string query_str{search_query};
   auto results_or_error = Map(mgp::MemHandlerCallback(graph_search_text_index,
                                                       memgraph_graph,
-                                                      index_name.data(),
-                                                      search_query.data(),
+                                                      idx_str.c_str(),
+                                                      query_str.c_str(),
                                                       search_mode,
                                                       config.limit,
                                                       config.fuzzy_distance,
@@ -5458,7 +6088,7 @@ inline List SearchTextIndex(mgp_graph *memgraph_graph, std::string_view index_na
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw TextSearchException{"The error message is not a string!"};
     }
-    throw TextSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw TextSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
 
   if (!results_or_error.KeyExists(kSearchResultsKey)) {
@@ -5474,10 +6104,12 @@ inline List SearchTextIndex(mgp_graph *memgraph_graph, std::string_view index_na
 
 inline List SearchTextEdgeIndex(mgp_graph *memgraph_graph, std::string_view index_name, std::string_view search_query,
                                 text_search_mode search_mode, const TextSearchConfig &config) {
+  const std::string idx_str{index_name};
+  const std::string query_str{search_query};
   auto results_or_error = Map(mgp::MemHandlerCallback(graph_search_text_edge_index,
                                                       memgraph_graph,
-                                                      index_name.data(),
-                                                      search_query.data(),
+                                                      idx_str.c_str(),
+                                                      query_str.c_str(),
                                                       search_mode,
                                                       config.limit,
                                                       config.fuzzy_distance,
@@ -5488,7 +6120,7 @@ inline List SearchTextEdgeIndex(mgp_graph *memgraph_graph, std::string_view inde
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw TextSearchException{"The error message is not a string!"};
     }
-    throw TextSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw TextSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
 
   if (!results_or_error.KeyExists(kSearchResultsKey)) {
@@ -5504,18 +6136,21 @@ inline List SearchTextEdgeIndex(mgp_graph *memgraph_graph, std::string_view inde
 
 inline std::string AggregateOverTextIndex(mgp_graph *memgraph_graph, std::string_view index_name,
                                           std::string_view search_query, std::string_view aggregation_query) {
+  const std::string idx_str{index_name};
+  const std::string query_str{search_query};
+  const std::string agg_str{aggregation_query};
   auto results_or_error = Map(mgp::MemHandlerCallback(graph_aggregate_over_text_index,
                                                       memgraph_graph,
-                                                      index_name.data(),
-                                                      search_query.data(),
-                                                      aggregation_query.data()),
+                                                      idx_str.c_str(),
+                                                      query_str.c_str(),
+                                                      agg_str.c_str()),
                               StealType{});
 
   if (results_or_error.KeyExists(kErrorMsgKey)) {
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw TextSearchException{"The error message is not a string!"};
     }
-    throw TextSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw TextSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
 
   if (!results_or_error.KeyExists(kAggregationResultsKey)) {
@@ -5532,18 +6167,21 @@ inline std::string AggregateOverTextIndex(mgp_graph *memgraph_graph, std::string
 
 inline std::string AggregateOverTextEdgeIndex(mgp_graph *memgraph_graph, std::string_view index_name,
                                               std::string_view search_query, std::string_view aggregation_query) {
+  const std::string idx_str{index_name};
+  const std::string query_str{search_query};
+  const std::string agg_str{aggregation_query};
   auto results_or_error = Map(mgp::MemHandlerCallback(graph_aggregate_over_text_edge_index,
                                                       memgraph_graph,
-                                                      index_name.data(),
-                                                      search_query.data(),
-                                                      aggregation_query.data()),
+                                                      idx_str.c_str(),
+                                                      query_str.c_str(),
+                                                      agg_str.c_str()),
                               StealType{});
 
   if (results_or_error.KeyExists(kErrorMsgKey)) {
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw TextSearchException{"The error message is not a string!"};
     }
-    throw TextSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw TextSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
 
   if (!results_or_error.KeyExists(kAggregationResultsKey)) {
@@ -5558,30 +6196,32 @@ inline std::string AggregateOverTextEdgeIndex(mgp_graph *memgraph_graph, std::st
 
 inline List SearchVectorIndex(mgp_graph *memgraph_graph, std::string_view index_name, List &query_vector,
                               size_t result_size) {
+  const std::string idx_str{index_name};
   auto results_or_error =
       Map(mgp::MemHandlerCallback(
-              graph_search_vector_index, memgraph_graph, index_name.data(), query_vector.GetPtr(), result_size),
+              graph_search_vector_index, memgraph_graph, idx_str.c_str(), query_vector.GetPtr(), result_size),
           StealType{});
   if (results_or_error.KeyExists(kErrorMsgKey)) {
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw VectorSearchException{"The error message is not a string!"};
     }
-    throw VectorSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw VectorSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
   return results_or_error.At(kSearchResultsKey).ValueList();
 }
 
 inline List SearchVectorIndexOnEdges(mgp_graph *memgraph_graph, std::string_view index_name, List &query_vector,
                                      size_t result_size) {
+  const std::string idx_str{index_name};
   auto results_or_error = Map(
       mgp::MemHandlerCallback(
-          graph_search_vector_index_on_edges, memgraph_graph, index_name.data(), query_vector.GetPtr(), result_size),
+          graph_search_vector_index_on_edges, memgraph_graph, idx_str.c_str(), query_vector.GetPtr(), result_size),
       StealType{});
   if (results_or_error.KeyExists(kErrorMsgKey)) {
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw VectorSearchException{"The error message is not a string!"};
     }
-    throw VectorSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw VectorSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
   return results_or_error.At(kSearchResultsKey).ValueList();
 }
@@ -5593,7 +6233,7 @@ inline List GetVectorIndexInfo(mgp_graph *memgraph_graph) {
     if (!results_or_error.At(kErrorMsgKey).IsString()) {
       throw VectorSearchException{"The error message is not a string!"};
     }
-    throw VectorSearchException(results_or_error.At(kErrorMsgKey).ValueString().data());
+    throw VectorSearchException(std::string(results_or_error.At(kErrorMsgKey).ValueString()));
   }
 
   if (!results_or_error.KeyExists(kSearchResultsKey)) {
@@ -5609,12 +6249,16 @@ inline List GetVectorIndexInfo(mgp_graph *memgraph_graph) {
 
 inline bool CreateExistenceConstraint(mgp_graph *memgraph_graph, const std::string_view label,
                                       const std::string_view property) {
-  return create_existence_constraint(memgraph_graph, label.data(), property.data());
+  const std::string label_str{label};
+  const std::string prop_str{property};
+  return create_existence_constraint(memgraph_graph, label_str.c_str(), prop_str.c_str());
 }
 
 inline bool DropExistenceConstraint(mgp_graph *memgraph_graph, const std::string_view label,
                                     const std::string_view property) {
-  return drop_existence_constraint(memgraph_graph, label.data(), property.data());
+  const std::string label_str{label};
+  const std::string prop_str{property};
+  return drop_existence_constraint(memgraph_graph, label_str.c_str(), prop_str.c_str());
 }
 
 inline List ListAllExistenceConstraints(mgp_graph *memgraph_graph) {
@@ -5626,11 +6270,13 @@ inline List ListAllExistenceConstraints(mgp_graph *memgraph_graph) {
 }
 
 inline bool CreateUniqueConstraint(mgp_graph *memgraph_graph, const std::string_view label, mgp_list *properties) {
-  return create_unique_constraint(memgraph_graph, label.data(), properties);
+  const std::string label_str{label};
+  return create_unique_constraint(memgraph_graph, label_str.c_str(), properties);
 }
 
 inline bool DropUniqueConstraint(mgp_graph *memgraph_graph, const std::string_view label, mgp_list *properties) {
-  return drop_unique_constraint(memgraph_graph, label.data(), properties);
+  const std::string label_str{label};
+  return drop_unique_constraint(memgraph_graph, label_str.c_str(), properties);
 }
 
 inline List ListAllUniqueConstraints(mgp_graph *memgraph_graph) {
@@ -5644,31 +6290,34 @@ inline List ListAllUniqueConstraints(mgp_graph *memgraph_graph) {
 void AddProcedure(mgp_proc_cb callback, std::string_view name, ProcedureType proc_type,
                   std::vector<Parameter> parameters, std::vector<Return> returns, mgp_module *module,
                   mgp_memory * /*memory*/) {
-  auto *proc = (proc_type == ProcedureType::Read) ? mgp::module_add_read_procedure(module, name.data(), callback)
-                                                  : mgp::module_add_write_procedure(module, name.data(), callback);
+  const std::string proc_name{name};
+  auto *proc = (proc_type == ProcedureType::Read) ? mgp::module_add_read_procedure(module, proc_name.c_str(), callback)
+                                                  : mgp::module_add_write_procedure(module, proc_name.c_str(), callback);
   detail::AddParamsReturnsToProc(proc, parameters, returns);
 }
 
 void AddBatchProcedure(mgp_proc_cb callback, mgp_proc_initializer initializer, mgp_proc_cleanup cleanup,
                        std::string_view name, ProcedureType proc_type, std::vector<Parameter> parameters,
                        std::vector<Return> returns, mgp_module *module, mgp_memory * /*memory*/) {
+  const std::string proc_name{name};
   auto *proc = (proc_type == ProcedureType::Read)
-                   ? mgp::module_add_batch_read_procedure(module, name.data(), callback, initializer, cleanup)
-                   : mgp::module_add_batch_write_procedure(module, name.data(), callback, initializer, cleanup);
+                   ? mgp::module_add_batch_read_procedure(module, proc_name.c_str(), callback, initializer, cleanup)
+                   : mgp::module_add_batch_write_procedure(module, proc_name.c_str(), callback, initializer, cleanup);
   detail::AddParamsReturnsToProc(proc, parameters, returns);
 }
 
 void AddFunction(mgp_func_cb callback, std::string_view name, std::vector<Parameter> parameters, mgp_module *module,
                  mgp_memory *memory) {
-  auto *func = mgp::module_add_function(module, name.data(), callback);
+  const std::string func_name{name};
+  auto *func = mgp::module_add_function(module, func_name.c_str(), callback);
 
   for (const auto &parameter : parameters) {
-    const auto *parameter_name = parameter.name.data();
+    const std::string parameter_name{parameter.name};
 
     if (!parameter.optional) {
-      mgp::func_add_arg(func, parameter_name, parameter.GetMGPType());
+      mgp::func_add_arg(func, parameter_name.c_str(), parameter.GetMGPType());
     } else {
-      mgp::func_add_opt_arg(func, parameter_name, parameter.GetMGPType(), parameter.default_value.ptr());
+      mgp::func_add_opt_arg(func, parameter_name.c_str(), parameter.GetMGPType(), parameter.default_value.ptr());
     }
   }
 }
@@ -5706,11 +6355,12 @@ struct hash<mgp::Path> {
       hash ^= element_hash;
     };
 
-    for (size_t i = 0; i < x.Length() - 1; ++i) {
+    const size_t length = x.Length();
+    for (size_t i = 0; i < length; ++i) {
       multiply_and_xor(hash, std::hash<mgp::Node>{}(x.GetNodeAt(i)));
       multiply_and_xor(hash, std::hash<mgp::Relationship>{}(x.GetRelationshipAt(i)));
     }
-    multiply_and_xor(hash, std::hash<mgp::Node>{}(x.GetNodeAt(x.Length())));
+    multiply_and_xor(hash, std::hash<mgp::Node>{}(x.GetNodeAt(length)));
     return hash;
   }
 };
@@ -5806,12 +6456,20 @@ struct hash<mgp::Value> {
         throw mg_exception::InvalidArgumentException();
       case mgp::Type::Bool:
         return std::hash<bool>{}(x.ValueBool());
-      case mgp::Type::Int:
-        // we cast int to double for hashing purposes
-        // to be consistent with equality (2.0 == 2) == true
-        return std::hash<double>{}((double)x.ValueInt());
-      case mgp::Type::Double:
-        return std::hash<double>{}(x.ValueDouble());
+      case mgp::Type::Int: {
+        // Preserve cross-type hash equality when the int64 value is an exact IEEE-754 double,
+        // while keeping distinct hashes for large integers (> 2^53) that cannot equal any double.
+        const int64_t v = x.ValueInt();
+        const double as_double = static_cast<double>(v);
+        if (as_double < 9223372036854775808.0 && static_cast<int64_t>(as_double) == v) {
+          return std::hash<double>{}(as_double == 0.0 ? 0.0 : as_double);
+        }
+        return std::hash<int64_t>{}(v);
+      }
+      case mgp::Type::Double: {
+        const double d = x.ValueDouble();
+        return std::hash<double>{}(d == 0.0 ? 0.0 : d);
+      }
       case mgp::Type::String:
         return std::hash<std::string_view>{}(x.ValueString());
       case mgp::Type::List:

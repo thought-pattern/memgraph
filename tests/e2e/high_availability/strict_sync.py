@@ -275,19 +275,19 @@ def check_if_data_preserved_after_restart(inner_instances_description, instance_
 
 
 # Tolerate if replica is down, it should come up
-def run_until_success(cursor, query):
-    start_time = time.time()
-    while True:
-        if time.time() - start_time >= 5:
-            assert "Taking too long for replica to commit"
+def run_until_success(cursor, query, max_attempts=10):
+    last_replication_error = None
+    for _ in range(max_attempts):
         try:
             execute_and_fetch_all(cursor, query)
-            break
+            return
         except Exception as e:
             if "Failed to replicate to STRICT_SYNC replica" in str(e):
+                last_replication_error = e
                 time.sleep(1)
                 continue
-            assert "Unknown error"
+            raise
+    raise AssertionError(f"Replica failed to commit after {max_attempts} attempts: {last_replication_error}")
 
 
 # We test the behavior in which replica was 1st down: during that time, commits don't pass on MAIN

@@ -78,11 +78,12 @@ class JsonlReaderTest : public ::testing::Test {
 };
 
 TEST_F(JsonlReaderTest, NumbersKeepTheirTypeAndValue) {
-  // A big integer does not fit int64, so it is carried through as the raw token rather than being
-  // narrowed to something that is no longer the number in the file.
-  auto const path = WriteFile("numbers.jsonl",
-                              R"({"i": 42, "neg": -7, "d": 1.5, "big": 123456789012345678901234567890})"
-                              "\n");
+  // Any integer past int64_t::max (including uint64 values above 9223372036854775807) is carried through
+  // as the raw token rather than being narrowed to a negative int64 or another value not in the file.
+  auto const path = WriteFile(
+      "numbers.jsonl",
+      R"({"i": 42, "neg": -7, "d": 1.5, "int64_max": 9223372036854775807, "uint64": 9223372036854775808, "big": 123456789012345678901234567890})"
+      "\n");
 
   auto *resource = std::pmr::new_delete_resource();
   memgraph::query::JsonlReader reader{path, std::nullopt, resource, {}, kTinyChunk};
@@ -95,6 +96,10 @@ TEST_F(JsonlReaderTest, NumbersKeepTheirTypeAndValue) {
   EXPECT_EQ(row.find("neg")->second.ValueInt(), -7);
   ASSERT_TRUE(row.find("d")->second.IsDouble());
   EXPECT_DOUBLE_EQ(row.find("d")->second.ValueDouble(), 1.5);
+  ASSERT_TRUE(row.find("int64_max")->second.IsInt());
+  EXPECT_EQ(row.find("int64_max")->second.ValueInt(), 9223372036854775807LL);
+  ASSERT_TRUE(row.find("uint64")->second.IsString());
+  EXPECT_EQ(row.find("uint64")->second.ValueString(), "9223372036854775808");
   ASSERT_TRUE(row.find("big")->second.IsString());
   EXPECT_EQ(row.find("big")->second.ValueString(), "123456789012345678901234567890");
 

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -48,6 +49,11 @@ struct Transaction {
   /// Takes an already-constructed action, for a caller that builds it before choosing a destination.
   void AddAction(std::unique_ptr<ISystemAction> action) { actions_.emplace_back(std::move(action)); }
 
+  /// Appends pre-allocated actions in O(1) without allocating, so durable writes and replication queueing stay atomic.
+  void AppendPreparedActions(std::list<std::unique_ptr<ISystemAction>> &prepared) noexcept {
+    actions_.splice(actions_.end(), prepared);
+  }
+
   template <ReplicationPolicy Handler>
   auto Commit(Handler handler) -> AllSyncReplicaStatus {
     if (!lock_.owns_lock() || actions_.empty()) {
@@ -73,12 +79,17 @@ struct Transaction {
       actions_.pop_front();
     }
 
+    if (!state_->PersistTimestamp(timestamp_)) {
+      lock_.unlock();
+      throw kvstore::KVStoreError("Failed to persist committed system transaction timestamp {}", timestamp_);
+    }
+
     /// replication
     auto action_sync_status = handler.FinalizeTransaction(*this);
     if (action_sync_status != AllSyncReplicaStatus::AllCommitsConfirmed) {
       sync_status = AllSyncReplicaStatus::SomeCommitsUnconfirmed;
     }
-    state_->FinalizeTransaction(timestamp_);
+    state_->AdvanceInMemoryTimestamp(timestamp_);
 
     lock_.unlock();
 
@@ -140,12 +151,19 @@ struct DoReplication {
     auto sync_status = AllSyncReplicaStatus::AllCommitsConfirmed;
 
     for (auto &client : main_data_.registered_replicas_) {
+      const auto committed_ts = system_tx.timestamp();
       const bool completed = client.StreamAndFinalizeDelta<replication::FinalizeSystemTxRpc>(
-          [](const replication::FinalizeSystemTxRes &response) { return response.success; },
+          [&client, committed_ts](const replication::FinalizeSystemTxRes &response) {
+            if (response.success) {
+              client.RecordConfirmedSystemTimestamp(committed_ts);
+            }
+            return response.success;
+          },
           main_data_.uuid_,
           system_tx.last_committed_system_timestamp(),
-          system_tx.timestamp());
-      if (!completed && client.mode_ == replication_coordination_glue::ReplicationMode::SYNC) {
+          committed_ts);
+      if (!completed && (client.mode_ == replication_coordination_glue::ReplicationMode::SYNC ||
+                         client.mode_ == replication_coordination_glue::ReplicationMode::STRICT_SYNC)) {
         sync_status = AllSyncReplicaStatus::SomeCommitsUnconfirmed;
       }
     }

@@ -33,11 +33,26 @@ constexpr char const *kArgumentDeletedEdges = "deleted_edges";
 
 void InsertPagerankRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const std::uint64_t node_id,
                           const double rank) {
-  auto *record = mgp::result_new_record(result);
-
-  if (mg_utility::InsertNodeValueResult(graph, record, kFieldNode, node_id, memory)) {
-    mg_utility::InsertDoubleValueResult(record, kFieldRank, rank, memory);
+  auto *vertex =
+      mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = static_cast<std::int64_t>(node_id)}, memory);
+  if (!vertex) {
+    return;
   }
+  auto *record = mgp::result_new_record(result);
+  if (record == nullptr) {
+    mgp::vertex_destroy(vertex);
+    throw mg_exception::NotEnoughMemoryException();
+  }
+  mg_utility::InsertNodeValueResult(record, kFieldNode, vertex, memory);
+  mg_utility::InsertDoubleValueResult(record, kFieldRank, rank, memory);
+}
+
+mgp_list *RequirePagerankListArg(mgp_list *args, std::size_t index, const char *name) {
+  auto *val = mgp::list_at(args, index);
+  if (val == nullptr || mgp::value_get_type(val) != MGP_VALUE_TYPE_LIST) {
+    throw std::invalid_argument(std::string(name) + " must be a list.");
+  }
+  return mgp::value_get_list(val);
 }
 
 void InsertMessageRecord(mgp_result *result, mgp_memory *memory, const char *message) {
@@ -102,14 +117,14 @@ void OnlinePagerankUpdate(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
     }
 
     // Created vertices
-    auto created_vertices_list = mgp::value_get_list(mgp::list_at(args, 0));
+    auto created_vertices_list = RequirePagerankListArg(args, 0, kArgumentCreatedVertices);
     auto size = mgp::list_size(created_vertices_list);
     auto created_vertices = std::vector<std::uint64_t>(size);
     for (std::size_t i = 0; i < size; i++) {
       created_vertices[i] = mgp::vertex_get_id(mgp::value_get_vertex(mgp::list_at(created_vertices_list, i))).as_int;
     }
 
-    auto created_edges_list = mgp::value_get_list(mgp::list_at(args, 1));
+    auto created_edges_list = RequirePagerankListArg(args, 1, kArgumentCreatedEdges);
     size = mgp::list_size(created_edges_list);
     auto created_edges = std::vector<std::pair<std::uint64_t, std::uint64_t>>(size);
     for (std::size_t i = 0; i < size; i++) {
@@ -120,14 +135,14 @@ void OnlinePagerankUpdate(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
     }
 
     // Deleted vertices
-    auto deleted_vertices_list = mgp::value_get_list(mgp::list_at(args, 2));
+    auto deleted_vertices_list = RequirePagerankListArg(args, 2, kArgumentDeletedVertices);
     size = mgp::list_size(deleted_vertices_list);
     auto deleted_vertices = std::vector<std::uint64_t>(size);
     for (std::size_t i = 0; i < size; i++) {
       deleted_vertices[i] = mgp::vertex_get_id(mgp::value_get_vertex(mgp::list_at(deleted_vertices_list, i))).as_int;
     }
 
-    auto deleted_edges_list = mgp::value_get_list(mgp::list_at(args, 3));
+    auto deleted_edges_list = RequirePagerankListArg(args, 3, kArgumentDeletedEdges);
     size = mgp::list_size(deleted_edges_list);
     auto deleted_edges = std::vector<std::pair<std::uint64_t, std::uint64_t>>(size);
     for (std::size_t i = 0; i < size; i++) {
@@ -217,22 +232,14 @@ extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *mem
       auto default_deleted_vertices = mgp::value_make_list(mgp::list_make_empty(0, memory));
       auto default_deleted_edges = mgp::value_make_list(mgp::list_make_empty(0, memory));
 
-      mgp::proc_add_opt_arg(pagerank_proc,
-                            kArgumentCreatedVertices,
-                            mgp::type_nullable(mgp::type_list(mgp::type_node())),
-                            default_created_vertices);
-      mgp::proc_add_opt_arg(pagerank_proc,
-                            kArgumentCreatedEdges,
-                            mgp::type_nullable(mgp::type_list(mgp::type_relationship())),
-                            default_created_edges);
-      mgp::proc_add_opt_arg(pagerank_proc,
-                            kArgumentDeletedVertices,
-                            mgp::type_nullable(mgp::type_list(mgp::type_node())),
-                            default_deleted_vertices);
-      mgp::proc_add_opt_arg(pagerank_proc,
-                            kArgumentDeletedEdges,
-                            mgp::type_nullable(mgp::type_list(mgp::type_relationship())),
-                            default_deleted_edges);
+      mgp::proc_add_opt_arg(
+          pagerank_proc, kArgumentCreatedVertices, mgp::type_list(mgp::type_node()), default_created_vertices);
+      mgp::proc_add_opt_arg(
+          pagerank_proc, kArgumentCreatedEdges, mgp::type_list(mgp::type_relationship()), default_created_edges);
+      mgp::proc_add_opt_arg(
+          pagerank_proc, kArgumentDeletedVertices, mgp::type_list(mgp::type_node()), default_deleted_vertices);
+      mgp::proc_add_opt_arg(
+          pagerank_proc, kArgumentDeletedEdges, mgp::type_list(mgp::type_relationship()), default_deleted_edges);
 
       mgp::value_destroy(default_created_vertices);
       mgp::value_destroy(default_created_edges);

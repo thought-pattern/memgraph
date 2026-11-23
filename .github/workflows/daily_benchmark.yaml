@@ -112,12 +112,19 @@ jobs:
       DEFAULT_MGBENCH_HA_SYNC_ASYNC_EXPORT_RESULTS_FILE: 'benchmark_result_ha_sync_async.json'
       DEFAULT_MGBENCH_HA_STRICT_SYNC_ASYNC_EXPORT_RESULTS_FILE: 'benchmark_result_ha_strict_sync_async.json'
       DEFAULT_MGBENCH_HA_2REP_RUST_EXPORT_RESULTS_FILE: 'benchmark_result_ha_2rep_rust.json'
-      LOOP_COUNT: ${{ inputs.loop_count || 10 }}
+      LOOP_COUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.loop_count || 10 }}
       CONAN_REMOTE: ${{ secrets.CONAN_REMOTE }}
       CONAN_USERNAME: ${{ secrets.CONAN_USERNAME }}
       CONAN_PASSWORD: ${{ secrets.CONAN_PASSWORD }}
 
     steps:
+      - name: Validate loop_count
+        run: |
+          if ! [[ "$LOOP_COUNT" =~ ^[0-9]+$ ]] || [ "$LOOP_COUNT" -lt 1 ]; then
+            echo "::error::loop_count must be a positive integer >= 1 (got '$LOOP_COUNT')."
+            exit 1
+          fi
+
       - name: Set up repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -221,7 +228,7 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.mgbench_ha_2rep_rust }}
         continue-on-error: true
         env:
-          LOOP_COUNT: ${{ inputs.loop_count || 3 }}
+          LOOP_COUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.loop_count || 3 }}
         run: |
           ./tools/ci/loop-benchmark.sh \
             "mgbench-ha-rust" \
@@ -513,7 +520,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.REPO_PAT }}
         run: |
-          curl -X POST \
+          curl -fsSL -X POST \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: token $GITHUB_TOKEN" \
             https://api.github.com/repos/memgraph/infra/dispatches \
@@ -532,6 +539,14 @@ jobs:
           }
           failed=""
           check mgbench-ha                       "${{ steps.mgbench-ha.outcome }}"
+          check mgbench-ha-2rep-rust             "${{ steps.mgbench-ha-2rep-rust.outcome }}"
+          check mgbench-ha-2-replicas            "${{ steps.mgbench-ha-2-replicas.outcome }}"
+          check mgbench-ha-async                 "${{ steps.mgbench-ha-async.outcome }}"
+          check mgbench-ha-strict-sync           "${{ steps.mgbench-ha-strict-sync.outcome }}"
+          check mgbench-ha-2-strict-sync         "${{ steps.mgbench-ha-2-strict-sync.outcome }}"
+          check mgbench-ha-sync-async            "${{ steps.mgbench-ha-sync-async.outcome }}"
+          check mgbench-ha-strict-sync-async     "${{ steps.mgbench-ha-strict-sync-async.outcome }}"
+          check mgbench-ha-2-async               "${{ steps.mgbench-ha-2-async.outcome }}"
           check load-parquet                     "${{ steps.load-parquet.outcome }}"
           check mgbench-vector-search-index      "${{ steps.mgbench-vector-search-index.outcome }}"
           check mgbench-vector-search-edge-index "${{ steps.mgbench-vector-search-edge-index.outcome }}"

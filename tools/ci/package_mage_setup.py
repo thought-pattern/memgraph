@@ -56,13 +56,32 @@ def _build_docker_image(distro: str, cugraph: str, requested: str = "default") -
 
 
 class PackageMageSetup:
-    def __init__(self, gh_context_path: str):
+    def __init__(self, gh_context_path: str, workflow_inputs_json: str = ""):
         self._gh_context_path = gh_context_path
+        self._workflow_inputs_override = self._parse_inputs_json(workflow_inputs_json)
         self._package_suite = []
         self._load_gh_context()
         self.event_name = self._get_event_name()
         self.workflow_inputs = self.get_workflow_inputs()
         self.setup_package_workflow()
+
+    @staticmethod
+    def _parse_inputs_json(raw_json: str) -> dict:
+        source = raw_json or os.environ.get("WORKFLOW_INPUTS_JSON", "")
+        if not source or not source.strip():
+            return {}
+        loaded = json.loads(source)
+        if not isinstance(loaded, dict):
+            return {}
+        normalized = {}
+        for key, val in loaded.items():
+            if val is True:
+                normalized[key] = "true"
+            elif val is False:
+                normalized[key] = "false"
+            elif val is not None:
+                normalized[key] = str(val)
+        return normalized
 
     def _load_gh_context(self) -> None:
         try:
@@ -95,6 +114,7 @@ class PackageMageSetup:
             "memgraph_rpm_download_link": "",
             "memgraph_debuginfo_download_link": "",
             "push_to_s3": "false",
+            "push_to_github": "false",
             "s3_dest_dir": "mage-unofficial",
             "run_smoke_tests": "true",
             "run_tests": "true",
@@ -125,9 +145,19 @@ class PackageMageSetup:
                 self._package_suite.append(result)
 
     def get_workflow_inputs(self) -> dict:
-        if self._get_event_name() in ["workflow_dispatch", "workflow_call"]:
-            return self._gh_context.get("event").get("inputs")
-        return None
+        if self._get_event_name() in ["workflow_dispatch", "workflow_call"] or self._workflow_inputs_override:
+            event_inputs = (self._gh_context.get("event") or {}).get("inputs") or {}
+            merged = {}
+            for key, val in event_inputs.items():
+                if val is True:
+                    merged[key] = "true"
+                elif val is False:
+                    merged[key] = "false"
+                elif val is not None:
+                    merged[key] = str(val)
+            merged.update(self._workflow_inputs_override)
+            return merged
+        return {}
 
     def _check_workflow_input(self) -> list:
         # Inputs that apply uniformly to every build in the suite (i.e. not the
@@ -137,6 +167,7 @@ class PackageMageSetup:
         # always serialises booleans consistently — see MATRIX_BUILDS comment.
         common = {
             "push_to_s3": self.workflow_inputs.get("push_to_s3", "false"),
+            "push_to_github": self.workflow_inputs.get("push_to_github", "false"),
             "s3_dest_dir": self.workflow_inputs.get("s3_dest_dir", "mage-unofficial"),
             "run_smoke_tests": self.workflow_inputs.get("run_smoke_tests", "false"),
             "run_tests": self.workflow_inputs.get("run_tests", "false"),
@@ -147,19 +178,31 @@ class PackageMageSetup:
         if requested_image not in ("default", "none", "prod", "debug", "both"):
             print(f"Error: invalid build_docker_image input '{requested_image}'")
             sys.exit(1)
+        requested_sbom = self.workflow_inputs.get("generate_sbom", "false")
         if self.workflow_inputs.get("matrix_build") == "true":
+            if requested_sbom == "true" and requested_image == "none":
+                print("Error: generate_sbom=true requires build_docker_image != 'none'", file=sys.stderr)
+                sys.exit(1)
             # arch/os/cuda/cugraph/malloc come from each MATRIX_BUILDS entry; the
             # remaining inputs above are applied uniformly across the matrix.
-            return [
-                {
-                    **build,
-                    **common,
-                    "build_docker_image": _build_docker_image(build["os"], build["cugraph"], requested_image),
-                }
-                for build in MATRIX_BUILDS
-            ]
+            suite = []
+            for build in MATRIX_BUILDS:
+                resolved_image = _build_docker_image(build["os"], build["cugraph"], requested_image)
+                suite.append(
+                    {
+                        **build,
+                        **common,
+                        "build_docker_image": resolved_image,
+                        "generate_sbom": "true" if (requested_sbom == "true" and resolved_image != "none") else "false",
+                    }
+                )
+            return suite
         distro = self.workflow_inputs.get("os", "ubuntu-24.04")
         cugraph = self.workflow_inputs.get("cugraph", "false")
+        resolved_image = _build_docker_image(distro, cugraph, requested_image)
+        if requested_sbom == "true" and resolved_image == "none":
+            print("Error: generate_sbom=true requires build_docker_image != 'none'", file=sys.stderr)
+            sys.exit(1)
         return [
             {
                 "arch": self.workflow_inputs.get("build_arch", "amd"),
@@ -167,27 +210,24 @@ class PackageMageSetup:
                 "cugraph": cugraph,
                 "malloc": self.workflow_inputs.get("malloc", "false"),
                 "os": distro,
-                "build_docker_image": _build_docker_image(distro, cugraph, requested_image),
+                "build_docker_image": resolved_image,
                 "memgraph_download_link": self.workflow_inputs.get("memgraph_download_link", ""),
                 "memgraph_rpm_download_link": self.workflow_inputs.get("memgraph_rpm_download_link", ""),
                 "memgraph_debuginfo_download_link": self.workflow_inputs.get("memgraph_debuginfo_download_link", ""),
-                "generate_sbom": self.workflow_inputs.get("generate_sbom", "false"),
+                "generate_sbom": requested_sbom,
                 **common,
             }
         ]
 
     def setup_package_workflow(self) -> None:
         print(f"Event name: {self.event_name}")
-        if self.event_name == "pull_request":
+        if self.event_name == "pull_request" and not self._workflow_inputs_override:
             self._setup_pull_request()
-        elif self.event_name in ["workflow_dispatch", "workflow_call"]:
+        elif self.event_name in ["workflow_dispatch", "workflow_call"] or self._workflow_inputs_override:
             self._package_suite = self._check_workflow_input()
         else:
             print("Invalid event name")
             sys.exit(1)
-
-    def get_package_suite(self) -> dict:
-        return self._package_suite
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,6 +237,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Path to json file containing the GitHub context for workflow run",
+    )
+    parser.add_argument(
+        "--workflow-inputs-json",
+        type=str,
+        default="",
+        help="JSON-encoded workflow_call / workflow_dispatch `inputs` context",
     )
     return parser.parse_args()
 
@@ -235,7 +281,7 @@ def print_package_suite(package_suite: dict) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
-    package_mage_setup = PackageMageSetup(args.gh_context_path)
+    package_mage_setup = PackageMageSetup(args.gh_context_path, args.workflow_inputs_json)
     package_suite = package_mage_setup.get_package_suite()
     print_package_suite(package_suite)
     print(json.dumps(package_suite, indent=2))

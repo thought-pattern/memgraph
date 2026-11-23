@@ -136,6 +136,7 @@ class Session : public std::enable_shared_from_this<Session<TRequestHandler, TSe
         // for the duration of the async operation so
         // we use a shared_ptr to manage it.
         auto sp = std::make_shared<boost::beast::http::response<boost::beast::http::string_body>>(std::move(msg));
+        close_ = sp->need_eof();
 
         // Store a type-erased version of the shared
         // pointer in the class to keep it alive.

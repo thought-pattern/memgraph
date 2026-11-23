@@ -52,6 +52,7 @@ def query(q, context, params={}):
 
     # Store the actual query being executed (for logging and validation purposes)
     context.last_executed_query = q
+    context.exception = None
 
     session = context.driver.session()
     try:

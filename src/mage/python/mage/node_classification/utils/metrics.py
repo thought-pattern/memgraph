@@ -1,56 +1,55 @@
-from typing import Dict, List
+"""Utilities for metrics."""
 
-import torch
-from torch_geometric.data import Data
-from torchmetrics import AUC, Accuracy, F1Score, Precision, Recall
+from torch import Tensor as torch_Tensor
+from torchmetrics.classification.accuracy import MulticlassAccuracy
+from torchmetrics.classification.auroc import MulticlassAUROC
+from torchmetrics.classification.f_beta import MulticlassF1Score
+from torchmetrics.classification.precision_recall import MulticlassPrecision, MulticlassRecall
 
 METRICS = {
-    "accuracy": Accuracy,
-    "auc_score": AUC,
-    "precision": Precision,
-    "recall": Recall,
-    "f1_score": F1Score,
+    "accuracy": MulticlassAccuracy,
+    "precision": MulticlassPrecision,
+    "recall": MulticlassRecall,
+    "f1_score": MulticlassF1Score,
 }
 
 
 def metrics(
-    mask: torch.tensor,
-    out: torch.tensor,
-    data: Data,
-    options: List[str],
+    mask: torch_Tensor,
+    out,
+    data,
+    options: list[str],
     observed_attribute: str,
     device: str,
-) -> Dict[str, float]:
-    """Selected metrics calculated for current model and data.
+) -> dict[str, float]:
+    """Selected metrics calculated for current model and data."""
+    scores = out.get(observed_attribute)
+    if scores is None:
+        raise KeyError(f"Model output has no node type {observed_attribute!r}")
 
-    Args:
-        mask (torch.tensor): used to mask which embeddings should be used
-        out (torch.tensor): output of the model
-        data (Data): dataset variable
-        options (List[str]): list of options to be calculated
-        device (str): cpu or cuda
+    if observed_attribute not in data.node_types:
+        raise KeyError(f"Data has no node type {observed_attribute!r}")
 
-    Returns:
-        Dict: dictionary of calculated metrics
-    """
+    if int(mask.sum().item()) == 0:
+        return {}
 
-    pred = out[observed_attribute].argmax(dim=1)  # Use the class with highest probability.
-
-    data = data[observed_attribute]
-
+    masked_scores = scores[mask]
+    predictions = masked_scores.argmax(dim=1)
+    labels = data[observed_attribute].y[mask]
+    num_classes = max(2, int(scores.shape[1]))
     ret = {}
 
-    multiclass = True
-    num_classes = len(set(data.y.detach().cpu().numpy()))
-
-    for metrics in METRICS.keys():
-        if metrics not in options:
+    for metric_name, metric_class in METRICS.items():
+        if metric_name not in options:
             continue
-        func = METRICS[metrics](
-            num_classes=num_classes,
-            multiclass=multiclass,
-            average="weighted",
-        ).to(device)
-        ret[metrics] = float(func(pred[mask], data.y[mask]).detach().cpu().numpy())
+        func = metric_class(num_classes=num_classes, average="weighted").to(device)
+        ret[metric_name] = float(func(predictions, labels).item())
+
+    if "auc_score" in options:
+        probs = masked_scores.softmax(dim=-1)
+        if probs.shape[1] < num_classes:
+            probs = probs.new_zeros((int(probs.shape[0]), num_classes)).scatter_(1, predictions.unsqueeze(1), 1.0)
+        auroc_fn = MulticlassAUROC(num_classes=num_classes, average="weighted").to(device)
+        ret["auc_score"] = float(auroc_fn(probs, labels).item())
 
     return ret

@@ -239,9 +239,12 @@ jobs:
             docker push "$RELEASE_IMAGE_AMD"
           fi
 
-          manifest_args=""
-          [[ "$push_amd" == "true" ]] && manifest_args="$manifest_args --amend $RELEASE_IMAGE_AMD"
-          [[ "$push_arm" == "true" ]] && manifest_args="$manifest_args --amend $RELEASE_IMAGE_ARM"
+          amd_arg=""
+          arm_arg=""
+          [[ "$push_amd" == "true" ]] && amd_arg="$RELEASE_IMAGE_AMD"
+          [[ "$push_arm" == "true" ]] && arm_arg="$RELEASE_IMAGE_ARM"
+          manifest_args="$(python3 tools/ci/preserve_manifest_arches.py --repo "$DOCKER_REPO_MG" --tag "$IMAGE_TAG" --amd-ref "$amd_arg" --arm-ref "$arm_arg")"
+          # shellcheck disable=SC2086
           docker manifest create "$RELEASE_IMAGE" $manifest_args
           docker manifest push "$RELEASE_IMAGE"
           echo "Successfully published $RELEASE_IMAGE to Docker Hub!"
@@ -371,9 +374,12 @@ jobs:
             docker push "$RELEASE_IMAGE_AMD"
           fi
 
-          manifest_args=""
-          [[ "$push_amd" == "true" ]] && manifest_args="$manifest_args --amend $RELEASE_IMAGE_AMD"
-          [[ "$push_arm" == "true" ]] && manifest_args="$manifest_args --amend $RELEASE_IMAGE_ARM"
+          amd_arg=""
+          arm_arg=""
+          [[ "$push_amd" == "true" ]] && amd_arg="$RELEASE_IMAGE_AMD"
+          [[ "$push_arm" == "true" ]] && arm_arg="$RELEASE_IMAGE_ARM"
+          manifest_args="$(python3 tools/ci/preserve_manifest_arches.py --repo "$DOCKER_REPO_MAGE" --tag "$IMAGE_TAG" --amd-ref "$amd_arg" --arm-ref "$arm_arg")"
+          # shellcheck disable=SC2086
           docker manifest create "$RELEASE_IMAGE" $manifest_args
           docker manifest push "$RELEASE_IMAGE"
           echo "Successfully published $RELEASE_IMAGE to Docker Hub!"

@@ -6,7 +6,7 @@ source "$DIR/lib.sh"
 TOOLCHAIN_BUILD_DEPS=(
     coreutils gcc g++ build-essential make # generic build tools
     file # libtool library checks (swig)
-    wget # archive download
+    curl wget # archive download
     gnupg # archive signature verification
     tar gzip bzip2 xz-utils unzip # archive unpacking (unzip: pahole)
     git # LLVM / mgconsole / heaptrack clones

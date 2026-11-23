@@ -10,13 +10,15 @@
 // licenses/APL.txt.
 #include "replication_coordination_glue/role.hpp"
 
+#include <algorithm>
 #include <array>
-#include <iterator>
 #include <nlohmann/json.hpp>
-#include <range/v3/algorithm/find.hpp>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include "utils/logging.hpp"
 
 namespace memgraph::replication_coordination_glue {
 
@@ -26,14 +28,21 @@ constexpr std::array<std::pair<ReplicationRole, std::string_view>, 2> kRoleMappi
 }  // namespace
 
 void to_json(nlohmann::json &j, const ReplicationRole &role) {
-  const auto *it = ranges::find(kRoleMapping, role, &std::pair<ReplicationRole, std::string_view>::first);
-  j = std::string(it != kRoleMapping.end() ? it->second : kRoleMapping.front().second);
+  const auto *it = std::ranges::find(kRoleMapping, role, &std::pair<ReplicationRole, std::string_view>::first);
+  MG_ASSERT(it != kRoleMapping.end(), "Unsupported replication role enum value");
+  j = std::string(it->second);
 }
 
 void from_json(const nlohmann::json &j, ReplicationRole &role) {
+  if (!j.is_string()) {
+    throw std::invalid_argument("Replication role JSON field must be a string");
+  }
   const auto value = j.get<std::string>();
-  const auto *it = ranges::find(kRoleMapping, value, &std::pair<ReplicationRole, std::string_view>::second);
-  role = it != kRoleMapping.end() ? it->first : kRoleMapping.front().first;
+  const auto *it = std::ranges::find(kRoleMapping, value, &std::pair<ReplicationRole, std::string_view>::second);
+  if (it == kRoleMapping.end()) {
+    throw std::invalid_argument("Unrecognized replication role: " + value);
+  }
+  role = it->first;
 }
 
 }  // namespace memgraph::replication_coordination_glue

@@ -1,627 +1,695 @@
-import csv
-import io
-import json as js
-import os
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
-from math import floor
-from typing import Any, Dict, List, Union
+"""Utilities for export util."""
 
-import gqlalchemy
-import mgp
-from gqlalchemy import Memgraph
+from csv import (
+    QUOTE_ALL as csv_QUOTE_ALL,
+    QUOTE_MINIMAL as csv_QUOTE_MINIMAL,
+    QUOTE_NONE as csv_QUOTE_NONE,
+    QUOTE_NONNUMERIC as csv_QUOTE_NONNUMERIC,
+    writer as csv_writer,
+)
+from datetime import date, datetime, time, timedelta
+from functools import partial
+from io import StringIO as io_StringIO
+from itertools import chain
+from json import dumps as js_dumps
+from os import (
+    O_RDONLY as os_O_RDONLY,
+    W_OK as os_W_OK,
+    access as os_access,
+    chmod as os_chmod,
+    close as os_close,
+    fsync as os_fsync,
+    open as os_open,
+    path as os_path,
+    remove as os_remove,
+    replace as os_replace,
+    stat as os_stat,
+)
+from stat import S_IMODE as stat_S_IMODE
+from uuid import uuid4
+from xml.sax.saxutils import escape as xml_escape
+
+from gqlalchemy import Memgraph as gqlalchemy_Memgraph
+from mgp import (
+    Any as mgp_Any,
+    Edge as mgp_Edge,
+    List as mgp_List,
+    Map as mgp_Map,
+    Nullable as mgp_Nullable,
+    ProcCtx as mgp_ProcCtx,
+    Record as mgp_Record,
+    Vertex as mgp_Vertex,
+    read_proc as mgp_read_proc,
+)
+
+from mage.export_import_util.duration import to_cypher_duration
 from mage.export_import_util.parameters import Parameter
+from mage.export_import_util.temporal import (
+    convert_to_isoformat,
+    convert_to_isoformat_graphML,
+)
+
+DEFAULT_ARGUMENT_DICT = {}
 
 HEADER_FILENAME = "header.csv"
 
-
-@dataclass
-class Node:
-    id: int
-    labels: list
-    properties: dict
-
-    def get_dict(self) -> dict:
-        return {
-            Parameter.ID.value: self.id,
-            Parameter.LABELS.value: self.labels,
-            Parameter.PROPERTIES.value: self.properties,
-            Parameter.TYPE.value: Parameter.NODE.value,
-        }
+# A Cypher string literal escapes its quote, backslash and line breaks (openCypher string grammar).
+CYPHER_STRING_ESCAPES = str.maketrans({"\\": "\\\\", "'": "\\'", "\n": "\\n", "\r": "\\r"})
+# A double-quoted XML attribute also escapes its quote, and the whitespace attribute-value normalization would fold.
+XML_ATTRIBUTE_ESCAPES = {'"': "&quot;", "\n": "&#10;", "\r": "&#13;", "\t": "&#9;"}
+IMPORT_ID_PREFIX = "_IMPORT_ID_"
 
 
-@dataclass
-class Relationship:
-    end: int
-    id: int
-    label: str
-    properties: dict
-    start: int
-    id: int
-
-    def get_dict(self) -> dict:
-        return {
-            Parameter.END.value: self.end,
-            Parameter.ID.value: self.id,
-            Parameter.LABEL.value: self.label,
-            Parameter.PROPERTIES.value: self.properties,
-            Parameter.START.value: self.start,
-            Parameter.TYPE.value: Parameter.RELATIONSHIP.value,
-        }
+def cypher_identifier(name: str) -> str:
+    """Backtick-quotes a label, relationship type, property key or trigger name; an embedded backtick is doubled."""
+    escaped = name.replace("`", "``")
+    quoted = f"`{escaped}`"
+    return quoted
 
 
-@dataclass
-class KeyObjectGraphML:
-    name: str
-    is_for: str
-    type: str
-    type_is_list: bool
-    default_value: str
-    id: str = None
+def xml_attribute(value: object) -> str:
+    """Escapes a value for a double-quoted XML attribute."""
+    escaped = xml_escape(str(value), XML_ATTRIBUTE_ESCAPES)
+    return escaped
 
-    def __init__(
-        self,
-        name: str,
-        is_for: str,
-        type: str = "",
-        type_is_list: str = False,
-        default_value: str = "",
-    ):
-        self.name = name
-        self.is_for = is_for
-        self.type = type
-        self.type_is_list = type_is_list
-        self.default_value = default_value
 
-    def __hash__(self):
-        return hash(
-            (
-                self.name,
-                self.is_for,
-                self.type,
-                self.type_is_list,
-                self.default_value,
-            )
+def xml_text(value: object) -> str:
+    """Escapes a value for XML character data."""
+    escaped = xml_escape(str(value))
+    return escaped
+
+
+def write_text(out, text: str) -> None:
+    out.write(text)
+
+
+def render_to_string(render) -> str:
+    """Renders an export into memory, for the stream option whose contract is one returned string."""
+    buffer = io_StringIO()
+    render(buffer)
+    rendered = buffer.getvalue()
+    return rendered
+
+
+def publish_file(path: str, render, newline: str) -> None:
+    """
+    Writes a complete export beside its destination and publishes it with one atomic rename, so a failed or interrupted
+    export never truncates or partly replaces an artifact already at that path. The staged file is flushed and fsynced
+    before the rename and the directory is fsynced after it; a staged file that is not published is removed. An existing
+    destination keeps its permission bits, and one the caller may not write is refused as before.
+    """
+    destination = os_path.realpath(path)
+    directory, name = os_path.split(destination)
+    staging_path = os_path.join(directory, f".{name}.{uuid4().hex}.partial")
+    published = False
+    try:
+        if os_path.exists(destination) and not os_access(destination, os_W_OK):
+            raise PermissionError(f"Cannot write to {destination}")
+        with open(staging_path, "x", encoding="utf-8", newline=newline) as staged:
+            render(staged)
+            staged.flush()
+            os_fsync(staged.fileno())
+        if os_path.exists(destination):
+            os_chmod(staging_path, stat_S_IMODE(os_stat(destination).st_mode))
+        os_replace(staging_path, destination)
+        published = True
+        directory_fd = os_open(directory, os_O_RDONLY)
+        try:
+            os_fsync(directory_fd)
+        finally:
+            os_close(directory_fd)
+    except PermissionError as err:
+        raise PermissionError(
+            "You don't have permissions to write into that file. Make sure to give the necessary permissions to user memgraph."
+        ) from err
+    except OSError as err:
+        raise OSError("Could not open or write to the file.") from err
+    finally:
+        if not published and os_path.exists(staging_path):
+            os_remove(staging_path)
+
+
+def convert_to_cypher_format(value: object) -> str:
+    if isinstance(value, timedelta):
+        computed_return_value = to_cypher_duration(value)
+        return computed_return_value
+
+    elif isinstance(value, time):
+        computed_return_value = f"localTime('{value.isoformat()}')"
+        return computed_return_value
+
+    elif isinstance(value, datetime):
+        computed_return_value = f"localDateTime('{value.isoformat()}')"
+        return computed_return_value
+
+    elif isinstance(value, date):
+        computed_return_value = f"date('{value.isoformat()}')"
+        return computed_return_value
+
+    elif isinstance(value, str):
+        computed_return_value = f"'{value.translate(CYPHER_STRING_ESCAPES)}'"
+        return computed_return_value
+
+    elif isinstance(value, (list, tuple)):  # list
+        computed_return_value = "[" + ", ".join([convert_to_cypher_format(item) for item in value]) + "]"
+        return computed_return_value
+
+    elif isinstance(value, dict):
+        computed_return_value = (
+            "{" + ", ".join([f"{cypher_identifier(k)}: {convert_to_cypher_format(v)}" for k, v in value.items()]) + "}"
         )
+        return computed_return_value
 
-    def __eq__(self, other):
-        if not isinstance(other, type(self)):
-            return NotImplemented
-        return (
-            self.name == other.name
-            and self.is_for == other.is_for
-            and self.type == other.type
-            and self.type_is_list == other.type_is_list
-            and self.default_value == other.default_value
-        )
+    computed_return_value = str(value)
+    return computed_return_value
 
 
-def convert_to_isoformat(
-    property: Union[
-        None,
-        str,
-        bool,
-        int,
-        float,
-        List[Any],
-        Dict[str, Any],
-        timedelta,
-        time,
-        datetime,
-        date,
-    ]
-):
-    if isinstance(property, timedelta):
-        return Parameter.DURATION.value + str(property) + ")"
-
-    elif isinstance(property, time):
-        return Parameter.LOCALTIME.value + property.isoformat() + ")"
-
-    elif isinstance(property, datetime):
-        return Parameter.LOCALDATETIME.value + property.isoformat() + ")"
-
-    elif isinstance(property, date):
-        return Parameter.DATE.value + property.isoformat() + ")"
-
-    else:
-        return property
-
-
-def to_duration_iso_format(value: timedelta) -> str:
-    """Converts timedelta to ISO-8601 duration: P<date>T<time>"""
-    date_parts: List[str] = []
-    time_parts: List[str] = []
-
-    if value.days != 0:
-        date_parts.append(f"{abs(value.days)}D")
-
-    if value.seconds != 0 or value.microseconds != 0:
-        abs_seconds = abs(value.seconds)
-        hours = floor(abs_seconds / 3600)
-        minutes = floor((abs_seconds - hours * 3600) / 60)
-        seconds = abs_seconds - hours * 3600 - minutes * 60
-        microseconds = value.microseconds
-
-        if hours > 0:
-            time_parts.append(f"{hours}H")
-        if minutes > 0:
-            time_parts.append(f"{minutes}M")
-        if seconds > 0 or microseconds > 0:
-            microseconds_part = f".{abs(value.microseconds)}" if value.microseconds != 0 else ""
-            time_parts.append(f"{seconds}{microseconds_part}S")
-
-    date_duration_str = "".join(date_parts)
-    time_duration_str = f'T{"".join(time_parts)}' if time_parts else ""
-
-    return f"P{date_duration_str}{time_duration_str}"
-
-
-def convert_to_cypher_format(
-    property: Union[
-        None,
-        str,
-        bool,
-        int,
-        float,
-        List[Any],
-        Dict[str, Any],
-        timedelta,
-        time,
-        datetime,
-        date,
-    ]
-) -> str:
-    if isinstance(property, timedelta):
-        return f"duration('{to_duration_iso_format(property)}')"
-
-    elif isinstance(property, time):
-        return f"localTime('{property.isoformat()}')"
-
-    elif isinstance(property, datetime):
-        return f"localDateTime('{property.isoformat()}')"
-
-    elif isinstance(property, date):
-        return f"date('{property.isoformat()}')"
-
-    elif isinstance(property, str):
-        return f"'{property}'"
-
-    elif isinstance(property, tuple):  # list
-        return "[" + ", ".join([convert_to_cypher_format(item) for item in property]) + "]"
-
-    elif isinstance(property, dict):
-        return "{" + ", ".join([f"{k}: {convert_to_cypher_format(v)}" for k, v in property.items()]) + "}"
-
-    return str(property)
-
-
-def get_properties_cypher(object, write_properties: bool) -> dict:
-    return (
-        {key: convert_to_cypher_format(object.properties.get(key)) for key in object.properties.keys()}
-        if write_properties
-        else {}
+def get_properties_cypher(graph_object, write_properties: bool) -> dict:
+    computed_return_value = (
+        {key: convert_to_cypher_format(value) for key, value in graph_object.properties.items()} if write_properties else {}
     )
-
-
-def get_graph_for_cypher(ctx: mgp.ProcCtx, write_properties: bool) -> List[Union[Node, Relationship]]:
-    nodes = list()
-    relationships = list()
-
-    for vertex in ctx.graph.vertices:
-        labels = [label.name for label in vertex.labels]
-        properties = get_properties_cypher(vertex, write_properties)
-        nodes.append(Node(vertex.id, labels, properties))
-
-        for edge in vertex.out_edges:
-            properties = get_properties_cypher(edge, write_properties)
-            relationships.append(
-                Relationship(
-                    edge.to_vertex.id,
-                    edge.id,
-                    edge.type.name,
-                    properties,
-                    edge.from_vertex.id,
-                )
-            )
-
-    return nodes + relationships
+    return computed_return_value
 
 
 def format_properties_cypher(properties) -> str:
-    return "{" + ", ".join([f"{k}: {v}" for k, v in properties.items()]) + "}"
+    computed_return_value = "{" + ", ".join([f"{cypher_identifier(k)}: {v}" for k, v in properties.items()]) + "}"
+    return computed_return_value
 
 
-@mgp.read_proc
-def cypher_all(
-    ctx: mgp.ProcCtx,
-    path: str = "",
-    config: mgp.Map = {},
-) -> mgp.Record(path=str, data=str):
-    """Exports the graph in cypher with all the constraints, indexes and triggers.
-    Args:
-        context (mgp.ProcCtx): Reference to the context execution.
-        path (str): A path to the file where the query results will be exported. Defaults to an empty string.
-        config : mgp.Map
-            stream (bool) = False: Flag to export the graph data to a stream.
-            write_properties (bool) = True: Flag to keep node and relationship properties. By default set to true.
-            write_triggers (bool) = True: Flag to export graph triggers.
-            write_indexes (bool) = True: Flag to export indexes.
-            write_constraints (bool) = True: Flag to export constraints.
-    Returns:
-        path (str): A path to the file where the query results are exported. If path is not provided, the output will be an empty string.
-        data (str): A stream of query results in a cypher format.
-    Raises:
-        PermissionError: If you provided file path that you have no permissions to write at.
-        OSError: If the file can't be opened or written to.
+def cypher_property_names(properties) -> list[str]:
+    """Normalizes the property column of SHOW INDEX/CONSTRAINT INFO (None, str, or sequence of strs)."""
+    if properties is None or properties == "":
+        return []
+    if isinstance(properties, str):
+        return [properties]
+    return [str(name) for name in properties]
+
+
+def cypher_property_path(path_text: str) -> str:
+    """Quotes each segment of a property name or dotted nested property path."""
+    if "." in path_text:
+        rendered_path = ".".join(cypher_identifier(part) for part in path_text.split("."))
+        return rendered_path
+    quoted = cypher_identifier(path_text)
+    return quoted
+
+
+def cypher_property_list(properties) -> str:
+    """Renders the n.`property` list of an index or constraint; Memgraph reports one name or a sequence of names."""
+    names = cypher_property_names(properties)
+    rendered = ", ".join(f"n.{cypher_property_path(name)}" for name in names)
+    return rendered
+
+
+def format_vector_filter(raw_filter: str) -> str:
+    """Renders the ON target of a vector index ('' for wildcard '*', else ':Label' / ':A|B' / ':A&B' backtick-quoted)."""
+    if not raw_filter or raw_filter == "*":
+        return ""
+    body = raw_filter[1:] if raw_filter.startswith(":") else raw_filter
+    for separator in ("|", "&"):
+        if separator in body:
+            joined = separator.join(cypher_identifier(part) for part in body.split(separator))
+            return f":{joined}"
+    single = f":{cypher_identifier(body)}"
+    return single
+
+
+def open_memgraph_client(config: mgp_Map, ctx: object = None) -> gqlalchemy_Memgraph:
+    """Opens a GQLAlchemy client honoring optional endpoint and multi-tenant database settings in config or ctx."""
+    cfg = dict(config) if config is not None else {}
+    conn_kwargs = {}
+    expected_types = {"host": str, "port": int, "username": str, "password": str, "encrypted": bool}
+    for key, expected in expected_types.items():
+        if key in cfg and cfg.get(key) is not None:
+            val = cfg.get(key)
+            if not isinstance(val, expected) or (expected is int and isinstance(val, bool)):
+                raise TypeError(f"Config attribute {key!r} must be of type {expected.__name__}.")
+            conn_kwargs[key] = val
+    if "host" in conn_kwargs and not conn_kwargs.get("host"):
+        raise ValueError("Config attribute 'host' must not be empty.")
+    if "port" in conn_kwargs and not 0 < conn_kwargs.get("port", 0) < 65536:
+        raise ValueError("Config attribute 'port' must be between 1 and 65535.")
+    client = gqlalchemy_Memgraph(**conn_kwargs) if conn_kwargs else gqlalchemy_Memgraph()
+    database = cfg.get("database") if "database" in cfg else cfg.get("db")
+    if database is None and ctx is not None:
+        database = getattr(ctx, "database", None) or getattr(getattr(ctx, "graph", None), "database", None)
+    if database:
+        if not isinstance(database, str):
+            raise TypeError("Config attribute 'database' must be a string.")
+        list(client.execute_and_fetch(f"USE DATABASE {cypher_identifier(database)};"))
+    return client
+
+
+def render_constraint_cypher(constraint: dict) -> str:
+    """Renders one SHOW CONSTRAINT INFO row as a CREATE CONSTRAINT statement."""
+    constraint_type = constraint.get("constraint type", "")
+    label = cypher_identifier(constraint.get("label", ""))
+    properties = cypher_property_list(constraint.get("properties", []))
+    if constraint_type == "exists":
+        return f"CREATE CONSTRAINT ON (n:{label}) ASSERT EXISTS ({properties});\n"
+    if constraint_type == "unique":
+        return f"CREATE CONSTRAINT ON (n:{label}) ASSERT {properties} IS UNIQUE;\n"
+    if constraint_type == "data_type":
+        data_type = constraint.get("data_type", "")
+        if not data_type:
+            raise ValueError("Data-type constraint row is missing 'data_type'.")
+        return f"CREATE CONSTRAINT ON (n:{label}) ASSERT {properties} IS TYPED {data_type};\n"
+    raise ValueError(f"Unknown constraint type {constraint_type!r}.")
+
+
+def render_index_cypher(index: dict) -> str:
+    """Renders one non-vector SHOW INDEX INFO row as its CREATE ... INDEX statement."""
+    index_type = index.get("index type", "")
+    raw_label = index.get("label", "") or ""
+    label = cypher_identifier(raw_label) if raw_label else ""
+    prop_names = cypher_property_names(index.get("property", []))
+    quoted_props = ", ".join(cypher_property_path(name) for name in prop_names)
+
+    if index_type == "label":
+        return f"CREATE INDEX ON :{label};\n"
+    if index_type == "label+property":
+        return f"CREATE INDEX ON :{label}({quoted_props});\n"
+    if index_type == "label+property (DESC)":
+        return f'CREATE INDEX ON :{label}({quoted_props}) WITH CONFIG {{"order": "DESC"}};\n'
+    if index_type == "edge-type":
+        return f"CREATE EDGE INDEX ON :{label};\n"
+    if index_type == "edge-type+property":
+        return f"CREATE EDGE INDEX ON :{label}({quoted_props});\n"
+    if index_type == "edge-property":
+        return f"CREATE GLOBAL EDGE INDEX ON :({quoted_props});\n"
+    if index_type == "vertex-property":
+        return f"CREATE GLOBAL INDEX ON :({quoted_props});\n"
+    if index_type == "point":
+        return f"CREATE POINT INDEX ON :{label}({quoted_props});\n"
+    if index_type.startswith("label_text (name: ") and index_type.endswith(")"):
+        index_name = cypher_identifier(index_type[len("label_text (name: ") : -1])
+        target = "*" if raw_label in ("", "*") else label
+        suffix = f"({quoted_props})" if quoted_props else ""
+        return f"CREATE TEXT INDEX {index_name} ON :{target}{suffix};\n"
+    if index_type.startswith("edge-type_text (name: ") and index_type.endswith(")"):
+        index_name = cypher_identifier(index_type[len("edge-type_text (name: ") : -1])
+        target = "*" if raw_label in ("", "*") else label
+        suffix = f"({quoted_props})" if quoted_props else ""
+        return f"CREATE TEXT EDGE INDEX {index_name} ON :{target}{suffix};\n"
+    raise ValueError(f"Unknown index type {index_type!r}.")
+
+
+def render_vector_index_cypher(spec: dict) -> str:
+    """Renders one SHOW VECTOR INDEX INFO row as a CREATE VECTOR [EDGE] INDEX statement."""
+    index_name = cypher_identifier(str(spec.get("index_name", "")))
+    filter_clause = format_vector_filter(str(spec.get("label", "") or ""))
+    prop_name = cypher_identifier(str(spec.get("property", "")))
+    dimension = int(spec.get("dimension", 0))
+    metric = str(spec.get("metric", "cos"))
+    capacity = int(spec.get("capacity", 1000))
+    scalar_kind = str(spec.get("scalar_kind", "f32"))
+    index_kind = "VECTOR EDGE INDEX" if spec.get("index_type") == "edge-type+property_vector" else "VECTOR INDEX"
+    config_json = (
+        f'{{"dimension": {dimension}, "metric": {js_dumps(metric)}, '
+        f'"capacity": {capacity}, "scalar_kind": {js_dumps(scalar_kind)}}}'
+    )
+    return f"CREATE {index_kind} {index_name} ON {filter_clause}({prop_name}) WITH CONFIG {config_json};\n"
+
+
+def fetch_vector_index_specs(memgraph: gqlalchemy_Memgraph, vector_rows: list[dict]) -> list[dict]:
+    """Reads full vector index definitions via SHOW VECTOR INDEX INFO or vector_search.show_index_info()."""
+    for query in ("SHOW VECTOR INDEX INFO;", "CALL vector_search.show_index_info() YIELD *;"):
+        try:
+            specs = list(memgraph.execute_and_fetch(query))
+        except Exception:
+            specs = []
+        if specs:
+            return specs
+    fallback_specs = []
+    for idx, row in enumerate(vector_rows):
+        prop_list = cypher_property_names(row.get("property", []))
+        fallback_specs.append(
+            {
+                "index_name": row.get("index_name") or f"vector_index_{idx}",
+                "label": row.get("label", ""),
+                "property": prop_list[0] if prop_list else "",
+                "dimension": row.get("dimension", 1),
+                "metric": row.get("metric", "cos"),
+                "capacity": row.get("capacity", 1000),
+                "scalar_kind": row.get("scalar_kind", "f32"),
+                "index_type": row.get("index type", ""),
+            }
+        )
+    return fallback_specs
+
+
+def write_cypher_export(
+    out,
+    ctx: mgp_ProcCtx,
+    memgraph: gqlalchemy_Memgraph,
+    config: mgp_Map,
+    import_id: str,
+) -> None:
     """
-
-    cypher = []
-
-    memgraph = gqlalchemy.Memgraph()
-
+    Writes the export one statement per semicolon. The graph is read twice, nodes then relationships, so neither the
+    graph nor the rendered script is held in memory.
+    """
     if config.get("write_triggers", True):
         triggers = memgraph.execute_and_fetch("SHOW TRIGGERS;")
         for trigger in triggers:
-            cypher.append(
-                f"CREATE TRIGGER {trigger['trigger name']} ON {trigger['event type']} {trigger['phase']} EXECUTE {trigger['statement']};"
-            )
-        cypher.append("")
-
-    if config.get("write_indexes", True):
-        constraints = memgraph.execute_and_fetch("SHOW CONSTRAINT INFO;")
-        for constraint in constraints:
-            constraint_type = constraint["constraint type"]
-
-            if constraint_type == "exists":
-                cypher.append(
-                    f"CREATE CONSTRAINT ON (n:{constraint['label']}) ASSERT EXISTS (n.{constraint['properties']});"
-                )
-            elif constraint_type == "unique":
-                properties = (
-                    [constraint["properties"]]
-                    if isinstance(constraint["properties"], str)
-                    else list(constraint["properties"])
-                )
-                cypher.append(
-                    f"CREATE CONSTRAINT ON (n:{constraint['label']}) ASSERT {'n.' + ', n.'.join(properties)} IS UNIQUE;"
-                )
-            else:
-                raise ValueError("Unknown constraint type.")
-        cypher.append("")
+            trigger_name = cypher_identifier(trigger.get("trigger name", ""))
+            event_type = (trigger.get("event type", "") or "").strip()
+            phase = (trigger.get("phase", "") or "").strip()
+            statement = (trigger.get("statement", "") or "").strip().rstrip(";").strip()
+            on_clause = f" ON {event_type}" if event_type else ""
+            out.write(f"CREATE TRIGGER {trigger_name}{on_clause} {phase} EXECUTE {statement};\n")
+        out.write("\n")
 
     if config.get("write_constraints", True):
-        indexes = memgraph.execute_and_fetch("SHOW INDEX INFO;")
+        constraints = memgraph.execute_and_fetch("SHOW CONSTRAINT INFO;")
+        for constraint in constraints:
+            out.write(render_constraint_cypher(constraint))
+        out.write("\n")
+
+    if config.get("write_indexes", True):
+        indexes = list(memgraph.execute_and_fetch("SHOW INDEX INFO;"))
+        vector_rows = []
         for index in indexes:
-            index_type = index["index type"]
-            if index_type == "label":
-                cypher.append(f"CREATE INDEX ON :{index['label']};")
-            elif index_type == "label+property":
-                cypher.append(f"CREATE INDEX ON :{index['label']}({index['property']});")
-            else:
-                raise ValueError("Unknown index type.")
-        cypher.append("")
+            index_type = index.get("index type", "")
+            if index_type in ("label+property_vector", "edge-type+property_vector"):
+                vector_rows.append(index)
+                continue
+            out.write(render_index_cypher(index))
+        if vector_rows:
+            for spec in fetch_vector_index_specs(memgraph, vector_rows):
+                out.write(render_vector_index_cypher(spec))
+        out.write("\n")
 
-    graph = get_graph_for_cypher(ctx, config.get("write_properties", True))
-
-    for object in graph:
-        if isinstance(object, Node):
-            object.labels.append("_IMPORT_ID")
-            object.properties["_IMPORT_ID"] = object.id
-            properties_str = format_properties_cypher(object.properties)
-            cypher.append(f"CREATE (n:{':'.join(object.labels)} {properties_str});")
-        elif isinstance(object, Relationship):
-            properties_str = format_properties_cypher(object.properties)
-            cypher.append(
-                f"MATCH (n:_IMPORT_ID {{_IMPORT_ID: {object.start}}}) MATCH (m:_IMPORT_ID {{_IMPORT_ID: {object.end}}}) CREATE (n)-[:{object.label} {properties_str}]->(m);"
-            )
-
-    cypher.append("MATCH (n:_IMPORT_ID) REMOVE n:`_IMPORT_ID` REMOVE n._IMPORT_ID;")
-
-    if path:
-        try:
-            with open(path, "w") as f:
-                f.write("\n".join(cypher))
-        except PermissionError:
-            raise PermissionError(
-                "You don't have permissions to write into that file. Make sure to give the necessary permissions to user memgraph."
-            )
-        except Exception:
-            raise OSError("Could not open or write to the file.")
-
-    return mgp.Record(path=path, data="\n".join(cypher) if config.get("stream", False) else "")
-
-
-def get_properties_json(object, write_properties: bool):
-    return (
-        {key: convert_to_isoformat(object.properties.get(key)) for key in object.properties.keys()}
-        if write_properties
-        else {}
-    )
-
-
-def convert_to_isoformat_graphML(
-    property: Union[
-        None,
-        str,
-        bool,
-        int,
-        float,
-        List[Any],
-        Dict[str, Any],
-        timedelta,
-        time,
-        datetime,
-        date,
-    ]
-):
-    if isinstance(property, timedelta):
-        return to_duration_iso_format(property)
-
-    if isinstance(property, (time, date, datetime)):
-        return property.isoformat()
-
-    else:
-        return property
-
-
-def get_graph(ctx: mgp.ProcCtx, write_properties: bool) -> List[Union[Node, Relationship]]:
-    nodes = list()
-    relationships = list()
+    write_properties = config.get("write_properties", True)
+    import_name = cypher_identifier(import_id)
+    for vertex in ctx.graph.vertices:
+        labels = "".join(f":{cypher_identifier(label.name)}" for label in vertex.labels)
+        properties = get_properties_cypher(vertex, write_properties)
+        properties[import_id] = f"{vertex.id}"
+        out.write(f"CREATE (n{labels}:{import_name} {format_properties_cypher(properties)});\n")
 
     for vertex in ctx.graph.vertices:
-        labels = [label.name for label in vertex.labels]
-        properties = get_properties_json(vertex, write_properties)
-
-        nodes.append(Node(vertex.id, labels, properties).get_dict())
-
         for edge in vertex.out_edges:
-            properties = get_properties_json(edge, write_properties)
-
-            relationships.append(
-                Relationship(
-                    edge.to_vertex.id,
-                    edge.id,
-                    edge.type.name,
-                    properties,
-                    edge.from_vertex.id,
-                ).get_dict()
+            properties_str = format_properties_cypher(get_properties_cypher(edge, write_properties))
+            out.write(
+                f"MATCH (n:{import_name} {{{import_name}: {edge.from_vertex.id}}}) MATCH (m:{import_name} {{{import_name}: "
+                f"{edge.to_vertex.id}}}) CREATE (n)-[:{cypher_identifier(edge.type.name)} {properties_str}]->(m);\n"
             )
 
-    return nodes + relationships
+    out.write(f"MATCH (n:{import_name}) REMOVE n:{import_name} REMOVE n.{import_name};\n")
 
 
-def get_graphML(
-    ctx: mgp.ProcCtx,
-    config: Union[mgp.Map, None] = {
-        "graphML": False,
-        "leaveOutLabels": False,
-        "leaveOutProperties": False,
-    },
-) -> List[Union[Node, Relationship]]:
+def cypher_all(
+    ctx: mgp_ProcCtx,
+    path: str = "",
+    config: mgp_Map = DEFAULT_ARGUMENT_DICT,
+) -> mgp_Record:
+    (
+        "Exports the graph in cypher with all the constraints, indexes and triggers.\n    Args:\n      "  # Continue literal.
+        "  context (mgp.ProcCtx): Reference to the context execution.\n        path (str): A path to t"  # Continue literal.
+        "he file where the query results will be exported. Defaults to an empty string.\n        confi"  # Continue literal.
+        "g : mgp.Map\n            stream (bool) = False: Flag to export the graph data to a stream.\n  "  # Continue literal.
+        "          write_properties (bool) = True: Flag to keep node and relationship properties. By "  # Continue literal.
+        "default set to true.\n            write_triggers (bool) = True: Flag to export graph triggers"  # Continue literal.
+        ".\n            write_indexes (bool) = True: Flag to export indexes.\n            write_constra"  # Continue literal.
+        "ints (bool) = True: Flag to export constraints.\n    Returns:\n        path (str): A path to t"  # Continue literal.
+        "he file where the query results are exported. If path is not provided, the output will be an"  # Continue literal.
+        " empty string.\n        data (str): A stream of query results in a cypher format.\n    Raises:"  # Continue literal.
+        "\n        PermissionError: If you provided file path that you have no permissions to write at"  # Continue literal.
+        ".\n        OSError: If the file can't be opened or written to.\n"
+    )
+
+    if config is DEFAULT_ARGUMENT_DICT:
+        config = DEFAULT_ARGUMENT_DICT.copy()
+
+    # The temporary import label/property is unique to this export, so replay never overwrites or removes a caller label
+    # or property of any name, and the final cleanup matches only the nodes this import created, even in a populated
+    # target graph.
+    need_catalog = any(config.get(flag, True) for flag in ("write_triggers", "write_constraints", "write_indexes"))
+    memgraph = open_memgraph_client(config, ctx=ctx) if need_catalog else None
+    import_id = f"{IMPORT_ID_PREFIX}{uuid4().hex}"
+    render = partial(
+        write_cypher_export,
+        ctx=ctx,
+        memgraph=memgraph,
+        config=config,
+        import_id=import_id,
+    )
+
+    data = ""
+    if config.get("stream", False):
+        data = render_to_string(render)
+        if path:
+            publish_file(path, partial(write_text, text=data), "\n")
+    elif path:
+        publish_file(path, render, "\n")
+
+    computed_return_value = mgp_Record(path=path, data=data)
+    return computed_return_value
+
+
+cypher_all.__annotations__["return"] = mgp_Record(path=str, data=str)
+cypher_all = mgp_read_proc(cypher_all)
+
+
+def get_properties_json(graph_object, write_properties: bool):
+    computed_return_value = (
+        {key: convert_to_isoformat(value) for key, value in graph_object.properties.items()} if write_properties else {}
+    )
+    return computed_return_value
+
+
+# Every element generator below writes the same export element shapes, in the key order import_util.json reads:
+# a node is {id, labels, properties, type: node} and a relationship {end, id, label, properties, start, type: relationship}.
+def json_elements(ctx: mgp_ProcCtx, write_properties: bool):
+    """Yields every node dict, then every relationship dict, reading the graph twice instead of holding it."""
+    for vertex in ctx.graph.vertices:
+        node = {
+            Parameter.ID.value: vertex.id,
+            Parameter.LABELS.value: [label.name for label in vertex.labels],
+            Parameter.PROPERTIES.value: get_properties_json(vertex, write_properties),
+            Parameter.TYPE.value: Parameter.NODE.value,
+        }
+        yield node
+
+    for vertex in ctx.graph.vertices:
+        for edge in vertex.out_edges:
+            relationship = {
+                Parameter.END.value: edge.to_vertex.id,
+                Parameter.ID.value: edge.id,
+                Parameter.LABEL.value: edge.type.name,
+                Parameter.PROPERTIES.value: get_properties_json(edge, write_properties),
+                Parameter.START.value: edge.from_vertex.id,
+                Parameter.TYPE.value: Parameter.RELATIONSHIP.value,
+            }
+            yield relationship
+
+
+def graphml_elements(ctx: mgp_ProcCtx, config: mgp_Map):
     """
+    Yields every node dict, then every relationship dict (two reads of the graph). Vertex and relationship property
+    values use the same codec: GraphML text when config graphML is set, else the JSON/Cypher wrapper form.
+
     config : Map
         - graphML: bool
         - leaveOutLabels: bool
         - leaveOutProperties: bool
-
     """
-    nodes = list()
-    relationships = list()
+    codec = convert_to_isoformat_graphML if config.get("graphML", False) else convert_to_isoformat
+    leave_out_labels = config.get("leaveOutLabels", False)
+    leave_out_properties = config.get("leaveOutProperties", False)
 
     for vertex in ctx.graph.vertices:
-        labels = []
-        properties = dict()
-        if not config.get("leaveOutLabels"):
-            labels = [label.name for label in vertex.labels]
-        if config.get("graphML") and not config.get("leaveOutProperties"):
-            properties = {
-                key: convert_to_isoformat_graphML(vertex.properties.get(key)) for key in vertex.properties.keys()
-            }
-        elif not config.get("leaveOutProperties"):
-            properties = {key: convert_to_isoformat(vertex.properties.get(key)) for key in vertex.properties.keys()}
+        properties = {} if leave_out_properties else {key: codec(value) for key, value in vertex.properties.items()}
+        node = {
+            Parameter.ID.value: vertex.id,
+            Parameter.LABELS.value: ([] if leave_out_labels else [label.name for label in vertex.labels]),
+            Parameter.PROPERTIES.value: properties,
+            Parameter.TYPE.value: Parameter.NODE.value,
+        }
+        yield node
 
-        nodes.append(Node(vertex.id, labels, properties).get_dict())
-
+    for vertex in ctx.graph.vertices:
         for edge in vertex.out_edges:
-            if not config.get("leaveOutProperties"):
-                properties = {key: convert_to_isoformat(edge.properties.get(key)) for key in edge.properties.keys()}
-
-            relationships.append(
-                Relationship(
-                    edge.to_vertex.id,
-                    edge.id,
-                    edge.type.name,
-                    properties,
-                    edge.from_vertex.id,
-                ).get_dict()
-            )
-
-    return nodes + relationships
+            properties = {} if leave_out_properties else {key: codec(value) for key, value in edge.properties.items()}
+            relationship = {
+                Parameter.END.value: edge.to_vertex.id,
+                Parameter.ID.value: edge.id,
+                Parameter.LABEL.value: edge.type.name,
+                Parameter.PROPERTIES.value: properties,
+                Parameter.START.value: edge.from_vertex.id,
+                Parameter.TYPE.value: Parameter.RELATIONSHIP.value,
+            }
+            yield relationship
 
 
-def get_graph_from_list(
-    graph_vertices: list, graph_edges: list, write_properties: bool
-) -> List[Union[Node, Relationship]]:
-    nodes = list()
-    relationships = list()
-
+def listed_json_elements(graph_vertices: list, graph_edges: list, write_properties: bool):
+    """Yields the given nodes, then the given relationships, as export dicts."""
     for vertex in graph_vertices:
-        labels = [label.name for label in vertex.labels]
-        properties = get_properties_json(vertex, write_properties)
-
-        nodes.append(Node(vertex.id, labels, properties).get_dict())
+        node = {
+            Parameter.ID.value: vertex.id,
+            Parameter.LABELS.value: [label.name for label in vertex.labels],
+            Parameter.PROPERTIES.value: get_properties_json(vertex, write_properties),
+            Parameter.TYPE.value: Parameter.NODE.value,
+        }
+        yield node
 
     for edge in graph_edges:
-        properties = get_properties_json(edge, write_properties)
-
-        relationships.append(
-            Relationship(
-                edge.to_vertex.id,
-                edge.id,
-                edge.type.name,
-                properties,
-                edge.from_vertex.id,
-            ).get_dict()
-        )
-
-    return nodes + relationships
+        relationship = {
+            Parameter.END.value: edge.to_vertex.id,
+            Parameter.ID.value: edge.id,
+            Parameter.LABEL.value: edge.type.name,
+            Parameter.PROPERTIES.value: get_properties_json(edge, write_properties),
+            Parameter.START.value: edge.from_vertex.id,
+            Parameter.TYPE.value: Parameter.RELATIONSHIP.value,
+        }
+        yield relationship
 
 
-def get_graph_info_from_lists(node_list: List[mgp.Vertex], relationship_list: List[mgp.Edge]):
-    graph = list()
-    all_node_properties = list()
-    all_node_prop_set = set()
-    all_relationship_properties = list()
-    all_relationship_prop_set = set()
-
-    for node in node_list:
-        for prop in node.properties:
-            if prop not in all_node_prop_set:
-                all_node_properties.append(prop)
-                all_node_prop_set.add(prop)
-        graph.append(Node(node.id, node.labels, node.properties))
-    all_node_properties.sort()
-
-    for relationship in relationship_list:
-        for prop in relationship.properties:
-            if prop not in all_relationship_prop_set:
-                all_relationship_properties.append(prop)
-                all_relationship_prop_set.add(prop)
-
-        graph.append(
-            Relationship(
-                relationship.to_vertex.id,
-                relationship.id,
-                relationship.type.name,
-                relationship.properties,
-                relationship.from_vertex.id,
-            )
-        )
-    all_relationship_properties.sort()
-
-    return graph, all_node_properties, all_relationship_properties
-
-
-def json_dump_to_file(graph: List[Union[Node, Relationship]], path: str):
-    try:
-        with open(path, "w") as outfile:
-            js.dump(
-                graph,
-                outfile,
-                indent=Parameter.STANDARD_INDENT.value,
-                default=str,
-            )
-    except PermissionError:
-        raise PermissionError(
-            "You don't have permissions to write into that file. Make sure to give the necessary permissions to user memgraph."  # noqa: E501
-        )
-    except Exception:
-        raise OSError("Could not open or write to the file.")
-
-
-@mgp.read_proc
-def json(ctx: mgp.ProcCtx, path: str = "", config: mgp.Map = {}) -> mgp.Record(path=str, data=str):
+def write_json_array(out, elements, indent: int) -> None:
     """
-    Procedure to export the whole database to a JSON file.
-
-    Parameters:
-        context : mgp.ProcCtx
-            Reference to the context execution.
-        path : str = ""
-            Path to the JSON file containing the exported graph database.
-        config : mgp.Map
-            stream (bool) = False: Flag to export the graph data to a stream.
-            write_properties (bool) = True: Flag to keep node and relationship properties. By default set to true.
-
-    Returns:
-        path (str): A path to the file where the query results are exported. If path is not provided, the output will be an empty string.
-        data (str): A stream of query results in JSON format.
-
-    Raises:
-        PermissionError: If you provided file path that you have no permissions to write at.
-        OSError: If the file can't be opened or written to.
+    Writes elements as one JSON array, one element at a time. A positive indent reproduces json.dump(..., indent=indent)
+    for files; indent 0 reproduces json.dumps' single-line list for streams.
     """
-    graph = get_graph(ctx, config.get("write_properties", True))
-    if path:
-        json_dump_to_file(graph, path)
+    if indent:
+        opening, separator, closing = "[\n", ",\n", "\n]"
+    else:
+        opening, separator, closing = "[", ", ", "]"
+    written = False
+    for element in elements:
+        out.write(separator if written else opening)
+        if indent:
+            # Nest the element one level; JSON text never contains a raw newline inside a string.
+            margin = " " * indent
+            out.write(margin + js_dumps(element, indent=indent, default=str).replace("\n", "\n" + margin))
+        else:
+            out.write(js_dumps(element, default=str))
+        written = True
+    out.write(closing if written else "[]")
 
-    return mgp.Record(
-        path=path,
-        data=js.dumps(graph) if config.get("stream", False) else "",
+
+def json(ctx: mgp_ProcCtx, path: str = "", config: mgp_Map = DEFAULT_ARGUMENT_DICT) -> mgp_Record:
+    (
+        "\n    Procedure to export the whole database to a JSON file.\n\n    Parameters:\n        context"  # Continue literal.
+        ' : mgp.ProcCtx\n            Reference to the context execution.\n        path : str = ""\n     '  # Continue literal.
+        "       Path to the JSON file containing the exported graph database.\n        config : mgp.Ma"  # Continue literal.
+        "p\n            stream (bool) = False: Flag to export the graph data to a stream.\n            "  # Continue literal.
+        "write_properties (bool) = True: Flag to keep node and relationship properties. By default se"  # Continue literal.
+        "t to true.\n\n    Returns:\n        path (str): A path to the file where the query results are "  # Continue literal.
+        "exported. If path is not provided, the output will be an empty string.\n        data (str): A"  # Continue literal.
+        " stream of query results in JSON format.\n\n    Raises:\n        PermissionError: If you provid"  # Continue literal.
+        "ed file path that you have no permissions to write at.\n        OSError: If the file can't be"  # Continue literal.
+        " opened or written to.\n"
     )
+    if config is DEFAULT_ARGUMENT_DICT:
+        config = DEFAULT_ARGUMENT_DICT.copy()
+    write_properties = config.get("write_properties", True)
+    if path:
+        elements = json_elements(ctx, write_properties)
+        publish_file(
+            path,
+            partial(
+                write_json_array,
+                elements=elements,
+                indent=Parameter.STANDARD_INDENT.value,
+            ),
+            "\n",
+        )
+
+    data = ""
+    if config.get("stream", False):
+        data = render_to_string(
+            partial(
+                write_json_array,
+                elements=json_elements(ctx, write_properties),
+                indent=0,
+            )
+        )
+
+    computed_return_value = mgp_Record(path=path, data=data)
+    return computed_return_value
 
 
-@mgp.read_proc
+json.__annotations__["return"] = mgp_Record(path=str, data=str)
+json = mgp_read_proc(json)
+
+
 def json_graph(
-    ctx: mgp.ProcCtx,
     nodes: list,
     relationships: list,
     path: str = "",
-    config: mgp.Map = {},
-) -> mgp.Record(path=str, data=str):
-    """
-    Procedure to export the given graph to a JSON file. The graph is given with a map that contains keys "nodes" and "relationships".
-
-    Parameters:
-        nodes : List[Node]
-            A list thats contains all nodes in the given graph.
-        relationships : List[Relationship]
-            A list that containts all the relationships in the given graph.
-        path : str
-            Path to the JSON file containing the exported graph database.
-        config : mgp.Map
-            stream (bool) = False: Flag to export the graph data to a stream.
-            write_properties (bool) = True: Flag to keep node and relationship properties. By default set to true.
-
-    Returns:
-        path (str): A path to the file where the query results are exported. If path is not provided, the output will be an empty string.
-        data (str): A stream of query results in JSON format.
-
-    Raises:
-        PermissionError: If you provided file path that you have no permissions to write at.
-        OSError: If the file can't be opened or written to.
-    """
-    graph = get_graph_from_list(nodes, relationships, config.get("write_properties", True))
-    if path:
-        json_dump_to_file(graph, path)
-
-    return mgp.Record(
-        path=path,
-        data=js.dumps(graph) if config.get("stream", False) else "",
+    config: mgp_Map = DEFAULT_ARGUMENT_DICT,
+) -> mgp_Record:
+    (
+        "\n    Procedure to export the given graph to a JSON file. The graph is given with a map that "  # Continue literal.
+        'contains keys "nodes" and "relationships".\n\n    Parameters:\n        nodes : List[Node]\n     '  # Continue literal.
+        "       A list thats contains all nodes in the given graph.\n        relationships : List[Rela"  # Continue literal.
+        "tionship]\n            A list that containts all the relationships in the given graph.\n      "  # Continue literal.
+        "  path : str\n            Path to the JSON file containing the exported graph database.\n     "  # Continue literal.
+        "   config : mgp.Map\n            stream (bool) = False: Flag to export the graph data to a st"  # Continue literal.
+        "ream.\n            write_properties (bool) = True: Flag to keep node and relationship propert"  # Continue literal.
+        "ies. By default set to true.\n\n    Returns:\n        path (str): A path to the file where the "  # Continue literal.
+        "query results are exported. If path is not provided, the output will be an empty string.\n   "  # Continue literal.
+        "     data (str): A stream of query results in JSON format.\n\n    Raises:\n        PermissionEr"  # Continue literal.
+        "ror: If you provided file path that you have no permissions to write at.\n        OSError: If"  # Continue literal.
+        " the file can't be opened or written to.\n"
     )
-
-
-def save_file(file_path: str, data_list: list):
-    try:
-        with open(
-            file_path,
-            "w",
-            newline="",
-            encoding="utf8",
-        ) as f:
-            writer = csv.writer(f)
-            writer.writerows(data_list)
-    except PermissionError:
-        raise PermissionError(
-            "You don't have permissions to write into that file. Make sure to give the necessary permissions to user memgraph."  # noqa: E501
+    if config is DEFAULT_ARGUMENT_DICT:
+        config = DEFAULT_ARGUMENT_DICT.copy()
+    write_properties = config.get("write_properties", True)
+    if path:
+        elements = listed_json_elements(nodes, relationships, write_properties)
+        publish_file(
+            path,
+            partial(
+                write_json_array,
+                elements=elements,
+                indent=Parameter.STANDARD_INDENT.value,
+            ),
+            "\n",
         )
-    except csv.Error as e:
-        raise csv.Error("Could not write to the file {}, stopped at line {}: {}".format(file_path, writer.line_num, e))
-    except Exception:
-        raise OSError("Could not open or write to the file.")
+
+    data = ""
+    if config.get("stream", False):
+        elements = listed_json_elements(nodes, relationships, write_properties)
+        data = render_to_string(partial(write_json_array, elements=elements, indent=0))
+
+    computed_return_value = mgp_Record(path=path, data=data)
+    return computed_return_value
 
 
-def csv_to_stream(data_list: list, delimiter: str = ",", quoting_type=csv.QUOTE_NONNUMERIC) -> str:
-    output = io.StringIO()
-    try:
-        writer = csv.writer(output, delimiter=delimiter, quoting=quoting_type, escapechar="\\")
-        writer.writerows(data_list)
-    except csv.Error as e:
-        raise csv.Error("Could not write a stream, stopped at line {}: {}".format(writer.line_num, e))
-    return output.getvalue()
+json_graph.__annotations__["return"] = mgp_Record(path=str, data=str)
+json_graph = mgp_read_proc(json_graph)
 
 
-def csv_header(node_properties: List[str], relationship_properties: List[str]) -> List[str]:
+def write_csv_rows(out, rows, delimiter: str, quoting_type: mgp_Any) -> None:
+    """Writes rows as the csv writer consumes them."""
+    writer = csv_writer(out, delimiter=delimiter, quoting=quoting_type, escapechar="\\")
+    writer.writerows(rows)
+
+
+def write_query_rows(rows, writers: list) -> None:
+    """Writes the first row's keys as the header, then every row, to each writer as the rows arrive."""
+    row_count = 0
+    for row in rows:
+        if row_count == 0:
+            header = list(row)
+            for writer in writers:
+                writer.writerow(header)
+        values = list(row.values())
+        for writer in writers:
+            writer.writerow(values)
+        row_count += 1
+
+    if row_count == 0:
+        raise ValueError("Your query yields no results. Check if the database is empty or rewrite the provided query.")
+
+
+def write_query_csv(out, rows, stream_writers: list) -> None:
+    write_query_rows(rows, [csv_writer(out)] + stream_writers)
+
+
+def csv_header(node_properties: list[str], relationship_properties: list[str]) -> list[list[str]]:
     """
     This function creates the header for csv file
     """
@@ -638,121 +706,103 @@ def csv_header(node_properties: List[str], relationship_properties: List[str]) -
     return [header]
 
 
-def process_properties(properties: Dict[str, mgp.Any], prop: str, write_list: List[mgp.Any]) -> None:
-    if isinstance(properties[prop], (set, list, tuple, map)):
-        write_list.append(js.dumps(properties[prop]))
-        return
+def csv_cell(value: object) -> object:
+    """Encodes one property value as its CSV cell: collections as JSON, durations as their typed wrapper text."""
+    if isinstance(value, (set, list, tuple, map)):
+        cell = js_dumps(value)
+    elif isinstance(value, timedelta):
+        cell = convert_to_isoformat(value)
+    else:
+        cell = value
+    return cell
 
-    if isinstance(properties[prop], timedelta):
-        write_list.append(convert_to_isoformat(properties[prop]))
-        return
 
-    write_list.append(properties[prop])
+def csv_property_keys(nodes_list: list[mgp_Vertex], relationships_list: list[mgp_Edge]) -> tuple[list[str], list[str]]:
+    """First pass: the sorted property names of the nodes and of the relationships, which the header needs first."""
+    node_properties = sorted({prop for node in nodes_list for prop in node.properties})
+    relationship_properties = sorted({prop for relationship in relationships_list for prop in relationship.properties})
+    return node_properties, relationship_properties
 
 
-def csv_data_list(
-    graph: List[Union[Node, Relationship]],
-    node_properties: List[str],
-    relationship_properties: List[str],
-) -> List[mgp.Any]:
+def csv_rows(
+    nodes_list: list[mgp_Vertex],
+    relationships_list: list[mgp_Edge],
+    node_properties: list[str],
+    relationship_properties: list[str],
+):
     """
-    Function that parses graph into a data_list appropriate for csv writing
+    Second pass: one row per node, then one per relationship, produced as the csv writer consumes them
     """
-    data_list = []
-    for element in graph:
-        write_list = []
-        is_node = isinstance(element, Node)
+    # A property an element does not have is an empty cell.
+    for node in nodes_list:
+        # id and labels, the node properties, then empty start, end, type and relationship properties
+        write_list = [node.id, "".join(":" + label.name for label in node.labels)]
+        write_list.extend(csv_cell(node.properties.get(prop, "")) for prop in node_properties)
+        write_list.extend(["", "", ""])
+        write_list.extend("" for _ in relationship_properties)
+        yield write_list
 
-        # processing id and labels part
-        if is_node:
-            write_list.extend(
-                [
-                    element.id,
-                    "".join(":" + label.name for label in element.labels),
-                ]
-            )
-        else:
-            write_list.extend(["", ""])
-
-        # node_properties
-        for prop in node_properties:
-            if prop in element.properties and is_node:
-                process_properties(element.properties, prop, write_list)
-            else:
-                write_list.append("")
-        # relationship
-        if is_node:
-            # start, end, type
-            write_list.extend(["", "", ""])
-        else:
-            # start, end, type
-            write_list.extend([element.start, element.end, element.label])
-
-        # relationship properties
-        for prop in relationship_properties:
-            if prop in element.properties and not is_node:
-                process_properties(element.properties, prop, write_list)
-            else:
-                write_list.append("")
-
-        data_list.append(write_list)
-
-    return data_list
+    for relationship in relationships_list:
+        write_list: list = ["", ""]
+        write_list.extend("" for _ in node_properties)
+        write_list.extend(
+            [
+                relationship.from_vertex.id,
+                relationship.to_vertex.id,
+                relationship.type.name,
+            ]
+        )
+        write_list.extend(csv_cell(relationship.properties.get(prop, "")) for prop in relationship_properties)
+        yield write_list
 
 
-def check_config_valid(config: mgp.Any, type: mgp.Any, name: str):
-    if not isinstance(config, type):
-        raise TypeError("Config attribute {0} must be of type {1}".format(name, type))
+def check_config_valid(config: mgp_Any, expected_type: mgp_Any, name: str):
+    if not isinstance(config, expected_type):
+        raise TypeError(f"Config attribute {name} must be of type {expected_type}")
+    return False
 
 
-def csv_process_config(config: mgp.Map):
+def csv_process_config(config: mgp_Map):
     delimiter = ","
     if "delimiter" in config:
-        check_config_valid(config["delimiter"], str, "delimiter")
+        check_config_valid(config.get("delimiter", ""), str, "delimiter")
 
-        delimiter = config["delimiter"]
+        delimiter = config.get("delimiter", "")
 
-    quoting_type = csv.QUOTE_ALL
+    quoting_type = csv_QUOTE_ALL
     if "quotes" in config:
-        check_config_valid(config["quotes"], str, "quotes")
+        check_config_valid(config.get("quotes", ""), str, "quotes")
 
-        if config["quotes"] == "none":
-            quoting_type = csv.QUOTE_NONE
-        elif config["quotes"] == "ifNeeded":
-            quoting_type = csv.QUOTE_MINIMAL
+        if config.get("quotes", "") == "none":
+            quoting_type = csv_QUOTE_NONE
+        elif config.get("quotes", "") == "ifNeeded":
+            quoting_type = csv_QUOTE_MINIMAL
 
     separate_header = False
     if "separateHeader" in config:
-        check_config_valid(config["separateHeader"], bool, "separateHeader")
-        separate_header = config["separateHeader"]
+        check_config_valid(config.get("separateHeader", False), bool, "separateHeader")
+        separate_header = config.get("separateHeader", False)
 
     stream = False
     if "stream" in config:
-        check_config_valid(config["stream"], bool, "stream")
-        stream = config["stream"]
+        check_config_valid(config.get("stream", False), bool, "stream")
+        stream = config.get("stream", False)
 
     return delimiter, quoting_type, separate_header, stream
 
 
-def header_path(path: str):
-    directory, filename = os.path.split(path)
-    new_filename = HEADER_FILENAME
-    return os.path.join(directory, new_filename)
+def header_path(path: str) -> str:
+    """Returns a path-specific sidecar header path (<path>.header.csv) that never collides with path or sibling exports."""
+    computed_return_value = f"{path}.{HEADER_FILENAME}"
+    return computed_return_value
 
 
-def write_file(path: str, delimiter: str, quoting_type: str, data: mgp.Any) -> None:
-    with open(path, "w", encoding="utf-8") as file:
-        writer = csv.writer(file, delimiter=delimiter, quoting=quoting_type, escapechar="\\")
-        writer.writerows(data)
-
-
-@mgp.read_proc
 def csv_graph(
-    nodes_list: mgp.List[mgp.Vertex],
-    relationships_list: mgp.List[mgp.Edge],
+    nodes_list: mgp_List[mgp_Vertex],
+    relationships_list: mgp_List[mgp_Edge],
     path: str = "",
-    config: mgp.Map = {},
-) -> mgp.Record(path=str, data=str):
+    config: mgp_Map = DEFAULT_ARGUMENT_DICT,
+) -> mgp_Record:
     """
     Procedure to export the given graph to a csv file.
     The graph is given with two lists, one for nodes,
@@ -787,54 +837,58 @@ def csv_graph(
         csv file
 
     """
+    if config is DEFAULT_ARGUMENT_DICT:
+        config = DEFAULT_ARGUMENT_DICT.copy()
     if path == "":
         path = "exported_file.csv"
     delimiter, quoting_type, separate_header, stream = csv_process_config(config)
-    (
-        graph,
-        node_properties,
-        relationship_properties,
-    ) = get_graph_info_from_lists(nodes_list, relationships_list)
-    data_list = csv_data_list(graph, node_properties, relationship_properties)
+    node_properties, relationship_properties = csv_property_keys(nodes_list, relationships_list)
     header = csv_header(node_properties, relationship_properties)
 
-    try:
-        if separate_header:
-            if not stream:
-                write_file(header_path(path), delimiter, quoting_type, header)
-        else:
-            data_list = header + data_list
-
-        if stream:
-            data = csv_to_stream(data_list, delimiter, quoting_type)
-            return mgp.Record(path=path, data=data)
-
-        write_file(path, delimiter, quoting_type, data_list)
-
-    except PermissionError:
-        raise PermissionError(
-            "You don't have permissions to write into that file."
-            "Make sure to give the necessary permissions to user memgraph."
-        )
-    except Exception:
-        raise OSError("Could not open or write to the file.")
-    return mgp.Record(
-        path=path,
-        data="",
+    # A separate header goes to its own file (and never into a stream); otherwise it leads the rows.
+    rows = chain(
+        [] if separate_header else header,
+        csv_rows(nodes_list, relationships_list, node_properties, relationship_properties),
     )
+    render = partial(write_csv_rows, rows=rows, delimiter=delimiter, quoting_type=quoting_type)
+
+    data = ""
+    if stream:
+        data = render_to_string(render)
+    else:
+        if separate_header:
+            hdr_path = header_path(path)
+            if os_path.realpath(hdr_path) == os_path.realpath(path):
+                raise ValueError(f"Separate header path {hdr_path!r} resolves to the same file as {path!r}.")
+            publish_file(
+                hdr_path,
+                partial(
+                    write_csv_rows,
+                    rows=header,
+                    delimiter=delimiter,
+                    quoting_type=quoting_type,
+                ),
+                "",
+            )
+        publish_file(path, render, "")
+
+    computed_return_value = mgp_Record(path=path, data=data)
+    return computed_return_value
 
 
-@mgp.read_proc
+csv_graph.__annotations__["return"] = mgp_Record(path=str, data=str)
+csv_graph = mgp_read_proc(csv_graph)
+
+
 def csv_query(
-    context: mgp.ProcCtx,
     query: str,
     file_path: str = "",
     stream: bool = False,
-) -> mgp.Record(file_path=str, data=str):
+    config: mgp_Map = DEFAULT_ARGUMENT_DICT,
+) -> mgp_Record:
     """
     Procedure to export query results to a CSV file.
     Args:
-        context (mgp.ProcCtx): Reference to the context execution.
         query (str): A query from which the results will be
         saved to a CSV file.
 
@@ -851,55 +905,65 @@ def csv_query(
             data (str): A stream of query results in a CSV format.
         )
     Raises:
-        Exception: If neither file nor config are provided,
+        ValueError: If neither file nor config are provided,
         or if only config is provided with stream set to False.
         Also if query yields no results or if the database is empty.
         PermissionError: If you provided file path that you have
         no permissions to write at.
         csv.Error: If an error occurred while writing into stream or CSV file.
         OSError: If the file can't be opened or written to.
-    """  # noqa: E501
+    """
 
     # file or config have to be provided
     if not file_path and not stream:
-        raise Exception("Please provide file name and/or config.")
+        raise ValueError("Please provide file name and/or config.")
 
     # only config provided with stream set to false
     if not file_path and not stream:
-        raise Exception("If you provided only stream value, it has to be set to True to get any results.")  # noqa: E501
+        raise ValueError("If you provided only stream value, it has to be set to True to get any results.")
 
-    memgraph = Memgraph()
-    results = list(memgraph.execute_and_fetch(query))
+    if config is DEFAULT_ARGUMENT_DICT:
+        config = DEFAULT_ARGUMENT_DICT.copy()
+    memgraph = open_memgraph_client(config)
+    rows = memgraph.execute_and_fetch(query)
 
-    # if query yields no result
-    if not len(results):
-        raise Exception(
-            "Your query yields no results. Check if the database is empty or rewrite the provided query."  # noqa: E501
-        )
-
-    result_keys = list(results[0])
-    data_list = [result_keys] + [list(result.values()) for result in results]
-    data = ""
-
+    # The query runs once and each row goes to the file and the stream (different CSV dialects) as it arrives, so the
+    # result set is not retained for the file. A query with no rows publishes nothing.
+    stream_buffer = io_StringIO()
+    stream_writers = [csv_writer(stream_buffer, quoting=csv_QUOTE_NONNUMERIC, escapechar="\\")] if stream else []
     if file_path:
-        save_file(file_path, data_list)
+        publish_file(
+            file_path,
+            partial(write_query_csv, rows=rows, stream_writers=stream_writers),
+            "",
+        )
+    else:
+        write_query_rows(rows, stream_writers)
+    data = stream_buffer.getvalue()
 
-    if stream:
-        data = csv_to_stream(data_list)
-
-    return mgp.Record(file_path=file_path, data=data)
+    computed_return_value = mgp_Record(file_path=file_path, data=data)
+    return computed_return_value
 
 
-def write_graphml_header(output: io.StringIO):
+csv_query.__annotations__["return"] = mgp_Record(file_path=str, data=str)
+csv_query = mgp_read_proc(csv_query)
+
+
+def write_graphml_header(output: io_StringIO):
     output.write('<?xml version="1.0" encoding="UTF-8"?>\n')
     output.write(
-        '<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">\n'  # noqa: E501
+        '<graphml xmlns="http://graphml.graphdrawing.org/xmlns" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns '
+        'http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">\n'
     )
+    return False
 
 
-def translate_types(variable: Any):
-    if isinstance(variable, tuple):
-        return get_value_string(variable)
+def translate_types(variable: object):
+    if isinstance(variable, (tuple, list)):
+        computed_return_value = get_value_string(variable)
+        return computed_return_value
     if isinstance(variable, str):
         return "string"
     if isinstance(variable, bool):
@@ -908,240 +972,233 @@ def translate_types(variable: Any):
         return "float"
     if isinstance(variable, int):
         return "int"
-    raise Exception("Property values can only be primitive types or arrays of primitive types.")  # noqa: E501
+    raise TypeError("Property values can only be primitive types or arrays of primitive types.")
 
 
-def check_if_elements_same_type(variable: List[Any]):
-    if not isinstance(variable, (tuple, list)):
-        return
+def check_if_elements_same_type(variable: mgp_Any):
+    if not isinstance(variable, (tuple, list)) or len(variable) == 0:
+        return False
     list_type = type(variable[0])
     for element in variable:
-        if not isinstance(element, list_type):
-            raise Exception("If property value is a list it must consist of same typed elements.")  # noqa: E501
+        if type(element) is not list_type:
+            raise TypeError("If property value is a list it must consist of same typed elements.")
+    return False
 
 
-def get_type_string(variable: Any) -> Union[str, List[Any]]:
-    if not isinstance(variable, tuple):
-        return translate_types(variable), False
+def get_type_string(variable: mgp_Any) -> tuple[str, bool]:
+    if not isinstance(variable, (tuple, list)):
+        computed_return_value = translate_types(variable), False
+        return computed_return_value
     if len(variable) == 0:
         return "string", True
     check_if_elements_same_type(variable)
-    return translate_types(variable[0]), True
+    computed_return_value = translate_types(variable[0]), True
+    return computed_return_value
 
 
-def write_key_graphml(
-    output: io.StringIO,
-    working_key: KeyObjectGraphML,
-    key_id_counter: int,
-    config: mgp.Map,
-):
-    output.write(f'<key id="d{key_id_counter}" for="{working_key.is_for}" attr.name="{working_key.name}"')  # noqa: E501
-    if config.get("useTypes"):
-        if working_key.type_is_list:
-            output.write(f' attr.type="string" attr.list="{working_key.type}"')
-        else:
-            output.write(f' attr.type="{working_key.type}"')
-    output.write("/>\n")
-    working_key.id = "d" + str(key_id_counter)
+def get_gephi_label_value(element: mgp_Any, config: mgp_Map) -> str:
+    for caption in config.get("caption", ()):
+        if caption in element.get("properties", {}).keys():
+            computed_return_value = str(element.get("properties", {}).get(caption, ""))
+            return computed_return_value
+
+    if element.get("properties", {}).values():
+        computed_return_value = str(list(element.get("properties", {}).values())[0])
+        return computed_return_value
+
+    computed_return_value = str(element.get("id", ""))
+    return computed_return_value
 
 
-def get_gephi_label_value(element: Union[Node, Relationship], config: mgp.Map) -> str:
-    for caption in config.get("caption"):
-        if caption in element.get("properties").keys():
-            return str(element.get("properties").get(caption))
-
-    if element.get("properties").values():
-        return str(list(element.get("properties").values())[0])
-
-    return str(element.get("id"))
-
-
-def get_data_key(keys: set, name: str, is_for: str, type: str = "", is_list: bool = False) -> str:
-    for key in keys:
-        if key.name == name and key.is_for == is_for and key.type == type and key.type_is_list == is_list:
-            return key.id
-
-
-def write_labels_as_data(
-    element: Union[Node, Relationship],
-    output: io.StringIO,
-    config: mgp.Map,
-    keys: set,
-):
-    if not element.get("labels"):
-        return
-
-    if config.get("format").upper() == "GEPHI":
-        output.write(f'<data key="{get_data_key(keys, "TYPE", "node", translate_types("TYPE"))}">')  # noqa: E501
-        for label in element.get("labels"):
-            output.write(f":{label}")
+def write_labels_as_data(element: mgp_Any, output: io_StringIO, config: mgp_Map, key_ids: dict) -> None:
+    labels = element.get("labels", [])
+    graph_format = config.get("format", "").upper()
+    # An unlabelled element writes no label data in any format.
+    if labels and graph_format == "GEPHI":
+        output.write(f'<data key="{key_ids.get(("TYPE", "node", "string", False), "")}">')
+        output.write(xml_text("".join(f":{label}" for label in labels)))
         output.write("</data>")
         output.write(
-            f'<data key="{get_data_key(keys, "labels", "node", translate_types("labels"))}">{get_gephi_label_value(element, config)}</data>'  # noqa: E501 SHOULD IT BE LABEL?
+            f'<data key="{key_ids.get(("labels", "node", "string", False), "")}">'
+            f"{xml_text(get_gephi_label_value(element, config))}</data>"
         )
-        return
-
-    if config.get("format").upper() == "TINKERPOP":
-        output.write(f'<data key="{get_data_key(keys, "labelV", "node", translate_types("labelV"))}">')  # noqa: E501
-        for index, value in enumerate(element.get("labels")):
-            if index == 0:
-                output.write(value)
-            else:
-                output.write(f":{value}")
+    elif labels and graph_format == "TINKERPOP":
+        output.write(f'<data key="{key_ids.get(("labelV", "node", "string", False), "")}">')
+        output.write(xml_text(":".join(labels)))
         output.write("</data>")
-        return
-
-    output.write(f'<data key="{get_data_key(keys, "labels", "node", translate_types("labels"))}">')  # noqa: E501
-    for label in element.get("labels"):
-        output.write(f":{label}")
-    output.write("</data>")
+    elif labels:
+        output.write(f'<data key="{key_ids.get(("labels", "node", "string", False), "")}">')
+        output.write(xml_text("".join(f":{label}" for label in labels)))
+        output.write("</data>")
 
 
-def get_value_string(value: Any) -> str:
+def get_value_string(value: object) -> str:
     if isinstance(value, (set, list, tuple, map)):
-        return js.dumps(value, ensure_ascii=False)
-    return str(value)
+        computed_return_value = js_dumps(value, ensure_ascii=False)
+        return computed_return_value
+    computed_return_value = str(value)
+    return computed_return_value
 
 
-def process_graph_element_graphml(  # noqa: C901
-    graph: List[Union[Node, Relationship]],
-    keys_output: io.StringIO,
-    nodes_and_rels_output: io.StringIO,
-    config: mgp.Map,
-) -> set:
-    keys = set()
-    key_id_counter = 0
-
-    for element in graph:
-        working_key = None
-        if element.get("type") == "node":
-            nodes_and_rels_output.write(f'<node id="n{str(element.get("id"))}')
-            if element.get("labels") and config.get("format").upper() != "TINKERPOP":
-                nodes_and_rels_output.write('" labels="')
-                for label in element.get("labels"):
-                    nodes_and_rels_output.write(f":{label}")
-            nodes_and_rels_output.write('">')
-
-            if config.get("format").upper() == "GEPHI":
-                working_key = KeyObjectGraphML("TYPE", "node", translate_types("TYPE"))
-                keys.add(working_key)
-                if len(keys) == key_id_counter + 1:
-                    write_key_graphml(keys_output, working_key, key_id_counter, config)
-                    key_id_counter = key_id_counter + 1
-
-            if element.get("labels"):
-                if config.get("format").upper() == "TINKERPOP":
-                    working_key = KeyObjectGraphML("labelV", "node", translate_types("labelV"))
-                else:  # SHOULD IT BE LABEL OR LABELS FOR GEPHI?
-                    working_key = KeyObjectGraphML("labels", "node", translate_types("labels"))
-                keys.add(working_key)
-                if len(keys) == key_id_counter + 1:
-                    write_key_graphml(keys_output, working_key, key_id_counter, config)
-                    key_id_counter = key_id_counter + 1
-
-            write_labels_as_data(element, nodes_and_rels_output, config, keys)
-
-            for name, value in element.get("properties").items():
-                type_string, is_list = get_type_string(value)
-                working_key = KeyObjectGraphML(name, "node", type_string, is_list)
-                keys.add(working_key)
-                if len(keys) == key_id_counter + 1:
-                    write_key_graphml(keys_output, working_key, key_id_counter, config)
-                    key_id_counter = key_id_counter + 1
-                else:
-                    working_key.id = get_data_key(keys, name, "node", type_string, is_list)
-
-                nodes_and_rels_output.write(
-                    f'<data key="{working_key.id}">{get_value_string(value)}</data>'  # noqa: E501
+def graphml_element_keys(element: dict, config: mgp_Map) -> list[tuple[str, str, str, bool]]:
+    """The (name, for, type, is-list) keys an element uses, in the order the writer declares them."""
+    graph_format = config.get("format", "").upper()
+    keys = []
+    if element.get("type", "") == "node":
+        is_for = "node"
+        if graph_format == "GEPHI":
+            keys.append(("TYPE", is_for, "string", False))
+        if element.get("labels", []):
+            keys.append(
+                (
+                    "labelV" if graph_format == "TINKERPOP" else "labels",
+                    is_for,
+                    "string",
+                    False,
                 )
-            nodes_and_rels_output.write("</node>\n")
-
-        elif element.get("type") == "relationship":
-            nodes_and_rels_output.write(
-                f'<edge id="e{str(element.get("id"))}" source="n{str(element.get("start"))}" target="n{str(element.get("end"))}" label="{element.get("label")}">'  # noqa: E501
             )
-
-            if config.get("format").upper() == "GEPHI":
-                working_key = KeyObjectGraphML("TYPE", "edge", translate_types("TYPE"))
-                keys.add(working_key)
-                if len(keys) == key_id_counter + 1:
-                    write_key_graphml(keys_output, working_key, key_id_counter, config)
-                    key_id_counter = key_id_counter + 1
-                nodes_and_rels_output.write(
-                    f'<data key="{get_data_key(keys, "TYPE", "edge", translate_types("TYPE"))}">{element.get("label")}</data>'  # noqa: E501
-                )
-            if config.get("format").upper() == "TINKERPOP":
-                working_key = KeyObjectGraphML("labelE", "edge", translate_types("labelE"))
-            else:
-                working_key = KeyObjectGraphML("label", "edge", translate_types("label"))
-            keys.add(working_key)
-            if len(keys) == key_id_counter + 1:
-                write_key_graphml(keys_output, working_key, key_id_counter, config)
-                key_id_counter = key_id_counter + 1
-            nodes_and_rels_output.write(
-                f'<data key="{get_data_key(keys, working_key.name, "edge", working_key.type)}">{element.get("label")}</data>'  # noqa: E501
+    else:
+        is_for = "edge"
+        if graph_format == "GEPHI":
+            keys.append(("TYPE", is_for, "string", False))
+        keys.append(
+            (
+                "labelE" if graph_format == "TINKERPOP" else "label",
+                is_for,
+                "string",
+                False,
             )
+        )
 
-            for name, value in element.get("properties").items():
-                type_string, is_list = get_type_string(value)
-                working_key = KeyObjectGraphML(name, "edge", type_string, is_list)
-                keys.add(working_key)
-                if len(keys) == key_id_counter + 1:
-                    write_key_graphml(keys_output, working_key, key_id_counter, config)
-                    key_id_counter = key_id_counter + 1
+    for name, value in element.get("properties", {}).items():
+        type_string, is_list = get_type_string(value)
+        keys.append((name, is_for, type_string, is_list))
+    return keys
+
+
+def write_graphml_keys(output: io_StringIO, elements, config: mgp_Map) -> dict:
+    """
+    First pass: declares every key once, in first-use order, and returns each key's id for the second pass. Only the
+    key schema is kept, never the graph.
+    """
+    key_ids = {}
+    for element in elements:
+        for key in graphml_element_keys(element, config):
+            if key in key_ids:
+                continue
+            key_id = f"d{len(key_ids)}"
+            key_ids[key] = key_id
+            name, is_for, type_string, is_list = key
+            output.write(f'<key id="{key_id}" for="{is_for}" attr.name="{xml_attribute(name)}"')
+            if config.get("useTypes", False):
+                if is_list:
+                    output.write(f' attr.type="string" attr.list="{xml_attribute(type_string)}"')
                 else:
-                    working_key.id = get_data_key(keys, name, "edge", type_string, is_list)
-
-                nodes_and_rels_output.write(
-                    f'<data key="{working_key.id}">{get_value_string(value)}</data>'  # noqa: E501
-                )
-            nodes_and_rels_output.write("</edge>\n")
+                    output.write(f' attr.type="{xml_attribute(type_string)}"')
+            output.write("/>\n")
+    return key_ids
 
 
-def write_graphml_graph_id(output: io.StringIO):
+def write_graphml_elements(output: io_StringIO, elements, key_ids: dict, config: mgp_Map) -> None:
+    """Second pass: writes each node and edge with its data, escaping every attribute and text value."""
+    graph_format = config.get("format", "").upper()
+    for element in elements:
+        if element.get("type", "") == "node":
+            is_for = "node"
+            closing = "</node>\n"
+            labels = element.get("labels", [])
+            output.write(f'<node id="n{xml_attribute(element.get("id", ""))}')
+            if labels and graph_format != "TINKERPOP":
+                output.write(f'" labels="{xml_attribute("".join(f":{label}" for label in labels))}')
+            output.write('">')
+            write_labels_as_data(element, output, config, key_ids)
+        else:
+            is_for = "edge"
+            closing = "</edge>\n"
+            label = element.get("label", "")
+            output.write(
+                f'<edge id="e{xml_attribute(element.get("id", ""))}" '
+                f'source="n{xml_attribute(element.get("start", ""))}" '
+                f'target="n{xml_attribute(element.get("end", ""))}" '
+                f'label="{xml_attribute(label)}">'
+            )
+            if graph_format == "GEPHI":
+                output.write(f'<data key="{key_ids.get(("TYPE", is_for, "string", False), "")}">{xml_text(label)}</data>')
+            label_key = (
+                "labelE" if graph_format == "TINKERPOP" else "label",
+                is_for,
+                "string",
+                False,
+            )
+            output.write(f'<data key="{key_ids.get(label_key, "")}">{xml_text(label)}</data>')
+
+        for name, value in element.get("properties", {}).items():
+            type_string, is_list = get_type_string(value)
+            key_id = key_ids.get((name, is_for, type_string, is_list), "")
+            output.write(f'<data key="{key_id}">{xml_text(get_value_string(value))}</data>')
+        output.write(closing)
+
+
+def write_graphml(output: io_StringIO, ctx: mgp_ProcCtx, config: mgp_Map) -> None:
+    """Writes the document in two reads of the graph: key declarations first, then nodes and edges."""
+    graph_config = {
+        "graphML": True,
+        "leaveOutLabels": config.get("leaveOutLabels", False),
+        "leaveOutProperties": config.get("leaveOutProperties", False),
+    }
+    write_graphml_header(output)
+    key_ids = write_graphml_keys(output, graphml_elements(ctx, graph_config), config)
+    write_graphml_graph_id(output)
+    write_graphml_elements(output, graphml_elements(ctx, graph_config), key_ids, config)
+    write_graphml_footer(output)
+
+
+def write_graphml_graph_id(output: io_StringIO):
     output.write('<graph id="G" edgedefault="directed">\n')
+    return False
 
 
-def write_graphml_footer(output: io.StringIO):
+def write_graphml_footer(output: io_StringIO):
     output.write("</graph>\n")
     output.write("</graphml>")
+    return False
 
 
-def set_default_config(config: mgp.Map) -> mgp.Map:
+def set_default_config(config: mgp_Map) -> mgp_Map:
     if config is None:
         config = dict()
-    if not config.get("stream"):
-        config.update({"stream": False})
-    if not config.get("format"):
-        config.update({"format": ""})
-    if not config.get("caption"):
-        config.update({"caption": tuple()})
-    if not config.get("useTypes"):
-        config.update({"useTypes": False})
-    if not config.get("leaveOutLabels"):
-        config.update({"leaveOutLabels": False})
-    if not config.get("leaveOutProperties"):
-        config.update({"leaveOutProperties": False})
+    else:
+        config = dict(config)
+    defaults = {
+        "stream": False,
+        "format": "",
+        "caption": tuple(),
+        "useTypes": False,
+        "leaveOutLabels": False,
+        "leaveOutProperties": False,
+    }
+    for key, default_val in defaults.items():
+        if config.get(key) is None:
+            config[key] = default_val
+    if isinstance(config.get("caption"), list):
+        config["caption"] = tuple(config.get("caption", ()))
     if (
-        not isinstance(config.get("stream"), bool)
-        or not isinstance(config.get("format"), str)
-        or not isinstance(config.get("caption"), tuple)
-        or not isinstance(config.get("useTypes"), bool)
-        or not isinstance(config.get("leaveOutLabels"), bool)
-        or not isinstance(config.get("leaveOutProperties"), bool)
+        not isinstance(config.get("stream", False), bool)
+        or not isinstance(config.get("format", ""), str)
+        or not isinstance(config.get("caption", ()), tuple)
+        or not isinstance(config.get("useTypes", False), bool)
+        or not isinstance(config.get("leaveOutLabels", False), bool)
+        or not isinstance(config.get("leaveOutProperties", False), bool)
     ):
-        raise TypeError(
-            "Config parameter must be a map with specific keys and values described in documentation."  # noqa: E501
-        )
+        raise TypeError("Config parameter must be a map with specific keys and values described in documentation.")
     return config
 
 
-@mgp.read_proc
 def graphml(
-    ctx: mgp.ProcCtx,
+    ctx: mgp_ProcCtx,
     path: str = "",
-    config: Union[mgp.Map, None] = None,
-) -> mgp.Record(status=str):
+    config: mgp_Nullable[mgp_Map] = None,
+) -> mgp_Record:
     """
     Procedure to export the whole database to a graphML file.
 
@@ -1153,40 +1210,23 @@ def graphml(
 
     """
 
+    # A null (omitted) config is normalized to the defaults; a supplied map is validated.
     config = set_default_config(config)
-    graph_config = {"graphML": True}
-    graph_config.update({"leaveOutLabels": config.get("leaveOutLabels")})
-    graph_config.update({"leaveOutProperties": config.get("leaveOutProperties")})
+    if not path and not config.get("stream", False):
+        raise ValueError("Please provide file name or set stream to True in config.")
 
-    graph = get_graphML(ctx, graph_config)
-
-    if not path and not config.get("stream"):
-        raise Exception("Please provide file name or set stream to True in config.")
-
-    output = io.StringIO()
-    keys_output = io.StringIO()
-    nodes_and_rels_output = io.StringIO()
-
-    write_graphml_header(output)
-    process_graph_element_graphml(graph, keys_output, nodes_and_rels_output, config)
-    output.write(keys_output.getvalue())
-    write_graphml_graph_id(output)
-    output.write(nodes_and_rels_output.getvalue())
-    write_graphml_footer(output)
-
-    try:
+    render = partial(write_graphml, ctx=ctx, config=config)
+    if config.get("stream", False):
+        data = render_to_string(render)
         if path:
-            with open(path, "w") as outfile:
-                outfile.write(output.getvalue())
-            outfile.close()
-    except PermissionError:
-        raise PermissionError(
-            "You don't have permissions to write into that file. Make sure to give the necessary permissions to user memgraph."  # noqa: E501
-        )
-    except Exception:
-        raise OSError("Could not open or write to the file.")
+            publish_file(path, partial(write_text, text=data), "\n")
+        computed_return_value = mgp_Record(status=data)
+        return computed_return_value
 
-    if config.get("stream"):
-        return mgp.Record(status=output.getvalue())
+    publish_file(path, render, "\n")
+    computed_return_value = mgp_Record(status="success")
+    return computed_return_value
 
-    return mgp.Record(status="success")
+
+graphml.__annotations__["return"] = mgp_Record(status=str)
+graphml = mgp_read_proc(graphml)

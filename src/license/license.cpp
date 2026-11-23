@@ -56,27 +56,6 @@ bool IsLicenseExpired(int64_t valid_until, int64_t now_seconds) {
   return valid_until != 0 && now_seconds - kExpirationGraceSeconds > valid_until;
 }
 
-std::optional<License> GetLicense(std::string_view license_key) {
-  if (license_key.empty()) {
-    return std::nullopt;
-  }
-
-  static utils::Synchronized<std::pair<std::string, License>, utils::SpinLock> cached_license;
-  {
-    auto cache_locked = cached_license.Lock();
-    const auto &[cached_key, license] = *cache_locked;
-    if (cached_key == license_key) {
-      return license;
-    }
-  }
-  auto license = Decode(license_key);
-  if (license) {
-    auto cache_locked = cached_license.Lock();
-    *cache_locked = std::make_pair(license_key, *license);
-  }
-  return license;
-}
-
 LicenseCheckResult IsValidLicenseInternal(const License &license, std::string_view organization_name) {
   if (license.organization_name != organization_name) {
     return std::unexpected{LicenseCheckError::INVALID_ORGANIZATION_NAME};
@@ -126,11 +105,11 @@ std::string LicenseTypeToString(const LicenseType license_type) {
 }
 
 void RegisterLicenseSettings(LicenseChecker &license_checker, utils::Settings &settings) {
-  // Validate that the license key is well-formed and not already expired.
-  // Org name mismatch is caught later in RevalidateLicense; the user gets a warning there.
-  auto validate_license_key = [](std::string_view new_value) -> utils::Settings::ValidatorResult {
+  // Validate that the license key is well-formed, signed by the trusted issuer, and not already expired.
+  // Org name mismatch is caught later in RevalidateLicense.
+  auto validate_license_key = [&license_checker](std::string_view new_value) -> utils::Settings::ValidatorResult {
     if (new_value.empty()) return {};
-    const auto maybe_license = Decode(new_value);
+    const auto maybe_license = license_checker.GetLicense(new_value);
     if (!maybe_license) {
       return std::unexpected<std::string>{"Invalid license key: could not be decoded."};
     }
@@ -147,17 +126,38 @@ void RegisterLicenseSettings(LicenseChecker &license_checker, utils::Settings &s
       std::string{kEnterpriseLicenseSettingKey},
       "",
       utils::Settings::Persistence::kPersisted,
-      [&] { license_checker.RevalidateLicense(settings); },
+      [&license_checker, &settings] { license_checker.RevalidateLicense(settings); },
       validate_license_key);
-  settings.RegisterSetting(std::string{kOrganizationNameSettingKey}, "", utils::Settings::Persistence::kPersisted, [&] {
-    license_checker.RevalidateLicense(settings);
-  });
+  settings.RegisterSetting(std::string{kOrganizationNameSettingKey},
+                           "",
+                           utils::Settings::Persistence::kPersisted,
+                           [&license_checker, &settings] { license_checker.RevalidateLicense(settings); });
 }
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 LicenseChecker global_license_checker;
 
 LicenseChecker::~LicenseChecker() { Finalize(); }
+
+std::optional<License> LicenseChecker::GetLicense(std::string_view license_key) const {
+  if (license_key.empty()) {
+    return std::nullopt;
+  }
+
+  {
+    auto cache_locked = cached_license_.Lock();
+    const auto &[cached_key, license] = *cache_locked;
+    if (cached_key == license_key) {
+      return license;
+    }
+  }
+  auto license = Decode(license_key, issuer_modulus_);
+  if (license) {
+    auto cache_locked = cached_license_.Lock();
+    *cache_locked = std::make_pair(std::string{license_key}, *license);
+  }
+  return license;
+}
 
 namespace {
 // Shared by RevalidateLicense and the test-only EnableTesting/DisableTesting so tests hit the real routing.
@@ -215,114 +215,147 @@ void LicenseChecker::RevalidateLicense(utils::Settings &settings) {
     int priority;
   };
 
-  std::vector<Candidate> valid_candidates;
-  std::vector<std::string> failures;
-  // An incomplete pair is usually a licence still being set up, one setting at a time; it is not a rejected licence.
-  bool license_rejected = false;
+  static constexpr std::array<std::string_view, 2> kLicenseSettingKeys = {
+      kEnterpriseLicenseSettingKey,
+      kOrganizationNameSettingKey,
+  };
 
-  auto try_add = [&](std::string_view key, std::string_view org, int priority, std::string_view source_name) {
-    auto const reject = [&](std::string_view reason, bool const rejected = true) {
-      failures.push_back(fmt::format("[{}] {}", source_name, reason));
-      license_rejected |= rejected;
-    };
-    if (key.empty() && org.empty()) return;
-    if (key.empty()) {
-      reject("The organization name is set, but the license key is not.", false);
-      return;
-    }
-    if (org.empty()) {
-      reject("The license key is set, but the organization name is not.", false);
-      return;
-    }
-    const auto maybe_license = GetLicense(key);
-    if (!maybe_license) {
-      reject("The license key is not a valid key.");
-      return;
-    }
-    const auto check = IsValidLicenseInternal(*maybe_license, org);
-    if (!check) {
-      switch (check.error()) {
-        case LicenseCheckError::INVALID_ORGANIZATION_NAME:
-          reject(fmt::format("The organization name '{}' does not match the license key, which is for '{}'.",
-                             org,
-                             maybe_license->organization_name));
-          break;
-        case LicenseCheckError::EXPIRED_LICENSE:
-          reject(fmt::format("The license expired on {}.", ValidUntilToString(maybe_license->valid_until)));
-          break;
-        default:
-          reject(LicenseCheckErrorToString(check.error(), "Enterprise features"));
+  while (true) {
+    const auto snapshot = settings.GetValuesSnapshot(kLicenseSettingKeys);
+    const std::string db_key =
+        (snapshot.values.size() > 0 && snapshot.values[0].has_value()) ? *snapshot.values[0] : "";
+    const std::string db_org =
+        (snapshot.values.size() > 1 && snapshot.values[1].has_value()) ? *snapshot.values[1] : "";
+
+    std::vector<Candidate> valid_candidates;
+    std::vector<std::string> failures;
+    // An incomplete pair is usually a licence still being set up, one setting at a time; it is not a rejected licence.
+    bool license_rejected = false;
+
+    auto try_add = [&](std::string_view key, std::string_view org, int priority, std::string_view source_name) {
+      auto const reject = [&](std::string_view reason, bool const rejected = true) {
+        failures.push_back(fmt::format("[{}] {}", source_name, reason));
+        license_rejected |= rejected;
+      };
+      if (key.empty() && org.empty()) return;
+      if (key.empty()) {
+        reject("The organization name is set, but the license key is not.", false);
+        return;
       }
+      if (org.empty()) {
+        reject("The license key is set, but the organization name is not.", false);
+        return;
+      }
+      const auto maybe_license = GetLicense(key);
+      if (!maybe_license) {
+        reject("The license key is not a valid key.");
+        return;
+      }
+      const auto check = IsValidLicenseInternal(*maybe_license, org);
+      if (!check) {
+        switch (check.error()) {
+          case LicenseCheckError::INVALID_ORGANIZATION_NAME:
+            reject(fmt::format("The organization name '{}' does not match the license key, which is for '{}'.",
+                               org,
+                               maybe_license->organization_name));
+            break;
+          case LicenseCheckError::EXPIRED_LICENSE:
+            reject(fmt::format("The license expired on {}.", ValidUntilToString(maybe_license->valid_until)));
+            break;
+          default:
+            reject(LicenseCheckErrorToString(check.error(), "Enterprise features"));
+        }
+        return;
+      }
+      valid_candidates.push_back({*maybe_license, std::string{key}, std::string{org}, priority});
+    };
+
+    try_add(db_key, db_org, 0, "DB");
+    if (env_license_info_) try_add(env_license_info_->first, env_license_info_->second, 1, "ENV");
+    if (cli_license_info_) try_add(cli_license_info_->first, cli_license_info_->second, 2, "CLI");
+
+    if (valid_candidates.empty()) {
+      if (settings.CurrentRevision() != snapshot.revision) {
+        continue;
+      }
+      auto const failures_changed = std::exchange(*license_failures_.Lock(), failures) != failures;
+      auto locked = previous_license_info_.Lock();
+      if (*locked || (failures_changed && license_rejected)) {
+        spdlog::error("No valid license found. Running in community mode.{}",
+                      failures.empty() ? "" : " " + utils::Join(failures, " "));
+        locked->reset();
+      } else if (failures_changed && !failures.empty()) {
+        spdlog::warn("No valid license found. {}", utils::Join(failures, " "));
+      }
+      atomic_struct_update<LicenseState>(state_, [](LicenseState s) {
+        s.valid = false;
+        return s;
+      });
+      ApplyLicenseMemoryLimit(0, std::nullopt);
       return;
     }
-    valid_candidates.push_back({*maybe_license, std::string{key}, std::string{org}, priority});
-  };
 
-  auto db_key = settings.GetValue(std::string{kEnterpriseLicenseSettingKey}).value_or("");
-  auto db_org = settings.GetValue(std::string{kOrganizationNameSettingKey}).value_or("");
-  try_add(db_key, db_org, 0, "DB");
-
-  if (env_license_info_) try_add(env_license_info_->first, env_license_info_->second, 1, "ENV");
-  if (cli_license_info_) try_add(cli_license_info_->first, cli_license_info_->second, 2, "CLI");
-
-  auto const failures_changed = std::exchange(*license_failures_.Lock(), failures) != failures;
-
-  if (valid_candidates.empty()) {
-    auto locked = previous_license_info_.Lock();
-    if (*locked || (failures_changed && license_rejected)) {
-      spdlog::error("No valid license found. Running in community mode.{}",
-                    failures.empty() ? "" : " " + utils::Join(failures, " "));
-      locked->reset();
-    } else if (failures_changed && !failures.empty()) {
-      spdlog::warn("No valid license found. {}", utils::Join(failures, " "));
-    }
-    atomic_struct_update<LicenseState>(state_, [](LicenseState s) {
-      s.valid = false;
-      return s;
+    // Select the winner: furthest expiry wins; source priority (CLI > ENV > DB) breaks ties.
+    // valid_until == 0 means the license never expires, treated as INT64_MAX.
+    const auto expiry_of = [](const Candidate &c) -> int64_t {
+      return c.license.valid_until == 0 ? std::numeric_limits<int64_t>::max() : c.license.valid_until;
+    };
+    const auto &winner = *std::ranges::max_element(valid_candidates, [&](const Candidate &a, const Candidate &b) {
+      if (expiry_of(a) != expiry_of(b)) return expiry_of(a) < expiry_of(b);
+      return a.priority < b.priority;
     });
-    ApplyLicenseMemoryLimit(0, std::nullopt);
-    return;
-  }
 
-  // Select the winner: furthest expiry wins; source priority (CLI > ENV > DB) breaks ties.
-  // valid_until == 0 means the license never expires, treated as INT64_MAX.
-  const auto expiry_of = [](const Candidate &c) -> int64_t {
-    return c.license.valid_until == 0 ? std::numeric_limits<int64_t>::max() : c.license.valid_until;
-  };
-  const auto &winner = *std::ranges::max_element(valid_candidates, [&](const Candidate &a, const Candidate &b) {
-    if (expiry_of(a) != expiry_of(b)) return expiry_of(a) < expiry_of(b);
-    return a.priority < b.priority;
-  });
-
-  if (failures_changed && !failures.empty()) {
-    spdlog::warn("Ignoring a license source. {}", utils::Join(failures, " "));
-  }
-
-  // Persist winner to Settings so it survives restarts where CLI/ENV are absent.
-  settings.SetValueForce(std::string{kEnterpriseLicenseSettingKey}, winner.key);
-  settings.SetValueForce(std::string{kOrganizationNameSettingKey}, winner.org);
-
-  // Log and update stored state only when the winner changes.
-  {
-    auto locked = previous_license_info_.Lock();
-    const bool changed = !*locked || (*locked)->license_key != winner.key || (*locked)->organization_name != winner.org;
-    if (changed) {
-      spdlog::info("{} license is active.", LicenseTypeToString(winner.license.type));
-      locked->emplace(winner.key, winner.org);
-      (*locked)->is_valid = true;
-      (*locked)->license = winner.license;
-      ApplyLicenseMemoryLimit(winner.license.memory_limit, winner.license.type);
+    // Atomically persist winner key + organization together against the observed settings revision.
+    const std::array<std::pair<std::string_view, std::string>, 2> updates = {{
+        {kEnterpriseLicenseSettingKey, winner.key},
+        {kOrganizationNameSettingKey, winner.org},
+    }};
+    const auto cas_status = settings.CompareAndSetValuesForce(snapshot.revision, updates);
+    if (cas_status == utils::Settings::CasForceStatus::kRevisionMismatch) {
+      continue;
     }
-  }
+    if (cas_status != utils::Settings::CasForceStatus::kApplied) {
+      failures.push_back("[DB] Failed to persist active license key and organization atomically.");
+      *license_failures_.Lock() = failures;
+      spdlog::error("Failed to persist active license settings; refusing to activate unsaved license.");
+      previous_license_info_.Lock()->reset();
+      atomic_struct_update<LicenseState>(state_, [](LicenseState s) {
+        s.valid = false;
+        return s;
+      });
+      ApplyLicenseMemoryLimit(0, std::nullopt);
+      return;
+    }
 
-  state_.store(LicenseState{.valid = true, .type = winner.license.type}, std::memory_order_release);
+    auto const failures_changed = std::exchange(*license_failures_.Lock(), failures) != failures;
+    if (failures_changed && !failures.empty()) {
+      spdlog::warn("Ignoring a license source. {}", utils::Join(failures, " "));
+    }
 
-  const auto now =
-      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-  if (winner.license.valid_until != 0 && winner.license.valid_until - now < kExpiryWarningSeconds &&
-      last_expiry_warning_day_.exchange(now / kSecondsPerDay) != now / kSecondsPerDay) {
-    spdlog::warn("The license is valid until {}. Enterprise features stop working 24 hours after that.",
-                 ValidUntilToString(winner.license.valid_until));
+    // Log and update stored state only when the winner changes.
+    {
+      auto locked = previous_license_info_.Lock();
+      const bool changed =
+          !*locked || (*locked)->license_key != winner.key || (*locked)->organization_name != winner.org;
+      if (changed) {
+        spdlog::info("{} license is active.", LicenseTypeToString(winner.license.type));
+        locked->emplace(winner.key, winner.org);
+        (*locked)->is_valid = true;
+        (*locked)->license = winner.license;
+        ApplyLicenseMemoryLimit(winner.license.memory_limit, winner.license.type);
+      }
+    }
+
+    state_.store(LicenseState{.valid = true, .type = winner.license.type}, std::memory_order_release);
+
+    const auto now =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    if (winner.license.valid_until != 0 && winner.license.valid_until - now < kExpiryWarningSeconds &&
+        last_expiry_warning_day_.exchange(now / kSecondsPerDay) != now / kSecondsPerDay) {
+      spdlog::warn("The license is valid until {}. Enterprise features stop working 24 hours after that.",
+                   ValidUntilToString(winner.license.valid_until));
+    }
+    return;
   }
 }
 
@@ -442,7 +475,7 @@ void LicenseChecker::StartBackgroundLicenseChecker(std::weak_ptr<utils::Settings
   MG_ASSERT(locked_settings, "Settings are not available");
   RevalidateLicense(*locked_settings);
   scheduler_.SetInterval(std::chrono::minutes{5});
-  scheduler_.Run("licensechecker", [this, settings] {
+  scheduler_.Run("licensechecker", [this, settings = std::move(settings)] {
     if (auto locked_settings = settings.lock()) {
       RevalidateLicense(*locked_settings);
     }
@@ -522,7 +555,8 @@ bool LicenseChecker::IsEnterpriseValidFast() const {
   return s.valid && IsEnterpriseTier(s.type);
 }
 
-std::string Encode(const License &license) {
+std::string Encode(const License &license, const crypto::Rsa2048Exponent &private_exponent,
+                   const crypto::Rsa2048Modulus &issuer_modulus) {
   std::vector<uint8_t> buffer;
   slk::Builder builder([&buffer](const uint8_t *data, size_t size, bool /*have_more*/) {
     for (size_t i = 0; i < size; ++i) {
@@ -537,10 +571,13 @@ std::string Encode(const License &license) {
   slk::Save(license.core_limit, &builder);
   builder.Finalize();
 
+  const auto signature = crypto::SignRsa2048Sha256(buffer, private_exponent, issuer_modulus);
+  buffer.insert(buffer.end(), signature.begin(), signature.end());
+
   return std::string{license_key_prefix} + utils::base64_encode(buffer.data(), buffer.size());
 }
 
-std::optional<License> Decode(std::string_view license_key) {
+std::optional<License> Decode(std::string_view license_key, const crypto::Rsa2048Modulus &issuer_modulus) {
   if (!license_key.starts_with(license_key_prefix)) {
     return std::nullopt;
   }
@@ -555,12 +592,21 @@ std::optional<License> Decode(std::string_view license_key) {
     }
   });
 
-  if (!decoded) {
+  if (!decoded || decoded->size() <= crypto::kRsa2048Bytes) {
+    return std::nullopt;
+  }
+
+  const auto *raw_bytes = reinterpret_cast<const uint8_t *>(decoded->data());
+  const size_t payload_size = decoded->size() - crypto::kRsa2048Bytes;
+  const std::span<const uint8_t> payload(raw_bytes, payload_size);
+  const std::span<const uint8_t, crypto::kRsa2048Bytes> signature(raw_bytes + payload_size, crypto::kRsa2048Bytes);
+
+  if (!crypto::VerifyRsa2048Sha256Signature(payload, signature, issuer_modulus)) {
     return std::nullopt;
   }
 
   try {
-    slk::Reader reader(std::bit_cast<uint8_t *>(decoded->c_str()), decoded->size());
+    slk::Reader reader(payload.data(), payload.size());
     std::string organization_name;
     slk::Load(&organization_name, &reader);
     int64_t valid_until{0};
@@ -570,9 +616,12 @@ std::optional<License> Decode(std::string_view license_key) {
     std::underlying_type_t<LicenseType> license_type{0};
     slk::Load(&license_type, &reader);
     int64_t core_limit{0};
-    try {
+    if (reader.RemainingPayloadBytes() > 0) {
       slk::Load(&core_limit, &reader);
-    } catch (const slk::SlkReaderException & /*exception*/) {  // NOLINT(bugprone-empty-catch)
+    }
+    reader.Finalize();
+    if (reader.GetPos() != payload.size()) {
+      return std::nullopt;
     }
     const auto typed = static_cast<LicenseType>(license_type);
     switch (typed) {
@@ -585,7 +634,9 @@ std::optional<License> Decode(std::string_view license_key) {
         return std::nullopt;
     }
     return std::nullopt;
-  } catch (const slk::SlkReaderException &e) {
+  } catch (const slk::SlkReaderException &) {
+    return std::nullopt;
+  } catch (const slk::SlkReaderLeftoverDataException &) {
     return std::nullopt;
   }
 }

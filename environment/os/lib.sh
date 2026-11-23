@@ -51,7 +51,8 @@ _package_manager() {
 }
 
 list() {
-    local -n _packages="$1"
+    local _arr_ref="$1[@]"
+    local _packages=(${!_arr_ref+"${!_arr_ref}"})
     [[ ${#_packages[@]} -gt 0 ]] || return 0
     printf '%s\n' "${_packages[@]}"
 }
@@ -65,13 +66,14 @@ _is_special_package() {
 }
 
 check() {
-    local -n _packages="$1"
+    local _arr_ref="$1[@]"
+    local _packages=(${!_arr_ref+"${!_arr_ref}"})
     local missing="" missing_custom="" missing_pkg=""
     local standard_packages=() custom_packages=() pkg
 
     # custom-* packages are checked by install location; everything else --
     # special packages included -- by querying the package database.
-    for pkg in "${_packages[@]}"; do
+    for pkg in ${_packages[@]+"${_packages[@]}"}; do
         if [[ "$pkg" == custom-* ]]; then
             custom_packages+=("$pkg")
         else
@@ -109,7 +111,8 @@ install() {
         exit 1
     fi
 
-    local -n _packages="$1"
+    local _arr_ref="$1[@]"
+    local _packages=(${!_arr_ref+"${!_arr_ref}"})
 
     # If GitHub Actions runner is installed, append LANG to the environment.
     # Python related tests don't work without the LANG export.
@@ -142,7 +145,7 @@ install() {
     fi
 
     local standard_packages=() custom_packages=() special_packages=() pkg
-    for pkg in "${_packages[@]}"; do
+    for pkg in ${_packages[@]+"${_packages[@]}"}; do
         if [[ "$pkg" == custom-* ]]; then
             custom_packages+=("$pkg")
         elif _is_special_package "$pkg"; then
@@ -171,8 +174,17 @@ install() {
 }
 
 main() {
-    local skip_check
-    skip_check=$(parse_skip_check_flag "$@")
+    local skip_check=false
+    local positional=()
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == "--skip-check" ]]; then
+            skip_check=true
+        else
+            positional+=("$arg")
+        fi
+    done
+    set -- ${positional[@]+"${positional[@]}"}
     if [[ "$skip_check" == "false" ]]; then
         check_operating_system "$OS"
         # amd64 and arm64 are what the BSDs call x86_64 and aarch64.

@@ -2896,6 +2896,7 @@ class CallProcedure : public memgraph::query::plan::LogicalOperator {
 
   static void IncrementCounter(const std::string &procedure_name);
   static std::unordered_map<std::string, int64_t> GetAndResetCounters();
+  static void RestoreCounters(const std::unordered_map<std::string, int64_t> &counters);
 
   std::shared_ptr<memgraph::query::plan::LogicalOperator> input_;
   std::string procedure_name_;

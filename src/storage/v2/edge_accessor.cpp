@@ -202,7 +202,7 @@ Result<storage::PropertyValue> EdgeAccessor::SetProperty(PropertyId property, co
   if (edge_.ptr->deleted()) return std::unexpected{Error::DELETED_OBJECT};
   using ReturnType = decltype(edge_.ptr->properties.GetProperty(property));
   std::optional<ReturnType> current_value;
-  const bool skip_duplicate_write = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_write = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   utils::AtomicMemoryBlock([this, &current_value, &property, &value, skip_duplicate_write, &schema_acc]() {
     current_value.emplace(edge_.ptr->properties.GetProperty(
         property,
@@ -322,7 +322,7 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> EdgeAc
 
   if (edge_.ptr->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
-  const bool skip_duplicate_write = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_write = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   using ReturnType = decltype(edge_.ptr->properties.UpdateProperties(properties));
   std::optional<ReturnType> id_old_new_change;
   utils::AtomicMemoryBlock([this, &properties, &id_old_new_change, skip_duplicate_write, &schema_acc]() {

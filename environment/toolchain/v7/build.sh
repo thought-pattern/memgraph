@@ -80,9 +80,6 @@ fi
 
 # Set the right operating system setup script.
 ENV_SCRIPT_RELATIVE="environment/os/$DISTRO.sh"
-if [[ "$for_arm" = true ]]; then
-    ENV_SCRIPT_RELATIVE="environment/os/$DISTRO-arm.sh"
-fi
 ENV_SCRIPT="$DIR/../../../$ENV_SCRIPT_RELATIVE"
 echo "ALL BUILD PACKAGES: $(${ENV_SCRIPT} list TOOLCHAIN_BUILD_DEPS)"
 ${ENV_SCRIPT} check TOOLCHAIN_BUILD_DEPS
@@ -114,47 +111,73 @@ if [ ! -d $PREFIX ] || [ ! -w $PREFIX ]; then
         fi
     done
 fi
+prev_stdcxx=""
+if [ -f "$PREFIX/.toolchain-stdcxx" ]; then
+    prev_stdcxx="$(cat "$PREFIX/.toolchain-stdcxx")"
+elif [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]; then
+    if [ -d "$PREFIX/include/c++/v1" ]; then
+        prev_stdcxx="libc++"
+    else
+        prev_stdcxx="libstdc++"
+    fi
+fi
+if [ -n "$prev_stdcxx" ] && [ "$prev_stdcxx" != "$TOOLCHAIN_STDCXX" ]; then
+    echo "TOOLCHAIN_STDCXX changed ($prev_stdcxx -> $TOOLCHAIN_STDCXX); cleaning $PREFIX..."
+    find "$PREFIX" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+printf '%s\n' "$TOOLCHAIN_STDCXX" > "$PREFIX/.toolchain-stdcxx"
 
 # create archives directory
 mkdir -p archives && pushd archives
-# download all archives
-if [ ! -f gcc-$GCC_VERSION.tar.gz ]; then
-    # wget https://ftp.gnu.org/gnu/gcc/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz
-    wget https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz
-    wget https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz.sig
-    gpg --keyserver keyserver.ubuntu.com --recv-keys 6C35B99309B5FA62
-    gpg --verify gcc-$GCC_VERSION.tar.gz.sig gcc-$GCC_VERSION.tar.gz
-fi
-if [ ! -f binutils-$BINUTILS_VERSION.tar.gz ]; then
-    # wget https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VERSION.tar.gz
-    wget https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz
-    wget https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz.sig
-    gpg --keyserver keyserver.ubuntu.com --recv-keys 3A24BC1E8FB409FA9F14371813FCEF89DD9E3C4F
-    gpg --verify binutils-$BINUTILS_VERSION.tar.gz.sig binutils-$BINUTILS_VERSION.tar.gz
-fi
-if [ ! -f gdb-$GDB_VERSION.tar.gz ]; then
-    # wget https://ftp.gnu.org/gnu/gdb/gdb-$GDB_VERSION.tar.gz
-    wget https://sourceware.org/pub/gdb/releases/gdb-$GDB_VERSION.tar.gz
-    wget https://sourceware.org/pub/gdb/releases/sha512.sum
-    sha512sum -c sha512.sum | grep gdb-$GDB_VERSION.tar.gz
-fi
-if [ ! -f cmake-$CMAKE_VERSION.tar.gz ]; then
-    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION.tar.gz
-    CMAKE_SHA256="8d3537b7b7732660ea247398f166be892fe6131d63cc291944b45b91279f3ffb"
-    echo "$CMAKE_SHA256  cmake-$CMAKE_VERSION.tar.gz" | sha256sum -c -
-fi
-if [ ! -f cppcheck-$CPPCHECK_VERSION.tar.gz ]; then
-    wget https://github.com/danmar/cppcheck/archive/refs/tags/$CPPCHECK_VERSION.tar.gz -O cppcheck-$CPPCHECK_VERSION.tar.gz
-fi
+fetch_if_missing () {
+    local out_file="$1"
+    local url="$2"
+    if [[ ! -f "$out_file" ]]; then
+        rm -f "$out_file.part."*
+        wget --https-only "$url" -O "$out_file.part.$$" || {
+            rm -f "$out_file.part.$$"
+            exit 1
+        }
+        mv -f "$out_file.part.$$" "$out_file"
+    fi
+}
+verify_or_purge () {
+    local target_file="$1"
+    shift
+    if ! "$@"; then
+        echo "Integrity verification failed for '$target_file'; removing cached file." >&2
+        rm -f "$target_file"
+        exit 1
+    fi
+}
+
+# download and verify all compiler archives (including cached retries)
+fetch_if_missing "gcc-$GCC_VERSION.tar.gz" "https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz"
+fetch_if_missing "gcc-$GCC_VERSION.tar.gz.sig" "https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz.sig"
+gpg --keyserver keyserver.ubuntu.com --recv-keys 6C35B99309B5FA62
+verify_or_purge "gcc-$GCC_VERSION.tar.gz" gpg --verify "gcc-$GCC_VERSION.tar.gz.sig" "gcc-$GCC_VERSION.tar.gz"
+
+fetch_if_missing "binutils-$BINUTILS_VERSION.tar.gz" "https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz"
+fetch_if_missing "binutils-$BINUTILS_VERSION.tar.gz.sig" "https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz.sig"
+gpg --keyserver keyserver.ubuntu.com --recv-keys 3A24BC1E8FB409FA9F14371813FCEF89DD9E3C4F
+verify_or_purge "binutils-$BINUTILS_VERSION.tar.gz" gpg --verify "binutils-$BINUTILS_VERSION.tar.gz.sig" "binutils-$BINUTILS_VERSION.tar.gz"
+
+fetch_if_missing "gdb-$GDB_VERSION.tar.gz" "https://sourceware.org/pub/gdb/releases/gdb-$GDB_VERSION.tar.gz"
+fetch_if_missing "sha512.sum" "https://sourceware.org/pub/gdb/releases/sha512.sum"
+verify_or_purge "gdb-$GDB_VERSION.tar.gz" bash -o pipefail -c "grep ' gdb-$GDB_VERSION\\.tar\\.gz\$' sha512.sum | sha512sum -c -"
+
+fetch_if_missing "cmake-$CMAKE_VERSION.tar.gz" "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION.tar.gz"
+CMAKE_SHA256="8d3537b7b7732660ea247398f166be892fe6131d63cc291944b45b91279f3ffb"
+verify_or_purge "cmake-$CMAKE_VERSION.tar.gz" bash -o pipefail -c "echo '$CMAKE_SHA256  cmake-$CMAKE_VERSION.tar.gz' | sha256sum -c -"
+
+fetch_if_missing "cppcheck-$CPPCHECK_VERSION.tar.gz" "https://github.com/danmar/cppcheck/archive/refs/tags/$CPPCHECK_VERSION.tar.gz"
 if [ ! -d llvmorg-$LLVM_VERSION ]; then
     git clone --depth 1 --branch llvmorg-$LLVM_VERSION https://github.com/llvm/llvm-project.git llvmorg-$LLVM_VERSION
 fi
-if [ ! -f pahole-gdb-master.zip ]; then
-    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip
-fi
-if [ ! -f swig-$SWIG_VERSION.tar.gz ]; then
-    wget https://github.com/swig/swig/archive/refs/tags/v$SWIG_VERSION.tar.gz -O swig-$SWIG_VERSION.tar.gz
-fi
+PAHOLE_SHA256="7abd613e4dfabeb46d8ef312ef85b280808a369301db21cb7c2b76a6660b53de"
+fetch_if_missing "pahole-gdb-master.zip" "https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip"
+verify_or_purge "pahole-gdb-master.zip" bash -o pipefail -c "echo '$PAHOLE_SHA256  pahole-gdb-master.zip' | sha256sum -c -"
+fetch_if_missing "swig-$SWIG_VERSION.tar.gz" "https://github.com/swig/swig/archive/refs/tags/v$SWIG_VERSION.tar.gz"
 
 # verify all archives
 # NOTE: Verification can fail if the archive is signed by another developer. I
@@ -543,7 +566,7 @@ if [[ ! -d "swig-$SWIG_VERSION/install" ]]; then
 fi
 
 log_tool_name "LLVM $LLVM_VERSION"
-if [[ ! -f "$PREFIX/bin/clang" ]]; then
+if [[ ! -f "$PREFIX/bin/clang" || ( "$TOOLCHAIN_STDCXX" = "libc++" && ! -d "$PREFIX/include/c++/v1" ) ]]; then
     if [[ -d llvmorg-$LLVM_VERSION ]]; then
         rm -rf llvmorg-$LLVM_VERSION
     fi
@@ -644,10 +667,10 @@ fi
 if [[ ! -f "$PREFIX/activate" ]]; then
     cat >$PREFIX/activate <<EOF
 # Detect the shell
-if [ -n "\$BASH_VERSION" ]; then
+if [ -n "\${BASH_VERSION:-}" ]; then
     current_shell="bash"
     SCRIPT_SOURCE="\${BASH_SOURCE[0]}"
-elif [ -n "\$ZSH_VERSION" ]; then
+elif [ -n "\${ZSH_VERSION:-}" ]; then
     current_shell="zsh"
     SCRIPT_SOURCE="\${(%):-%N}"
 else
@@ -655,8 +678,8 @@ else
     return 1 2>/dev/null || exit 1
 fi
 
-readonly SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${SCRIPT_SOURCE}" )" &> /dev/null && pwd )
-PREFIX=\$SCRIPT_DIR
+PREFIX="\$( cd -- "\$( dirname -- "\${SCRIPT_SOURCE}" )" &> /dev/null && pwd )"
+unset SCRIPT_SOURCE
 
 # This file must be used with "source /path/to/toolchain/activate" *from bash*
 # You can't run it directly!
@@ -665,7 +688,7 @@ env_error="You already have an active virtual environment!"
 
 # zsh does not recognize the option -t of the command type
 # therefore we use the alternative whence -w
-if [[ "\$ZSH_NAME" == "zsh" ]]; then
+if [[ "\$current_shell" == "zsh" ]]; then
     # check for active virtual environments
     if [ "\$( whence -w deactivate )" != "deactivate: none" ]; then
         echo \$env_error
@@ -681,26 +704,27 @@ else
 fi
 
 # check that we aren't root
-if [[ "\$USER" == "root" ]]; then
+if [[ "\${USER:-}" == "root" ]]; then
     echo "You shouldn't use the toolchain as root!"
     return 0
 fi
 
 # save original environment
-export ORIG_PATH=\$PATH
-export ORIG_PS1=\$PS1
-export ORIG_LD_LIBRARY_PATH=\$LD_LIBRARY_PATH
-export ORIG_CXXFLAGS=\$CXXFLAGS
-export ORIG_CFLAGS=\$CFLAGS
+export ORIG_PATH=\${PATH:-}
+export ORIG_PS1=\${PS1:-}
+export ORIG_LD_LIBRARY_PATH=\${LD_LIBRARY_PATH:-}
+export ORIG_CXXFLAGS=\${CXXFLAGS:-}
+export ORIG_CFLAGS=\${CFLAGS:-}
 
 # activate new environment
-export PATH=\$PREFIX:\$PREFIX/bin:\$PATH
-export PS1="($NAME) \$PS1"
+export PATH=\$PREFIX:\$PREFIX/bin:\${PATH:-}
+export PS1="($NAME) \${PS1:-}"
 export LD_LIBRARY_PATH=\$PREFIX/lib:\$PREFIX/lib64
-export CXXFLAGS=-isystem\ \$PREFIX/include\ \$CXXFLAGS
-export CFLAGS=-isystem\ \$PREFIX/include\ \$CFLAGS
+export CXXFLAGS=-isystem\ \$PREFIX/include\ \${CXXFLAGS:-}
+export CFLAGS=-isystem\ \$PREFIX/include\ \${CFLAGS:-}
 export MG_TOOLCHAIN_ROOT=\$PREFIX
 export MG_TOOLCHAIN_VERSION=$TOOLCHAIN_VERSION
+unset current_shell env_error PREFIX
 
 # disable root
 function su () {
@@ -714,13 +738,13 @@ function sudo () {
 
 # create deactivation function
 function deactivate() {
-    export PATH=\$ORIG_PATH
-    export PS1=\$ORIG_PS1
-    export LD_LIBRARY_PATH=\$ORIG_LD_LIBRARY_PATH
-    export CXXFLAGS=\$ORIG_CXXFLAGS
-    export CFLAGS=\$ORIG_CFLAGS
-    unset ORIG_PATH ORIG_PS1 ORIG_LD_LIBRARY_PATH ORIG_CXXFLAGS ORIG_CFLAGS
-    unset MG_TOOLCHAIN_ROOT MG_TOOLCHAIN_VERSION
+    export PATH=\${ORIG_PATH:-}
+    export PS1=\${ORIG_PS1:-}
+    export LD_LIBRARY_PATH=\${ORIG_LD_LIBRARY_PATH:-}
+    export CXXFLAGS=\${ORIG_CXXFLAGS:-}
+    export CFLAGS=\${ORIG_CFLAGS:-}
+    unset ORIG_PATH ORIG_PS1 ORIG_LD_LIBRARY_PATH ORIG_CXXFLAGS ORIG_CFLAGS 2>/dev/null || true
+    unset MG_TOOLCHAIN_ROOT MG_TOOLCHAIN_VERSION SCRIPT_DIR 2>/dev/null || true
     unset -f su sudo deactivate
 }
 EOF
@@ -858,7 +882,7 @@ if [[ ! -f libunwind-$LIBUNWIND_VERSION.tar.gz.asc ]]; then
     wget https://github.com/libunwind/libunwind/releases/download/v$LIBUNWIND_VERSION/libunwind-$LIBUNWIND_VERSION.tar.gz.asc
 fi
 $GPG --keyserver $KEYSERVER --recv-keys 0x75D2CFC56CC2E935A4143297015A268A17D55FA4
-$GPG --verify libunwind-$LIBUNWIND_VERSION.tar.gz.sig libunwind-$LIBUNWIND_VERSION.tar.gz
+$GPG --verify libunwind-$LIBUNWIND_VERSION.tar.gz.asc libunwind-$LIBUNWIND_VERSION.tar.gz
 
 # verify proxygen
 echo "$PROXYGEN_SHA256 proxygen-$FBLIBS_VERSION.tar.gz" | sha256sum -c
@@ -894,11 +918,11 @@ source $PREFIX/activate
 
 export CC=$PREFIX/bin/clang
 export CXX=$PREFIX/bin/clang++
-export CFLAGS="$CFLAGS -fPIC"
+export CFLAGS="${CFLAGS:-} -fPIC"
 if [ "$TOOLCHAIN_STDCXX" = "libstdc++" ]; then
-    export CXXFLAGS="$CXXFLAGS -fPIC"
+    export CXXFLAGS="${CXXFLAGS:-} -fPIC"
 else
-    export CXXFLAGS="$CXXFLAGS -fPIC -stdlib=libc++"
+    export CXXFLAGS="${CXXFLAGS:-} -fPIC -stdlib=libc++"
 fi
 
 # possible fix for debian 13 arm
@@ -908,8 +932,8 @@ else
     export EXTRA_CLANG_TOOLCHAIN_FLAGS="--gcc-toolchain=$PREFIX --target=x86_64-linux-gnu"
 fi
 
-export CXXFLAGS="$CXXFLAGS $EXTRA_CLANG_TOOLCHAIN_FLAGS"
-export LDFLAGS="$LDFLAGS $EXTRA_CLANG_TOOLCHAIN_FLAGS"
+export CXXFLAGS="${CXXFLAGS:-} $EXTRA_CLANG_TOOLCHAIN_FLAGS"
+export LDFLAGS="${LDFLAGS:-} $EXTRA_CLANG_TOOLCHAIN_FLAGS"
 
 COMMON_CMAKE_FLAGS="-DCMAKE_INSTALL_PREFIX=$PREFIX
                     -DCMAKE_PREFIX_PATH=$PREFIX
@@ -1513,19 +1537,28 @@ cp -v $DIR/toolchain.cmake $PREFIX/
 mkdir -p output
 pushd output
 # Create the toolchain archive.
-if [[ ! -f "$NAME-binaries-$DISTRO_FULL_NAME.tar.gz" ]]; then
-    tar --owner=root --group=root -cpvzf "$NAME-binaries-$DISTRO_FULL_NAME.tar.gz" -C /opt $NAME
+ARCHIVE_FILE="$NAME-binaries-$DISTRO_FULL_NAME.tar.gz"
+if [[ -f "$ARCHIVE_FILE" ]] && ! (gzip -t "$ARCHIVE_FILE" >/dev/null 2>&1 && tar -tzf "$ARCHIVE_FILE" >/dev/null 2>&1); then
+    echo "Removing unreadable toolchain archive '$ARCHIVE_FILE' before rebuilding..."
+    rm -f "$ARCHIVE_FILE"
+fi
+if [[ ! -f "$ARCHIVE_FILE" ]]; then
+    rm -f "$ARCHIVE_FILE.tmp."*
+    tar --owner=root --group=root -cpvzf "$ARCHIVE_FILE.tmp.$$" -C /opt "$NAME"
+    gzip -t "$ARCHIVE_FILE.tmp.$$"
+    tar -tzf "$ARCHIVE_FILE.tmp.$$" >/dev/null
+    mv -f "$ARCHIVE_FILE.tmp.$$" "$ARCHIVE_FILE"
 else
-  echo "NOTE: Skipping archiving because the file already exists"
+    echo "NOTE: Skipping archiving because the file already exists"
 fi
 
 # output final instructions
 echo -e "\n\n"
 echo "All tools have been built. They are installed in '$PREFIX'."
-echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'build' directory."
+echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'output' directory."
 echo "If you want to install the packed tools you should execute the following command:"
 echo
-echo "    tar -xvzf output/$NAME-binaries.tar.gz -C /opt"
+echo "    tar -xvzf output/$ARCHIVE_FILE -C /opt"
 echo
 echo "Because the tools were built on this machine, you should probably change the permissions of the installation directory using:"
 echo

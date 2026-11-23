@@ -71,13 +71,16 @@ func testAll(tx neo4j.Transaction) (interface{}, error) {
 	node_value := node_record.(neo4j.Node)
 	fmt.Println("Record matched.")
 
+	if len(node_value.Labels) != 1 {
+	  return nil, fmt.Errorf("Data doesn't match.")
+	}
 	label := node_value.Labels[0]
 	name, err := neo4j.GetProperty[string](node_value, "name")
 	handle_if_error(err)
 	age, err := neo4j.GetProperty[int64](node_value, "age")
 	handle_if_error(err)
 
-	if label != "Person" && name != "Alice" && age != 22 {
+	if label != "Person" || name != "Alice" || age != 22 {
 	  return nil, fmt.Errorf("Data doesn't match.")
 	}
 

@@ -1,7 +1,35 @@
-import urllib.request
+"""
+Note: our implementation of xpath is different from neo4j,
+because python offers different support for xpath than java
+We cant have absolute paths
+And our xpath search starts from the root node,
+so ./something is equivalent to /root/something
+For example,
+python input : .//ZONE is equivalent to java input //ZONE
+https://docs.python.org/3/library/xml.etree.elementtree.html#xpath-support
+here are our avaliable xpath options
+"""
 
-import defusedxml.ElementTree as ET
-import mgp
+from io import DEFAULT_BUFFER_SIZE
+from time import monotonic as time_monotonic
+from urllib import request as urllib_request
+from urllib.parse import urlsplit
+
+from defusedxml import ElementTree as ET
+from mgp import (
+    Map as mgp_Map,
+    Record as mgp_Record,
+    function as mgp_function,
+    read_proc as mgp_read_proc,
+)
+
+DEFAULT_ARGUMENT_DICT = {}
+
+# A URL source is remote and unsized until it is read. These bounds own its acquisition: the whole fetch must finish
+# within the deadline (each blocking socket operation also times out at it), and the body may not exceed the byte
+# allowance. Parsing and output-map construction are linear in the admitted document, so the allowance bounds them too.
+XML_URL_TIMEOUT_SECONDS = 60.0
+XML_URL_MAX_BYTES = 64 * 1024 * 1024
 
 TYPE = "_type"
 TEXT = "_text"
@@ -9,43 +37,86 @@ CHILDREN = "_children"
 
 
 def parse_element(element, simple):
-    result = {TYPE: element.tag}
+    children = list(element)
+    children_name = "_" + str(element.tag) if simple else CHILDREN
+    reserved = {TYPE, TEXT, children_name}
 
+    result = {}
     attributes = element.attrib
     if attributes:
-        result.update(attributes)
+        for attr_key, attr_val in attributes.items():
+            if attr_key in reserved:
+                result[f"@{attr_key}"] = attr_val
+            else:
+                result[attr_key] = attr_val
+    result[TYPE] = element.tag
 
-    text_content = element.text
-    if text_content and text_content.strip():
-        result[TEXT] = text_content
+    text_segments = []
+    if element.text and element.text.strip():
+        text_segments.append(element.text)
+    for child in children:
+        if child.tail and child.tail.strip():
+            text_segments.append(child.tail)
+    if text_segments:
+        result[TEXT] = "".join(text_segments)
 
-    children = list(element)
     if children:
-        children_name = CHILDREN
-        if simple:
-            children_name = "_" + str(element.tag)
         result[children_name] = [parse_element(child, simple) for child in children]
 
     return result
 
 
-def xml_file_to_string(xml_file):
-    xml_string = ""
+def read_xml_file(xml_file: str) -> bytes:
+    """
+    Returns the file's original bytes so the XML parser sees exactly the document the string branch would: the
+    parser honors the declared encoding, and significant whitespace in text and attributes is preserved.
+    Whitespace-only presentation text is dropped afterwards by parse_element.
+    """
     try:
-        with open(xml_file, "r") as xml_file:
-            xml_string = xml_file.read().replace("\n", "").replace("  ", "")
-    except PermissionError:
+        with open(xml_file, "rb") as xml_stream:
+            xml_bytes = xml_stream.read()
+    except PermissionError as err:
         raise PermissionError(
-            "You don't have permissions to write into that file."
-            "Make sure to give the necessary permissions to user memgraph."
-        )
-    except Exception:
-        raise OSError("Could not open or write to file.")
-    return xml_string
+            "You don't have permissions to read that file. Make sure to give the necessary permissions to user memgraph."
+        ) from err
+    except OSError as err:
+        raise OSError(f"Could not open or read XML file {xml_file}: {err}") from err
+    return xml_bytes
 
 
-@mgp.function
-def parse(xml_input: str, simple: bool = False, path: str = "") -> mgp.Map:
+def fetch_xml_bytes(xml_url: str, headers: dict) -> bytes:
+    """
+    Fetches an XML document within XML_URL_TIMEOUT_SECONDS and XML_URL_MAX_BYTES, closing the response on every
+    path. read1 performs at most one blocking read per call, so the deadline is checked between bounded reads.
+    """
+    # Files load through the path parameter, so a URL is fetched only over HTTP or HTTPS.
+    if urlsplit(xml_url).scheme not in ("http", "https"):
+        raise ValueError(f"XML URL must use http or https: {xml_url}")
+    request = urllib_request.Request(xml_url, headers=headers)
+    deadline = time_monotonic() + XML_URL_TIMEOUT_SECONDS
+    chunks: list[bytes] = []
+    received_bytes = 0
+    try:
+        # The scheme check above admits only http and https, so urlopen never opens a local file or a custom scheme.
+        with urllib_request.urlopen(request, timeout=XML_URL_TIMEOUT_SECONDS) as response:  # nosec B310
+            while True:
+                chunk = response.read1(DEFAULT_BUFFER_SIZE)
+                if not chunk:
+                    break
+                received_bytes += len(chunk)
+                if received_bytes > XML_URL_MAX_BYTES:
+                    raise ValueError(f"XML response from {xml_url} exceeds {XML_URL_MAX_BYTES} bytes")
+                if time_monotonic() > deadline:
+                    raise TimeoutError(f"XML response did not complete within {XML_URL_TIMEOUT_SECONDS} seconds")
+                chunks.append(chunk)
+    except OSError as err:
+        raise ValueError(f"Error while fetching XML from {xml_url}: {err}") from err
+    xml_bytes = b"".join(chunks)
+    return xml_bytes
+
+
+@mgp_function
+def parse(xml_input: str, simple: bool = False, path: str = "") -> mgp_Map:
     """
     Function to parse xml string (or file) into a map.
 
@@ -66,12 +137,11 @@ def parse(xml_input: str, simple: bool = False, path: str = "") -> mgp.Map:
         mgp.Map -> XML file parsed as map
     """
 
-    root = None
-    parser = ET.DefusedXMLParser()
+    root = False
     if path:
-        root = ET.fromstring(xml_file_to_string(path), parser)
+        root = ET.fromstring(read_xml_file(path))
     else:
-        root = ET.fromstring(xml_input, parser)
+        root = ET.fromstring(xml_input)
     output_map = parse_element(root, simple)
     return output_map
 
@@ -79,37 +149,24 @@ def parse(xml_input: str, simple: bool = False, path: str = "") -> mgp.Map:
 def check_url(url):
     if not url.endswith(".xml"):
         raise ValueError("File must be xml!")
+    return False
 
 
 def xpath_search(root, xpath_expression):
     try:
         result = root.findall(xpath_expression)
         return result
-    except Exception as e:
-        raise ValueError(f"XPath search error: {e}")
+    except Exception as err:
+        raise ValueError(f"XPath search error: {err}") from err
 
 
-"""
-Note: our implementation of xpath is different from neo4j,
-because python offers different support for xpath than java
-We cant have absolute paths
-And our xpath search starts from the root node,
-so ./something is equivalent to /root/something
-For example,
-python input : .//ZONE is equivalent to java input //ZONE
-https://docs.python.org/3/library/xml.etree.elementtree.html#xpath-support
-here are our avaliable xpath options
-"""
-
-
-@mgp.read_proc
 def load(
     xml_url: str,
     simple: bool = False,
     path: str = "",
     xpath: str = "",
-    headers: mgp.Map = {},
-) -> mgp.Record(output_map=mgp.Map):
+    headers: mgp_Map = DEFAULT_ARGUMENT_DICT,
+) -> list:
     """
     Procedure to load XML from url or from file to a map.
 
@@ -137,24 +194,29 @@ def load(
         mgp.Map -> XML file or URL parsed as map.
         In case XPATH is active, a map of for each element will be returned.
     """
-    root = None
-    parser = ET.DefusedXMLParser()
+    if headers is DEFAULT_ARGUMENT_DICT:
+        headers = DEFAULT_ARGUMENT_DICT.copy()
+    root = False
     if path:
-        root = ET.fromstring(xml_file_to_string(path), parser)
+        root = ET.fromstring(read_xml_file(path))
     else:
         check_url(xml_url)
+        xml_bytes = fetch_xml_bytes(xml_url, headers)
         try:
-            request = urllib.request.Request(xml_url, headers=headers)
-            response = urllib.request.urlopen(request).read()
-            root = ET.fromstring(response)
-        except Exception as e:
-            raise ValueError(f"Error while fetching or parsing XML: {e}")
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError as err:
+            raise ValueError(f"Error while parsing XML from {xml_url}: {err}") from err
 
     if xpath:
         record_list = list()
         xpath_list = xpath_search(root, xpath)
         for element in xpath_list:
-            record_list.append(mgp.Record(output_map=parse_element(element, simple)))
+            record_list.append(mgp_Record(output_map=parse_element(element, simple)))
         return record_list
     output_map = parse_element(root, simple)
-    return mgp.Record(output_map=output_map)
+    computed_return_value = [mgp_Record(output_map=output_map)]
+    return computed_return_value
+
+
+load.__annotations__["return"] = mgp_Record(output_map=mgp_Map)
+load = mgp_read_proc(load)

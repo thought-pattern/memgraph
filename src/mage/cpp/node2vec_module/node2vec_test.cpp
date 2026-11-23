@@ -331,16 +331,27 @@ N2vGraph BuildProbGraph(bool is_directed) {
 }
 
 std::vector<double> Normalize(std::vector<double> v) {
+  double max_val = 0.0;
+  for (const double x : v) {
+    if (x > max_val) max_val = x;
+  }
+  if (max_val == 0.0) return v;
   double sum = 0.0;
-  for (const double x : v) sum += x;
+  for (double &x : v) {
+    x /= max_val;
+    sum += x;
+  }
   for (double &x : v) x /= sum;
   return v;
 }
 
 bool AllClose(const std::vector<double> &a, const std::vector<double> &b, double tol = 1e-9) {
   if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i)
-    if (std::fabs(a[i] - b[i]) > tol) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (!std::isfinite(a[i]) || !std::isfinite(b[i]) || !(std::fabs(a[i] - b[i]) <= tol)) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -432,9 +443,9 @@ TEST(N2vGraphTest, HasEdgeUndirected) {
 
 TEST(N2vGraphTest, NeighborsDirected) {
   auto g = BuildBasicGraph(true);
-  // Only nodes that are an edge source appear (5 and 6 are targets only).
+  // Sink vertices (5 and 6) stay in the node set with empty outgoing neighbor lists.
   const std::map<NodeId, std::vector<NodeId>> expected = {
-      {0, {1, 2, 4}}, {1, {5, 6}}, {2, {5}}, {3, {0}}, {4, {6}}, {7, {1, 5, 6}}};
+      {0, {1, 2, 4}}, {1, {5, 6}}, {2, {5}}, {3, {0}}, {4, {6}}, {5, {}}, {6, {}}, {7, {1, 5, 6}}};
   std::set<NodeId> expected_nodes;
   for (const auto &[node, nbrs] : expected) expected_nodes.insert(node);
   EXPECT_EQ(NodeSet(g), expected_nodes);

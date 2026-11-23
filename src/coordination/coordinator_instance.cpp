@@ -1594,6 +1594,12 @@ auto CoordinatorInstance::ChooseMostUpToDateInstance(
     dbs_info.try_emplace(db_uuid);
   }
 
+  if (dbs_info.empty()) {
+    spdlog::info("The newest instance is {} (by system committed timestamp; no databases present)",
+                 largest_sys_ts_instance->first);
+    return largest_sys_ts_instance->first;
+  }
+
   // Pre-process received failover data
   for (auto const &[instance_name, instance_info] : instances_info) {
     for (auto const &[db_uuid, num_committed_txns] : instance_info.dbs_info) {
@@ -1673,6 +1679,15 @@ auto CoordinatorInstance::ChooseMostUpToDateInstance(
         spdlog::info("Instance {} has the total sum of num_committed_txns larger than {}. It will be considered newer.",
                      instance_name,
                      newest_instance->first);
+        newest_instance.emplace(instance_name, cnt_newest_dbs);
+      } else if (total_instances_sum[instance_name] == total_instances_sum[newest_instance->first] &&
+                 instances_info.at(instance_name).last_committed_system_timestamp >
+                     instances_info.at(newest_instance->first).last_committed_system_timestamp) {
+        spdlog::info(
+            "Instance {} has a newer system committed timestamp than {} at equal data score. It will be considered "
+            "newer.",
+            instance_name,
+            newest_instance->first);
         newest_instance.emplace(instance_name, cnt_newest_dbs);
       }
     }

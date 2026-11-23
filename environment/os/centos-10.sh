@@ -75,8 +75,10 @@ setup_repos() {
     dnf config-manager --set-enabled crb
     # EPEL is required for, e.g. rpmlint, python3-virtualenv
     dnf install -y epel-release
-    # enable rpm fusion
-    dnf install --nogpgcheck -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm
+    # Authenticate RPM Fusion against the distribution-packaged signing key
+    dnf install -y distribution-gpg-keys
+    rpmkeys --import /usr/share/distribution-gpg-keys/rpmfusion/RPM-GPG-KEY-rpmfusion-free-el-10
+    dnf --setopt=localpkg_gpgcheck=1 install -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm
 }
 
 main "$@"

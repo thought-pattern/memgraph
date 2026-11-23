@@ -65,7 +65,7 @@ class RpcMessageDeliverer {
 
  private:
   auto GetRemainingFileSize() const -> std::optional<uint64_t>;
-  auto GetReqReader() const -> slk::Reader;
+  auto GetReqReader(size_t message_bytes) const -> slk::Reader;
 
   Server *server_;
   communication::InputStream *input_stream_;

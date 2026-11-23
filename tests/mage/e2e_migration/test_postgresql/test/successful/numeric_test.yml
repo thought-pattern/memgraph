@@ -10,5 +10,5 @@ query: |
   RETURN valueType(row.numeric_col) AS numeric_col_type, toString(row.numeric_col) AS numeric_col
 
 output:
-  - numeric_col_type: 'FLOAT'
-    numeric_col: '678.899999999999977'
+  - numeric_col_type: 'STRING'
+    numeric_col: '678.90'

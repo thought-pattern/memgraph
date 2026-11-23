@@ -100,7 +100,7 @@ EOF
 # Default values
 BUILD_TYPE="Release"
 TARGETS=()
-CMAKE_ARGS=""
+CMAKE_ARGS=()
 config_only=false
 keep_build=false
 skip_os_deps=false
@@ -212,12 +212,34 @@ while [[ $# -gt 0 ]]; do
             show_help
             ;;
         *)
-            # Capture any other arguments to pass to cmake
-            CMAKE_ARGS="$CMAKE_ARGS $1"
+            # Capture any other arguments to pass to cmake without word-splitting
+            CMAKE_ARGS+=("$1")
             shift
             ;;
     esac
 done
+
+cmake_arg_defined() {
+    local var_name="$1"
+    local i=0
+    local n=${#CMAKE_ARGS[@]}
+    while [[ $i -lt $n ]]; do
+        local arg="${CMAKE_ARGS[$i]}"
+        if [[ "$arg" == "-D" && $((i + 1)) -lt $n ]]; then
+            local next="${CMAKE_ARGS[$((i + 1))]}"
+            if [[ "$next" =~ ^[[:space:]]*${var_name}([[:space:]]*:[[:alnum:]_]+)?[[:space:]]*= ]]; then
+                return 0
+            fi
+            i=$((i + 2))
+            continue
+        fi
+        if [[ "$arg" =~ ^-D[[:space:]]*${var_name}([[:space:]]*:[[:alnum:]_]+)?[[:space:]]*= ]]; then
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
 
 # Job pools are cache variables, so an omitted flag keeps whatever the previous
 # configure left behind; pass 0 to go back to the memory-derived default.
@@ -228,43 +250,47 @@ for jobs in "$COMPILE_JOBS" "$LINK_JOBS"; do
     fi
 done
 if [[ -n "$COMPILE_JOBS" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_COMPILE_JOBS=$COMPILE_JOBS"
+    CMAKE_ARGS+=("-DMG_COMPILE_JOBS=$COMPILE_JOBS")
 fi
 if [[ -n "$LINK_JOBS" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_LINK_JOBS=$LINK_JOBS"
+    CMAKE_ARGS+=("-DMG_LINK_JOBS=$LINK_JOBS")
 fi
 if [[ ! "$RESERVE_CORES" =~ ^[0-9]+$ ]]; then
     echo "Error: --reserve-cores takes a non-negative integer (got '$RESERVE_CORES')" >&2
     exit 1
 fi
-if [[ ! "$CMAKE_ARGS" =~ MG_RESERVE_CORES ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_RESERVE_CORES=$RESERVE_CORES"
+if ! cmake_arg_defined "MG_RESERVE_CORES"; then
+    CMAKE_ARGS+=("-DMG_RESERVE_CORES=$RESERVE_CORES")
 fi
 
 # Stated explicitly either way, so dropping --no-job-memory-cap restores the
 # cap instead of inheriting the previous configure's OFF. A raw -D for the same
 # variable stays authoritative.
-if [[ ! "$CMAKE_ARGS" =~ MG_LIMIT_PARALLELISM_BY_MEMORY ]]; then
+if ! cmake_arg_defined "MG_LIMIT_PARALLELISM_BY_MEMORY"; then
     if [[ "$JOB_MEMORY_CAP" == "off" ]]; then
-        CMAKE_ARGS="$CMAKE_ARGS -DMG_LIMIT_PARALLELISM_BY_MEMORY=OFF"
+        CMAKE_ARGS+=("-DMG_LIMIT_PARALLELISM_BY_MEMORY=OFF")
     else
-        CMAKE_ARGS="$CMAKE_ARGS -DMG_LIMIT_PARALLELISM_BY_MEMORY=ON"
+        CMAKE_ARGS+=("-DMG_LIMIT_PARALLELISM_BY_MEMORY=ON")
     fi
 fi
 
-if [[ "$SPLIT_DEBUG" == "on" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_SPLIT_DEBUG=ON"
+if ! cmake_arg_defined "MG_SPLIT_DEBUG"; then
+    if [[ "$SPLIT_DEBUG" == "on" ]]; then
+        CMAKE_ARGS+=("-DMG_SPLIT_DEBUG=ON")
+    else
+        CMAKE_ARGS+=("-DMG_SPLIT_DEBUG=OFF")
+    fi
 fi
 
 if [[ "$FIPS" == "on" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_FIPS=ON"
+    CMAKE_ARGS+=("-DMG_FIPS=ON")
 fi
 
-if [[ ! "$CMAKE_ARGS" =~ MG_PYTHON_SUPPORT ]]; then
+if ! cmake_arg_defined "MG_PYTHON_SUPPORT"; then
     if [[ "$PYTHON_SUPPORT" == "off" ]]; then
-        CMAKE_ARGS="$CMAKE_ARGS -DMG_PYTHON_SUPPORT=OFF"
+        CMAKE_ARGS+=("-DMG_PYTHON_SUPPORT=OFF")
     else
-        CMAKE_ARGS="$CMAKE_ARGS -DMG_PYTHON_SUPPORT=ON"
+        CMAKE_ARGS+=("-DMG_PYTHON_SUPPORT=ON")
     fi
 fi
 
@@ -285,16 +311,16 @@ fi
 # cuGraph modules are part of MAGE, so --cugraph implies at least --mage on
 # (an explicit --mage only is respected).
 if [[ "$CUGRAPH" == "on" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_ENABLE_CUGRAPH=ON"
+    CMAKE_ARGS+=("-DMG_ENABLE_CUGRAPH=ON")
     if [[ "$MAGE" == "off" ]]; then
         MAGE=on
     fi
 fi
 
 if [[ "$MAGE" == "on" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_BUILD_MEMGRAPH=ON -DMG_BUILD_MAGE=ON"
+    CMAKE_ARGS+=("-DMG_BUILD_MEMGRAPH=ON" "-DMG_BUILD_MAGE=ON")
 elif [[ "$MAGE" == "off" ]]; then
-    CMAKE_ARGS="$CMAKE_ARGS -DMG_BUILD_MEMGRAPH=ON -DMG_BUILD_MAGE=OFF"
+    CMAKE_ARGS+=("-DMG_BUILD_MEMGRAPH=ON" "-DMG_BUILD_MAGE=OFF")
 fi
 
 # Map comma-separated --profiling tokens to CMake options.
@@ -302,8 +328,8 @@ if [[ -n "$PROFILING" ]]; then
     IFS=',' read -ra _profiling_modes <<< "$PROFILING"
     for mode in "${_profiling_modes[@]}"; do
         case "$mode" in
-            fp)  CMAKE_ARGS="$CMAKE_ARGS -DMG_PROFILE=ON" ;;
-            mem) CMAKE_ARGS="$CMAKE_ARGS -DMG_MEMORY_PROFILE=ON" ;;
+            fp)  CMAKE_ARGS+=("-DMG_PROFILE=ON") ;;
+            mem) CMAKE_ARGS+=("-DMG_MEMORY_PROFILE=ON") ;;
             "")  ;;
             *)   echo "Error: unknown --profiling mode '$mode' (valid: fp, mem)"; exit 1 ;;
         esac
@@ -415,7 +441,7 @@ DEV_SETUP_ARGS=()
 if [[ -n "${CI:-}" ]]; then
     DEV_SETUP_ARGS+=("--ci")
 fi
-bash ./init-dev "${DEV_SETUP_ARGS[@]}"
+bash ./init-dev ${DEV_SETUP_ARGS[@]+"${DEV_SETUP_ARGS[@]}"}
 
 if [[ -f "$VENV_DIR/bin/activate" ]]; then
     echo "Using existing virtual environment at $VENV_DIR"
@@ -449,30 +475,66 @@ conan config install conan_config
 # NOTE: also registered in release/package/mgbuild.sh — keep in sync
 conan remote add memgraph-recipes "$(pwd)/conan_recipes" -t local-recipes-index --force
 
-# Function to check if a CMake boolean variable is enabled
-# Handles various CMake boolean formats: ON, TRUE, YES, 1 (case insensitive)
-# Supports both -DVAR=VALUE and -D VAR=VALUE formats
+cmake_is_truthy() {
+    local raw
+    raw="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$raw" in
+        1|on|yes|true|y)
+            return 0
+            ;;
+        0|off|no|false|n|ignore|notfound|""|*-notfound)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# Function to check the effective final state of a CMake boolean variable
+# across CMAKE_ARGS (case-insensitive, last occurrence wins, supports -DVAR=VAL
+# and -D VAR=VAL).
 cmake_var_enabled() {
     local var_name="$1"
-    local args="$2"
-    # Match patterns like -DVAR=ON, -D VAR=ON, -DVAR:BOOL=TRUE, etc.
-    # Accepts ON, TRUE, YES, 1 as true values (case insensitive)
-    if [[ "$args" =~ -D[[:space:]]*${var_name}([[:space:]]*:[[:alnum:]]+)?[[:space:]]*=[[:space:]]*(ON|TRUE|YES|1) ]]; then
-        return 0
-    fi
-    return 1
+    local state=1
+    local i=0
+    local n=${#CMAKE_ARGS[@]}
+    while [[ $i -lt $n ]]; do
+        local arg="${CMAKE_ARGS[$i]}"
+        local spec=""
+        if [[ "$arg" == "-D" && $((i + 1)) -lt $n ]]; then
+            spec="${CMAKE_ARGS[$((i + 1))]}"
+            i=$((i + 2))
+        elif [[ "$arg" == -D* ]]; then
+            spec="${arg#-D}"
+            i=$((i + 1))
+        else
+            i=$((i + 1))
+            continue
+        fi
+        spec="${spec#"${spec%%[![:space:]]*}"}"
+        if [[ "$spec" =~ ^${var_name}([[:space:]]*:[[:alnum:]_]+)?[[:space:]]*=(.*)$ ]]; then
+            local val="${BASH_REMATCH[2]}"
+            if cmake_is_truthy "$val"; then
+                state=0
+            else
+                state=1
+            fi
+        fi
+    done
+    return $state
 }
 
 # Add sanitizer profiles based on CMAKE_ARGS
-if cmake_var_enabled "ASAN" "$CMAKE_ARGS"; then
+if cmake_var_enabled "ASAN"; then
     HOST_PROFILES+=("-pr:h" "add_asan")
     echo "ASAN enabled"
 fi
-if cmake_var_enabled "UBSAN" "$CMAKE_ARGS"; then
+if cmake_var_enabled "UBSAN"; then
     HOST_PROFILES+=("-pr:h" "add_ubsan")
     echo "UBSAN enabled"
 fi
-if cmake_var_enabled "TSAN" "$CMAKE_ARGS"; then
+if cmake_var_enabled "TSAN"; then
     HOST_PROFILES+=("-pr:h" "add_tsan")
     echo "TSAN enabled"
 fi
@@ -511,15 +573,31 @@ PRESET="conan-$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')"
 
 # Filter out sanitizer flags from CMAKE_ARGS since conanfile.py handles them automatically
 # via compiler settings (compiler.asan, compiler.ubsan, compiler.tsan)
-FILTERED_CMAKE_ARGS=""
-for arg in $CMAKE_ARGS; do
-    if [[ ! "$arg" =~ ^-D(ASAN|UBSAN|TSAN)(=|:|$) ]]; then
-        FILTERED_CMAKE_ARGS="$FILTERED_CMAKE_ARGS $arg"
+FILTERED_CMAKE_ARGS=()
+filter_idx=0
+filter_total=${#CMAKE_ARGS[@]}
+while [[ $filter_idx -lt $filter_total ]]; do
+    arg="${CMAKE_ARGS[$filter_idx]}"
+    if [[ "$arg" == "-D" && $((filter_idx + 1)) -lt $filter_total ]]; then
+        next_arg="${CMAKE_ARGS[$((filter_idx + 1))]}"
+        if [[ "$next_arg" =~ ^[[:space:]]*(ASAN|UBSAN|TSAN)([[:space:]]*:[[:alnum:]_]+)?([[:space:]]*=|$) ]]; then
+            filter_idx=$((filter_idx + 2))
+            continue
+        fi
+        FILTERED_CMAKE_ARGS+=("$arg" "$next_arg")
+        filter_idx=$((filter_idx + 2))
+        continue
     fi
+    if [[ "$arg" =~ ^-D[[:space:]]*(ASAN|UBSAN|TSAN)([[:space:]]*:[[:alnum:]_]+)?([[:space:]]*=|$) ]]; then
+        filter_idx=$((filter_idx + 1))
+        continue
+    fi
+    FILTERED_CMAKE_ARGS+=("$arg")
+    filter_idx=$((filter_idx + 1))
 done
 
 # Configure cmake with additional arguments (sanitizer flags automatically set by Conan)
-cmake --preset $PRESET $FILTERED_CMAKE_ARGS
+cmake --preset "$PRESET" ${FILTERED_CMAKE_ARGS[@]+"${FILTERED_CMAKE_ARGS[@]}"}
 
 if [[ "$config_only" = true ]]; then
     exit 0
@@ -539,6 +617,6 @@ fi
 
 cmake \
   --build build \
-  --preset $PRESET \
-  "${TARGET_ARGS[@]}" \
+  --preset "$PRESET" \
+  ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
   -j "$BUILD_JOBS"

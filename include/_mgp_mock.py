@@ -26,6 +26,10 @@ class ImmutableObjectError(Exception):
     pass
 
 
+class OutOfRangeError(Exception):
+    pass
+
+
 class LogicErrorError(Exception):
     pass
 
@@ -94,16 +98,10 @@ class Graph:
         self.nx = nx.freeze(self.nx)
 
     def _new_vertex_id(self):
-        if self._highest_vertex_id is None:
-            self._highest_vertex_id = max(vertex_id for vertex_id in self.nx.nodes)
-
-        return self._highest_vertex_id + 1
+        return self.highest_vertex_id + 1
 
     def _new_edge_id(self):
-        if self._highest_edge_id is None:
-            self._highest_edge_id = max(edge[EdgeConstants.I_KEY.value] for edge in self.nx.edges(keys=True))
-
-        return self._highest_edge_id + 1
+        return self.highest_edge_id + 1
 
     def create_vertex(self) -> "Vertex":
         vertex_id = self._new_vertex_id()
@@ -128,24 +126,29 @@ class Graph:
         return Edge((from_id, to_id, edge_id), self)
 
     def delete_vertex(self, vertex_id: int):
+        _ = self.highest_vertex_id
         self.nx.remove_node(vertex_id)
 
     def delete_edge(self, from_vertex_id: int, to_vertex_id: int, edge_id: int):
+        _ = self.highest_edge_id
         self.nx.remove_edge(from_vertex_id, to_vertex_id, edge_id)
 
     @property
     def highest_vertex_id(self) -> int:
         if self._highest_vertex_id is None:
-            self._highest_vertex_id = max(vertex_id for vertex_id in self.nx.nodes) + 1
+            self._highest_vertex_id = max(self.nx.nodes, default=-1)
 
         return self._highest_vertex_id
 
     @property
     def highest_edge_id(self) -> int:
         if self._highest_edge_id is None:
-            self._highest_edge_id = max(edge[EdgeConstants.I_KEY.value] for edge in self.nx.edges(keys=True))
+            self._highest_edge_id = max(
+                (edge[EdgeConstants.I_KEY.value] for edge in self.nx.edges(keys=True)),
+                default=-1,
+            )
 
-        return self._highest_edge_id + 1
+        return self._highest_edge_id
 
 
 class Vertex:
@@ -180,28 +183,30 @@ class Vertex:
         return not nx.is_frozen(self._graph.nx)
 
     @property
-    def labels(self) -> typing.List[int]:
-        return self._graph.nx.nodes[self._id][NX_LABEL_ATTR].split(":")
+    def labels(self) -> typing.List[str]:
+        raw = self._graph.nx.nodes[self._id].get(NX_LABEL_ATTR)
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            return list(dict.fromkeys(part for part in raw.split(":") if part))
+        return list(dict.fromkeys(str(part) for part in raw if part))
 
-    def add_label(self, label: str) -> None:
+    def add_label(self, label: typing.Any) -> None:
         if nx.is_frozen(self._graph.nx):
             raise ImmutableObjectError("Cannot modify immutable object.")
 
-        self._graph.nx.nodes[self._id][NX_LABEL_ATTR] += f":{label}"
+        label_name = label.name if hasattr(label, "name") else str(label)
+        current = self.labels
+        if label_name and label_name not in current:
+            current.append(label_name)
+        self._graph.nx.nodes[self._id][NX_LABEL_ATTR] = current
 
-    def remove_label(self, label: str) -> None:
+    def remove_label(self, label: typing.Any) -> None:
         if nx.is_frozen(self._graph.nx):
             raise ImmutableObjectError("Cannot modify immutable object.")
 
-        labels = self._graph.nx.nodes[self._id][NX_LABEL_ATTR]
-        if labels.startswith(f"{label}:"):
-            labels = "\n" + labels  # pseudo-string starter
-            self._graph.nx.nodes[self._id][NX_LABEL_ATTR] = labels.replace(f"\n{label}:", "")
-        elif labels.endswith(f":{label}"):
-            labels += "\n"  # pseudo-string terminator
-            self._graph.nx.nodes[self._id][NX_LABEL_ATTR] = labels.replace(f":{label}\n", "")
-        else:
-            self._graph.nx.nodes[self._id][NX_LABEL_ATTR] = labels.replace(f":{label}:", ":")
+        label_name = label.name if hasattr(label, "name") else str(label)
+        self._graph.nx.nodes[self._id][NX_LABEL_ATTR] = [item for item in self.labels if item != label_name]
 
     @property
     def id(self) -> int:
@@ -212,14 +217,20 @@ class Vertex:
         return (
             (key, value)
             for key, value in self._graph.nx.nodes[self._id].items()
-            if key not in (NX_LABEL_ATTR, NX_TYPE_ATTR)
+            if key not in (NX_LABEL_ATTR, NX_TYPE_ATTR) and value is not None
         )
 
     def get_property(self, property_name: str):
-        return self._graph.nx.nodes[self._id][property_name]
+        value = self._graph.nx.nodes[self._id][property_name]
+        if value is None:
+            raise KeyError(property_name)
+        return value
 
     def set_property(self, property_name: str, value: object):
-        self._graph.nx.nodes[self._id][property_name] = value
+        if value is None:
+            self._graph.nx.nodes[self._id].pop(property_name, None)
+        else:
+            self._graph.nx.nodes[self._id][property_name] = value
 
     @property
     def in_edges(self) -> typing.Iterable["Edge"]:
@@ -290,14 +301,20 @@ class Edge:
         return (
             (key, value)
             for key, value in self._graph.nx.edges[self._edge].items()
-            if key not in (NX_LABEL_ATTR, NX_TYPE_ATTR)
+            if key not in (NX_LABEL_ATTR, NX_TYPE_ATTR) and value is not None
         )
 
     def get_property(self, property_name: str):
-        return self._graph.nx.edges[self._edge][property_name]
+        value = self._graph.nx.edges[self._edge][property_name]
+        if value is None:
+            raise KeyError(property_name)
+        return value
 
     def set_property(self, property_name: str, value: object):
-        self._graph.nx.edges[self._edge][property_name] = value
+        if value is None:
+            self._graph.nx.edges[self._edge].pop(property_name, None)
+        else:
+            self._graph.nx.edges[self._edge][property_name] = value
 
 
 class Path:
@@ -333,10 +350,15 @@ class Path:
         return not nx.is_frozen(self._graph.nx)
 
     def expand(self, edge: Edge):
-        if edge.start_id != self._vertices[-1]:
-            raise LogicErrorError("Logic error.")
+        last_vertex = self._vertices[-1]
+        if edge.end_id == last_vertex:
+            next_vertex = edge.start_id
+        elif edge.start_id == last_vertex:
+            next_vertex = edge.end_id
+        else:
+            raise LogicErrorError("The current last vertex in the path is not part of the given edge.")
 
-        self._vertices.append(edge.end_id)
+        self._vertices.append(next_vertex)
         self._edges.append((edge.start_id, edge.end_id, edge.id))
 
     def pop(self):

@@ -377,9 +377,9 @@ auto Socket::Write(const uint8_t *data, size_t len, bool have_more, std::optiona
         if (errno == ETIMEDOUT) {
           spdlog::warn("TCP_USER_TIMEOUT triggered on socket write (fd={}): unacknowledged data exceeded timeout",
                        socket_);
-        } else {
-          spdlog::warn("Socket write error (fd={}, errno={}): {}", socket_, errno, strerror(errno));
+          return std::unexpected{ClientCommunicationError::TIMEOUT_ERROR};
         }
+        spdlog::warn("Socket write error (fd={}, errno={}): {}", socket_, errno, strerror(errno));
         return std::unexpected{ClientCommunicationError::GENERIC_ERROR};
       }
       // Non-fatal error, retry after the socket is ready. This is here to
@@ -490,6 +490,10 @@ bool Socket::WaitForReadyWrite(std::optional<int> timeout_ms) const {
   }
   if (ret == 0) {
     spdlog::error("Waiting too long to get in ready state for writing. Timeout occurred.");
+    return false;
+  }
+  constexpr unsigned poll_err_mask = POLLERR | POLLHUP | POLLNVAL;
+  if (static_cast<unsigned>(p.revents) & poll_err_mask) {
     return false;
   }
   constexpr unsigned pollout = POLLOUT;

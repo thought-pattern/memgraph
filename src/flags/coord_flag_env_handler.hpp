@@ -11,8 +11,11 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace memgraph::flags {
 
@@ -40,6 +43,16 @@ struct CoordinationSetup {
   [[nodiscard]] auto IsDataInstanceManagedByCoordinator() const -> bool;
   [[nodiscard]] auto IsCoordinator() const -> bool;
 };
+
+struct CoordinationEnvInputs {
+  std::optional<std::string_view> management_port;
+  std::optional<std::string_view> coordinator_port;
+  std::optional<std::string_view> coordinator_id;
+  std::optional<std::string_view> nuraft_log_file;
+  std::optional<std::string_view> coordinator_hostname;
+};
+
+std::expected<CoordinationSetup, std::string> ParseCoordinationSetupFromEnv(const CoordinationEnvInputs &envs);
 
 auto CoordinationSetupInstance() -> CoordinationSetup &;
 

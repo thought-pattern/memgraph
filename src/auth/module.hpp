@@ -11,6 +11,8 @@
 
 #include <sys/types.h>
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -20,6 +22,14 @@
 #include <string>
 
 namespace memgraph::auth {
+
+inline constexpr size_t kMaxAuthModuleResponseBytes = 1024 * 1024;
+
+bool PutAuthModuleRequestWithDeadline(int fd, const nlohmann::json &data,
+                                      std::chrono::steady_clock::time_point deadline);
+nlohmann::json GetAuthModuleResponseWithDeadline(int fd, std::string &rx_buffer,
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 size_t max_response_bytes = kMaxAuthModuleResponseBytes);
 struct TargetArguments {
   std::filesystem::path module_executable_path;
   int pipe_to_module{-1};
@@ -65,6 +75,7 @@ class Module final {
   std::unique_ptr<TargetArguments> target_arguments_{new TargetArguments()};
   std::array<int, 2> pipe_to_module_ = {-1, -1};
   std::array<int, 2> pipe_from_module_ = {-1, -1};
+  std::string rx_buffer_;
 };
 
 }  // namespace memgraph::auth

@@ -5794,7 +5794,9 @@ void InMemoryStorage::InMemoryAccessor::DropGraph() {
   mem_storage->edge_count_.store(0, std::memory_order_release);
   mem_storage->description_store_.Clear();
 
-  memory::PurgeUnusedMemory();
+  if (!memory::PurgeUnusedMemory()) {
+    spdlog::warn("Failed to purge unused allocator memory after dropping graph.");
+  }
 }
 
 auto InMemoryStorage::InMemoryAccessor::PointVertices(LabelId label, PropertyId property, CoordinateReferenceSystem crs,

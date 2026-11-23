@@ -1,9 +1,10 @@
+"""Utilities for bfs weight min max."""
+
 from collections import deque
+from math import isfinite
 
-import mgp
 
-
-def BFS_find_weight_min_max(start_v: mgp.Vertex, edge_property: str) -> mgp.Number:
+def BFS_find_weight_min_max(start_v: object, edge_property: str) -> tuple[float, float]:
     """
     Breadth-first search for finding the largest and smallest edge weight,
     largest being used for capacity scaling, and smallest for lower bound
@@ -14,25 +15,55 @@ def BFS_find_weight_min_max(start_v: mgp.Vertex, edge_property: str) -> mgp.Numb
     :return: Number, the largest value of edge_property in graph
     """
 
+    if not isinstance(edge_property, str) or not edge_property:
+        raise ValueError("edge_property must be a nonempty string")
+    if not hasattr(start_v, "out_edges"):
+        raise TypeError("start_v must provide out_edges")
+    # Vertices are marked when discovered, not when dequeued, so a vertex reached from several parents is queued and
+    # scanned once and the work stays linear in reachable vertices and edges.
     next_queue = deque([start_v])
-    visited = set()
-    max_weight = 0
+    visited: set[object] = {start_v}
+    max_weight = float("-Inf")
     min_weight = float("Inf")
+    found_weight = False
 
     while next_queue:
         current_v = next_queue.popleft()
-        visited.add(current_v)
 
-        for e in current_v.out_edges:
+        out_edges = getattr(current_v, "out_edges", False)
+        if isinstance(out_edges, (bool, str, bytes)) or not hasattr(out_edges, "__iter__"):
+            raise TypeError("every traversed vertex must provide iterable out_edges")
+        for e in out_edges:
             # if there are edges without the given property, we ignore them,
             # in order to support heterogeneous graphs
-            if edge_property not in e.properties:
+            properties = getattr(e, "properties", False)
+            if (
+                isinstance(properties, (bool, str, bytes))
+                or not callable(getattr(properties, "get", False))
+                or not hasattr(properties, "__contains__")
+            ):
+                raise TypeError("every traversed edge must provide a property mapping")
+            if edge_property not in properties:
                 continue
 
-            max_weight = max(max_weight, e.properties[edge_property])
-            min_weight = min(min_weight, e.properties[edge_property])
+            weight = properties.get(edge_property, False)
+            if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                raise TypeError(f"edge property {edge_property!r} must be numeric")
+            # flow capacities: negative or non-finite values have no flow meaning
+            # and would break capacity scaling, zero means the edge carries no flow
+            if not isfinite(weight) or weight < 0:
+                raise ValueError(f"edge property {edge_property!r} must be a finite nonnegative capacity")
+            max_weight = max(max_weight, float(weight))
+            min_weight = min(min_weight, float(weight))
+            found_weight = True
 
-            if e.to_vertex not in visited:
-                next_queue.append(e.to_vertex)
+            to_vertex = getattr(e, "to_vertex", False)
+            if to_vertex is False:
+                raise TypeError("every traversed edge must provide to_vertex")
+            if to_vertex not in visited:
+                visited.add(to_vertex)
+                next_queue.append(to_vertex)
 
+    if not found_weight:
+        return 0.0, 0.0
     return max_weight, min_weight

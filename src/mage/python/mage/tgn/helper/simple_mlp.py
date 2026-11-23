@@ -1,10 +1,12 @@
-from typing import List
+"""Utilities for simple mlp."""
 
-import torch.nn as nn
+from torch import nn
 
 
 class MLP(nn.Module):
-    def __init__(self, dims: List[int]):
+    """Two-layer perceptron with the input, hidden and output widths given in dims."""
+
+    def __init__(self, dims: list[int]):
         super().__init__()
         assert len(dims) == 3
         self.fc1 = nn.Linear(dims[0], dims[1])
@@ -16,10 +18,13 @@ class MLP(nn.Module):
 
     def forward(self, data):
         h = self.act(self.fc1(data))
-        return self.fc2(h)
+        computed_return_value = self.fc2(h)
+        return computed_return_value
 
 
 class SimpleMLP(nn.Module):
+    """Two-layer perceptron that halves the input width in its hidden layer."""
+
     def __init__(self, dim_input, dim_output):
         super(SimpleMLP, self).__init__()
         self.fc1 = nn.Linear(dim_input, dim_input // 2)
@@ -31,4 +36,5 @@ class SimpleMLP(nn.Module):
 
     def forward(self, data):
         h = self.act(self.fc1(data))
-        return self.fc2(h).squeeze(dim=0)
+        computed_return_value = self.fc2(h).squeeze(dim=0)
+        return computed_return_value

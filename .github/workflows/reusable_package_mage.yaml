@@ -353,7 +353,7 @@ jobs:
         run: |
           artifact_name="$OS"
           artifact_dir='build/output'
-          if [[ "$ADDITIONAL_BUILD_ARGS" == *"--disable-jemalloc"* ]]; then
+          if [[ "$MALLOC" == "true" || "$ADDITIONAL_BUILD_ARGS" == *"--disable-jemalloc"* ]]; then
             artifact_name="${artifact_name}-malloc"
           fi
           if [[ "$ARCH" == 'arm' ]]; then
@@ -365,11 +365,11 @@ jobs:
       - name: Set Additional Build Args
         if: ${{ inputs.memgraph_download_link == '' }}
         run: |
-          if [[ -z "$ADDITIONAL_BUILD_ARGS" ]]; then
-            args="--disable-testing"
-          else
-            args="$ADDITIONAL_BUILD_ARGS --disable-testing"
+          args="${ADDITIONAL_BUILD_ARGS:-}"
+          if [[ "$MALLOC" == "true" && " $args " != *" --disable-jemalloc "* ]]; then
+            args="${args:+$args }--disable-jemalloc"
           fi
+          args="${args:+$args }--disable-testing"
           echo "ADDITIONAL_BUILD_ARGS=$args" >> $GITHUB_ENV
           echo "Final build args: $args"
 
@@ -653,8 +653,8 @@ jobs:
 
       - name: "Reuse memgraph build SBOM"
         # The memgraph package job already produced memgraph-build-sbom.json
-        # (conan + MGCXX) and uploaded it as the `memgraph-sbom` artifact. When
-        # this MAGE build runs in the same workflow run, reuse it instead of
+        # (conan + MGCXX) and uploaded it as the `memgraph-sbom-<arch>` artifact.
+        # When this MAGE build runs in the same workflow run, reuse it instead of
         # regenerating it in-container. A standalone MAGE run has no such
         # artifact, so the download fails and the next step regenerates it.
         id: reuse_memgraph_sbom
@@ -662,7 +662,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
         with:
-          name: memgraph-sbom
+          name: memgraph-sbom-${{ inputs.arch }}
           path: memgraph-sbom-artifact
 
       - name: "Stage reused memgraph build SBOM"
@@ -803,31 +803,32 @@ jobs:
           ./tools/ci/smoke_test_docker_image.sh "${DOCKER_REPOSITORY_NAME}:${DEBUG_IMAGE_TAG}"
 
       - name: Generate SBOM
-        if: ${{ inputs.generate_sbom == true }}
+        if: ${{ inputs.generate_sbom == true && env.BUILD_DOCKER_IMAGE != 'none' }}
         run: |
           ./release/package/mgbuild.sh \
             --toolchain $TOOLCHAIN \
             --os "$OS" \
             --arch $ARCH \
             generate-mage-image-sbom \
+            --docker-repository-name "$DOCKER_REPOSITORY_NAME" \
             --image-tag "$IMAGE_TAG" \
             --sbom-scripts-dir "${GITHUB_WORKSPACE}/infra/infosec/sbom/memgraph"
 
       - name: Upload SBOM to GitHub
-        if: ${{ inputs.generate_sbom == true }}
+        if: ${{ inputs.generate_sbom == true && env.BUILD_DOCKER_IMAGE != 'none' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
         with:
-          name: "mage-sbom"
+          name: "mage-sbom-${{ inputs.arch }}"
           path: "sbom/"
 
       - name: Upload SBOM to S3
-        if: ${{ inputs.generate_sbom == true && inputs.push_to_s3 == true && startsWith(inputs.ref, 'v') && contains(inputs.ref, '-rc') }}
+        if: ${{ inputs.generate_sbom == true && env.BUILD_DOCKER_IMAGE != 'none' && inputs.push_to_s3 == true && startsWith(inputs.ref, 'v') && contains(inputs.ref, '-rc') }}
         env:
           AWS_S3_BUCKET: deps.memgraph.io
           AWS_ACCESS_KEY_ID: ${{ secrets.S3_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: "eu-west-1"
-          S3_DEST_DIR: "${{ inputs.s3_dest_dir }}/sbom/"
+          S3_DEST_DIR: "${{ inputs.s3_dest_dir }}/sbom/${{ inputs.arch }}/"
         run: |
           aws s3 sync sbom/ "s3://$AWS_S3_BUCKET/$S3_DEST_DIR"
 
@@ -1080,17 +1081,30 @@ jobs:
       - name: Save docker image(s)
         if: ${{ (inputs.push_to_github || inputs.push_to_s3) && env.BUILD_DOCKER_IMAGE != 'none' }}
         run: |
+          set -euo pipefail
           mkdir -p output
+          save_archive() {
+            local image_ref="$1"
+            local out_path="$2"
+            if ! docker save "$image_ref" | gzip > "$out_path"; then
+              rm -f "$out_path"
+              return 1
+            fi
+            if [[ "$(gzip -dc "$out_path" | wc -c | tr -d ' ')" -eq 0 ]]; then
+              echo "Error: exported Docker archive '$out_path' is empty" >&2
+              rm -f "$out_path"
+              return 1
+            fi
+            du -h "$out_path"
+          }
           # Save every image this job produced. For build_docker_image=both
           # that's two tar.gz files (prod + relwithdebinfo) keyed by their
           # respective ARTIFACT_NAMEs; for prod/debug-only it's one.
           if [[ "$BUILD_DOCKER_IMAGE" == "prod" || "$BUILD_DOCKER_IMAGE" == "both" ]]; then
-            docker save ${DOCKER_REPOSITORY_NAME}:$PROD_IMAGE_TAG | gzip > output/${PROD_ARTIFACT_NAME}.tar.gz
-            du -h output/${PROD_ARTIFACT_NAME}.tar.gz
+            save_archive "${DOCKER_REPOSITORY_NAME}:${PROD_IMAGE_TAG}" "output/${PROD_ARTIFACT_NAME}.tar.gz"
           fi
           if [[ "$BUILD_DOCKER_IMAGE" == "debug" || "$BUILD_DOCKER_IMAGE" == "both" ]]; then
-            docker save ${DOCKER_REPOSITORY_NAME}:$DEBUG_IMAGE_TAG | gzip > output/${DEBUG_ARTIFACT_NAME}.tar.gz
-            du -h output/${DEBUG_ARTIFACT_NAME}.tar.gz
+            save_archive "${DOCKER_REPOSITORY_NAME}:${DEBUG_IMAGE_TAG}" "output/${DEBUG_ARTIFACT_NAME}.tar.gz"
           fi
 
       - name: "Run Docker smoke tests (prod)"
@@ -1144,11 +1158,18 @@ jobs:
           name: "${{ env.ARTIFACT_NAME }}-rpm"
           path: "output/memgraph-mage*.rpm"
 
+      - name: Push offline installer to GitHub
+        if: ${{ inputs.push_to_github && env.OFFLINE_INSTALLER != '' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+        with:
+          name: "${{ env.ARTIFACT_NAME }}-offline-installer"
+          path: "output/memgraph-mage-offline-*.run"
+
       - name: Push docker image to GitHub
         if: ${{ inputs.push_to_github && env.BUILD_DOCKER_IMAGE != 'none' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
         with:
-          name: "${{ env.IMAGE_TAG }}-docker"
+          name: "${{ env.ARTIFACT_NAME }}-docker"
           path: "output/mage-*.tar.gz"
 
       - name: Push to S3 with retry
@@ -1201,14 +1222,28 @@ jobs:
           base="https://s3.eu-west-1.amazonaws.com/deps.memgraph.io/$DEST_DIR"
           prod_url=""
           debug_url=""
+          primary_url=""
           if [[ "$BUILD_DOCKER_IMAGE" == "prod" || "$BUILD_DOCKER_IMAGE" == "both" ]]; then
             prod_url="$base/${S3_DIR_DOCKER_PROD}/${PROD_ARTIFACT_NAME}.tar.gz"
           fi
           if [[ "$BUILD_DOCKER_IMAGE" == "debug" || "$BUILD_DOCKER_IMAGE" == "both" ]]; then
             debug_url="$base/${S3_DIR_DOCKER_DEBUG}/${DEBUG_ARTIFACT_NAME}.tar.gz"
           fi
-          # S3_DIR_DOCKER is the dir matching ARTIFACT_NAME (see "Set S3 artifact dirs").
-          primary_url="$base/${S3_DIR_DOCKER}/${ARTIFACT_NAME}.tar.gz"
+          if [[ "$BUILD_DOCKER_IMAGE" == "prod" || "$BUILD_DOCKER_IMAGE" == "both" ]]; then
+            primary_url="$prod_url"
+          elif [[ "$BUILD_DOCKER_IMAGE" == "debug" ]]; then
+            primary_url="$debug_url"
+          else
+            deb_file="$(ls -1 output/memgraph-mage_*.deb 2>/dev/null | head -n 1 || true)"
+            rpm_file="$(ls -1 output/memgraph-mage-[0-9]*.rpm 2>/dev/null | head -n 1 || true)"
+            if [[ -n "$deb_file" ]]; then
+              enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$(basename "$deb_file")")"
+              primary_url="$base/${S3_DIR_DEB}/${enc}"
+            elif [[ -n "$rpm_file" ]]; then
+              enc="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$(basename "$rpm_file")")"
+              primary_url="$base/${S3_DIR_RPM}/${enc}"
+            fi
+          fi
           echo "s3_url=$primary_url" >> $GITHUB_OUTPUT
           echo "s3_url_prod=$prod_url" >> $GITHUB_OUTPUT
           echo "s3_url_debug=$debug_url" >> $GITHUB_OUTPUT

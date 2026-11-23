@@ -328,6 +328,13 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
     }
     spdlog::info("Database {} restored.", name);
   }
+  if (it.HasError()) {
+    durability_view_incomplete = true;
+    spdlog::error(
+        "Database catalog scan ended with a storage read error ({}); skipping unused-directory cleanup and profile "
+        "pruning so live tenant directories are preserved.",
+        it.ErrorMessage());
+  }
   // Set the cold-tenant gauge ONCE after the restore loop (a per-iteration Set would be repeatedly
   // overwritten; no scrape endpoint is live during construction anyway). Counts the cold-shell tenants
   // restored above (a failed HOT recovery aborts, so it never contributes a COLD entry here).
@@ -373,14 +380,18 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
     // Built from the durable key prefix, not Get_: Get_ is HOT-gated, so a suspended (COLD) tenant
     // would look absent and have its attachment pruned. A key also survives a value that failed to parse.
     std::set<std::string> live{std::string{kDefaultDB}};
-    for (auto pit = durability_->begin(std::string(kDBPrefix)), pend = durability_->end(std::string(kDBPrefix));
-         pit != pend;
-         ++pit) {
+    auto pit = durability_->begin(std::string(kDBPrefix));
+    const auto pend = durability_->end(std::string(kDBPrefix));
+    for (; pit != pend; ++pit) {
       live.insert(pit->first.substr(kDBPrefix.size()));
     }
-    const auto pruned = tenant_profiles_->PruneDatabases(live);
-    if (pruned != 0) {
-      spdlog::warn("Pruned {} tenant profile attachment(s) whose database no longer exists.", pruned);
+    if (pit.HasError() || durability_view_incomplete) {
+      spdlog::warn("Skipping tenant profile attachment pruning because the durable database catalog scan was incomplete.");
+    } else {
+      const auto pruned = tenant_profiles_->PruneDatabases(live);
+      if (pruned != 0) {
+        spdlog::warn("Pruned {} tenant profile attachment(s) whose database no longer exists.", pruned);
+      }
     }
   }
 
@@ -1304,7 +1315,9 @@ DbmsHandler::SuspendResult DbmsHandler::Suspend_(std::string_view name, system::
 
   // The database teardown frees its own arena, but many allocations remain in shared jemalloc arenas.
   // Force a global purge so SUSPEND returns only after the tenant's memory has been reclaimed.
-  memory::PurgeUnusedMemory();
+  if (!memory::PurgeUnusedMemory()) {
+    spdlog::warn("Failed to purge unused allocator memory after suspending database.");
+  }
 
   // The suspend is committed (tenant is COLD, in-memory storage and stream consumers dropped;
   // durable stream metadata persists for resume). Keep the streams stopped — do NOT run the undo guard.

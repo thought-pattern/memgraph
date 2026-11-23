@@ -148,7 +148,7 @@ class JemallocConan(ConanFile):
             enable_disable("debug", self.settings.build_type == "Debug"),
             enable_disable("cxx", self.options.enable_cxx),
             enable_disable("fill", self.options.enable_fill),
-            enable_disable("xmalloc", self.options.enable_cxx),
+            enable_disable("xmalloc", self.options.enable_xmalloc),
             enable_disable("readlinkat", self.options.enable_readlinkat),
             enable_disable("syscall", self.options.enable_syscall),
             enable_disable("lazy-lock", self.options.enable_lazy_lock),

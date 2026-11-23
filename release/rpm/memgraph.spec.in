@@ -106,14 +106,26 @@ chmod 750 /var/lib/memgraph || exit 1
 chown memgraph:adm /var/log/memgraph || exit 1
 chmod 750 /var/log/memgraph || exit 1
 
-# Generate SSL certificates
-if [ ! -d /etc/memgraph/ssl ]; then
-    mkdir /etc/memgraph/ssl || exit 1
-    openssl req -x509 -newkey rsa:4096 -days 3650 -nodes \
-        -keyout /etc/memgraph/ssl/key.pem -out /etc/memgraph/ssl/cert.pem \
+# Ensure SSL directory and certificates exist and are readable by memgraph
+mkdir -p /etc/memgraph/ssl || exit 1
+chown memgraph:memgraph /etc/memgraph/ssl || exit 1
+chmod 700 /etc/memgraph/ssl || exit 1
+if [ "${MG_SKIP_SSL_CERT_GEN:-}" = "1" ]; then
+    echo "NOTE: MG_SKIP_SSL_CERT_GEN=1 — skipping image-time TLS key generation." >&2
+elif [ -s /etc/memgraph/ssl/key.pem ] && [ -s /etc/memgraph/ssl/cert.pem ]; then
+    if ! su -s /bin/sh memgraph -c 'test -r /etc/memgraph/ssl/key.pem && test -r /etc/memgraph/ssl/cert.pem' 2>/dev/null; then
+        chown memgraph:memgraph /etc/memgraph/ssl/key.pem /etc/memgraph/ssl/cert.pem || exit 1
+        chmod 400 /etc/memgraph/ssl/key.pem /etc/memgraph/ssl/cert.pem || exit 1
+    fi
+else
+    rm -f /etc/memgraph/ssl/key.pem.tmp /etc/memgraph/ssl/cert.pem.tmp
+    openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+        -keyout /etc/memgraph/ssl/key.pem.tmp -out /etc/memgraph/ssl/cert.pem.tmp \
         -subj "/C=GB/ST=London/L=London/O=Memgraph Ltd./CN=Memgraph DB" || exit 1
-    chown memgraph:memgraph /etc/memgraph/ssl/* || exit 1
-    chmod 400 /etc/memgraph/ssl/* || exit 1
+    chown memgraph:memgraph /etc/memgraph/ssl/key.pem.tmp /etc/memgraph/ssl/cert.pem.tmp || exit 1
+    chmod 400 /etc/memgraph/ssl/key.pem.tmp /etc/memgraph/ssl/cert.pem.tmp || exit 1
+    mv -f /etc/memgraph/ssl/key.pem.tmp /etc/memgraph/ssl/key.pem || exit 1
+    mv -f /etc/memgraph/ssl/cert.pem.tmp /etc/memgraph/ssl/cert.pem || exit 1
 fi
 
 # Python-less builds (MG_PYTHON_SUPPORT=OFF, substituted by cpack) link no

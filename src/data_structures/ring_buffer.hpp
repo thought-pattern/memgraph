@@ -31,7 +31,10 @@
 template <typename TElement>
 class RingBuffer {
  public:
-  explicit RingBuffer(int capacity) : capacity_(capacity), buffer_{std::make_unique<TElement[]>(capacity_)} {}
+  explicit RingBuffer(int capacity)
+      : capacity_(capacity), buffer_{capacity > 0 ? std::make_unique<std::optional<TElement>[]>(capacity_) : nullptr} {
+    MG_ASSERT(capacity_ > 0, "RingBuffer capacity must be positive");
+  }
 
   RingBuffer(const RingBuffer &) = delete;
   RingBuffer(RingBuffer &&) = delete;
@@ -51,9 +54,9 @@ class RingBuffer {
       {
         auto guard = std::lock_guard{lock_};
         if (size_ < capacity_) {
-          buffer_[write_pos_++] = TElement(std::forward<TArgs>(args)...);
-          write_pos_ %= capacity_;
-          size_++;
+          buffer_[write_pos_].emplace(std::forward<TArgs>(args)...);
+          write_pos_ = (write_pos_ + 1) % capacity_;
+          ++size_;
           return;
         }
       }
@@ -70,17 +73,22 @@ class RingBuffer {
    * empty, nullopt is returned.
    */
   std::optional<TElement> pop() {
+    std::optional<TElement> result;
     auto guard = std::lock_guard{lock_};
-    if (size_ == 0) return std::nullopt;
-    size_--;
-    std::optional<TElement> result(std::move(buffer_[read_pos_++]));
-    read_pos_ %= capacity_;
+    if (size_ == 0) return result;
+    result.emplace(std::move(*buffer_[read_pos_]));
+    buffer_[read_pos_].reset();
+    read_pos_ = (read_pos_ + 1) % capacity_;
+    --size_;
     return result;
   }
 
   /** Removes all elements from the buffer. */
   void clear() {
     auto guard = std::lock_guard{lock_};
+    for (int idx = 0; idx < size_; ++idx) {
+      buffer_[(read_pos_ + idx) % capacity_].reset();
+    }
     read_pos_ = 0;
     write_pos_ = 0;
     size_ = 0;
@@ -88,7 +96,7 @@ class RingBuffer {
 
  private:
   int capacity_;
-  std::unique_ptr<TElement[]> buffer_;
+  std::unique_ptr<std::optional<TElement>[]> buffer_;
   memgraph::utils::SpinLock lock_;
   int read_pos_{0};
   int write_pos_{0};

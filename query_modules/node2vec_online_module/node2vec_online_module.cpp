@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <node2vec/word2vec.hpp>
@@ -30,7 +32,7 @@ constexpr const char *kResultEmbedding = "embedding";
 constexpr const char *kResultName = "name";
 constexpr const char *kResultValue = "value";
 
-// Persistent module-global state, shared across procedure invocations.
+// Persistent per-database state, isolated across databases and guarded by g_mtx.
 struct OnlineContext {
   std::unique_ptr<node2vec_alg::StreamWalkUpdater> updater;
   std::unique_ptr<node2vec_alg::Word2Vec> learner;
@@ -43,8 +45,10 @@ struct OnlineContext {
   }
 };
 
-OnlineContext g_ctx;  // NOSONAR: intentional mutable module state, persisted across procedure calls
-std::mutex g_mtx;     // NOSONAR: guards g_ctx; a mutex cannot be const
+std::unordered_map<std::string, OnlineContext> g_contexts;  // NOSONAR: per-database state persisted across calls
+std::mutex g_mtx;                                           // NOSONAR: guards g_contexts; a mutex cannot be const
+
+OnlineContext &ContextForGraph(mgp_graph *graph) { return g_contexts[mgp::GetDatabaseUuid(graph)]; }
 
 void CheckEnterprise() {
   if (!mgp_is_enterprise_valid()) {
@@ -65,7 +69,7 @@ void InsertMessage(mgp::RecordFactory &factory, const char *msg) {
   record.Insert(kResultMessage, msg);
 }
 
-void SetStreamwalkUpdater(mgp_list *args, mgp_graph * /*graph*/, mgp_result *result, mgp_memory *memory) {
+void SetStreamwalkUpdater(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   const mgp::MemoryDispatcherGuard guard(memory);
   try {
     CheckEnterprise();
@@ -73,7 +77,8 @@ void SetStreamwalkUpdater(mgp_list *args, mgp_graph * /*graph*/, mgp_result *res
     mgp::RecordFactory factory(result);
 
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_ctx.IsInitialized()) {
+    auto &ctx = ContextForGraph(memgraph_graph);
+    if (ctx.IsInitialized()) {
       InsertMessage(factory,
                     "StreamWalk updater is already initialized. Call: `CALL node2vec_online.reset() YIELD *;` in "
                     "order to set parameters again. Warning: all embeddings will be lost.");
@@ -90,7 +95,7 @@ void SetStreamwalkUpdater(mgp_list *args, mgp_graph * /*graph*/, mgp_result *res
       throw std::runtime_error("half_life must be positive.");
     }
 
-    g_ctx.updater = std::make_unique<node2vec_alg::StreamWalkUpdater>(
+    ctx.updater = std::make_unique<node2vec_alg::StreamWalkUpdater>(
         half_life, static_cast<int>(max_length), beta, cutoff, static_cast<int>(sampled_walks), full_walks);
     InsertMessage(factory, "Parameters for StreamWalk updater are set.");
   } catch (const std::exception &e) {
@@ -98,7 +103,7 @@ void SetStreamwalkUpdater(mgp_list *args, mgp_graph * /*graph*/, mgp_result *res
   }
 }
 
-void SetWord2vecLearner(mgp_list *args, mgp_graph * /*graph*/, mgp_result *result, mgp_memory *memory) {
+void SetWord2vecLearner(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   const mgp::MemoryDispatcherGuard guard(memory);
   try {
     CheckEnterprise();
@@ -106,7 +111,8 @@ void SetWord2vecLearner(mgp_list *args, mgp_graph * /*graph*/, mgp_result *resul
     mgp::RecordFactory factory(result);
 
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_ctx.IsInitialized()) {
+    auto &ctx = ContextForGraph(memgraph_graph);
+    if (ctx.IsInitialized()) {
       InsertMessage(factory,
                     "Word2Vec learner is already initialized. Call: `CALL node2vec_online.reset() YIELD *;` in order "
                     "to set parameters again. Warning: all embeddings will be lost.");
@@ -142,19 +148,19 @@ void SetWord2vecLearner(mgp_list *args, mgp_graph * /*graph*/, mgp_result *resul
       wp.hs = false;
     }
 
-    g_ctx.learner = std::make_unique<node2vec_alg::Word2Vec>(wp);
+    ctx.learner = std::make_unique<node2vec_alg::Word2Vec>(wp);
     InsertMessage(factory, "Parameters for Word2Vec learner are set.");
   } catch (const std::exception &e) {
     mgp::result_set_error_msg(result, e.what());
   }
 }
 
-void Reset(mgp_list * /*args*/, mgp_graph * /*graph*/, mgp_result *result, mgp_memory *memory) {
+void Reset(mgp_list * /*args*/, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   const mgp::MemoryDispatcherGuard guard(memory);
   try {
     CheckEnterprise();
     std::lock_guard<std::mutex> lock(g_mtx);
-    g_ctx.Reset();
+    g_contexts.erase(mgp::GetDatabaseUuid(memgraph_graph));
     mgp::RecordFactory factory(result);
     InsertMessage(factory, "Updater and learner are ready to be set again.");
   } catch (const std::exception &e) {
@@ -166,18 +172,18 @@ void Get(mgp_list * /*args*/, mgp_graph *memgraph_graph, mgp_result *result, mgp
   const mgp::MemoryDispatcherGuard guard(memory);
   try {
     CheckEnterprise();
-    mgp::Graph graph(memgraph_graph);
     mgp::RecordFactory factory(result);
 
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_ctx.IsInitialized()) {
+    auto &ctx = ContextForGraph(memgraph_graph);
+    if (!ctx.IsInitialized()) {
       throw std::runtime_error(
           "Learner or updater are not initialized. Initialize them by calling: `CALL "
           "node2vec_online.set_word2vec_learner() YIELD *;` and `CALL node2vec_online.set_streamwalk_updater() YIELD "
           "*;`");
     }
 
-    auto embeddings = g_ctx.learner->GetEmbeddings();
+    auto embeddings = ctx.learner->GetEmbeddings();
     // Emit rows in ascending node-id order; the embeddings map is unordered, so
     // otherwise the row order is arbitrary and shifts as the vocabulary rehashes
     // (mirrors the batch module's SortedNodeIds).
@@ -186,11 +192,18 @@ void Get(mgp_list * /*args*/, mgp_graph *memgraph_graph, mgp_result *result, mgp
     for (const auto &kv : embeddings) ids.push_back(kv.first);
     std::ranges::sort(ids);
     for (const int64_t id : ids) {
+      auto *raw_vertex = mgp::graph_get_vertex_by_id(memgraph_graph, mgp_vertex_id{.as_int = id}, memory);
+      if (raw_vertex == nullptr) {
+        continue;
+      }
+      mgp::Node node(raw_vertex);
+      mgp::vertex_destroy(raw_vertex);
+
       const auto &vec = embeddings.at(id);
       mgp::List emb(vec.size());
       for (const float x : vec) emb.AppendExtend(mgp::Value(static_cast<double>(x)));
       auto record = factory.NewRecord();
-      record.Insert(kResultNode, graph.GetNodeById(mgp::Id::FromInt(id)));
+      record.Insert(kResultNode, node);
       record.Insert(kResultEmbedding, emb);
     }
   } catch (const std::exception &e) {
@@ -206,7 +219,8 @@ void Update(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_m
     const mgp::Graph graph(memgraph_graph);
 
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_ctx.IsInitialized()) {
+    auto &ctx = ContextForGraph(memgraph_graph);
+    if (!ctx.IsInitialized()) {
       throw std::runtime_error(
           "Learner or updater are not initialized. Initialize them by calling: `CALL "
           "node2vec_online.set_word2vec_learner() YIELD *;` and `CALL node2vec_online.set_streamwalk_updater() YIELD "
@@ -215,14 +229,23 @@ void Update(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_m
 
     const auto current_time = static_cast<int64_t>(std::time(nullptr));
     auto edges = arguments[0].ValueList();
+    std::vector<std::pair<int64_t, int64_t>> batch_edges;
+    batch_edges.reserve(edges.Size());
     for (size_t i = 0; i < edges.Size(); ++i) {
       graph.CheckMustAbort();  // stay responsive to query termination / timeout
       auto rel = edges[i].ValueRelationship();
-      const int64_t source = rel.From().Id().AsInt();
-      const int64_t target = rel.To().Id().AsInt();
-      auto pairs = g_ctx.updater->ProcessNewEdge(source, target, current_time);
-      g_ctx.learner->PartialFit(pairs);
+      batch_edges.emplace_back(rel.From().Id().AsInt(), rel.To().Id().AsInt());
     }
+
+    auto staged_updater = std::make_unique<node2vec_alg::StreamWalkUpdater>(*ctx.updater);
+    auto staged_learner = std::make_unique<node2vec_alg::Word2Vec>(*ctx.learner);
+    for (const auto &[source, target] : batch_edges) {
+      graph.CheckMustAbort();
+      auto pairs = staged_updater->ProcessNewEdge(source, target, current_time);
+      staged_learner->PartialFit(pairs);
+    }
+    ctx.updater = std::move(staged_updater);
+    ctx.learner = std::move(staged_learner);
   } catch (const std::exception &e) {
     mgp::result_set_error_msg(result, e.what());
   }

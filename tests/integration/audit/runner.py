@@ -191,7 +191,7 @@ def execute_test(memgraph_binary, tester_binary):
         queries = []
         user_i = 0
         for line in reader:
-            timestamp, address, username, database, query, params = line
+            timestamp, address, username, impersonator, database, query, params = line
             params = json.loads(params)
             print(database, query, params)
             # Skip all databases switching queries
@@ -202,8 +202,12 @@ def execute_test(memgraph_binary, tester_binary):
                 assert (
                     username == users[user_i]
                 ), f"Logged incorrect user. Expecting '{users[user_i]}'; got '{username}'"
+                assert (
+                    impersonator == "admin"
+                ), f"Logged incorrect impersonator. Expecting 'admin'; got '{impersonator}'"
                 user_i = user_i + 1
                 continue
+            assert impersonator == "", f"Unexpected impersonator '{impersonator}' on non-impersonated query"
             # Append to list of all queries
             queries.append((database, query, params))
 

@@ -36,15 +36,15 @@ constexpr const char *kDefaultWeightProperty = "weight";
 const double kDefaultWeight = 1.0;
 
 void InsertLouvainRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, std::uint64_t node_id,
-                         std::uint64_t community) {
-  auto *vertex = mg_utility::GetNodeForInsertion(static_cast<int>(node_id), graph, memory);
+                         std::int64_t community) {
+  auto *vertex = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(node_id), graph, memory);
   if (!vertex) return;
 
   mgp_result_record *record = mgp::result_new_record(result);
   if (record == nullptr) throw mg_exception::NotEnoughMemoryException();
 
   mg_utility::InsertNodeValueResult(record, kFieldNode, vertex, memory);
-  mg_utility::InsertIntValueResult(record, kFieldCommunity, static_cast<int>(community), memory);
+  mg_utility::InsertIntValueResult(record, kFieldCommunity, community, memory);
 }
 
 void LouvainCommunityDetection(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory,
@@ -61,18 +61,41 @@ void LouvainCommunityDetection(mgp_list *args, mgp_graph *memgraph_graph, mgp_re
   auto min_graph_shrink = mgp::value_get_int(mgp::list_at(args, i++));
   auto community_alg_threshold = mgp::value_get_double(mgp::list_at(args, i++));
   auto coloring_alg_threshold = mgp::value_get_double(mgp::list_at(args, i++));
+  const int previous_omp_max_threads = std::max(1, omp_get_max_threads());
+  const mg_utility::OnScopeExit restore_omp_threads(
+      [previous_omp_max_threads] { omp_set_num_threads(previous_omp_max_threads); });
+  const auto host_max_threads =
+      static_cast<int64_t>(std::max(previous_omp_max_threads, std::max(1, omp_get_num_procs())));
   auto num_threads = mgp::value_get_int(mgp::list_at(args, i++));
-  num_threads = num_threads > omp_get_max_threads() ? omp_get_max_threads() : num_threads;
+  num_threads = num_threads > host_max_threads ? host_max_threads : num_threads;
   num_threads = std::max(num_threads, int64_t{1});
   auto louvain_graph =
       subgraph ? louvain_alg::GetLouvainSubgraph(
                      memory, memgraph_graph, subgraph_nodes, subgraph_relationships, weight_property, kDefaultWeight)
                : louvain_alg::GetLouvainGraph(memgraph_graph, memory, weight_property, kDefaultWeight);
   if (louvain_graph.edges.empty()) {
+    for (const auto &[memgraph_id, _] : louvain_graph.memgraph_id_to_id) {
+      if (mgp::must_abort(memgraph_graph)) [[unlikely]] {
+        throw mgp::TerminatedMustAbortException();
+      }
+      InsertLouvainRecord(memgraph_graph, result, memory, memgraph_id, -1);
+    }
     return;
   }
-  auto *grappolo_graph = static_cast<louvain_alg::GrappoloGraph *>(malloc(sizeof(louvain_alg::GrappoloGraph)));
+  auto *grappolo_graph = static_cast<louvain_alg::GrappoloGraph *>(calloc(1, sizeof(louvain_alg::GrappoloGraph)));
+  if (grappolo_graph == nullptr) {
+    throw mg_exception::NotEnoughMemoryException();
+  }
+  bool grappolo_owned_by_runner = false;
+  const mg_utility::OnScopeExit cleanup_grappolo_graph([&grappolo_graph, &grappolo_owned_by_runner] {
+    if (!grappolo_owned_by_runner && grappolo_graph != nullptr) {
+      free(grappolo_graph->edgeListPtrs);
+      free(grappolo_graph->edgeList);
+      free(grappolo_graph);
+    }
+  });
   louvain_alg::GetGrappoloSuitableGraph(*grappolo_graph, static_cast<int>(num_threads), louvain_graph);
+  grappolo_owned_by_runner = true;
   const auto communities = louvain_alg::GrappoloCommunityDetection(*grappolo_graph,
                                                                    memgraph_graph,
                                                                    coloring,
@@ -152,6 +175,7 @@ extern "C" int mgp_init_module(mgp_module *module, mgp_memory *memory) {
     mgp::value_destroy(default_min_graph_shrink);
     mgp::value_destroy(default_community_alg_threshold);
     mgp::value_destroy(default_coloring_alg_threshold);
+    mgp::value_destroy(default_num_threads);
   } catch (const std::exception &e) {
     return 1;
   }

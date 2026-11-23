@@ -74,22 +74,54 @@ def _is_numeric_list(value: Any) -> bool:
     return all(isinstance(v, (int, float)) for v in value)
 
 
-def _extract_features(
+def _extract_features_with_spec(
     items: List[Any],
     property_names: List[str],
-) -> List[List[float]]:
-    features = []
+) -> Tuple[List[List[float]], List[Dict[str, Any]]]:
+    spec: List[Dict[str, Any]] = []
+    for name in property_names:
+        present = [item.properties.get(name, None) for item in items if item.properties.get(name, None) is not None]
+        has_list = any(isinstance(val, (list, tuple)) for val in present)
+        if has_list:
+            if not all(_is_numeric_list(val) for val in present):
+                raise ValueError(f"Property {name!r} mixes list and non-numeric-list values across elements.")
+            widths = {len(val) for val in present}
+            if len(widths) > 1:
+                raise ValueError(f"Vector property {name!r} has inconsistent widths {sorted(widths)} across elements.")
+            width = next(iter(widths)) if widths else 0
+            is_int = bool(present) and all(
+                isinstance(elem, int) and not isinstance(elem, bool) for val in present for elem in val
+            )
+            spec.append({"name": name, "width": width, "is_list": True, "is_int": is_int})
+        else:
+            is_int = bool(present) and all(isinstance(val, int) and not isinstance(val, bool) for val in present)
+            spec.append({"name": name, "width": 1, "is_list": False, "is_int": is_int})
+
+    features: List[List[float]] = []
     for item in items:
         row: List[float] = []
         props = item.properties
-        for name in property_names:
+        for entry in spec:
+            name = entry["name"]
+            width = entry["width"]
             value = props.get(name, None)
-            if _is_numeric_list(value):
-                row.extend(float(v) for v in value)
+            if entry["is_list"]:
+                if value is None:
+                    row.extend([0.0] * width)
+                else:
+                    row.extend(float(v) for v in value)
             else:
                 num = _property_to_numeric(value)
                 row.append(num if num is not None else 0.0)
         features.append(row)
+    return features, spec
+
+
+def _extract_features(
+    items: List[Any],
+    property_names: List[str],
+) -> List[List[float]]:
+    features, _ = _extract_features_with_spec(items, property_names)
     return features
 
 
@@ -123,18 +155,49 @@ def _resolve_named_props(
     return props
 
 
+def _coerce_spec_number(value: Any, is_int: bool) -> Any:
+    if is_int and isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _resolve_feature_fallback(
     props: Dict[str, Any],
     feats: List[Any],
     property_names: Optional[List[str]],
+    feature_spec: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Fill property values from a feature vector for unresolved names."""
-    if property_names:
+    """Fill property values from a feature vector respecting recorded field widths."""
+    if feature_spec:
+        wanted = set(property_names) if property_names is not None else None
         col_idx = 0
-        for name in property_names:
+        for entry in feature_spec:
+            name = entry.get("name", "")
+            width = int(entry.get("width", 1))
+            is_list = bool(entry.get("is_list", False))
+            is_int = bool(entry.get("is_int", False))
+            if (wanted is None or name in wanted) and name not in props and col_idx + width <= len(feats):
+                if is_list:
+                    props[name] = [_coerce_spec_number(v, is_int) for v in feats[col_idx : col_idx + width]]
+                elif width == 1:
+                    props[name] = _coerce_spec_number(feats[col_idx], is_int)
+            col_idx += width
+        return props
+
+    if property_names:
+        if len(property_names) == 1 and len(feats) > 1:
+            only_name = property_names[0]
+            if only_name not in props:
+                props[only_name] = list(feats)
+            return props
+        unresolved = [name for name in property_names if name not in props]
+        if unresolved and len(feats) != len(property_names):
+            raise ValueError(
+                f"Feature vector length ({len(feats)}) does not match property_names ({len(property_names)}) without feature_spec."
+            )
+        for col_idx, name in enumerate(property_names):
             if name not in props and col_idx < len(feats):
                 props[name] = feats[col_idx]
-            col_idx += 1
     elif not props:
         props["features"] = feats
     return props
@@ -168,10 +231,14 @@ def _pyg_export_dict(
     }
 
     if node_property_names:
-        result["x"] = _extract_features(vertices, node_property_names)
+        x_feats, node_spec = _extract_features_with_spec(vertices, node_property_names)
+        result["x"] = x_feats
+        result["node_feature_spec"] = node_spec
 
     if edge_property_names:
-        result["edge_attr"] = _extract_features(included_edges, edge_property_names)
+        edge_feats, edge_spec = _extract_features_with_spec(included_edges, edge_property_names)
+        result["edge_attr"] = edge_feats
+        result["edge_feature_spec"] = edge_spec
 
     if node_label_property:
         result["y"] = [v.properties.get(node_label_property, None) for v in vertices]
@@ -194,6 +261,8 @@ def _pyg_import_data(
     num_nodes = pyg_dict.get("num_nodes", 0)
     x = pyg_dict.get("x")
     edge_attr = pyg_dict.get("edge_attr")
+    node_feature_spec = pyg_dict.get("node_feature_spec")
+    edge_feature_spec = pyg_dict.get("edge_feature_spec")
     y = pyg_dict.get("y")
     labels = pyg_dict.get("labels")
     edge_types = pyg_dict.get("edge_types")
@@ -211,7 +280,7 @@ def _pyg_import_data(
         if node_property_names:
             props = _resolve_named_props(pyg_dict, node_property_names, idx)
         if x is not None and idx < len(x):
-            props = _resolve_feature_fallback(props, x[idx], node_property_names)
+            props = _resolve_feature_fallback(props, x[idx], node_property_names, node_feature_spec)
         if y is not None and idx < len(y) and y[idx] is not None:
             props["y"] = y[idx]
         if idx_to_node_id:
@@ -224,6 +293,8 @@ def _pyg_import_data(
 
     src = edge_index[0] if edge_index else []
     dst = edge_index[1] if len(edge_index) > 1 else []
+    if len(src) != len(dst):
+        raise ValueError(f"PyG edge_index source ({len(src)}) and target ({len(dst)}) lengths differ.")
     edges_data: List[Dict[str, Any]] = []
     for ei, (si, di) in enumerate(zip(src, dst)):
         ed: Dict[str, Any] = {
@@ -231,11 +302,11 @@ def _pyg_import_data(
             "target_idx": di,
             "type": (edge_types[ei] if edge_types and ei < len(edge_types) else default_edge_type),
         }
-        props: Dict[str, Any] = {}
+        props = {}
         if edge_property_names:
             props = _resolve_named_props(pyg_dict, edge_property_names, ei)
         if edge_attr is not None and ei < len(edge_attr):
-            props = _resolve_feature_fallback(props, edge_attr[ei], edge_property_names)
+            props = _resolve_feature_fallback(props, edge_attr[ei], edge_property_names, edge_feature_spec)
 
         ed["properties"] = props
         edges_data.append(ed)
@@ -383,6 +454,15 @@ def _tf_export_dict(
     return {"schema": schema, "graph": graph}
 
 
+def _sum_component_sizes(sizes: List[Any], label: str) -> int:
+    total = 0
+    for component_size in sizes:
+        if isinstance(component_size, bool) or not isinstance(component_size, int) or component_size < 0:
+            raise ValueError(f"TF-GNN {label} component size must be a non-negative integer, got {component_size!r}.")
+        total += component_size
+    return total
+
+
 def _tf_import_data(
     tfgnn_dict: Dict[str, Any],
     default_node_label: str,
@@ -395,9 +475,9 @@ def _tf_import_data(
     nodes_data: List[Dict[str, Any]] = []
     for ns_name, ns_data in node_sets.items():
         sizes = ns_data.get("sizes", [])
-        size = sizes[0] if sizes else 0
+        size = _sum_component_sizes(sizes, f"node set {ns_name!r}") if sizes else 0
         feats = ns_data.get("features", {})
-        if size == 0 and feats:
+        if size == 0 and not sizes and feats:
             size = max(
                 (len(v) for v in feats.values()),
                 default=0,
@@ -425,9 +505,18 @@ def _tf_import_data(
         dst_set = dst_info.get("node_set_name", default_node_label)
         src_idx = src_info.get("indices", [])
         dst_idx = dst_info.get("indices", [])
+        if len(src_idx) != len(dst_idx):
+            raise ValueError(f"TF-GNN edge set {es_name!r} source ({len(src_idx)}) and target ({len(dst_idx)}) lengths differ.")
+        edge_sizes = es_data.get("sizes", [])
+        if edge_sizes:
+            expected_edges = _sum_component_sizes(edge_sizes, f"edge set {es_name!r}")
+            if expected_edges != len(src_idx):
+                raise ValueError(
+                    f"TF-GNN edge set {es_name!r} sizes sum ({expected_edges}) does not match adjacency length ({len(src_idx)})."
+                )
         feats = es_data.get("features", {})
         for ei, (si, di) in enumerate(zip(src_idx, dst_idx)):
-            props: Dict[str, Any] = {}
+            props = {}
             for fname, vals in feats.items():
                 if ei < len(vals) and vals[ei] is not None:
                     props[fname] = vals[ei]
@@ -493,6 +582,7 @@ def pyg_import(
         idx_to_node_id = pyg_dict.get("idx_to_node_id", {})
         num_nodes = pyg_dict.get("num_nodes", 0)
         x = pyg_dict.get("x")
+        node_feature_spec = pyg_dict.get("node_feature_spec")
         nodes_updated = 0
 
         for idx in range(num_nodes):
@@ -508,7 +598,7 @@ def pyg_import(
             if node_props:
                 props = _resolve_named_props(pyg_dict, node_props, idx)
             if x is not None and idx < len(x):
-                props = _resolve_feature_fallback(props, x[idx], node_props)
+                props = _resolve_feature_fallback(props, x[idx], node_props, node_feature_spec)
             for k, v in props.items():
                 vertex.properties.set(k, v)
 
@@ -545,15 +635,16 @@ def pyg_import(
     edges_created = 0
     for ed in edges_data:
         si, di = ed["source_idx"], ed["target_idx"]
-        if si in idx_to_vertex and di in idx_to_vertex:
-            e = ctx.graph.create_edge(
-                idx_to_vertex[si],
-                idx_to_vertex[di],
-                mgp.EdgeType(ed.get("type", default_edge_type)),
-            )
-            for k, v in ed.get("properties", {}).items():
-                e.properties.set(k, v)
-            edges_created += 1
+        if si not in idx_to_vertex or di not in idx_to_vertex:
+            raise ValueError(f"PyG edge endpoint ({si}, {di}) is outside imported node indices [0, {nodes_created}).")
+        e = ctx.graph.create_edge(
+            idx_to_vertex[si],
+            idx_to_vertex[di],
+            mgp.EdgeType(ed.get("type", default_edge_type)),
+        )
+        for k, v in ed.get("properties", {}).items():
+            e.properties.set(k, v)
+        edges_created += 1
 
     return mgp.Record(
         nodes_created=nodes_created,
@@ -618,7 +709,7 @@ def tf_import(
         sv = node_lookup.get((ss, si))
         dv = node_lookup.get((ds, di))
         if sv is None or dv is None:
-            continue
+            raise ValueError(f"TF-GNN edge endpoint (({ss!r}, {si}), ({ds!r}, {di})) does not match any imported node.")
         e = ctx.graph.create_edge(
             sv,
             dv,

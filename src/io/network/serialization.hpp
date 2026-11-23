@@ -17,15 +17,17 @@
 namespace memgraph::slk {
 
 inline void Save(const io::network::Endpoint &endpoint, Builder *builder) {
-  Save(endpoint.address_, builder);
-  Save(endpoint.port_, builder);
-  Save(endpoint.family_, builder);
+  Save(endpoint.GetAddress(), builder);
+  Save(endpoint.GetPort(), builder);
 }
 
 inline void Load(io::network::Endpoint *endpoint, Reader *reader) {
-  Load(&endpoint->address_, reader);
-  Load(&endpoint->port_, reader);
-  Load(&endpoint->family_, reader);
+  std::string address;
+  uint16_t port = 0;
+  Load(&address, reader);
+  Load(&port, reader);
+  endpoint->SetAddress(std::move(address));
+  endpoint->SetPort(port);
 }
 
 }  // namespace memgraph::slk

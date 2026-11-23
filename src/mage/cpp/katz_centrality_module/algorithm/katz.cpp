@@ -202,12 +202,12 @@ bool Converged(std::set<std::uint64_t> &active_nodes, std::uint64_t k, const dou
   }
 
   // Check if the top of the partial list has converged
-  const auto size = std::min(active_centrality.size(), k);
+  const auto size = std::min<std::size_t>(active_centrality.size(), static_cast<std::size_t>(k));
   for (std::size_t i = 1; i < size; i++) {
     const double u = ur.at(active_centrality[i].first);
     const double l = lr.at(active_centrality[i - 1].first);
 
-    if (u - epsilon >= l) {
+    if (!std::isfinite(u) || u - epsilon > l) {
       return false;
     }
   }
@@ -392,6 +392,9 @@ std::vector<std::pair<std::uint64_t, double>> GetKatz(const mg_graph::GraphView<
 
 std::vector<std::pair<std::uint64_t, double>> SetKatz(const mg_graph::GraphView<> &graph, const double alpha,
                                                       const double epsilon) {
+  if (!std::isfinite(epsilon) || epsilon < 0.0) {
+    throw std::invalid_argument("Katz centrality epsilon tolerance must be a finite non-negative number.");
+  }
   katz_alg::alpha = alpha;
   katz_alg::epsilon = epsilon;
   katz_alg::context.Init(graph);

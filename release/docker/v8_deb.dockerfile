@@ -112,7 +112,23 @@ RUN --mount=type=secret,id=ubuntu_sources,target=/ubuntu.sources,required=false 
   # MG_SKIP_PYTHON_DEPS: the postinst would pip-install the query-module
   # python deps into the image layer, duplicating what the python-base
   # stage already provides (COPYed into /home/memgraph/.local below).
-  MG_SKIP_PYTHON_DEPS=1 dpkg -i "${BINARY_NAME}${TARGETARCH}.deb" && \
+  # MG_SKIP_SSL_CERT_GEN: never bake a shared TLS key pair into the image;
+  # docker-entrypoint.sh provisions a unique pair per deployment at startup.
+  MG_SKIP_PYTHON_DEPS=1 MG_SKIP_SSL_CERT_GEN=1 dpkg -i "${BINARY_NAME}${TARGETARCH}.deb" && \
+  rm -f /etc/memgraph/ssl/key.pem /etc/memgraph/ssl/cert.pem && \
+  mkdir -p /etc/memgraph/ssl && chown memgraph:memgraph /etc/memgraph/ssl && chmod 700 /etc/memgraph/ssl && \
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'ssl_dir="/etc/memgraph/ssl"' \
+    'key_file="${ssl_dir}/key.pem"' \
+    'cert_file="${ssl_dir}/cert.pem"' \
+    'if { [ ! -s "$key_file" ] || [ ! -s "$cert_file" ]; } && command -v openssl >/dev/null 2>&1 && [ -d "$ssl_dir" ] && [ -w "$ssl_dir" ]; then' \
+    '  (umask 077; rm -f "${key_file}.tmp" "${cert_file}.tmp"; openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes -keyout "${key_file}.tmp" -out "${cert_file}.tmp" -subj "/C=GB/ST=London/L=London/O=Memgraph Ltd./CN=Memgraph DB" >/dev/null 2>&1 && chmod 400 "${key_file}.tmp" "${cert_file}.tmp" && mv -f "${key_file}.tmp" "$key_file" && mv -f "${cert_file}.tmp" "$cert_file")' \
+    'fi' \
+    'exec /usr/lib/memgraph/memgraph "$@"' \
+    > /usr/local/bin/docker-entrypoint.sh && \
+  chmod 755 /usr/local/bin/docker-entrypoint.sh && \
   apt remove adduser -y && \
   apt autoremove -y && \
   rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
@@ -141,7 +157,7 @@ COPY --from=python-base --chown=memgraph:memgraph /home/memgraph/.local /home/me
 USER memgraph
 WORKDIR /usr/lib/memgraph
 
-ENTRYPOINT ["/usr/lib/memgraph/memgraph"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD []
 
 ###############################################################################
@@ -294,7 +310,21 @@ RUN --mount=type=secret,id=ubuntu_sources,target=/ubuntu.sources,required=false 
     echo "# Include all memgraph documentation files (licenses, etc.)" >> /etc/dpkg/dpkg.cfg.d/excludes && \
     echo "path-include=/usr/share/doc/memgraph/*" >> /etc/dpkg/dpkg.cfg.d/excludes; \
   fi && \
-  MG_SKIP_PYTHON_DEPS=1 dpkg -i "${BINARY_NAME}${TARGETARCH}.deb" && \
+  MG_SKIP_PYTHON_DEPS=1 MG_SKIP_SSL_CERT_GEN=1 dpkg -i "${BINARY_NAME}${TARGETARCH}.deb" && \
+  rm -f /etc/memgraph/ssl/key.pem /etc/memgraph/ssl/cert.pem && \
+  mkdir -p /etc/memgraph/ssl && chown memgraph:memgraph /etc/memgraph/ssl && chmod 700 /etc/memgraph/ssl && \
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'ssl_dir="/etc/memgraph/ssl"' \
+    'key_file="${ssl_dir}/key.pem"' \
+    'cert_file="${ssl_dir}/cert.pem"' \
+    'if { [ ! -s "$key_file" ] || [ ! -s "$cert_file" ]; } && command -v openssl >/dev/null 2>&1 && [ -d "$ssl_dir" ] && [ -w "$ssl_dir" ]; then' \
+    '  (umask 077; rm -f "${key_file}.tmp" "${cert_file}.tmp"; openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes -keyout "${key_file}.tmp" -out "${cert_file}.tmp" -subj "/C=GB/ST=London/L=London/O=Memgraph Ltd./CN=Memgraph DB" >/dev/null 2>&1 && chmod 400 "${key_file}.tmp" "${cert_file}.tmp" && mv -f "${key_file}.tmp" "$key_file" && mv -f "${cert_file}.tmp" "$cert_file")' \
+    'fi' \
+    'exec /usr/lib/memgraph/memgraph "$@"' \
+    > /usr/local/bin/docker-entrypoint.sh && \
+  chmod 755 /usr/local/bin/docker-entrypoint.sh && \
   apt remove adduser -y && \
   apt autoremove -y && \
   rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
@@ -358,5 +388,5 @@ COPY --from=python-fips /usr/local/lib/python3.12/dist-packages /usr/local/lib/p
 USER memgraph
 WORKDIR /usr/lib/memgraph
 
-ENTRYPOINT ["/usr/lib/memgraph/memgraph"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD []

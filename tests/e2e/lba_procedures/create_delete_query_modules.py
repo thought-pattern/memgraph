@@ -55,7 +55,7 @@ def test_can_create_vertex_when_given_global_create(switch):
 
     result = execute_and_fetch_all(test_cursor, create_vertex_query)
 
-    len(result[0][0]) == 1
+    assert len(result) == 1 and len(result[0][0]) == 1
 
 
 @pytest.mark.parametrize("switch", [False, True])

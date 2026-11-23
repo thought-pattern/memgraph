@@ -554,6 +554,9 @@ mgp_value::mgp_value(double val, allocator_type alloc) noexcept
 mgp_value::mgp_value(const char *val, allocator_type alloc)
     : type(MGP_VALUE_TYPE_STRING), alloc(alloc), string_v(val, alloc) {}
 
+mgp_value::mgp_value(std::string_view val, allocator_type alloc)
+    : type(MGP_VALUE_TYPE_STRING), alloc(alloc), string_v(val.empty() ? "" : val.data(), val.size(), alloc) {}
+
 mgp_value::mgp_value(mgp_list *val, allocator_type alloc) noexcept
     : type(MGP_VALUE_TYPE_LIST), alloc(alloc), list_v(val) {
   MG_ASSERT(val->GetMemoryResource() == alloc.resource(),
@@ -1302,6 +1305,17 @@ DEFINE_MGP_VALUE_MAKE_WITH_MEMORY(int, int64_t);
 DEFINE_MGP_VALUE_MAKE_WITH_MEMORY(double, double);
 DEFINE_MGP_VALUE_MAKE_WITH_MEMORY(string, const char *);
 
+mgp_error mgp_value_make_string_with_size(const char *val, size_t size, mgp_memory *memory, mgp_value **result) {
+  return WrapExceptions(
+      [val, size, memory] {
+        if (size > 0 && val == nullptr) {
+          throw std::invalid_argument("Cannot construct a non-empty string value from a null pointer.");
+        }
+        return NewRawMgpObject<mgp_value>(memory, std::string_view{size == 0 ? "" : val, size});
+      },
+      result);
+}
+
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define DEFINE_MGP_VALUE_MAKE(type)                                                                             \
   mgp_error mgp_value_make_##type(mgp_##type *val, mgp_value **result) {                                        \
@@ -1377,6 +1391,12 @@ mgp_error mgp_value_get_double(mgp_value *val, double *result) {
 mgp_error mgp_value_get_string(mgp_value *val, const char **result) {
   static_assert(noexcept(val->string_v.c_str()));
   *result = val->string_v.c_str();
+  return mgp_error::MGP_ERROR_NO_ERROR;
+}
+
+mgp_error mgp_value_get_string_size(mgp_value *val, size_t *result) {
+  static_assert(noexcept(val->string_v.size()));
+  *result = val->string_v.size();
   return mgp_error::MGP_ERROR_NO_ERROR;
 }
 
@@ -1497,6 +1517,23 @@ mgp_error mgp_map_insert(mgp_map *map, const char *key, mgp_value *value) {
   });
 }
 
+mgp_error mgp_map_insert_with_size(mgp_map *map, const char *key, size_t key_size, mgp_value *value) {
+  return WrapExceptions([&] {
+    if (key_size > 0 && key == nullptr) {
+      throw std::invalid_argument("Cannot insert a map entry with a null key pointer and non-zero size.");
+    }
+    const std::string_view key_sv{key_size == 0 ? "" : key, key_size};
+    std::visit(
+        [key_sv, value](auto &items) {
+          auto emplace_result = items.emplace(key_sv, *value);
+          if (!emplace_result.second) {
+            throw KeyAlreadyExistsException{"Map already contains mapping for {}", key_sv};
+          }
+        },
+        map->items);
+  });
+}
+
 mgp_error mgp_map_insert_move(mgp_map *map, const char *key, mgp_value *value) {
   return WrapExceptions([&] {
     std::visit(
@@ -1518,6 +1555,24 @@ mgp_error mgp_map_update(mgp_map *map, const char *key, mgp_value *value) {
           if (!emplace_result.second) {
             items.erase(emplace_result.first);
             items.emplace(key, *value);
+          }
+        },
+        map->items);
+  });
+}
+
+mgp_error mgp_map_update_with_size(mgp_map *map, const char *key, size_t key_size, mgp_value *value) {
+  return WrapExceptions([&] {
+    if (key_size > 0 && key == nullptr) {
+      throw std::invalid_argument("Cannot update a map entry with a null key pointer and non-zero size.");
+    }
+    const std::string_view key_sv{key_size == 0 ? "" : key, key_size};
+    std::visit(
+        [key_sv, value](auto &items) {
+          auto emplace_result = items.emplace(key_sv, *value);
+          if (!emplace_result.second) {
+            items.erase(emplace_result.first);
+            items.emplace(key_sv, *value);
           }
         },
         map->items);
@@ -1551,6 +1606,23 @@ mgp_error mgp_map_erase(mgp_map *map, const char *key) {
   });
 }
 
+mgp_error mgp_map_erase_with_size(mgp_map *map, const char *key, size_t key_size) {
+  return WrapExceptions([&] {
+    if (key_size > 0 && key == nullptr) {
+      throw std::invalid_argument("Cannot erase a map entry with a null key pointer and non-zero size.");
+    }
+    const std::string_view key_sv{key_size == 0 ? "" : key, key_size};
+    std::visit(
+        [key_sv](auto &items) {
+          auto iterator = items.find(key_sv);
+          if (iterator != items.end()) {
+            items.erase(iterator);
+          }
+        },
+        map->items);
+  });
+}
+
 mgp_error mgp_map_size(mgp_map *map, size_t *result) {
   *result = std::visit([](const auto &items) { return items.size(); }, map->items);
   return mgp_error::MGP_ERROR_NO_ERROR;
@@ -1572,6 +1644,26 @@ mgp_error mgp_map_at(mgp_map *map, const char *key, mgp_value **result) {
       result);
 }
 
+mgp_error mgp_map_at_with_size(mgp_map *map, const char *key, size_t key_size, mgp_value **result) {
+  return WrapExceptions(
+      [map, key, key_size]() -> mgp_value * {
+        if (key_size > 0 && key == nullptr) {
+          throw std::invalid_argument("Cannot look up a map entry with a null key pointer and non-zero size.");
+        }
+        const std::string_view key_sv{key_size == 0 ? "" : key, key_size};
+        return std::visit(
+            [key_sv](const auto &items) -> mgp_value * {
+              auto found_it = items.find(key_sv);
+              if (found_it == items.end()) {
+                return nullptr;
+              }
+              return const_cast<mgp_value *>(&found_it->second);
+            },
+            map->items);
+      },
+      result);
+}
+
 mgp_error mgp_key_exists(mgp_map *map, const char *key, int *result) {
   return WrapExceptions(
       [map, key]() -> int {
@@ -1580,8 +1672,24 @@ mgp_error mgp_key_exists(mgp_map *map, const char *key, int *result) {
       result);
 }
 
+mgp_error mgp_key_exists_with_size(mgp_map *map, const char *key, size_t key_size, int *result) {
+  return WrapExceptions(
+      [map, key, key_size]() -> int {
+        if (key_size > 0 && key == nullptr) {
+          throw std::invalid_argument("Cannot check a map entry with a null key pointer and non-zero size.");
+        }
+        const std::string_view key_sv{key_size == 0 ? "" : key, key_size};
+        return std::visit([key_sv](const auto &items) -> int { return items.contains(key_sv); }, map->items);
+      },
+      result);
+}
+
 mgp_error mgp_map_item_key(mgp_map_item *item, const char **result) {
   return WrapExceptions([&item] { return item->key; }, result);
+}
+
+mgp_error mgp_map_item_key_size(mgp_map_item *item, size_t *result) {
+  return WrapExceptions([&item] { return item->key_size; }, result);
 }
 
 mgp_error mgp_map_item_value(mgp_map_item *item, mgp_value **result) {
@@ -1622,6 +1730,7 @@ mgp_error mgp_map_items_iterator_next(mgp_map_items_iterator *it, mgp_map_item *
         std::visit(
             [&it](auto &itr) mutable {
               it->current.key = itr->first.c_str();
+              it->current.key_size = itr->first.size();
               it->current.value = const_cast<mgp_value *>(&itr->second);
             },
             it->current_it);
@@ -3326,6 +3435,20 @@ mgp_error mgp_graph_get_vertex_by_id(mgp_graph *graph, mgp_vertex_id id, mgp_mem
       result);
 }
 
+mgp_error mgp_graph_get_database_uuid(mgp_graph *graph, mgp_memory *memory, mgp_value **result) {
+  return WrapExceptions(
+      [graph, memory]() -> mgp_value * {
+        const auto uuid_str = std::string(graph->getImpl()->GetStorageAccessor()->GetDatabaseUuid());
+        mgp_value *val = nullptr;
+        if (const auto err = mgp_value_make_string(uuid_str.c_str(), memory, &val);
+            err != mgp_error::MGP_ERROR_NO_ERROR) {
+          throw std::bad_alloc{};
+        }
+        return val;
+      },
+      result);
+}
+
 mgp_error mgp_create_label_index(mgp_graph *graph, const char *label, int *result) {
   return WrapExceptions(
       [graph, label]() {
@@ -3478,23 +3601,56 @@ mgp_error create_and_append_label_property_to_mgp_list(
         },
         graph->CheckedImpl());
 
-    // This is hack to avoid dealing with pairs
-    mgp_value *label_property = nullptr;
-    auto final_str = label_id_str + ":";
-    final_str += property_path_str;
-
-    if (const auto err_str = mgp_value_make_string(final_str.c_str(), memory, &label_property);
-        err_str != mgp_error::MGP_ERROR_NO_ERROR) {
-      throw std::logic_error(
-          "Creating a list of label+property pairs failed due to failure of creating label+property value");
+    mgp_list *pair_list = nullptr;
+    if (const auto err_pair_list = mgp_list_make_empty(2, memory, &pair_list);
+        err_pair_list != mgp_error::MGP_ERROR_NO_ERROR) {
+      throw std::logic_error("Creating a list of label+property pairs failed due to failure of creating an inner list");
     }
-    if (const auto err_list = mgp_list_append_extend(*result, label_property);
-        err_list != mgp_error::MGP_ERROR_NO_ERROR) {
+
+    mgp_value *label_val = nullptr;
+    if (const auto err_label = mgp_value_make_string(label_id_str.c_str(), memory, &label_val);
+        err_label != mgp_error::MGP_ERROR_NO_ERROR) {
+      mgp_list_destroy(pair_list);
+      throw std::logic_error("Creating a list of label+property pairs failed due to failure of creating label value");
+    }
+    if (const auto err_append_label = mgp_list_append_extend(pair_list, label_val);
+        err_append_label != mgp_error::MGP_ERROR_NO_ERROR) {
+      mgp_value_destroy(label_val);
+      mgp_list_destroy(pair_list);
+      throw std::logic_error("Creating a list of label+property pairs failed due to failure of appending label value");
+    }
+    mgp_value_destroy(label_val);
+
+    mgp_value *property_val = nullptr;
+    if (const auto err_prop = mgp_value_make_string(property_path_str.c_str(), memory, &property_val);
+        err_prop != mgp_error::MGP_ERROR_NO_ERROR) {
+      mgp_list_destroy(pair_list);
+      throw std::logic_error(
+          "Creating a list of label+property pairs failed due to failure of creating property value");
+    }
+    if (const auto err_append_prop = mgp_list_append_extend(pair_list, property_val);
+        err_append_prop != mgp_error::MGP_ERROR_NO_ERROR) {
+      mgp_value_destroy(property_val);
+      mgp_list_destroy(pair_list);
+      throw std::logic_error(
+          "Creating a list of label+property pairs failed due to failure of appending property value");
+    }
+    mgp_value_destroy(property_val);
+
+    mgp_value *pair_val = nullptr;
+    if (const auto err_pair_val = mgp_value_make_list(pair_list, &pair_val);
+        err_pair_val != mgp_error::MGP_ERROR_NO_ERROR) {
+      mgp_list_destroy(pair_list);
+      throw std::logic_error(
+          "Creating a list of label+property pairs failed due to failure of creating label+property list value");
+    }
+    if (const auto err_list = mgp_list_append_extend(*result, pair_val); err_list != mgp_error::MGP_ERROR_NO_ERROR) {
+      mgp_value_destroy(pair_val);
       throw std::logic_error(
           "Creating a list of label-property pairs due to failure of appending label+property value");
     }
 
-    mgp_value_destroy(label_property);
+    mgp_value_destroy(pair_val);
   });
 }
 
@@ -5961,24 +6117,25 @@ mgp_error mgp_execute_query(mgp_graph *graph, mgp_memory *memory, const char *qu
         auto query_string = std::string(query);
         auto &instance = memgraph::query::InterpreterContextHolder::GetInstance();
 
-        auto *result = NewRawMgpObject<mgp_execution_result>(memory->impl, graph);
-        result->pImpl->interpreter->SetUser(graph->ctx->user_or_role ? graph->ctx->user_or_role->clone() : nullptr);
+        auto owned_result = NewMgpObject<mgp_execution_result>(memory, graph);
+        owned_result->pImpl->interpreter->SetUser(
+            graph->ctx->user_or_role ? graph->ctx->user_or_role->clone() : nullptr);
 
         instance.interpreters.WithLock(
-            [result](auto &interpreters) { interpreters.insert(result->pImpl->interpreter.get()); });
+            [raw = owned_result.get()](auto &interpreters) { interpreters.insert(raw->pImpl->interpreter.get()); });
         auto query_params_func =
             [&](memgraph::storage::Storage const *) -> memgraph::storage::ExternalPropertyValue::map_t {
           return CreateQueryParams(params);
         };
-        auto prepare_query_result = result->pImpl->interpreter->Prepare(query_string, query_params_func, {});
+        auto prepare_query_result = owned_result->pImpl->interpreter->Prepare(query_string, query_params_func, {});
 
         memgraph::utils::pmr::vector<memgraph::utils::pmr::string> headers(memory->impl);
         for (const auto &header : prepare_query_result.headers) {
           headers.emplace_back(header);
         }
-        result->pImpl->headers = std::make_unique<mgp_execution_headers>(std::move(headers));
+        owned_result->pImpl->headers = std::make_unique<mgp_execution_headers>(std::move(headers));
 
-        return result;
+        return owned_result.release();
       },
       result);
 }
@@ -5992,11 +6149,7 @@ mgp_error mgp_pull_one(mgp_execution_result *exec_result, mgp_graph *graph, mgp_
       [exec_result, graph, memory]() -> mgp_map * {
         MgProcedureResultStream stream(memory);
 
-        try {
-          exec_result->pImpl->interpreter->Pull(&stream, 1, {});
-        } catch (const std::exception &e) {
-          return nullptr;
-        }
+        exec_result->pImpl->interpreter->Pull(&stream, 1, {});
 
         if (stream.rows.empty()) {
           return nullptr;

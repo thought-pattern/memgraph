@@ -97,10 +97,13 @@ class UserProfiles {
     [[nodiscard]] bool operator()(const Profile &lhs, const Profile &rhs) const { return lhs.name == rhs.name; }
 
     [[nodiscard]] bool operator()(const char *lhs, const Profile &rhs) const { return lhs == rhs.name; }
+    [[nodiscard]] bool operator()(const Profile &lhs, const char *rhs) const { return lhs.name == rhs; }
 
     [[nodiscard]] bool operator()(std::string_view lhs, const Profile &rhs) const { return lhs == rhs.name; }
+    [[nodiscard]] bool operator()(const Profile &lhs, std::string_view rhs) const { return lhs.name == rhs; }
 
     [[nodiscard]] bool operator()(const std::string &lhs, const Profile &rhs) const { return lhs == rhs.name; }
+    [[nodiscard]] bool operator()(const Profile &lhs, const std::string &rhs) const { return lhs.name == rhs; }
   };
 
   // Writes the profile, plus the stale spellings hidden from it at load so unrelated saves never rewrite them.
@@ -109,6 +112,15 @@ class UserProfiles {
   // Drops the user's stale spellings and rewrites the profiles that held them. Caller holds the unique lock.
   void Resolve(const std::string &folded);
 
+ public:
+  struct MemorySnapshot {
+    std::vector<Profile> profiles;
+    std::unordered_map<std::string, std::vector<std::string>> stale;
+  };
+  MemorySnapshot CaptureMemorySnapshot() const;
+  void RestoreMemorySnapshot(MemorySnapshot snapshot);
+
+ private:
   mutable utils::RWSpinLock mtx_;
   Repository *durability_;                                             // Reuse auth's durability
   std::unordered_set<Profile, profile_hash, profile_equal> profiles_;  // Local storage

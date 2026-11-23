@@ -15,14 +15,15 @@
 std::string Util::Md5(mgp::List arguments) {
   if (arguments[0].IsList()) {
     const mgp::List arg_list = arguments[0].ValueList();
-    std::string return_string;
+    MD5 hasher;
     for (auto value : arg_list) {
-      return_string += value.ToString();
+      const auto part = value.ToString();
+      hasher.update(part.data(), part.size());
     }
-
-    return md5(return_string);
+    hasher.finalize();
+    return hasher.hexdigest();
   }
-  auto string_value = std::string(arguments[0].ToString());
+  const auto string_value = arguments[0].ToString();
   return md5(string_value);
 }
 

@@ -21,6 +21,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, DockerMgBuild]
     outputs:
       pr_number: ${{ steps.get_pr.outputs.pr_number }}
+      pr_ref: ${{ steps.get_pr.outputs.pr_ref }}
       memgraph_download_link: ${{ steps.get_links.outputs.memgraph_download_link }}
       memgraph_debuginfo_download_link: ${{ steps.get_links.outputs.memgraph_debuginfo_download_link }}
     steps:
@@ -35,7 +36,10 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
           MERGED_PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGED_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             PR_NUMBER="$INPUT_PR_NUMBER"
             echo "Using manually provided PR number: $PR_NUMBER"
@@ -47,14 +51,36 @@ jobs:
             echo "PR number is not a number"
             exit 1
           fi
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
-          echo "PR Number: $PR_NUMBER"
+          PR_REF="$MERGED_COMMIT_SHA"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if ! pr_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json mergeCommit,headRefOid,isCrossRepository 2>/dev/null); then
+              echo "::error::Could not find PR #${PR_NUMBER} in ${GITHUB_REPOSITORY}."
+              exit 1
+            fi
+            merge_oid=$(jq -r '.mergeCommit.oid // empty' <<<"$pr_json")
+            head_oid=$(jq -r '.headRefOid // empty' <<<"$pr_json")
+            is_fork=$(jq -r '.isCrossRepository' <<<"$pr_json")
+            if [[ -n "$merge_oid" ]]; then
+              PR_REF="$merge_oid"
+            elif [[ "$is_fork" == "true" ]]; then
+              echo "::error::Unmerged PR #${PR_NUMBER} is from a fork; use Package mage (External) instead."
+              exit 1
+            elif [[ "$head_oid" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              PR_REF="$head_oid"
+            else
+              echo "::error::Could not resolve commit SHA for PR #${PR_NUMBER}."
+              exit 1
+            fi
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_ref=$PR_REF" >> "$GITHUB_OUTPUT"
+          echo "PR Number: $PR_NUMBER (ref: $PR_REF)"
 
       - name: Resolve memgraph package links
         # The merge queue run of Diff uploads the amd64 memgraph debs to
         # pr-build/memgraph/pr<N>/ (diff_release.yaml). Reuse them so the
-        # post-merge MAGE build doesn't rebuild memgraph. If they are missing,
-        # leave the links empty and the MAGE job builds memgraph itself.
+        # post-merge MAGE build doesn't rebuild memgraph. If they are missing
+        # or mismatched, leave the links empty and the MAGE job builds memgraph itself.
         id: get_links
         if: ${{ github.event_name == 'pull_request' }}
         env:
@@ -67,9 +93,15 @@ jobs:
           # Newest upload last, so a re-queued PR resolves to its latest packages.
           listing="$(aws s3 ls "s3://deps.memgraph.io/$S3_DIR/" 2>/dev/null | sort -k1,2 | awk '{print $4}' || true)"
           deb="$(grep -E '^memgraph_.*_amd64\.deb$' <<<"$listing" | tail -n 1 || true)"
-          debuginfo="$(grep -E '^memgraph-debuginfo_.*_amd64\.deb$' <<<"$listing" | tail -n 1 || true)"
+          debuginfo=""
+          if [[ -n "$deb" ]]; then
+            expected_debuginfo="memgraph-debuginfo_${deb#memgraph_}"
+            if grep -qxF "$expected_debuginfo" <<<"$listing"; then
+              debuginfo="$expected_debuginfo"
+            fi
+          fi
           if [[ -z "$deb" || -z "$debuginfo" ]]; then
-            echo "::warning::No memgraph amd64 deb + debuginfo found under $S3_DIR; MAGE job will build memgraph from source."
+            echo "::warning::No matching memgraph amd64 deb + debuginfo pair found under $S3_DIR; MAGE job will build memgraph from source."
             deb_link=""
             debuginfo_link=""
           else
@@ -99,7 +131,7 @@ jobs:
       build_docker_image: debug
       push_to_s3: true
       s3_dest_dir: pr-build/mage/pr${{ needs.get-pr-number.outputs.pr_number }}
-      ref: refs/heads/master
+      ref: ${{ needs.get-pr-number.outputs.pr_ref }}
       print_output_url: true
 
   build-package-mage-post-merge:

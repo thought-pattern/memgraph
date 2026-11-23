@@ -184,7 +184,10 @@ void SystemRecoveryHandler(memgraph::system::ReplicaHandlerAccessToState &system
 #endif
   if (!parameters.ApplyRecovery(req.parameters)) return;
 
-  system_state_access.SetLastCommitedTS(req.forced_group_timestamp);
+  if (!system_state_access.SetLastCommitedTS(req.forced_group_timestamp)) {
+    spdlog::error("SystemRecoveryHandler: failed to persist LCTS {}", req.forced_group_timestamp);
+    return;
+  }
   spdlog::debug("SystemRecoveryHandler: SUCCESS updated LCTS to {}", req.forced_group_timestamp);
   res = SystemRecoveryRes(SystemRecoveryRes::Result::SUCCESS);
 }
@@ -218,7 +221,10 @@ void FinalizeSystemTxHandler(memgraph::system::ReplicaHandlerAccessToState &syst
     return;
   }
 
-  system_state_access.SetLastCommitedTS(req.new_group_timestamp);
+  if (!system_state_access.SetLastCommitedTS(req.new_group_timestamp)) {
+    spdlog::error("FinalizeSystemTxHandler: failed to persist LCTS {}", req.new_group_timestamp);
+    return;
+  }
   spdlog::debug("FinalizeSystemTxHandler: SUCCESS updated LCTS to {}", req.new_group_timestamp);
   res = FinalizeSystemTxRes(true);
 }

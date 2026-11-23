@@ -46,11 +46,20 @@ def str2bool(v):
 
 
 def replace_header(tmp_path, real_path, year):
-    with open(tmp_path) as f:
-        lines = f.readlines()
-    lines[0] = f"// Copyright {year} Memgraph Ltd.\n"
-    with open(real_path, "w") as f:
-        f.writelines(lines)
+    target_path = real_path if real_path else tmp_path
+    with open(target_path, "r", encoding="utf-8", newline="") as f:
+        real_content = f.read()
+    updated_content, count = re.subn(
+        r"\A// Copyright [0-9]{4} Memgraph Ltd\.",
+        f"// Copyright {year} Memgraph Ltd.",
+        real_content,
+        count=1,
+    )
+    if count != 1:
+        return False
+    with open(target_path, "w", encoding="utf-8", newline="") as f:
+        f.write(updated_content)
+    return True
 
 
 def red(s):
@@ -90,9 +99,8 @@ def main():
             is_header_corrected = is_header_correct(replaced_content, bls_header_complete) or is_header_correct(
                 replaced_content, mel_header_complete
             )
-            if is_header_corrected:
-                replace_header(args.file, args.real_file, year)
-                sys.stdout.writelines(yellow(f"Changing year in header for {args.real_file}!\n"))
+            if is_header_corrected and replace_header(args.file, args.real_file, year):
+                sys.stdout.writelines(yellow(f"Changing year in header for {args.real_file or args.file}!\n"))
                 sys.exit(1)
 
         sys.stdout.writelines(

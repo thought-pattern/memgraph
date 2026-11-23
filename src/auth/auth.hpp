@@ -535,6 +535,12 @@ class Auth final {
 #ifdef MG_ENTERPRISE
   std::vector<std::string> *&dropped_users() { return dropped_users_; }
 
+  UserProfiles::MemorySnapshot CaptureProfileMemorySnapshot() const { return user_profiles_.CaptureMemorySnapshot(); }
+  void RestoreProfileMemorySnapshot(UserProfiles::MemorySnapshot snapshot) {
+    user_profiles_.RestoreMemorySnapshot(std::move(snapshot));
+  }
+  void RefreshAllUserProfileResources();
+
   // Releases the live limits a dropped user was holding. Deferred to COMMIT, because ResourceMonitoring is shared
   // with every session and has no rollback of its own.
   void ReleaseUserResources(std::string const &username) {
