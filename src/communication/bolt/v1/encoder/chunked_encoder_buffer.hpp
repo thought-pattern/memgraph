@@ -90,16 +90,31 @@ class ChunkedEncoderBuffer {
    *                  waiting to be sent (in order to optimize network packets)
    */
   bool Flush(bool have_more = false) {
+    if (unrecoverable_incomplete_flush_) {
+      ResetChunkBuffer();
+      return false;
+    }
+
+    const size_t chunk_size = pos_ - chunk_start_ - kChunkHeaderSize;
     // Write the size of the chunk.
-    chunk_[chunk_start_] = (pos_ - chunk_start_ - kChunkHeaderSize) >> 8;
-    chunk_[chunk_start_ + 1] = (pos_ - chunk_start_ - kChunkHeaderSize) & 0xFF;
+    chunk_[chunk_start_] = (chunk_size >> 8) & 0xFF;
+    chunk_[chunk_start_ + 1] = chunk_size & 0xFF;
+
+    const bool is_end_marker = (chunk_size == 0);
+    if (is_end_marker) {
+      finalized_end_ = pos_;
+    }
 
     // Write the data to the stream.
     if (!have_more || (kChunkWholeSize - pos_ <= kChunkHeaderSize)) {
       auto ret = output_stream_.Write(chunk_.data(), pos_, have_more);
-
-      // Cleanup.
-      Clear();
+      if (!ret) {
+        incomplete_message_flushed_ = true;
+        unrecoverable_incomplete_flush_ = true;
+      } else {
+        incomplete_message_flushed_ = !is_end_marker;
+      }
+      ResetChunkBuffer();
       return ret;
     } else {
       chunk_start_ = pos_;
@@ -108,10 +123,11 @@ class ChunkedEncoderBuffer {
     return true;
   }
 
-  /** Clears the internal buffers. */
+  /** Clears the internal buffers and resets message framing state. */
   void Clear() {
-    pos_ = kChunkHeaderSize;
-    chunk_start_ = 0;
+    ResetChunkBuffer();
+    incomplete_message_flushed_ = false;
+    unrecoverable_incomplete_flush_ = false;
   }
 
   /**
@@ -122,21 +138,47 @@ class ChunkedEncoderBuffer {
   bool HasData() const { return (pos_ - chunk_start_) > kChunkHeaderSize; }
 
   /**
+   * Returns true if bytes of an incomplete (unterminated) message have already been flushed to the
+   * output stream and no 0x0000 terminator has been buffered for it.
+   */
+  bool HasIncompleteMessageFlushed() const {
+    return unrecoverable_incomplete_flush_ || (incomplete_message_flushed_ && finalized_end_ == 0);
+  }
+
+  /**
    * Flush every completed (message-terminated) chunk buffered so far and drop any partially-encoded
-   * current chunk. Used wherever deferred responses must reach the client before the session yields or
-   * closes: the end-of-input batch drain that turns a pipelined burst into one write, and the
-   * failure/close paths, which additionally complete a record the 64 KiB auto-flush already started
-   * delivering before the summary, so a summary is never spliced into a half-delivered record.
-   * A single field value >= 65535 bytes that auto-flushed mid-encode leaves chunk_start_ = 0; this
-   * cannot recover that (pre-existing) partial chunk.
+   * current chunk. If bytes of an unfinished message have already been flushed to the wire without a
+   * buffered 0x0000 terminator, returns false and marks the encoder stream unrecoverable so callers
+   * close the Bolt connection rather than splicing FAILURE into an open RECORD frame.
    */
   [[nodiscard]] bool FlushFinalized() {
-    auto ret = chunk_start_ > 0 ? output_stream_.Write(chunk_.data(), chunk_start_, false) : true;
-    Clear();
+    if (unrecoverable_incomplete_flush_) {
+      ResetChunkBuffer();
+      return false;
+    }
+    if (incomplete_message_flushed_ && finalized_end_ == 0) {
+      unrecoverable_incomplete_flush_ = true;
+      ResetChunkBuffer();
+      return false;
+    }
+    auto ret = finalized_end_ > 0 ? output_stream_.Write(chunk_.data(), finalized_end_, false) : true;
+    if (!ret) {
+      incomplete_message_flushed_ = true;
+      unrecoverable_incomplete_flush_ = true;
+    } else {
+      incomplete_message_flushed_ = false;
+    }
+    ResetChunkBuffer();
     return ret;
   }
 
  private:
+  void ResetChunkBuffer() {
+    pos_ = kChunkHeaderSize;
+    chunk_start_ = 0;
+    finalized_end_ = 0;
+  }
+
   // The output stream used.
   TOutputStream &output_stream_;
 
@@ -146,5 +188,8 @@ class ChunkedEncoderBuffer {
   // Amount of data in chunk array.
   size_t pos_{kChunkHeaderSize};
   size_t chunk_start_{0};
+  size_t finalized_end_{0};
+  bool incomplete_message_flushed_{false};
+  bool unrecoverable_incomplete_flush_{false};
 };
 }  // namespace memgraph::communication::bolt

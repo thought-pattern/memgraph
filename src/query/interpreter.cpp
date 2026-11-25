@@ -55,6 +55,7 @@
 #include "coordination/coordinator_ops_status.hpp"
 #include "coordination/coordinator_state.hpp"
 #include "db_accessor.hpp"
+#include "storage/v2/indices/text_index_utils.hpp"
 #include "dbms/constants.hpp"
 #include "dbms/coordinator_handler.hpp"
 #include "dbms/dbms_handler.hpp"
@@ -5657,9 +5658,10 @@ PreparedQuery PrepareTextIndexQuery(ParsedQuery parsed_query, bool in_explicit_t
   auto *dba = &*current_db.execution_db_accessor_;
 
   auto *storage = db_acc->storage();
+  auto &index_name = text_index_query->index_name_;
+  storage::ValidateTextIndexName(index_name);
   auto label_name = text_index_query->label_.name;
   auto label_id = storage->NameToLabel(label_name);
-  auto &index_name = text_index_query->index_name_;
   auto property_ids = text_index_query->properties_ |
                       rv::transform([&](const auto &property) { return storage->NameToProperty(property.name); }) |
                       r::to_vector;
@@ -5731,8 +5733,9 @@ PreparedQuery PrepareCreateTextEdgeIndexQuery(ParsedQuery parsed_query, bool in_
   auto *dba = &*current_db.execution_db_accessor_;
 
   auto *storage = db_acc->storage();
-  const auto edge_type_id = storage->NameToEdgeType(text_edge_index_query->edge_type_.name);
   const auto &index_name = text_edge_index_query->index_name_;
+  storage::ValidateTextIndexName(index_name);
+  const auto edge_type_id = storage->NameToEdgeType(text_edge_index_query->edge_type_.name);
   auto property_ids = text_edge_index_query->properties_ |
                       rv::transform([&](const auto &property) { return storage->NameToProperty(property.name); }) |
                       r::to_vector;

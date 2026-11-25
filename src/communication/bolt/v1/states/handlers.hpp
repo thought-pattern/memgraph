@@ -173,6 +173,7 @@ State HandlePullDiscardV4(TSession &session, const State state, const Marker mar
   Value extra;
   if (!session.decoder_.ReadValue(&extra, Value::Type::Map)) {
     spdlog::trace("Couldn't read extra field!");
+    return State::Close;
   }
   const auto &extra_map = extra.ValueMap();
   auto n_it = extra_map.find("n");
@@ -198,7 +199,9 @@ inline State HandleFailure(TSession &session, const std::exception &e) {
   if (const auto *p = dynamic_cast<const utils::StacktraceException *>(&e)) {
     spdlog::trace("Error trace: {}", p->trace());
   }
-  // Complete any record already partially on the wire (64 KiB auto-flush split) before the summary.
+  // Flush completed buffered messages; if an incomplete message has already been auto-flushed to the
+  // wire without a terminator, FlushFinalized returns false so we close the connection instead of
+  // splicing FAILURE into an open RECORD frame.
   if (!session.encoder_buffer_.FlushFinalized()) {
     spdlog::trace("Couldn't flush finalized record chunks!");
     return State::Close;

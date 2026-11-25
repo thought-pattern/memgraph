@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 
@@ -44,6 +45,10 @@ struct TextIndexData {
   /// Set by DropIndex so the context stays valid for existing snapshots until
   /// the last reference is released.
   bool deferred_drop{false};
+
+  /// Set if a post-WAL ApplyTrackedChanges batch failed and rolled back, requiring
+  /// recovery on next startup to rebuild the index from durable graph state.
+  std::atomic<bool> dirty{false};
 
   TextIndexData(mgcxx::text_search::Context context, LabelId scope, std::vector<PropertyId> properties)
       : context(std::move(context)), scope(scope), properties(std::move(properties)) {}
@@ -80,6 +85,8 @@ struct TextIndexActiveIndices {
   virtual std::vector<TextIndexSpec> ListIndices() const = 0;
   virtual std::optional<uint64_t> ApproximateVerticesTextCount(std::string_view index_name) const = 0;
 
+  /// Called after the transaction is durable, so it reports nothing to the caller: a batch that
+  /// cannot be published marks its index dirty and the remaining indexes are still applied.
   virtual void ApplyTrackedChanges(Transaction &tx, NameIdMapper *name_id_mapper) = 0;
 };
 
@@ -141,7 +148,7 @@ class TextIndex {
 
   void RecoverIndex(const TextIndexSpec &index_info, utils::SkipListDb<Vertex>::Accessor vertices,
                     NameIdMapper *name_id_mapper, ActiveIndicesUpdater const &updater,
-                    ProgressCallback const &on_progress = {});
+                    ProgressCallback const &on_progress = {}, bool force_rebuild = false);
 
   /// Removes the index from the live container and returns the evicted
   /// TextIndexData. The caller MUST keep the returned shared_ptr until commit
@@ -161,6 +168,9 @@ class TextIndex {
 
   /// ListIndices on the owning class (for snapshot creation, outside transaction context).
   std::vector<TextIndexSpec> ListIndices() const;
+
+  /// Returns specs for indices whose on-disk Tantivy state has not experienced a failed batch.
+  std::vector<TextIndexSpec> ListCleanIndices() const;
 
   /// Empties the live container and returns the evicted TextIndexData entries.
   /// The caller owns the flip-and-publish contract: match DropIndex and only

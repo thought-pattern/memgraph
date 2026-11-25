@@ -411,7 +411,16 @@ void Schema::NodeTypeProperties(mgp_list *args, mgp_graph *memgraph_graph, mgp_r
     }
 
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    try {
+      record_factory.SetErrorMessage(e.what());
+    } catch (...) {
+    }
+    return;
+  } catch (...) {
+    try {
+      record_factory.SetErrorMessage("Unknown error occurred in schema.node_type_properties.");
+    } catch (...) {
+    }
     return;
   }
 }
@@ -419,9 +428,9 @@ void Schema::NodeTypeProperties(mgp_list *args, mgp_graph *memgraph_graph, mgp_r
 void Schema::RelTypeProperties(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
 
-  std::unordered_map<RelKey, LabelOrRelTypeInfo, RelKeyHash, RelKeyEqual> rel_types_properties;
   const auto record_factory = mgp::RecordFactory(result);
   try {
+    std::unordered_map<RelKey, LabelOrRelTypeInfo, RelKeyHash, RelKeyEqual> rel_types_properties;
     auto arguments = mgp::List(args);
     auto config = arguments[0].ValueMap();
     auto include_labels = ExtractStringSetFromConfig(config, kConfigIncludeLabels);
@@ -515,7 +524,16 @@ void Schema::RelTypeProperties(mgp_list *args, mgp_graph *memgraph_graph, mgp_re
     }
 
   } catch (const std::exception &e) {
-    record_factory.SetErrorMessage(e.what());
+    try {
+      record_factory.SetErrorMessage(e.what());
+    } catch (...) {
+    }
+    return;
+  } catch (...) {
+    try {
+      record_factory.SetErrorMessage("Unknown error occurred in schema.rel_type_properties.");
+    } catch (...) {
+    }
     return;
   }
 }
@@ -932,15 +950,27 @@ void ProcessUniqueConstraints(const mgp::Map &unique_constraints_map, mgp_graph 
 void Schema::Assert(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
-  auto arguments = mgp::List(args);
-  auto indices_map = arguments[0].ValueMap();
-  auto unique_constraints_map = arguments[1].ValueMap();
-  auto existence_constraints_map = arguments[2].ValueMap();
-  auto drop_existing = arguments[3].ValueBool();
+  try {
+    auto arguments = mgp::List(args);
+    auto indices_map = arguments[0].ValueMap();
+    auto unique_constraints_map = arguments[1].ValueMap();
+    auto existence_constraints_map = arguments[2].ValueMap();
+    auto drop_existing = arguments[3].ValueBool();
 
-  ProcessIndices(indices_map, memgraph_graph, record_factory, drop_existing);
-  ProcessExistenceConstraints(existence_constraints_map, memgraph_graph, record_factory, drop_existing);
-  ProcessUniqueConstraints(unique_constraints_map, memgraph_graph, record_factory, drop_existing);
+    ProcessIndices(indices_map, memgraph_graph, record_factory, drop_existing);
+    ProcessExistenceConstraints(existence_constraints_map, memgraph_graph, record_factory, drop_existing);
+    ProcessUniqueConstraints(unique_constraints_map, memgraph_graph, record_factory, drop_existing);
+  } catch (const std::exception &e) {
+    try {
+      record_factory.SetErrorMessage(e.what());
+    } catch (...) {
+    }
+  } catch (...) {
+    try {
+      record_factory.SetErrorMessage("Unknown error occurred in schema.assert.");
+    } catch (...) {
+    }
+  }
 }
 
 extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
@@ -995,6 +1025,8 @@ extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *mem
         memory);
   } catch (const std::exception &e) {
     std::cerr << "Error while initializing query module: " << e.what() << '\n';
+    return 1;
+  } catch (...) {
     return 1;
   }
 

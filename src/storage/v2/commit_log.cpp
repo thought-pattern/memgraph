@@ -114,7 +114,7 @@ void CommitLog::MarkFinishedInRange(uint64_t const start_id, uint64_t const end_
     Block *current = start_block->next;
 
     // mark intermediate blocks as finished
-    while (current_start + kIdsInBlock < end_id) {
+    while (current_start + kIdsInBlock <= end_id) {
       // Mark whole block as finished
       for (auto i = 0; i < kBlockSize; ++i) {
         current->field[i] = std::numeric_limits<uint64_t>::max();

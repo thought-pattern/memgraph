@@ -97,53 +97,89 @@ void TextEdgeIndex::PublishActiveIndices(ActiveIndicesUpdater const &updater) {
 
 void TextEdgeIndex::CreateIndex(const TextEdgeIndexSpec &index_info, VerticesIterable vertices,
                                 NameIdMapper *name_id_mapper, ProgressCallback const &on_progress) {
-  CreateTantivyIndex(MakeIndexPath(text_index_storage_dir_, index_info.index_name), index_info);
+  const auto index_path = MakeIndexPath(text_index_storage_dir_, index_info.index_name);
+  if (index_->contains(index_info.index_name)) {
+    throw TextSearchException("Text edge index {} already exists at path: {}.", index_info.index_name, index_path);
+  }
+  if (std::filesystem::exists(index_path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(index_path, ec);
+    if (ec) {
+      throw TextSearchException("Failed to remove orphan text edge index directory {}: {}", index_info.index_name,
+                                ec.message());
+    }
+  }
 
-  auto &index_data = *index_->at(index_info.index_name);
-  // Every edge is read for the same properties, so the order and the slots are settled once here
-  // rather than per edge.
-  auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_info.properties);
-  auto values = std::vector<PropertyValue>(ordered.size());
+  try {
+    CreateTantivyIndex(index_path, index_info);
 
-  for (const auto &vertex : vertices) {
-    // Reported per vertex examined, not per edge indexed: a long run of vertices with no matching edge is
-    // still progress.
-    if (on_progress) on_progress();
-    const auto edges_accessor = vertex.OutEdges(View::NEW, {index_info.edge_type}).value();
-    for (const auto &edge : edges_accessor.edges) {
-      if (index_info.properties.empty()) {
-        auto fields = TextFieldsOf(edge.Properties(View::NEW).value(), name_id_mapper);
+    auto &index_data = *index_->at(index_info.index_name);
+    // Every edge is read for the same properties, so the order and the slots are settled once here
+    // rather than per edge.
+    auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_info.properties);
+    auto values = std::vector<PropertyValue>(ordered.size());
+
+    for (const auto &vertex : vertices) {
+      // Reported per vertex examined, not per edge indexed: a long run of vertices with no matching edge is
+      // still progress.
+      if (on_progress) on_progress();
+      const auto edges_accessor = vertex.OutEdges(View::NEW, {index_info.edge_type}).value();
+      for (const auto &edge : edges_accessor.edges) {
+        if (index_info.properties.empty()) {
+          auto fields = TextFieldsOf(edge.Properties(View::NEW).value(), name_id_mapper);
+          TextEdgeIndex::AddEdgeToTextIndex(edge.Gid().AsInt(),
+                                            edge.FromVertex().Gid().AsInt(),
+                                            edge.ToVertex().Gid().AsInt(),
+                                            std::move(fields.properties),
+                                            std::move(fields.all_property_values),
+                                            index_data.context);
+          continue;
+        }
+        // Throws if the edge cannot be read, as reading its properties one set at a time did.
+        edge.ReadPropertyValues(ordered, values, View::NEW).value();
+        auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
         TextEdgeIndex::AddEdgeToTextIndex(edge.Gid().AsInt(),
                                           edge.FromVertex().Gid().AsInt(),
                                           edge.ToVertex().Gid().AsInt(),
                                           std::move(fields.properties),
                                           std::move(fields.all_property_values),
                                           index_data.context);
-        continue;
       }
-      // Throws if the edge cannot be read, as reading its properties one set at a time did.
-      edge.ReadPropertyValues(ordered, values, View::NEW).value();
-      auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
-      TextEdgeIndex::AddEdgeToTextIndex(edge.Gid().AsInt(),
-                                        edge.FromVertex().Gid().AsInt(),
-                                        edge.ToVertex().Gid().AsInt(),
-                                        std::move(fields.properties),
-                                        std::move(fields.all_property_values),
-                                        index_data.context);
     }
-  }
-  try {
-    mgcxx::text_search::commit(index_data.context);
-  } catch (const std::exception &e) {
-    throw TextSearchException("Text index commit error: {}", e.what());
+
+    try {
+      mgcxx::text_search::commit(index_data.context);
+    } catch (const std::exception &e) {
+      throw TextSearchException("Text index commit error: {}", e.what());
+    }
+  } catch (...) {
+    if (index_->contains(index_info.index_name)) {
+      auto evicted = DropIndex(index_info.index_name);
+      if (evicted) evicted->deferred_drop = true;
+    } else {
+      std::error_code ec;
+      std::filesystem::remove_all(index_path, ec);
+    }
+    throw;
   }
 }
 
 void TextEdgeIndex::RecoverIndex(const TextEdgeIndexSpec &index_info, utils::SkipListDb<Vertex>::Accessor vertices,
                                  NameIdMapper *name_id_mapper, ActiveIndicesUpdater const &updater,
-                                 ProgressCallback const &on_progress) {
+                                 ProgressCallback const &on_progress, bool force_rebuild) {
   const auto index_path = MakeIndexPath(text_index_storage_dir_, index_info.index_name);
-  auto needs_rebuild = !std::filesystem::exists(index_path);
+  const auto watermark = ReadTextIndicesWatermark(text_index_storage_dir_);
+  bool needs_rebuild = force_rebuild || !std::filesystem::exists(index_path) || !watermark.has_value() ||
+                       !watermark->ContainsCleanEdgeIndex(index_info);
+
+  if (needs_rebuild && std::filesystem::exists(index_path)) {
+    std::error_code ec;
+    std::filesystem::remove_all(index_path, ec);
+    if (ec) {
+      throw TextSearchException("Failed to remove stale text edge index {}: {}", index_info.index_name, ec.message());
+    }
+  }
+
   try {
     CreateTantivyIndex(index_path, index_info);
   } catch (const TextSearchException &) {
@@ -159,59 +195,70 @@ void TextEdgeIndex::RecoverIndex(const TextEdgeIndexSpec &index_info, utils::Ski
     CreateTantivyIndex(index_path, index_info);
   }
 
-  if (needs_rebuild) {
-    auto &context = index_->at(index_info.index_name)->context;
-    auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_info.properties);
-    auto values = std::vector<PropertyValue>(ordered.size());
+  try {
+    if (needs_rebuild) {
+      auto &context = index_->at(index_info.index_name)->context;
+      auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_info.properties);
+      auto values = std::vector<PropertyValue>(ordered.size());
 
-    for (const auto &vertex : vertices) {
-      for (const auto &[edge_type, to_vertex, edge_ref] : vertex.out_edges) {
-        if (edge_type != index_info.edge_type) continue;
+      for (const auto &vertex : vertices) {
+        if (vertex.deleted()) continue;
+        for (const auto &[edge_type, to_vertex, edge_ref] : vertex.out_edges) {
+          if (edge_type != index_info.edge_type) continue;
 
-        auto *edge = edge_ref.ptr;
-        if (index_info.properties.empty()) {
-          auto const edge_properties = edge->properties.Properties();
-          if (edge_properties.empty()) continue;
-          auto fields = TextFieldsOf(edge_properties, name_id_mapper);
+          auto *edge = edge_ref.ptr;
+          if (edge->deleted()) continue;
+          if (index_info.properties.empty()) {
+            auto const edge_properties = edge->properties.Properties();
+            if (edge_properties.empty()) continue;
+            auto fields = TextFieldsOf(edge_properties, name_id_mapper);
+            TextEdgeIndex::AddEdgeToTextIndex(edge->gid.AsInt(),
+                                              vertex.gid.AsInt(),
+                                              to_vertex->gid.AsInt(),
+                                              std::move(fields.properties),
+                                              std::move(fields.all_property_values),
+                                              context);
+            continue;
+          }
+
+          edge->properties.ExtractPropertyValuesMissingAsNull(ordered, values);
+          // An edge carrying none of the named properties has nothing to put in the index. Setting a
+          // property to Null removes it, so a Null here means the edge does not carry it.
+          // Nothing readable means an empty document, which is dropped when it is added. Skipping here
+          // just avoids building one.
+          if (std::ranges::all_of(values, [](PropertyValue const &value) { return value.IsNull(); })) continue;
+
+          auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
           TextEdgeIndex::AddEdgeToTextIndex(edge->gid.AsInt(),
                                             vertex.gid.AsInt(),
                                             to_vertex->gid.AsInt(),
                                             std::move(fields.properties),
                                             std::move(fields.all_property_values),
                                             context);
-          continue;
         }
+      }
 
-        edge->properties.ExtractPropertyValuesMissingAsNull(ordered, values);
-        // An edge carrying none of the named properties has nothing to put in the index. Setting a
-        // property to Null removes it, so a Null here means the edge does not carry it.
-        // Nothing readable means an empty document, which is dropped when it is added. Skipping here
-        // just avoids building one.
-        if (std::ranges::all_of(values, [](PropertyValue const &value) { return value.IsNull(); })) continue;
-
-        auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
-        TextEdgeIndex::AddEdgeToTextIndex(edge->gid.AsInt(),
-                                          vertex.gid.AsInt(),
-                                          to_vertex->gid.AsInt(),
-                                          std::move(fields.properties),
-                                          std::move(fields.all_property_values),
-                                          context);
+      try {
+        mgcxx::text_search::commit(context);
+      } catch (const std::exception &e) {
+        throw TextSearchException("Text index commit error: {}", e.what());
       }
     }
 
-    try {
-      mgcxx::text_search::commit(context);
-    } catch (const std::exception &e) {
-      throw TextSearchException("Text index commit error: {}", e.what());
+    if (on_progress) on_progress();
+
+    PublishActiveIndices(updater);
+  } catch (...) {
+    if (index_->contains(index_info.index_name)) {
+      auto evicted = DropIndex(index_info.index_name);
+      if (evicted) evicted->deferred_drop = true;
     }
+    throw;
   }
-
-  if (on_progress) on_progress();
-
-  PublishActiveIndices(updater);
 }
 
 std::shared_ptr<TextEdgeIndexData> TextEdgeIndex::DropIndex(const std::string &index_name) {
+  ValidateTextIndexName(index_name);
   auto it = index_->find(index_name);
   if (it == index_->end()) {
     throw TextSearchException("Text index {} doesn't exist.", index_name);
@@ -244,6 +291,17 @@ std::vector<TextEdgeIndexSpec> TextEdgeIndex::ListIndices() const {
   ret.reserve(index_->size());
   for (const auto &[index_name, data_ptr] : *index_) {
     ret.emplace_back(index_name, data_ptr->scope, data_ptr->properties);
+  }
+  return ret;
+}
+
+std::vector<TextEdgeIndexSpec> TextEdgeIndex::ListCleanIndices() const {
+  std::vector<TextEdgeIndexSpec> ret;
+  ret.reserve(index_->size());
+  for (const auto &[index_name, data_ptr] : *index_) {
+    if (!data_ptr->dirty.load(std::memory_order_acquire)) {
+      ret.emplace_back(index_name, data_ptr->scope, data_ptr->properties);
+    }
   }
   return ret;
 }
@@ -439,65 +497,82 @@ std::optional<uint64_t> TextEdgeIndex::ActiveIndices::ApproximateEdgesTextCount(
 }
 
 void TextEdgeIndex::ActiveIndices::ApplyTrackedChanges(Transaction &tx, NameIdMapper *name_id_mapper) {
+  // Runs once the transaction is durable, so a failure here must not surface as a failed commit and
+  // must not stop the batches behind it. An index whose batch was not published is marked dirty,
+  // which keeps it out of the shutdown watermark so that recovery rebuilds it from the graph.
   for (const auto &[index_data_ptr, pending] : tx.text_edge_index_change_collector_) {
-    struct PreparedEdgeDoc {
-      std::int64_t edge_gid;
-      std::int64_t from_vertex_gid;
-      std::int64_t to_vertex_gid;
-      nlohmann::json properties;
-      std::string all_property_values;
-    };
+    try {
+      struct PreparedEdgeDoc {
+        std::int64_t edge_gid;
+        std::int64_t from_vertex_gid;
+        std::int64_t to_vertex_gid;
+        nlohmann::json properties;
+        std::string all_property_values;
+      };
 
-    std::vector<std::int64_t> gids_to_remove;
-    gids_to_remove.reserve(pending.to_remove.size());
-    for (const auto *edge : pending.to_remove) {
-      gids_to_remove.push_back(edge->gid.AsInt());
-    }
+      std::vector<std::int64_t> gids_to_remove;
+      gids_to_remove.reserve(pending.to_remove.size());
+      for (const auto *edge : pending.to_remove) {
+        gids_to_remove.push_back(edge->gid.AsInt());
+      }
 
-    std::vector<PreparedEdgeDoc> docs_to_add;
-    docs_to_add.reserve(pending.to_add.size());
-    // Every edge here belongs to the same index, so it is read for the same properties.
-    auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_data_ptr->properties);
-    auto values = std::vector<PropertyValue>(ordered.size());
+      std::vector<PreparedEdgeDoc> docs_to_add;
+      docs_to_add.reserve(pending.to_add.size());
+      // Every edge here belongs to the same index, so it is read for the same properties.
+      auto const ordered = OrderedPropertyPaths::FromPropertyIds(index_data_ptr->properties);
+      auto values = std::vector<PropertyValue>(ordered.size());
 
-    for (const auto &edge_with_vertices : pending.to_add) {
-      if (index_data_ptr->properties.empty()) {
-        auto fields = TextFieldsOf(edge_with_vertices.edge->properties.Properties(), name_id_mapper);
+      for (const auto &edge_with_vertices : pending.to_add) {
+        if (index_data_ptr->properties.empty()) {
+          auto fields = TextFieldsOf(edge_with_vertices.edge->properties.Properties(), name_id_mapper);
+          docs_to_add.push_back({.edge_gid = edge_with_vertices.edge->gid.AsInt(),
+                                 .from_vertex_gid = edge_with_vertices.from_vertex->gid.AsInt(),
+                                 .to_vertex_gid = edge_with_vertices.to_vertex->gid.AsInt(),
+                                 .properties = std::move(fields.properties),
+                                 .all_property_values = std::move(fields.all_property_values)});
+          continue;
+        }
+        edge_with_vertices.edge->properties.ExtractPropertyValuesMissingAsNull(ordered, values);
+        auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
         docs_to_add.push_back({.edge_gid = edge_with_vertices.edge->gid.AsInt(),
                                .from_vertex_gid = edge_with_vertices.from_vertex->gid.AsInt(),
                                .to_vertex_gid = edge_with_vertices.to_vertex->gid.AsInt(),
                                .properties = std::move(fields.properties),
                                .all_property_values = std::move(fields.all_property_values)});
-        continue;
       }
-      edge_with_vertices.edge->properties.ExtractPropertyValuesMissingAsNull(ordered, values);
-      auto fields = TextFieldsOf(ordered.paths(), values, name_id_mapper);
-      docs_to_add.push_back({.edge_gid = edge_with_vertices.edge->gid.AsInt(),
-                             .from_vertex_gid = edge_with_vertices.from_vertex->gid.AsInt(),
-                             .to_vertex_gid = edge_with_vertices.to_vertex->gid.AsInt(),
-                             .properties = std::move(fields.properties),
-                             .all_property_values = std::move(fields.all_property_values)});
-    }
 
-    const std::lock_guard lock(index_data_ptr->write_mutex);
-    try {
-      for (auto gid : gids_to_remove) {
-        mgcxx::text_search::delete_document(
-            index_data_ptr->context,
-            mgcxx::text_search::SearchInput{.search_query = fmt::format("edge_gid:{}", gid)},
-            kDoSkipCommit);
+      const std::lock_guard lock(index_data_ptr->write_mutex);
+      try {
+        for (auto gid : gids_to_remove) {
+          mgcxx::text_search::delete_document(
+              index_data_ptr->context,
+              mgcxx::text_search::SearchInput{.search_query = fmt::format("edge_gid:{}", gid)},
+              kDoSkipCommit);
+        }
+        for (auto &doc : docs_to_add) {
+          TextEdgeIndex::AddEdgeToTextIndex(doc.edge_gid,
+                                            doc.from_vertex_gid,
+                                            doc.to_vertex_gid,
+                                            std::move(doc.properties),
+                                            std::move(doc.all_property_values),
+                                            index_data_ptr->context);
+        }
+        mgcxx::text_search::commit(index_data_ptr->context);
+      } catch (const std::exception &) {
+        // Rolled back while write_mutex is still held, so no other writer builds on the partial batch.
+        try {
+          mgcxx::text_search::rollback(index_data_ptr->context);
+        } catch (const std::exception &rollback_err) {
+          spdlog::error("Failed to roll back text edge index uncommitted changes: {}", rollback_err.what());
+        }
+        throw;
       }
-      for (auto &doc : docs_to_add) {
-        TextEdgeIndex::AddEdgeToTextIndex(doc.edge_gid,
-                                          doc.from_vertex_gid,
-                                          doc.to_vertex_gid,
-                                          std::move(doc.properties),
-                                          std::move(doc.all_property_values),
-                                          index_data_ptr->context);
-      }
-      mgcxx::text_search::commit(index_data_ptr->context);
     } catch (const std::exception &e) {
-      throw TextSearchException("Text search error: {}", e.what());
+      index_data_ptr->dirty.store(true, std::memory_order_release);
+      spdlog::error(
+          "A committed transaction was not published to a text edge index, which stays stale until it is rebuilt "
+          "on the next startup: {}",
+          e.what());
     }
   }
 }

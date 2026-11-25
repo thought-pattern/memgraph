@@ -12,8 +12,10 @@
 #pragma once
 
 #include <algorithm>
+#include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,6 +61,7 @@ class TextSearchSession {
 };
 
 inline constexpr std::string_view kTextIndicesDirectory = "text_indices";
+inline constexpr std::string_view kTextIndicesWatermarkFile = ".memgraph_watermark.json";
 inline constexpr bool kDoSkipCommit = true;
 
 // Tantivy schema field names; must stay in sync across index creation, document construction and search.
@@ -77,8 +80,14 @@ inline constexpr std::string_view kBooleanNot = "NOT";
 // Convert text to lowercase while preserving boolean operators
 std::string ToLowerCasePreservingBooleanOperators(std::string_view input);
 
-// Make index path from base directory and index name
-std::string MakeIndexPath(const std::string &base_path, std::string_view index_name);
+// Validate that a text index name is a single safe directory component.
+void ValidateTextIndexName(std::string_view index_name);
+
+// The same check for callers that report an invalid name through a return value instead.
+bool IsValidTextIndexName(std::string_view index_name);
+
+// Make index path from base directory and index name, rejecting any traversal outside base_path.
+std::string MakeIndexPath(const std::filesystem::path &base_path, std::string_view index_name);
 
 /// The two forms a text index holds a record's properties in: the properties, and all their values
 /// run together as the one string a search matches against.
@@ -124,6 +133,28 @@ struct TextEdgeIndexSpec {
   /// Naming none means indexing every property the entity carries.
   std::vector<PropertyId> properties;
 };
+
+struct TextIndicesWatermark {
+  std::string storage_uuid;
+  uint64_t last_durable_timestamp{0};
+  uint64_t num_committed_txns{0};
+  std::vector<TextIndexSpec> clean_node_indices;
+  std::vector<TextEdgeIndexSpec> clean_edge_indices;
+
+  bool MatchesStorageState(std::string_view expected_uuid, uint64_t expected_ldt,
+                           uint64_t expected_committed_txns) const noexcept {
+    return storage_uuid == expected_uuid && last_durable_timestamp == expected_ldt &&
+           num_committed_txns == expected_committed_txns;
+  }
+
+  bool ContainsCleanNodeIndex(const TextIndexSpec &spec) const noexcept;
+  bool ContainsCleanEdgeIndex(const TextEdgeIndexSpec &spec) const noexcept;
+};
+
+void WriteTextIndicesWatermark(const std::filesystem::path &text_indices_dir,
+                               const TextIndicesWatermark &watermark) noexcept;
+std::optional<TextIndicesWatermark> ReadTextIndicesWatermark(const std::filesystem::path &text_indices_dir) noexcept;
+void ClearTextIndicesWatermark(const std::filesystem::path &text_indices_dir) noexcept;
 
 struct TextIndexPending {
   boost::unordered_flat_set<const Vertex *, absl::Hash<const Vertex *>> to_add;
