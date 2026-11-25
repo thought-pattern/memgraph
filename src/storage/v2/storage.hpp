@@ -778,12 +778,13 @@ class Accessor {
 
   std::string TextIndexAggregate(const std::string &index_name, const std::string &search_query,
                                  const std::string &aggregation_query) const {
-    return transaction_.active_indices_->text_->Aggregate(index_name, search_query, aggregation_query);
+    return transaction_.active_indices_->text_->Aggregate(index_name, search_query, aggregation_query, transaction_);
   }
 
   std::string TextEdgeIndexAggregate(const std::string &index_name, const std::string &search_query,
                                      const std::string &aggregation_query) const {
-    return transaction_.active_indices_->text_edge_->Aggregate(index_name, search_query, aggregation_query);
+    return transaction_.active_indices_->text_edge_->Aggregate(
+        index_name, search_query, aggregation_query, transaction_);
   }
 
   std::vector<TextEdgeSearchResult> SearchEdgeTextIndex(const std::string &index_name, const std::string &search_query,
@@ -939,7 +940,7 @@ class Accessor {
 
   virtual utils::small_vector<uint64_t> GetVectorIndexIdsForVertex(Vertex *vertex, PropertyId property) = 0;
 
-  virtual utils::small_vector<float> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const = 0;
+  virtual utils::small_vector<double> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const = 0;
 
   virtual std::expected<void, storage::StorageIndexDefinitionError> CreateVectorEdgeIndex(
       VectorEdgeIndexSpec spec, ProgressCallback const &on_progress) = 0;

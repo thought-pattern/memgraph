@@ -195,8 +195,8 @@ class Consumer final : public RdKafka::EventCb {
   ConsumerThreadFactory thread_factory_;
   mutable std::atomic<bool> is_running_{false};
   mutable std::vector<RdKafka::TopicPartition *> last_assignment_;  // Protected by is_running_
-  std::thread thread_;
   ConsumerRebalanceCb cb_;
+  std::thread thread_;
   std::unique_ptr<RdKafka::KafkaConsumer, std::move_only_function<void(RdKafka::KafkaConsumer *)>> consumer_;
 };
 }  // namespace memgraph::integrations::kafka

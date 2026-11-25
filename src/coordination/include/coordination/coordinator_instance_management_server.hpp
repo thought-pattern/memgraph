@@ -37,6 +37,7 @@ class CoordinatorInstanceManagementServer {
   }
 
  private:
+  bool has_mutual_tls_{false};
   communication::ServerContext rpc_server_context_;
   rpc::Server rpc_server_;
 };

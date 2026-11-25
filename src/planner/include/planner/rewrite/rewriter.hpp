@@ -221,8 +221,6 @@ class Rewriter {
     driver.begin(graph_->core());
 
     for (std::size_t iter = 0; iter < config.max_iterations; ++iter) {
-      result.iterations = iter + 1;
-
       auto const elapsed = std::chrono::steady_clock::now() - start_time;
       if (elapsed >= config.timeout) {
         result.stop_reason = RewriteResult::StopReason::Timeout;
@@ -243,14 +241,12 @@ class Rewriter {
       audit_moved_facts_were_touched(analysis_before);
 #endif
 
+      result.iterations = iter + 1;
       result.rewrites_applied += pass.rewrites;
 
       // A pass that rewrote nothing is a fixpoint only if it also learned
-      // nothing. Its refresh can still derive a fact, and the rules gated on
-      // that fact are armed for the pass after, which stopping here would never
-      // run. Facts only widen, so the passes this keeps alive are bounded by
-      // what is left to learn.
-      if (pass.rewrites == 0 && pass.facts_moved == 0) {
+      // nothing and inserted no fresh e-classes via Make.
+      if (pass.rewrites == 0 && pass.facts_moved == 0 && pass.new_eclasses == 0) {
         result.stop_reason = RewriteResult::StopReason::Saturated;
         return result;
       }
@@ -345,6 +341,7 @@ class Rewriter {
   struct PassOutcome {
     std::size_t rewrites;
     std::size_t facts_moved;
+    std::size_t new_eclasses;
   };
 
   /**
@@ -386,11 +383,12 @@ class Rewriter {
 
     // Incremental matcher rebuild for new e-classes only
     // rebuild_index handles canonicalization and duplicates internally
-    if (!ctx_.new_eclasses().empty()) {
+    auto const new_eclasses = ctx_.new_eclasses().size();
+    if (new_eclasses > 0) {
       matcher_.rebuild_index(std::span<EClassId const>{ctx_.new_eclasses()});
     }
 
-    return {.rewrites = total_rewrites, .facts_moved = facts_moved};
+    return {.rewrites = total_rewrites, .facts_moved = facts_moved, .new_eclasses = new_eclasses};
   }
 
  public:

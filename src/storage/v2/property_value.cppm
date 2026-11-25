@@ -290,8 +290,8 @@ class PropertyValueImpl {
 
   // pmr instantiation: a stateful pmr resource cannot go into small_vector, so charge coordinates via the TLS arena.
   using vector_index_list_t =
-      utils::small_vector<float, std::conditional_t<std::same_as<Alloc, std::pmr::polymorphic_allocator<std::byte>>,
-                                                    memory::DbAwareAllocator<float>, std::allocator<float>>>;
+      utils::small_vector<double, std::conditional_t<std::same_as<Alloc, std::pmr::polymorphic_allocator<std::byte>>,
+                                                     memory::DbAwareAllocator<double>, std::allocator<double>>>;
 
   struct VectorIndexIdData {
     vector_index_id_t ids;
@@ -1249,10 +1249,10 @@ inline auto operator<=>(const PropertyValueImpl<Alloc, KeyType, VectorIndexIdTyp
     case PropertyValueType::VectorIndexId: {
       const auto &vector1 = first.ValueVectorIndexListUnchecked();
       const auto &vector2 = second.ValueVectorIndexListUnchecked();
-      // A coordinate is a float, which carries a NaN of its own, so each is read through the
+      // A coordinate is a double, which carries a NaN of its own, so each is read through the
       // comparison that places one rather than leaving the pair unordered.
       return std::lexicographical_compare_three_way(
-          vector1.begin(), vector1.end(), vector2.begin(), vector2.end(), [](float a, float b) {
+          vector1.begin(), vector1.end(), vector2.begin(), vector2.end(), [](double a, double b) {
             return CompareDoublesNaNLast(a, b);
           });
     }

@@ -104,7 +104,8 @@ template <class TAllocator>
 std::basic_string<char, std::char_traits<char>, TAllocator> *ToLowerCase(
     std::basic_string<char, std::char_traits<char>, TAllocator> *out, const std::string_view s) {
   out->resize(s.size());
-  std::transform(s.begin(), s.end(), out->begin(), [](char c) { return tolower(c); });
+  std::transform(
+      s.begin(), s.end(), out->begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
   return out;
 }
 
@@ -237,7 +238,8 @@ template <class TAllocator>
 std::basic_string<char, std::char_traits<char>, TAllocator> *ToUpperCase(
     std::basic_string<char, std::char_traits<char>, TAllocator> *out, const std::string_view s) {
   out->resize(s.size());
-  std::transform(s.begin(), s.end(), out->begin(), [](char c) { return toupper(c); });
+  std::transform(
+      s.begin(), s.end(), out->begin(), [](char c) { return static_cast<char>(std::toupper(static_cast<unsigned char>(c))); });
   return out;
 }
 

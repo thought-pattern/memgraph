@@ -32,61 +32,9 @@
 
 namespace memgraph::audit {
 
-namespace {
-
-communication::bolt::Value RedactBoltValue(const communication::bolt::Value &value) {
-  using enum communication::bolt::Value::Type;
-  switch (value.type()) {
-    case String:
-      if (utils::LooksLikePasswordHash(value.ValueString())) {
-        return communication::bolt::Value{utils::kRedactedMask};
-      }
-      return value;
-    case List: {
-      std::vector<communication::bolt::Value> redacted;
-      const auto &items = value.ValueList();
-      redacted.reserve(items.size());
-      for (const auto &item : items) {
-        redacted.push_back(RedactBoltValue(item));
-      }
-      return communication::bolt::Value{std::move(redacted)};
-    }
-    case Map: {
-      const auto &bolt_map = value.ValueMap();
-      if (communication::bolt::BoltMapToMgTypeInfo(bolt_map)) {
-        return value;
-      }
-      communication::bolt::map_t redacted_map;
-      for (const auto &[k, v] : bolt_map) {
-        if (utils::IsSensitiveParamKey(k)) {
-          redacted_map.emplace(k, communication::bolt::Value{utils::kRedactedMask});
-        } else {
-          redacted_map.emplace(k, RedactBoltValue(v));
-        }
-      }
-      return communication::bolt::Value{std::move(redacted_map)};
-    }
-    default:
-      return value;
-  }
-}
-
-}  // namespace
-
 std::pair<std::string, memgraph::communication::bolt::map_t> RedactAuditQueryAndParams(
     const std::string &query, const memgraph::communication::bolt::map_t &params) {
-  std::unordered_set<std::string> redacted_param_names;
-  std::string redacted_query = utils::RedactQueryCredentials(query, &redacted_param_names);
-
-  communication::bolt::map_t redacted_params;
-  for (const auto &[k, v] : params) {
-    if (redacted_param_names.contains(k) || utils::IsSensitiveParamKey(k)) {
-      redacted_params.emplace(k, communication::bolt::Value{utils::kRedactedMask});
-    } else {
-      redacted_params.emplace(k, RedactBoltValue(v));
-    }
-  }
-  return {std::move(redacted_query), std::move(redacted_params)};
+  return communication::bolt::RedactBoltQueryAndParams(query, params);
 }
 
 // Helper function that converts a `communication::bolt::Value` to `nlohmann::json`.

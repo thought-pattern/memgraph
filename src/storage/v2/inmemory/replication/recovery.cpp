@@ -31,6 +31,11 @@ void RpcInfo<replication::WalFilesRpc>::ObserveThroughput(std::string const &ins
 }
 
 template <>
+void RpcInfo<replication::WalFilesRpc>::ObserveApplyLatency(std::string const &instance_name, double const seconds) {
+  metrics::Metrics().ObserveWalApplyLatency(instance_name, seconds);
+}
+
+template <>
 prometheus::Histogram *RpcInfo<replication::CurrentWalRpc>::histogram() {
   return metrics::Metrics().global.current_wal_rpc_seconds;
 }
@@ -42,6 +47,11 @@ void RpcInfo<replication::CurrentWalRpc>::ObserveThroughput(std::string const &i
 }
 
 template <>
+void RpcInfo<replication::CurrentWalRpc>::ObserveApplyLatency(std::string const &instance_name, double const seconds) {
+  metrics::Metrics().ObserveWalApplyLatency(instance_name, seconds);
+}
+
+template <>
 prometheus::Histogram *RpcInfo<replication::SnapshotRpc>::histogram() {
   return metrics::Metrics().global.snapshot_rpc_seconds;
 }
@@ -50,6 +60,11 @@ template <>
 void RpcInfo<replication::SnapshotRpc>::ObserveThroughput(std::string const &instance_name,
                                                           double const bytes_per_second) {
   metrics::Metrics().ObserveSnapshotThroughput(instance_name, bytes_per_second);
+}
+
+template <>
+void RpcInfo<replication::SnapshotRpc>::ObserveApplyLatency(std::string const &instance_name, double const seconds) {
+  metrics::Metrics().ObserveSnapshotApplyLatency(instance_name, seconds);
 }
 
 /// This method tries to find the optimal path for recovering a single replica.
@@ -76,7 +91,7 @@ std::optional<std::vector<RecoveryStep>> GetRecoverySteps(uint64_t replica_commi
                                                           utils::FileRetainer::FileLocker *file_locker,
                                                           const InMemoryStorage *main_storage) {
   std::vector<RecoveryStep> recovery_steps;
-  auto locker_acc = file_locker->Access();
+  std::optional<utils::FileRetainer::FileLockerAccessor> locker_acc;
 
   // First check if we can recover using the current wal file only
   // otherwise save the seq_num of the current wal file
@@ -86,16 +101,19 @@ std::optional<std::vector<RecoveryStep>> GetRecoverySteps(uint64_t replica_commi
   std::optional<uint64_t> current_wal_from_timestamp;
   uint64_t last_durable_timestamp{kTimestampInitialId};
 
-  // Both locks together are what keeps the current WAL file from changing underneath: the engine lock
-  // is no longer enough on its own, because a committer appends under commit_mutex_ alone.
+  // Acquire commit_mutex_ and engine_lock_ before file_locker->Access() so recovery and log
+  // rotation take locks in one consistent order.
   auto commit_serializer = main_storage->LockCommitMutexIfNarrowing();
   std::unique_lock transaction_guard(main_storage->engine_lock_);
+  locker_acc.emplace(file_locker->Access());
 
-  (void)locker_acc.AddPath(main_storage->recovery_.wal_directory_);  // Protect all WALs from being deleted
+  (void)locker_acc->AddPath(main_storage->recovery_.wal_directory_);  // Protect all WALs from being deleted
   // Read in finalized WAL files (excluding the current/active WAL)
   utils::OnScopeExit const
       release_wal_dir(  // Each individually used file will be locked, so at the end, the dir can be released
-          [&locker_acc, &wal_dir = main_storage->recovery_.wal_directory_]() { (void)locker_acc.RemovePath(wal_dir); });
+          [&locker_acc, &wal_dir = main_storage->recovery_.wal_directory_]() {
+            (void)locker_acc->RemovePath(wal_dir);
+          });
 
   if (main_storage->wal_file_) {
     current_wal_timestamp.emplace(main_storage->wal_file_->ToTimestamp());
@@ -117,18 +135,22 @@ std::optional<std::vector<RecoveryStep>> GetRecoverySteps(uint64_t replica_commi
   }
 
   // Read in snapshot files
-  (void)locker_acc.AddPath(main_storage->recovery_.snapshot_directory_);  // Protect all snapshots from being deleted
+  (void)locker_acc->AddPath(main_storage->recovery_.snapshot_directory_);  // Protect all snapshots from being deleted
   utils::OnScopeExit const
       release_snapshot_dir(  // Each individually used file will be locked, so at the end, the dir can be released
           [&locker_acc, &snapshot_dir = main_storage->recovery_.snapshot_directory_]() {
-            (void)locker_acc.RemovePath(snapshot_dir);
+            (void)locker_acc->RemovePath(snapshot_dir);
           });
 
-  auto const latest_snapshot = GetLatestSnapshot(main_storage);
+  auto const maybe_all_snapshots =
+      durability::GetSnapshotFiles(main_storage->recovery_.snapshot_directory_, std::string{main_storage->uuid()});
+  auto const latest_snapshot = (maybe_all_snapshots.has_value() && !maybe_all_snapshots->empty())
+                                   ? std::optional<durability::SnapshotDurabilityInfo>{maybe_all_snapshots->back()}
+                                   : std::nullopt;
 
   auto const add_snapshot = [&]() -> bool {
     // Handle snapshot step
-    if (const auto lock_success = locker_acc.AddPath(latest_snapshot->path); !lock_success.has_value()) {
+    if (const auto lock_success = locker_acc->AddPath(latest_snapshot->path); !lock_success.has_value()) {
       spdlog::error("Tried to lock a non-existent snapshot path while obtaining recovery steps.");
       return false;
     }
@@ -143,18 +165,21 @@ std::optional<std::vector<RecoveryStep>> GetRecoverySteps(uint64_t replica_commi
     auto const &wal_files = *maybe_wal_files;
     auto wal_chain_info = GetWalChainInfo(wal_files, replica_commit);
 
-    // A snapshot timestamp inside no WAL file's range means its data was never written to a WAL
-    // (analytical-mode writes bypass it), so WAL-only recovery would silently skip it. The chain looks
-    // intact because an analytical episode punches a timestamp hole without disturbing seq numbering.
-    // The > replica_commit guard is load-bearing: a replica already past the snapshot would otherwise
-    // enter the branch below with first_useful_wal pointing past the snapshot and trip its
-    // "Broken data chain" assert.
-    if (latest_snapshot && latest_snapshot->durable_timestamp > replica_commit &&
-        !SnapshotTsCoveredByAnyWal(
-            wal_files, current_wal_from_timestamp, current_wal_timestamp, latest_snapshot->durable_timestamp)) {
+    bool uncovered_analytical_interval = main_storage->MinWalOnlyRecoveryTimestamp() > replica_commit;
+    if (!uncovered_analytical_interval && maybe_all_snapshots.has_value()) {
+      for (auto const &snap : *maybe_all_snapshots) {
+        if (snap.durable_timestamp > replica_commit &&
+            !SnapshotTsCoveredByAnyWal(
+                wal_files, current_wal_from_timestamp, current_wal_timestamp, snap.durable_timestamp)) {
+          uncovered_analytical_interval = true;
+          break;
+        }
+      }
+    }
+    if (latest_snapshot && latest_snapshot->durable_timestamp > replica_commit && uncovered_analytical_interval) {
       spdlog::info(
-          "Snapshot with durable timestamp {} is not covered by any WAL file; forcing snapshot-based recovery for a "
-          "replica at {}.",
+          "An analytical interval up to snapshot timestamp {} is not covered by WAL files; forcing snapshot-based "
+          "recovery for a replica at {}.",
           latest_snapshot->durable_timestamp,
           replica_commit);
       wal_chain_info.covered_by_wals = false;
@@ -174,10 +199,15 @@ std::optional<std::vector<RecoveryStep>> GetRecoverySteps(uint64_t replica_commi
 
         auto const snap_durable_ts = latest_snapshot->durable_timestamp;
 
-        // This is the same check as the one in durability.cpp when instance is restarting. Search for
-        // "You must have at least one WAL file that contains at least one
-        // delta that was created before the snapshot file!";
-        MG_ASSERT(wal.from_timestamp <= snap_durable_ts || wal.seq_num == 0, "Broken data chain.");
+        if (wal.from_timestamp > snap_durable_ts && wal.seq_num != 0) {
+          spdlog::error(
+              "Replication recovery steps incomplete: oldest contiguous WAL (seq {}) starts at timestamp {} after "
+              "snapshot durable timestamp {}.",
+              wal.seq_num,
+              wal.from_timestamp,
+              snap_durable_ts);
+          return std::nullopt;
+        }
 
         if (snap_durable_ts > replica_commit) {
           // There is some data we need in the snapshot
@@ -191,7 +221,7 @@ std::optional<std::vector<RecoveryStep>> GetRecoverySteps(uint64_t replica_commi
     }
 
     if (std::cmp_less(wal_chain_info.first_useful_wal, wal_files.size())) {
-      auto rw = GetRecoveryWalFiles(&locker_acc, wal_files, wal_chain_info.first_useful_wal);
+      auto rw = GetRecoveryWalFiles(&*locker_acc, wal_files, wal_chain_info.first_useful_wal);
       if (!rw) return std::nullopt;
       recovery_steps.emplace_back(std::in_place_type_t<RecoveryWals>{}, std::move(*rw));
     }

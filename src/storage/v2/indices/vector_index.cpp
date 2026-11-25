@@ -12,11 +12,13 @@
 #include "storage/v2/indices/vector_index.hpp"
 
 #include <range/v3/all.hpp>
+#include "storage/v2/delta_action_methods.hpp"
 #include "storage/v2/exceptions.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indexed_property_decoder.hpp"
 #include "storage/v2/indices/active_indices_updater.hpp"
 #include "storage/v2/indices/vector_index_utils.hpp"
+#include "storage/v2/mvcc.hpp"
 #include "storage/v2/property_value.hpp"
 #include "storage/v2/vertex.hpp"
 #include "usearch/index_dense.hpp"
@@ -37,20 +39,31 @@ void VectorIndex::PublishActiveIndices(ActiveIndicesUpdater const &updater) cons
 
 bool VectorIndex::CreateIndex(VectorIndexSpec &spec, utils::SkipListDb<Vertex>::Accessor &vertices, Indices *indices,
                               NameIdMapper *name_id_mapper, ProgressCallback const &on_progress) {
+  std::optional<uint64_t> index_id;
+  std::vector<std::pair<Vertex *, PropertyValue>> original_properties;
   try {
-    const auto index_id = SetupIndex(spec, name_id_mapper);
+    index_id = SetupIndex(spec, name_id_mapper);
     if (!index_id.has_value()) return false;
     PopulateVectorIndexSingleThreaded(vertices, [&](Vertex &vertex, std::optional<std::size_t> thread_id) {
       AddVertexToIndex(
           *index_id,
           vertex,
           IndexedPropertyDecoder<Vertex>{.indices = indices, .name_id_mapper = name_id_mapper, .entity = &vertex},
-          thread_id);
+          thread_id,
+          &original_properties);
       if (on_progress) on_progress();
     });
     return true;
-  } catch (const std::exception &) {
-    DropIndex(spec.index_name, name_id_mapper);
+  } catch (...) {
+    const utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_blocker;
+    for (auto &[vertex, orig_prop] : original_properties) {
+      vertex->properties.SetProperty(spec.property, orig_prop);
+    }
+    if (index_id.has_value()) {
+      auto new_map = std::make_shared<VectorIndexContainer>(*index_);
+      new_map->erase(*index_id);
+      index_ = std::move(new_map);
+    }
     throw;
   }
 }
@@ -123,10 +136,10 @@ void VectorIndex::RecoverAllVectorIndices(std::vector<VectorIndexRecoveryInfo> &
         if (stored_value.IsNull()) continue;
 
         const bool stored_as_tag = stored_value.IsVectorIndexId();
-        utils::small_vector<float> vec;
+        utils::small_vector<double> vec;
 
         if (stored_as_tag) {
-          utils::small_vector<float> *entry_ptr = nullptr;
+          utils::small_vector<double> *entry_ptr = nullptr;
           if (auto map_it = vertex_vectors.find(property); map_it != vertex_vectors.end()) {
             if (auto entry_it = map_it->second.find(vertex.gid); entry_it != map_it->second.end()) {
               entry_ptr = &entry_it->second;
@@ -193,7 +206,8 @@ void VectorIndex::RecoverAllVectorIndices(std::vector<VectorIndexRecoveryInfo> &
 }
 
 void VectorIndex::AddVertexToIndex(uint64_t index_id, Vertex &vertex, const IndexedPropertyDecoder<Vertex> &decoder,
-                                   std::optional<std::size_t> thread_id) {
+                                   std::optional<std::size_t> thread_id,
+                                   std::vector<std::pair<Vertex *, PropertyValue>> *original_properties) {
   auto it = index_->find(index_id);
   if (it == index_->end()) {
     throw VectorSearchException(fmt::format("Vector index {} does not exist.", index_id));
@@ -203,20 +217,43 @@ void VectorIndex::AddVertexToIndex(uint64_t index_id, Vertex &vertex, const Inde
   if (!spec.label_filter.Matches(vertex.labels)) {
     return;
   }
+  auto raw_before = original_properties ? vertex.properties.GetProperty(spec.property) : PropertyValue{};
   auto property = vertex.properties.GetProperty(spec.property, decoder);
   if (property.IsNull()) return;
   // An empty plain list has nothing to index and stays a plain list — never promote it.
   if (!property.IsVectorIndexId() && property.IsAnyList() && property.ListSize() == 0) return;
 
   auto vector = RegisterIndexId(property, index_id);
-  // Tag only after uSearch accepted the vector: a rejected one (e.g. wrong dimension) must keep its list.
-  UpdateVectorIndex(item_ptr->mg_index, spec, &vertex, vector, thread_id);
-  vertex.properties.SetProperty(spec.property, property);
+  if (original_properties) {
+    // Reserve rollback capacity before mutating the index or vertex property.
+    original_properties->emplace_back(&vertex, std::move(raw_before));
+  }
+  try {
+    // Tag only after uSearch accepted the vector: a rejected one (e.g. wrong dimension) must keep its list.
+    UpdateVectorIndex(item_ptr->mg_index, spec, &vertex, vector, thread_id);
+    vertex.properties.SetProperty(spec.property, property);
+  } catch (...) {
+    if (original_properties) {
+      original_properties->pop_back();
+    }
+    throw;
+  }
 }
 
 std::optional<VectorIndex::DroppedIndexCapture> VectorIndex::DropIndex(std::string_view index_name,
                                                                        NameIdMapper *name_id_mapper,
                                                                        ProgressCallback const &on_progress) {
+  return DropIndex(index_name, name_id_mapper, on_progress, /*enforce_memory_limit=*/true);
+}
+
+std::optional<VectorIndex::DroppedIndexCapture> VectorIndex::DropIndex(std::string_view index_name,
+                                                                       NameIdMapper *name_id_mapper,
+                                                                       ProgressCallback const &on_progress,
+                                                                       bool enforce_memory_limit) {
+  std::optional<utils::MemoryTracker::OutOfMemoryExceptionBlocker> rollback_oom_blocker;
+  if (!enforce_memory_limit) {
+    rollback_oom_blocker.emplace();
+  }
   auto maybe_id = name_id_mapper->NameToIdIfExists(index_name);
   if (!maybe_id.has_value()) return std::nullopt;
   const auto index_id = *maybe_id;
@@ -226,22 +263,44 @@ std::optional<VectorIndex::DroppedIndexCapture> VectorIndex::DropIndex(std::stri
   auto &mg_index = evicted_item->mg_index;
   auto &spec = evicted_item->spec;
 
+  // Allocate replacement index container before mutating vertex properties so container allocation
+  // cannot fail after graph state has already changed.
+  auto new_map = std::make_shared<VectorIndexContainer>(*index_);
+  new_map->erase(index_id);
+
   std::vector<Vertex *> rewritten_vertices;
   {
     auto guard = std::lock_guard{mg_index.mutex};
 
     const auto dimension = mg_index.index.dimensions();
-    CheckGraphMemoryForIndexDrop(index_name, mg_index.index.size(), dimension);
-
     auto const index_size = mg_index.index.size();
     std::vector<Vertex *> indexed_vertices(index_size);
     mg_index.index.export_keys(indexed_vertices.data(), 0, index_size);
 
-    // Convert indexed vectors back to property values with OOM protection.
-    // Track processed vertices so we can rollback on OOM.
+    if (enforce_memory_limit) {
+      std::size_t vectors_to_materialize = 0;
+      for (auto *vertex : indexed_vertices) {
+        auto raw_prop = vertex->properties.GetProperty(spec.property);
+        if (!raw_prop.IsVectorIndexId()) {
+          ++vectors_to_materialize;
+        } else {
+          auto const &ids = raw_prop.ValueVectorIndexIds();
+          const bool any_other_id = std::ranges::any_of(ids, [&](uint64_t id) { return id != index_id; });
+          if (!any_other_id) {
+            ++vectors_to_materialize;
+          }
+        }
+      }
+      CheckGraphMemoryForIndexDrop(index_name, vectors_to_materialize, dimension);
+    }
+
+    // Convert indexed vectors back to property values with full rollback on any exception.
     rewritten_vertices.reserve(indexed_vertices.size());
     try {
-      const utils::MemoryTracker::OutOfMemoryExceptionEnabler oom_enabler;
+      std::optional<utils::MemoryTracker::OutOfMemoryExceptionEnabler> oom_enabler;
+      if (enforce_memory_limit) {
+        oom_enabler.emplace();
+      }
       std::vector<double> vector(dimension);
       for (auto *vertex : indexed_vertices) {
         if (on_progress) on_progress();
@@ -254,15 +313,13 @@ std::optional<VectorIndex::DroppedIndexCapture> VectorIndex::DropIndex(std::stri
         }
         rewritten_vertices.push_back(vertex);
       }
-    } catch (const utils::OutOfMemoryException &) {
+    } catch (...) {
       const utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_blocker;
       for (auto *vertex : rewritten_vertices) ReinstallIndexIdInProperty(vertex, spec.property, index_id);
       throw;
     }
   }
-  auto new_map = std::make_shared<VectorIndexContainer>(*index_);
-  new_map->erase(index_id);
-  index_ = new_map;
+  index_ = std::move(new_map);
   return DroppedIndexCapture{.index_id = index_id,
                              .evicted_item = std::move(evicted_item),
                              .rewritten_vertices = std::move(rewritten_vertices)};
@@ -378,11 +435,11 @@ void VectorIndex::RemoveVertexFromIndex(Vertex *vertex, uint64_t index_id) {
         fmt::format("Error in removing vertex from index: index id {} does not exist.", index_id));
   }
   auto &item_ptr = it->second;
-  UpdateVectorIndex(item_ptr->mg_index, item_ptr->spec, vertex, utils::small_vector<float>{});
+  UpdateVectorIndex(item_ptr->mg_index, item_ptr->spec, vertex, utils::small_vector<double>{});
 }
 
-utils::small_vector<float> VectorIndex::GetVectorPropertyFromIndex(Vertex *vertex, std::string_view index_name,
-                                                                   NameIdMapper *name_id_mapper) const {
+utils::small_vector<double> VectorIndex::GetVectorPropertyFromIndex(Vertex *vertex, std::string_view index_name,
+                                                                    NameIdMapper *name_id_mapper) const {
   auto maybe_id = name_id_mapper->NameToIdIfExists(index_name);
   if (!maybe_id.has_value()) {
     throw VectorSearchException("Vector index {} does not exist.", index_name);
@@ -393,7 +450,7 @@ utils::small_vector<float> VectorIndex::GetVectorPropertyFromIndex(Vertex *verte
   }
   auto &item_ptr = it->second;
   auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
-  utils::small_vector<float> vector(item_ptr->mg_index.index.dimensions());
+  utils::small_vector<double> vector(item_ptr->mg_index.index.dimensions());
   if (!item_ptr->mg_index.index.get(vertex, vector.data())) return {};
   return vector;
 }
@@ -430,22 +487,44 @@ std::vector<VectorIndexInfo> VectorIndex::ListVectorIndicesInfo() const {
 std::vector<VectorIndexSpec> VectorIndex::ListIndices() const {
   std::vector<VectorIndexSpec> result;
   result.reserve(index_->size());
-  std::ranges::transform(
-      *index_, std::back_inserter(result), [](const auto &id_index_item) { return id_index_item.second->spec; });
+  for (const auto &[_, item_ptr] : *index_) {
+    auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    auto spec_copy = item_ptr->spec;
+    spec_copy.capacity = item_ptr->mg_index.index.capacity();
+    result.push_back(std::move(spec_copy));
+  }
   return result;
 }
 
 void VectorIndex::SerializeAllVectorIndices(durability::BaseEncoder *encoder,
                                             std::unordered_set<uint64_t> &mapped_ids) const {
+  SerializeAllVectorIndices(encoder, mapped_ids, nullptr, nullptr, std::numeric_limits<uint64_t>::max());
+}
+
+void VectorIndex::SerializeAllVectorIndices(durability::BaseEncoder *encoder, std::unordered_set<uint64_t> &mapped_ids,
+                                            Transaction const *transaction, utils::SkipListDb<Vertex> *vertices,
+                                            uint64_t unused_vertex_gid) const {
   auto write_mapping = [&](auto mapping) {
     mapped_ids.insert(mapping.AsUint());
     encoder->WriteUint(mapping.AsUint());
   };
 
+  std::vector<Vertex *> delta_vertices;
+  if (transaction != nullptr && vertices != nullptr && !index_->empty()) {
+    auto acc = vertices->access();
+    for (auto &vertex : acc) {
+      if (vertex.gid.AsUint() >= unused_vertex_gid) break;
+      if (vertex.delta() != nullptr) {
+        delta_vertices.push_back(&vertex);
+      }
+    }
+  }
+
   encoder->WriteUint(index_->size());
   for (const auto &[_, item_ptr] : *index_) {
     auto &mg_index = item_ptr->mg_index;
-    auto &spec = item_ptr->spec;
+    auto guard = utils::SharedResourceLockGuard(mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    auto const &spec = item_ptr->spec;
     encoder->WriteString(spec.index_name);
     encoder->WriteUint(static_cast<uint64_t>(spec.label_filter.mode));
     encoder->WriteUint(spec.label_filter.ids.size());
@@ -456,34 +535,120 @@ void VectorIndex::SerializeAllVectorIndices(durability::BaseEncoder *encoder,
     encoder->WriteString(NameFromMetric(spec.metric_kind));
     encoder->WriteUint(spec.dimension);
     encoder->WriteUint(spec.resize_coefficient);
-    encoder->WriteUint(spec.capacity);
+    encoder->WriteUint(mg_index.index.capacity());
     encoder->WriteUint(static_cast<uint64_t>(spec.scalar_kind));
 
-    using Entry = std::pair<uint64_t, std::vector<float>>;
-    auto const entries = std::invoke([&]() -> std::vector<Entry> {
-      // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
-      auto guard = utils::SharedResourceLockGuard(mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
-      auto const size = mg_index.index.size();
-      if (size == 0) return {};
+    auto const size = mg_index.index.size();
+    if (transaction == nullptr) {
+      if (size == 0) {
+        encoder->WriteUint(0);
+        continue;
+      }
 
       std::vector<Vertex *> keys(size);
       mg_index.index.export_keys(keys.data(), 0, size);
+      std::erase_if(keys, [&](Vertex *vertex) {
+        return vertex == nullptr || vertex->deleted() || !mg_index.index.contains(vertex);
+      });
 
-      std::vector<Entry> result;
-      result.reserve(size);
-      std::vector<float> buffer(mg_index.index.dimensions());
+      encoder->WriteUint(keys.size());
+      std::vector<double> buffer(mg_index.index.dimensions());
       for (auto *vertex : keys) {
-        if (vertex == nullptr || vertex->deleted()) continue;
-        if (!mg_index.index.get(vertex, buffer.data())) continue;
-        result.emplace_back(vertex->gid.AsUint(), buffer);
+        if (!mg_index.index.get(vertex, buffer.data())) {
+          std::ranges::fill(buffer, 0.0);
+        }
+        encoder->WriteUint(vertex->gid.AsUint());
+        for (auto value : buffer) encoder->WriteDouble(value);
       }
-      return result;
-    });
+      continue;
+    }
 
-    encoder->WriteUint(entries.size());
-    for (const auto &[gid, vector] : entries) {
+    if (size == 0 && delta_vertices.empty()) {
+      encoder->WriteUint(0);
+      continue;
+    }
+
+    std::vector<Vertex *> candidates(size);
+    if (size > 0) {
+      mg_index.index.export_keys(candidates.data(), 0, size);
+    }
+    std::unordered_set<Vertex *> seen(candidates.begin(), candidates.end());
+    for (auto *dv : delta_vertices) {
+      if (seen.insert(dv).second) {
+        candidates.push_back(dv);
+      }
+    }
+
+    std::vector<std::pair<uint64_t, utils::small_vector<double>>> visible_entries;
+    visible_entries.reserve(candidates.size());
+    utils::small_vector<double> live_buffer(mg_index.index.dimensions());
+
+    for (auto *vertex : candidates) {
+      if (vertex == nullptr || vertex->gid.AsUint() >= unused_vertex_gid) continue;
+
+      bool exists = true;
+      bool deleted = false;
+      Delta *delta = nullptr;
+      VertexKey labels;
+      PropertyValue prop;
+      {
+        auto v_guard = std::shared_lock{vertex->lock};
+        deleted = vertex->deleted();
+        delta = vertex->delta();
+        labels = vertex->labels;
+        prop = vertex->properties.GetProperty(spec.property);
+        if (prop.IsVectorIndexId() && prop.ValueVectorIndexList().empty()) {
+          if (mg_index.index.get(vertex, live_buffer.data())) {
+            prop.ValueVectorIndexList() = live_buffer;
+          }
+        }
+        if (!vertex->has_uncommitted_non_sequential_deltas()) {
+          v_guard.unlock();
+        }
+        if (delta != nullptr && transaction->isolation_level != IsolationLevel::READ_UNCOMMITTED) {
+          ApplyDeltasForRead(transaction, delta, View::OLD, [&](const Delta &d) {
+            DeltaDispatch(d,
+                          utils::ChainedOverloaded{
+                              Exists_ActionMethod(exists),
+                              Deleted_ActionMethod(deleted),
+                              PropertyValue_ActionMethod(prop, spec.property),
+                              ActionMethod<Delta::Action::ADD_LABEL>([&](const Delta &ld) {
+                                if (!std::ranges::contains(labels, ld.label.value)) {
+                                  labels.push_back(ld.label.value);
+                                }
+                              }),
+                              ActionMethod<Delta::Action::REMOVE_LABEL>([&](const Delta &ld) {
+                                auto rem = std::ranges::remove(labels, ld.label.value);
+                                labels.erase(rem.begin(), rem.end());
+                              }),
+                          });
+          });
+        }
+      }
+
+      if (!exists || deleted || !spec.label_filter.Matches(labels) || prop.IsNull()) continue;
+
+      utils::small_vector<double> coords;
+      if (prop.IsVectorIndexId()) {
+        coords = prop.ValueVectorIndexList();
+      } else if (prop.IsAnyList()) {
+        try {
+          coords = ListToVector(prop);
+        } catch (...) {
+          continue;
+        }
+      } else {
+        continue;
+      }
+
+      if (coords.size() != spec.dimension) continue;
+      visible_entries.emplace_back(vertex->gid.AsUint(), std::move(coords));
+    }
+
+    encoder->WriteUint(visible_entries.size());
+    for (const auto &[gid, coords] : visible_entries) {
       encoder->WriteUint(gid);
-      for (auto value : vector) encoder->WriteDouble(value);
+      for (auto value : coords) encoder->WriteDouble(value);
     }
   }
 }
@@ -534,7 +699,7 @@ VectorIndex::VectorSearchNodeResults VectorIndex::SearchNodes(std::string_view i
     result.emplace_back(
         vertex,
         static_cast<double>(result_keys[i].distance),
-        std::abs(SimilarityFromDistance(item_ptr->mg_index.index.metric().metric_kind(), result_keys[i].distance)));
+        SimilarityFromDistance(item_ptr->mg_index.index.metric().metric_kind(), result_keys[i].distance));
   }
 
   return result;
@@ -767,8 +932,12 @@ std::vector<VectorIndexSpec> VectorIndex::ActiveIndices::ListIndices() const {
   if (!index_container_) return {};
   std::vector<VectorIndexSpec> result;
   result.reserve(index_container_->size());
-  std::ranges::transform(
-      *index_container_, std::back_inserter(result), [](const auto &id_item) { return id_item.second->spec; });
+  for (const auto &[_, item_ptr] : *index_container_) {
+    auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    auto spec_copy = item_ptr->spec;
+    spec_copy.capacity = item_ptr->mg_index.index.capacity();
+    result.push_back(std::move(spec_copy));
+  }
   return result;
 }
 

@@ -87,7 +87,8 @@ class CoordinatorLogStore final : public log_store {
    * @param is_newest_entry - if this is the newest entry
    * @return true if storing was successful, false otherwise
    */
-  bool StoreEntryToDisk(const std::shared_ptr<log_entry> &clone, uint64_t key_id, bool is_newest_entry);
+  bool StoreEntryToDisk(const std::shared_ptr<log_entry> &clone, uint64_t key_id, bool is_newest_entry,
+                        const std::vector<std::string> &keys_to_delete = {});
 
  private:
   /*

@@ -1,4 +1,3 @@
-import os
 import sys
 
 import pytest
@@ -56,7 +55,7 @@ from oidc import process_tokens, _load_role_mappings
         },
         {
             "name": "successful_with_id_token_username",
-            "access_token": {"token": {"username": "username", "roles": "test-role", "groups": "test-role"}},
+            "access_token": {"token": {"sub": "sub-field", "username": "username", "roles": "test-role", "groups": "test-role"}},
             "id_token": {"token": {"sub": "sub-field"}},
             "config": {"role_mapping": {"test-role": ["admin"]}, "username": "id:sub", "use_id_token": True},
             "expected": {"authenticated": True, "roles": ["admin"], "username": "sub-field"},

@@ -35,6 +35,8 @@
 
 namespace memgraph::storage {
 
+struct Transaction;
+
 namespace r = ranges;
 namespace rv = r::views;
 
@@ -144,7 +146,7 @@ struct VectorIndexRecoveryInfo {
 /// the property store is its own vector and wins over any map entry. Tag IDs are not trusted during recovery.
 struct VectorIndexRecovery {
   using VertexVectors =
-      boost::unordered_flat_map<PropertyId, boost::unordered_flat_map<Gid, utils::small_vector<float>, std::hash<Gid>>,
+      boost::unordered_flat_map<PropertyId, boost::unordered_flat_map<Gid, utils::small_vector<double>, std::hash<Gid>>,
                                 std::hash<PropertyId>>;
 
   /// Called on WAL VertexSetProperty. Mutates value: an empty tag becomes plain []. With a spec on p, a tag is
@@ -279,6 +281,8 @@ class VectorIndex {
   /// last reference to the captured item goes.
   std::optional<DroppedIndexCapture> DropIndex(std::string_view index_name, NameIdMapper *name_id_mapper,
                                                ProgressCallback const &on_progress = {});
+  std::optional<DroppedIndexCapture> DropIndex(std::string_view index_name, NameIdMapper *name_id_mapper,
+                                               ProgressCallback const &on_progress, bool enforce_memory_limit);
 
   /// @brief Reinstalls an index previously evicted by DropIndex. Re-adds the
   /// captured index_id to each rewritten vertex's property and re-inserts the
@@ -317,8 +321,8 @@ class VectorIndex {
   /// @param index_name The name of the index to retrieve the vector from.
   /// @param name_id_mapper Mapper for name/ID conversions.
   /// @return The vector of the vertex as a list of float values.
-  utils::small_vector<float> GetVectorPropertyFromIndex(Vertex *vertex, std::string_view index_name,
-                                                        NameIdMapper *name_id_mapper) const;
+  utils::small_vector<double> GetVectorPropertyFromIndex(Vertex *vertex, std::string_view index_name,
+                                                         NameIdMapper *name_id_mapper) const;
 
   /// Reconstruct a vertex's indexed vector into `out` (resized to the index dimension); false if absent. Looked up by
   /// name-id. Zero owning PropertyValue — used to materialize an embedding transiently.
@@ -381,6 +385,9 @@ class VectorIndex {
   /// @param encoder The durability encoder to serialize to.
   /// @param mapped_ids Set of mapped IDs.
   void SerializeAllVectorIndices(durability::BaseEncoder *encoder, std::unordered_set<uint64_t> &mapped_ids) const;
+  void SerializeAllVectorIndices(durability::BaseEncoder *encoder, std::unordered_set<uint64_t> &mapped_ids,
+                                 Transaction const *transaction, utils::SkipListDb<Vertex> *vertices,
+                                 uint64_t unused_vertex_gid) const;
 
  private:
   /// @brief Removes a vertex from a vector index.
@@ -400,7 +407,8 @@ class VectorIndex {
   /// @param decoder Decoder for this vertex.
   /// @param thread_id Optional thread ID hint for usearch's internal optimizations.
   void AddVertexToIndex(uint64_t index_id, Vertex &vertex, const IndexedPropertyDecoder<Vertex> &decoder,
-                        std::optional<std::size_t> thread_id = std::nullopt);
+                        std::optional<std::size_t> thread_id = std::nullopt,
+                        std::vector<std::pair<Vertex *, PropertyValue>> *original_properties = nullptr);
 
   utils::MemoryTracker *memory_tracker_{nullptr};
   // Invariant: `index_` is only mutated under UNIQUE storage access (see the MG_ASSERTs in

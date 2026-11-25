@@ -11,9 +11,27 @@
 
 #include "dbms/rpc.hpp"
 
+#include "slk/serialization.hpp"
+#include "slk/streams.hpp"
+
+namespace memgraph::slk {
+
+void Save(const memgraph::dbms::TenantProfiles::Profile &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self.name, builder);
+  memgraph::slk::Save(self.memory_limit, builder);
+  memgraph::slk::Save(self.databases, builder);
+}
+
+void Load(memgraph::dbms::TenantProfiles::Profile *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(&self->name, reader);
+  memgraph::slk::Load(&self->memory_limit, reader);
+  memgraph::slk::Load(&self->databases, reader);
+}
+
+}  // namespace memgraph::slk
+
 #ifdef MG_ENTERPRISE
 
-#include "slk/streams.hpp"
 #include "storage/v2/replication/rpc.hpp"
 #include "utils/enum.hpp"
 
@@ -250,18 +268,6 @@ void Save(const memgraph::storage::replication::RenameDatabaseRes &self, memgrap
 
 void Load(memgraph::storage::replication::RenameDatabaseRes *self, memgraph::slk::Reader *reader) {
   memgraph::slk::Load(&self->result, reader);
-}
-
-void Save(const memgraph::dbms::TenantProfiles::Profile &self, memgraph::slk::Builder *builder) {
-  memgraph::slk::Save(self.name, builder);
-  memgraph::slk::Save(self.memory_limit, builder);
-  memgraph::slk::Save(self.databases, builder);
-}
-
-void Load(memgraph::dbms::TenantProfiles::Profile *self, memgraph::slk::Reader *reader) {
-  memgraph::slk::Load(&self->name, reader);
-  memgraph::slk::Load(&self->memory_limit, reader);
-  memgraph::slk::Load(&self->databases, reader);
 }
 
 void Save(const memgraph::storage::replication::TenantProfileReq &self, memgraph::slk::Builder *builder) {

@@ -970,6 +970,8 @@ class CoordQueryHandler final : public query::CoordinatorQueryHandler {
                                     coordinator_id);
       case RAFT_FAILED:
         throw QueryRuntimeException("Generic Raft failure occurred when removing coordinator {}!", coordinator_id);
+      case RAFT_LOG_ERROR:
+        throw QueryRuntimeException("Writing to Raft log failed. Please retry the operation.");
       case SUCCESS:
         break;
     }
@@ -2032,23 +2034,34 @@ Callback HandleAuthQuery(AuthQuery *auth_query, InterpreterContext *interpreter_
         return rows;
       };
       return callback;
-    case AuthQuery::Action::SHOW_USERS_FOR_ROLE:
+    case AuthQuery::Action::SHOW_USERS_FOR_ROLE: {
       callback.header = {"users"};
-      callback.fn = [auth, roles = std::move(auth_query->roles_), interpreter = &interpreter] {
+      auto runtime_notifications = std::make_shared<std::vector<Notification>>();
+      callback.notifications_ptr = runtime_notifications;
+      callback.fn = [auth, roles = std::move(auth_query->roles_), runtime_notifications, interpreter = &interpreter] {
         if (roles.empty()) {
           throw QueryRuntimeException("No role name provided for SHOW USERS FOR ROLE");
         }
         const std::string &rolename = roles[0];
 
         std::vector<std::vector<TypedValue>> rows;
-        auto usernames = auth->GetUsernamesForRole(rolename, interpreter->auth_transaction_ptr());
-        rows.reserve(usernames.size());
-        for (auto &&username : usernames) {
-          rows.emplace_back(std::vector<TypedValue>{username});
+        auto result = auth->GetUsernamesForRoleWithDiagnostics(rolename, interpreter->auth_transaction_ptr());
+        if (!result.complete) {
+          runtime_notifications->emplace_back(
+              SeverityLevel::WARNING,
+              NotificationCode::INCOMPLETE_AUTH_LISTING,
+              fmt::format("Role membership listing for '{}' is incomplete; skipped unreadable entry(ies): {}.",
+                          rolename,
+                          utils::JoinVector(result.unreadable_entries, ", ")));
+        }
+        rows.reserve(result.usernames.size());
+        for (auto &&username : result.usernames) {
+          rows.emplace_back(std::vector<TypedValue>{std::move(username)});
         }
         return rows;
       };
       return callback;
+    }
     case AuthQuery::Action::GRANT_DATABASE_TO_USER:
       forbid_on_replica();
 #ifdef MG_ENTERPRISE
@@ -9088,6 +9101,9 @@ PreparedQuery PrepareMultiDatabaseQuery(ParsedQuery parsed_query, InterpreterCon
                 case dbms::DbmsHandler::SuspendError::ACTIVE_CONNECTIONS:
                   throw QueryRuntimeException("Database {} has active connections; cannot suspend while in use.",
                                               db_name);
+                case dbms::DbmsHandler::SuspendError::DURABILITY_FAILED:
+                  throw QueryRuntimeException(
+                      "Failed to persist suspended state for database {}. Disk I/O error.", db_name);
               }
             }
             std::vector<std::vector<TypedValue>> status;
@@ -10455,17 +10471,21 @@ PreparedQuery PrepareUserProfileQuery(ParsedQuery parsed_query, InterpreterConte
         if (!user_or_role) {
           throw QueryException("Expected user or role.");
         }
-        (void)auth->GetProfileForUser(*user_or_role);  // Throws if user doesn't exist
+        const auto existing_resource = resource_monitor ? resource_monitor->FindUser(*user_or_role) : nullptr;
+        if (!existing_resource) {
+          (void)auth->GetProfileForUser(*user_or_role);  // Throws if user doesn't exist
+        }
+        const utils::UserResources default_resource{};
+        const utils::UserResources &resource_ref = existing_resource ? *existing_resource : default_resource;
         std::vector<std::vector<TypedValue>> res;
-        const auto resource = resource_monitor->GetUser(*user_or_role);
         // Session usage
-        const auto [session_usage, session_limit] = resource->GetSessions();
+        const auto [session_usage, session_limit] = resource_ref.GetSessions();
         res.emplace_back(std::vector<TypedValue>{
             TypedValue(auth::UserProfiles::kLimits[(int)auth::UserProfiles::Limits::kSessions]),
             TypedValue(static_cast<int64_t>(session_usage)),
             session_limit == -1 ? TypedValue("UNLIMITED") : TypedValue(static_cast<int64_t>(session_limit))});
         // Transaction memory usage
-        const auto [tm_usage, tm_limit] = resource->GetTransactionsMemory();
+        const auto [tm_usage, tm_limit] = resource_ref.GetTransactionsMemory();
         const auto unlimited = tm_limit == utils::TransactionsMemoryResource::kUnlimited;
         res.emplace_back(std::vector<TypedValue>{
             TypedValue(auth::UserProfiles::kLimits[(int)auth::UserProfiles::Limits::kTransactionsMemory]),

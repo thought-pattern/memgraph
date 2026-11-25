@@ -160,7 +160,7 @@ GENERATE_READ_TEST(
         memgraph::storage::CoordinateReferenceSystem::Cartesian_3d, 1.0, 2.0, 3.0}),
     memgraph::storage::ExternalPropertyValue(memgraph::storage::ExternalPropertyValue::VectorIndexIdData{
         memgraph::storage::ExternalPropertyValue::vector_index_id_t{"test_index"},
-        memgraph::utils::small_vector<float>{1.0f, 2.0f, 3.0f}}));
+        memgraph::utils::small_vector<double>{1.0, 2.0, 3.0}}));
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define GENERATE_SKIP_TEST(name, type, ...)                                           \
@@ -224,7 +224,7 @@ GENERATE_SKIP_TEST(
         memgraph::storage::CoordinateReferenceSystem::Cartesian_3d, 1.0, 2.0, 3.0}),
     memgraph::storage::ExternalPropertyValue(memgraph::storage::ExternalPropertyValue::VectorIndexIdData{
         memgraph::storage::ExternalPropertyValue::vector_index_id_t{"test_index"},
-        memgraph::utils::small_vector<float>{1.0f, 2.0f, 3.0f}}));
+        memgraph::utils::small_vector<double>{1.0, 2.0, 3.0}}));
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define GENERATE_PARTIAL_READ_TEST(name, value)                                                              \
@@ -311,7 +311,7 @@ GENERATE_PARTIAL_READ_TEST(
             memgraph::storage::CoordinateReferenceSystem::Cartesian_3d, 1.0, 2.0, 3.0}),
         memgraph::storage::ExternalPropertyValue(memgraph::storage::ExternalPropertyValue::VectorIndexIdData{
             memgraph::storage::ExternalPropertyValue::vector_index_id_t{"test_index"},
-            memgraph::utils::small_vector<float>{1.0f, 2.0f, 3.0f}})}));
+            memgraph::utils::small_vector<double>{1.0, 2.0, 3.0}})}));
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define GENERATE_PARTIAL_SKIP_TEST(name, value)                                                              \
@@ -384,7 +384,7 @@ GENERATE_PARTIAL_SKIP_TEST(
             memgraph::storage::CoordinateReferenceSystem::Cartesian_3d, 1.0, 2.0, 3.0}),
         memgraph::storage::ExternalPropertyValue(memgraph::storage::ExternalPropertyValue::VectorIndexIdData{
             memgraph::storage::ExternalPropertyValue::vector_index_id_t{"test_index"},
-            memgraph::utils::small_vector<float>{1.0F, 2.0F, 3.0F}})}));
+            memgraph::utils::small_vector<double>{1.0, 2.0, 3.0}})}));
 
 // NOLINTNEXTLINE(hicpp-special-member-functions)
 TYPED_TEST(DecoderEncoderTest, PropertyValueInvalidMarker) {

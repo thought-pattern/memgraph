@@ -106,6 +106,9 @@ class UserProfiles {
     [[nodiscard]] bool operator()(const Profile &lhs, const std::string &rhs) const { return lhs.name == rhs; }
   };
 
+  // Serializes a profile along with any unresolved raw spellings still attached to it.
+  static std::string SerializeWithStale(const Profile &profile, const std::vector<std::string> *stale_spellings);
+
   // Writes the profile, plus the stale spellings hidden from it at load so unrelated saves never rewrite them.
   bool Persist(const Profile &profile);
 

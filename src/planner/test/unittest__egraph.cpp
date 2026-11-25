@@ -1109,40 +1109,39 @@ TEST(EGraph_EdgeCases, RepairHashconsEclassMergesAwayOriginal) {
 
 TEST(EGraph_EdgeCases, RepairHashconsWithHigherRankTarget) {
   // Same scenario as RepairHashconsEclassMergesAwayOriginal, but using
-  // union-find rank (built through preliminary merges) to force the merge
-  // direction, rather than relying on creation order.
+  // union-find rank on one of the F parent classes itself (built through
+  // preliminary merges) to force the merge direction against creation order.
 
   TestEGraph egraph;
   TestProcessingContext ctx;
 
-  // Create leaf nodes - we'll merge c1, c2, c3 to build rank
-  auto c1 = egraph.emplace(Op::A, 1).eclass_id;
-  auto c2 = egraph.emplace(Op::A, 2).eclass_id;
-  auto c3 = egraph.emplace(Op::A, 3).eclass_id;
-  auto d = egraph.emplace(Op::A, 4).eclass_id;
+  auto c = egraph.emplace(Op::A, 1).eclass_id;
+  auto d = egraph.emplace(Op::A, 2).eclass_id;
 
-  // Merge c1, c2, c3 to increase rank of the merged class
-  egraph.merge(c1, c2);
-  egraph.rebuild(ctx);
-  auto merged_c = egraph.find(c1);
-  egraph.merge(merged_c, c3);
-  egraph.rebuild(ctx);
-  merged_c = egraph.find(c1);
-
-  // Create F nodes - f_high has child with higher union-find rank
-  auto f_high = egraph.emplace(Op::F, {merged_c}).eclass_id;
+  // Create f_low first (lower ID, rank 0) and f_high second (higher ID)
   auto f_low = egraph.emplace(Op::F, {d}).eclass_id;
+  auto f_high = egraph.emplace(Op::F, {c}).eclass_id;
+  EXPECT_GT(f_high.value_of(), f_low.value_of());
 
-  // Create parent nodes to ensure both F classes get processed
-  egraph.emplace(Op::F2, {f_high});
-  egraph.emplace(Op::F2, {f_low});
-
-  // Merge the leaves - this triggers congruence between f_high and f_low
-  egraph.merge(merged_c, d);
+  // Raise the rank of f_high's own e-class before c and d become equivalent
+  auto sib1 = egraph.emplace(Op::G, 1).eclass_id;
+  auto sib2 = egraph.emplace(Op::G, 2).eclass_id;
+  auto sib_pair = egraph.merge(sib1, sib2).eclass_id;
+  egraph.rebuild(ctx);
+  auto expected_winner = egraph.merge(f_high, sib_pair).eclass_id;
   egraph.rebuild(ctx);
 
-  // After rebuild, both F nodes should be in same class
-  EXPECT_EQ(egraph.find(f_high), egraph.find(f_low));
+  // Create outer parent nodes so both F classes participate in congruence propagation
+  auto outer_high = egraph.emplace(Op::F2, {expected_winner}).eclass_id;
+  auto outer_low = egraph.emplace(Op::F2, {f_low}).eclass_id;
+
+  // Merge leaves c and d - f_high and f_low become congruent and must merge into expected_winner
+  egraph.merge(c, d);
+  egraph.rebuild(ctx);
+
+  EXPECT_EQ(egraph.find(f_low), expected_winner);
+  EXPECT_EQ(egraph.find(f_high), expected_winner);
+  EXPECT_EQ(egraph.find(outer_high), egraph.find(outer_low));
   EXPECT_TRUE(egraph.ValidateCongruenceClosure());
 }
 

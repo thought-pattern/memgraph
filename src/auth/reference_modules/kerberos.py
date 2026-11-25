@@ -127,6 +127,10 @@ def _resolve_roles_ldap(client_principal: str, role_mapping: dict, config: dict)
 
             if not conn.entries:
                 return {"error": f"User {principal_name} not found in LDAP under {search_base}"}
+            if len(conn.entries) > 1:
+                return {
+                    "error": f"Ambiguous LDAP match for {principal_name} under {search_base}: found {len(conn.entries)} entries"
+                }
 
             if config["ldap_nested_groups_enabled"]:
                 user_dn = conn.entries[0].entry_dn
@@ -240,16 +244,30 @@ def authenticate(response: str, scheme: str):
     }
 
 
-if __name__ == "__main__":
+def process_pipe_line(raw_line: bytes) -> bytes:
     from common import add_call_id_to_response, pop_call_id
 
+    call_id = None
+    try:
+        params = json.loads(raw_line.decode("utf-8"))
+        if not isinstance(params, dict):
+            raise ValueError("Request payload must be a JSON object")
+        call_id = pop_call_id(params)
+        ret = authenticate(**params)
+    except Exception as exc:
+        ret = {"authenticated": False, "errors": f"Invalid authentication request: {exc}"}
+    add_call_id_to_response(ret, call_id)
+    return (json.dumps(ret) + "\n").encode("utf-8")
+
+
+if __name__ == "__main__":
     # Stateless: each request is independent. Do not cache tokens or user data,
     # or the next connection may get the previous user (wrong-user bug).
     input_stream = io.FileIO(1000, mode="r")
     output_stream = io.FileIO(1001, mode="w")
     while True:
-        params = json.loads(input_stream.readline().decode("ascii"))
-        call_id = pop_call_id(params)
-        ret = authenticate(**params)
-        add_call_id_to_response(ret, call_id)
-        output_stream.write((json.dumps(ret) + "\n").encode("ascii"))
+        line = input_stream.readline()
+        if not line:
+            break
+        output_stream.write(process_pipe_line(line))
+        output_stream.flush()

@@ -29,7 +29,7 @@ bool FromJson(std::string const &json, LabelPropertyIndexStats &out) {
 
 std::string ToJson(LabelPropertyIndexStats const &in) {
   return fmt::format(
-      R"({{"count":{}, "distinct_values_count":{}, "statistic":{}, "avg_group_size":{} "avg_degree":{}}})",
+      R"({{"count":{}, "distinct_values_count":{}, "statistic":{}, "avg_group_size":{}, "avg_degree":{}}})",
       in.count,
       in.distinct_values_count,
       in.statistic,

@@ -125,10 +125,11 @@ struct TrackingInfo {
   TrackingInfo &operator+=(const TrackingInfo<TOtherContainer> &rhs) {
     n += rhs.n;
     for (const auto &[id, val] : rhs.properties) {
-      auto &prop = properties[id];
+      auto &&prop_ref = properties[id];
+      auto &prop = utils::UnwrapConcurrentValue(prop_ref);
       prop.n += val.n;
-      for (const auto &[type, n] : val.types) {
-        prop.types[type] += n;
+      for (const auto &[type, count] : val.types) {
+        prop.types[type] += count;
       }
     }
     return *this;
@@ -206,7 +207,7 @@ template <>
 class hash<memgraph::storage::SchemaInfoEdge> {
  public:
   size_t operator()(const memgraph::storage::SchemaInfoEdge &pp) const {
-    return pp.edge_ref.gid.AsUint();  // Both ptr and gid are the same size and unique
+    return static_cast<size_t>(pp.edge_ref.RawBits());
   }
 };
 

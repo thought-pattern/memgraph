@@ -458,8 +458,23 @@ std::expected<void, FileWriteError> OutputFile::Open(const std::filesystem::path
   written_since_last_sync_ = 0;
   no_space_.Reset();
 
-  int flags = O_WRONLY | O_CLOEXEC | O_CREAT;
-  if (mode == Mode::APPEND_TO_EXISTING) flags |= O_APPEND;
+  int flags = O_WRONLY | O_CLOEXEC;
+  switch (mode) {
+    case Mode::OVERWRITE_EXISTING:
+      flags |= O_CREAT;
+      break;
+    case Mode::TRUNCATE_EXISTING:
+      flags |= O_CREAT | O_TRUNC;
+      break;
+    case Mode::APPEND_TO_EXISTING:
+      flags |= O_CREAT | O_APPEND;
+      break;
+    case Mode::PATCH_EXISTING:
+      break;
+    case Mode::CREATE_NEW:
+      flags |= O_CREAT | O_EXCL;
+      break;
+  }
 
   while (true) {
     // The permissions are set to ((rw-r-----) & ~umask)
@@ -773,8 +788,23 @@ std::expected<void, FileWriteError> NonConcurrentOutputFile::Open(const std::fil
   no_space_.Reset();
   RestartPacing(0);  // otherwise a reused handle carries the previous file's offset into this one
 
-  int flags = O_WRONLY | O_CLOEXEC | O_CREAT;
-  if (mode == Mode::APPEND_TO_EXISTING) flags |= O_APPEND;
+  int flags = O_WRONLY | O_CLOEXEC;
+  switch (mode) {
+    case Mode::OVERWRITE_EXISTING:
+      flags |= O_CREAT;
+      break;
+    case Mode::TRUNCATE_EXISTING:
+      flags |= O_CREAT | O_TRUNC;
+      break;
+    case Mode::APPEND_TO_EXISTING:
+      flags |= O_CREAT | O_APPEND;
+      break;
+    case Mode::PATCH_EXISTING:
+      break;
+    case Mode::CREATE_NEW:
+      flags |= O_CREAT | O_EXCL;
+      break;
+  }
 
   while (true) {
     // The permissions are set to ((rw-r-----) & ~umask)

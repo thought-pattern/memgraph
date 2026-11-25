@@ -124,13 +124,15 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
     std::vector<auth::User> auth_users;
     std::vector<auth::Role> auth_roles;
     std::vector<auth::UserProfiles::Profile> auth_profiles;
+    std::vector<dbms::TenantProfiles::Profile> tenant_profiles;
     if (is_enterprise) {
       auth.WithReadLock([&](const auto &locked_auth) {
         auth_config = locked_auth.GetConfig();
-        auth_users = locked_auth.AllUsers();
+        auth_users = locked_auth.AllUsersStrict();
         auth_roles = locked_auth.AllRoles();
         auth_profiles = locked_auth.AllProfiles();
       });
+      tenant_profiles = dbms_handler.GetAllTenantProfilesStrict();
     }
 #endif
     auto stream = std::invoke([&]() {
@@ -145,7 +147,9 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
                                                             std::vector<auth::UserProfiles::Profile>{},
                                                             params_snapshot,
                                                             std::vector<storage::ColdTenantRecovery>{},
-                                                            /*includes_auth_and_databases=*/false);
+                                                            /*includes_auth_and_databases=*/false,
+                                                            std::vector<dbms::TenantProfiles::Profile>{},
+                                                            /*includes_tenant_profiles=*/false);
       }
       return client.rpc_client_.Stream<SystemRecoveryRpc>(main_uuid,
                                                           db_info.last_committed_timestamp,
@@ -156,7 +160,9 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
                                                           std::move(auth_profiles),
                                                           params_snapshot,
                                                           std::move(db_info.cold_databases),
-                                                          /*includes_auth_and_databases=*/true);
+                                                          /*includes_auth_and_databases=*/true,
+                                                          std::move(tenant_profiles),
+                                                          /*includes_tenant_profiles=*/true);
 #else
       return client.rpc_client_.Stream<SystemRecoveryRpc>(main_uuid,
                                                           db_info.last_committed_timestamp,
@@ -167,7 +173,9 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
                                                           std::vector<auth::UserProfiles::Profile>{},
                                                           params_snapshot,
                                                           std::vector<storage::ColdTenantRecovery>{},
-                                                          /*includes_auth_and_databases=*/false);
+                                                          /*includes_auth_and_databases=*/false,
+                                                          std::vector<dbms::TenantProfiles::Profile>{},
+                                                          /*includes_tenant_profiles=*/false);
 #endif
     });
     guard.reset();

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -103,14 +104,20 @@ class Rewrite : public EGraphTestBase {
 
   void expect_rule_rewrites(TestRewriteRule const &rule, std::size_t n) {
     auto idx = rule_index(rule);
-    ASSERT_LT(idx, result_.rewrites_per_rule.size());
-    EXPECT_EQ(result_.rewrites_per_rule[idx], n);
+    if (!idx.has_value()) {
+      ADD_FAILURE() << "Rule not found: " << rule.name();
+      return;
+    }
+    ASSERT_LT(*idx, result_.rewrites_per_rule.size());
+    EXPECT_EQ(result_.rewrites_per_rule[*idx], n);
   }
 
  private:
-  auto rule_index(TestRewriteRule const &rule) const -> std::size_t {
+  auto rule_index(TestRewriteRule const &rule) const -> std::optional<std::size_t> {
     auto it = rule_indices_.find(std::string(rule.name()));
-    EXPECT_NE(it, rule_indices_.end()) << "Rule not found: " << rule.name();
+    if (it == rule_indices_.end()) {
+      return std::nullopt;
+    }
     return it->second;
   }
 };

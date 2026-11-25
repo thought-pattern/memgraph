@@ -11,11 +11,14 @@
 
 #pragma once
 
+#include <cctype>
+#include <cmath>
 #include <iosfwd>
 #include <map>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <type_traits>
 
 namespace memgraph::utils {
 
@@ -28,7 +31,7 @@ static inline bool GetJsonValue(const std::string &jsonString, const std::string
   const auto regex = GetRegexKey(key);
   std::smatch match;
 
-  if (std::regex_search(jsonString, match, regex)) {
+  if (std::regex_search(jsonString, match, regex) && match[1].matched) {
     out = match[1].str();
     return true;
   }
@@ -43,10 +46,25 @@ static inline bool GetJsonValue(const std::string &jsonString, const std::string
 
   if (std::regex_search(jsonString, match, regex)) {
     for (size_t i = 1; i < match.size(); ++i) {
-      const auto &m = match[i].str();
-      if (m.empty()) continue;
+      if (!match[i].matched) continue;
+      const auto m = match[i].str();
+      size_t start = 0;
+      while (start < m.size() && std::isspace(static_cast<unsigned char>(m[start])) != 0) {
+        ++start;
+      }
+      if (start == m.size()) return false;
+      if constexpr (std::is_unsigned_v<T> && !std::is_same_v<T, bool>) {
+        if (m[start] == '-') return false;
+      }
       std::istringstream ss(m);
-      ss >> out;
+      T parsed{};
+      if (!(ss >> parsed)) return false;
+      ss >> std::ws;
+      if (!ss.eof()) return false;
+      if constexpr (std::is_floating_point_v<T>) {
+        if (!std::isfinite(parsed)) return false;
+      }
+      out = parsed;
       return true;
     }
   }

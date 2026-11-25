@@ -11,8 +11,10 @@
 
 #include "query/stream/sources.hpp"
 
+#include <exception>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include <thread>
 #include <utility>
 
@@ -24,8 +26,14 @@ namespace {
 auto MakeDbAwareThreadFactory(memory::ArenaPool *arena_pool) {
   return [arena_pool](std::function<void()> task) {
     return std::thread([arena_pool, task = std::move(task)]() mutable {
-      const memory::DbArenaScope db_arena_scope{arena_pool};
-      task();
+      try {
+        const memory::DbArenaScope db_arena_scope{arena_pool};
+        task();
+      } catch (const std::exception &e) {
+        spdlog::error("Stream worker thread exited with unhandled exception: {}", e.what());
+      } catch (...) {
+        spdlog::error("Stream worker thread exited with unhandled non-standard exception");
+      }
     });
   };
 }

@@ -127,10 +127,22 @@ class InMemoryLabelIndex : public LabelIndex {
 
     class Iterator {
      public:
-      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator index_iterator)
-          : self_(self), index_iterator_(index_iterator), current_vertex_accessor_(nullptr, self_->storage_, nullptr) {
+      struct EndTag {};
+
+      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator index_iterator,
+               utils::SkipListDb<Entry>::ChunkedIterator chunk_end)
+          : self_(self),
+            index_iterator_(index_iterator),
+            chunk_end_(chunk_end),
+            current_vertex_accessor_(nullptr, self_->storage_, nullptr) {
         AdvanceUntilValid();
       }
+
+      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator chunk_end, EndTag)
+          : self_(self),
+            index_iterator_(chunk_end),
+            chunk_end_(chunk_end),
+            current_vertex_accessor_(nullptr, self_->storage_, nullptr) {}
 
       VertexAccessor const &operator*() const { return current_vertex_accessor_; }
 
@@ -149,6 +161,7 @@ class InMemoryLabelIndex : public LabelIndex {
 
       ChunkedIterable *self_;
       utils::SkipListDb<Entry>::ChunkedIterator index_iterator_;
+      utils::SkipListDb<Entry>::ChunkedIterator chunk_end_;
       VertexAccessor current_vertex_accessor_;
       Vertex *current_vertex_{nullptr};
     };
@@ -159,7 +172,7 @@ class InMemoryLabelIndex : public LabelIndex {
 
      public:
       Chunk(ChunkedIterable *self, utils::SkipListDb<Entry>::Chunk &chunk)
-          : begin_{self, chunk.begin()}, end_{self, chunk.end()} {}
+          : begin_{self, chunk.begin(), chunk.end()}, end_{self, chunk.end(), Iterator::EndTag{}} {}
 
       Iterator begin() { return begin_; }
 

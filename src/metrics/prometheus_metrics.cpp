@@ -103,6 +103,18 @@ void ObserveDurabilityThroughput(std::string const &instance_name, double bytes_
   it->second->Observe(bytes_per_second);
 }
 
+void ObserveDurabilityApplyLatency(std::string const &instance_name, double seconds,
+                                   prometheus::Family<prometheus::Histogram> &latency_family,
+                                   DurabilityThroughput &latency) {
+  std::lock_guard const lock{latency.mutex};
+  auto it = latency.by_instance.find(instance_name);
+  if (it == latency.by_instance.end()) {
+    prometheus::Labels const labels{{"mg_instance", instance_name}};
+    it = latency.by_instance.emplace(instance_name, &latency_family.Add(labels, kLatencyBuckets)).first;
+  }
+  it->second->Observe(seconds);
+}
+
 }  // namespace
 
 PrometheusMetrics::PrometheusMetrics()
@@ -796,7 +808,15 @@ PrometheusMetrics::PrometheusMetrics()
       wal_throughput_family_{prometheus::BuildHistogram()
                                  .Name("memgraph_wal_throughput_bytes_per_second")
                                  .Help("Throughput of WAL files sent to each replica during recovery, in bytes/s")
-                                 .Register(registry_)}
+                                 .Register(registry_)},
+      snapshot_apply_latency_family_{prometheus::BuildHistogram()
+                                         .Name("memgraph_snapshot_apply_latency_seconds")
+                                         .Help("Time spent by each replica applying a transferred snapshot, in seconds")
+                                         .Register(registry_)},
+      wal_apply_latency_family_{prometheus::BuildHistogram()
+                                    .Name("memgraph_wal_apply_latency_seconds")
+                                    .Help("Time spent by each replica applying transferred WAL files, in seconds")
+                                    .Register(registry_)}
 #ifdef MG_ENTERPRISE
       ,
       instance_up_family_{prometheus::BuildGauge()
@@ -1434,9 +1454,19 @@ void PrometheusMetrics::ObserveWalThroughput(std::string const &instance_name, d
   ObserveDurabilityThroughput(instance_name, bytes_per_second, wal_throughput_family_, wal_throughput_);
 }
 
+void PrometheusMetrics::ObserveSnapshotApplyLatency(std::string const &instance_name, double const seconds) {
+  ObserveDurabilityApplyLatency(instance_name, seconds, snapshot_apply_latency_family_, snapshot_apply_latency_);
+}
+
+void PrometheusMetrics::ObserveWalApplyLatency(std::string const &instance_name, double const seconds) {
+  ObserveDurabilityApplyLatency(instance_name, seconds, wal_apply_latency_family_, wal_apply_latency_);
+}
+
 void PrometheusMetrics::RemoveReplicationThroughput(std::string_view instance_name) {
   RemoveDurabilityThroughput(instance_name, snapshot_throughput_family_, snapshot_throughput_);
   RemoveDurabilityThroughput(instance_name, wal_throughput_family_, wal_throughput_);
+  RemoveDurabilityThroughput(instance_name, snapshot_apply_latency_family_, snapshot_apply_latency_);
+  RemoveDurabilityThroughput(instance_name, wal_apply_latency_family_, wal_apply_latency_);
 }
 
 namespace {

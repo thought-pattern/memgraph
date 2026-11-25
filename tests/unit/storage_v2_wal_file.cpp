@@ -1074,12 +1074,15 @@ TEST_P(WalFileTest, DamagedSummaryFailsRecovery) {
     corrupted.Close();
   }
 
-  EXPECT_THROW(static_cast<void>(memgraph::storage::durability::ReadWalHeader(wal_file)),
-               memgraph::storage::durability::RecoveryFailure);
+  auto const recovered_header = memgraph::storage::durability::ReadWalHeader(wal_file);
+  EXPECT_FALSE(recovered_header.summary.has_value());
+  EXPECT_TRUE(recovered_header.summary_corrupted);
   EXPECT_THROW(static_cast<void>(memgraph::storage::durability::ReadWalInfo(wal_file)),
                memgraph::storage::durability::RecoveryFailure);
-  EXPECT_THROW(static_cast<void>(memgraph::storage::durability::ReadWalContents(wal_file)),
-               memgraph::storage::durability::RecoveryFailure);
+  auto const recovered_contents = memgraph::storage::durability::ReadWalContents(wal_file);
+  EXPECT_EQ(recovered_contents.from_timestamp, pristine.summary->from_timestamp);
+  EXPECT_EQ(recovered_contents.to_timestamp, pristine.summary->to_timestamp);
+  EXPECT_EQ(recovered_contents.num_deltas, pristine.summary->num_deltas);
 }
 
 // A file the writer never finalized still holds the zeroed placeholders, which readers must not mistake for a real

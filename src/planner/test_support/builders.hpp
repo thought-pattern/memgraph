@@ -177,13 +177,13 @@ inline void BuildAddNegDisjoint(TestEGraph &g, int64_t n) {
 // One "hub" leaf with many parents of different symbols. Tests symbol-index
 // filtering: 1 hub + parents_f F(hub, other) + parents_neg Neg(hub).
 inline void BuildHighParentHub(TestEGraph &g, int64_t parents_f, int64_t parents_neg) {
-  auto hub = g.emplace(Op::Const, 0).eclass_id;
+  auto hub = g.emplace(Op::Var, 0).eclass_id;
   for (int64_t i = 0; i < parents_f; ++i) {
     auto other = g.emplace(Op::Const, static_cast<uint64_t>(i + 1)).eclass_id;
     g.emplace(Op::F, {hub, other});
   }
   for (int64_t i = 0; i < parents_neg; ++i) {
-    g.emplace(Op::Neg, {hub});
+    g.emplace(Op::Neg, {hub}, static_cast<uint64_t>(i));
   }
 }
 
@@ -214,6 +214,8 @@ inline void BuildNestedJoinGraph(TestEGraph &g, int64_t num_leaves) {
 
 // Many leaves, each with diverse parents distributed among Add, Mul, Neg, F.
 inline void BuildParentDiversity(TestEGraph &g, int64_t num_leaves, int64_t parents_per_leaf, uint64_t seed = 42) {
+  if (num_leaves <= 0 || parents_per_leaf <= 0) return;
+
   std::vector<EClassId> leaves;
   leaves.reserve(static_cast<std::size_t>(num_leaves));
 
@@ -225,18 +227,20 @@ inline void BuildParentDiversity(TestEGraph &g, int64_t num_leaves, int64_t pare
   uint64_t rng = seed;
   auto next_rng = [&rng]() {
     rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-    return rng;
+    return rng >> 32;
   };
 
-  for (auto leaf_id : leaves) {
+  for (std::size_t leaf_idx = 0; leaf_idx < leaves.size(); ++leaf_idx) {
+    auto leaf_id = leaves[leaf_idx];
     for (int64_t p = 0; p < parents_per_leaf; ++p) {
-      auto sym = symbols[next_rng() % 4];
+      auto sym = symbols[static_cast<std::size_t>((static_cast<int64_t>(leaf_idx) + p) % 4)];
+      auto disambig = static_cast<uint64_t>(p);
       if (sym == Op::Neg) {
-        g.emplace(Op::Neg, {leaf_id});
+        g.emplace(Op::Neg, {leaf_id}, disambig);
       } else {
-        auto other_idx = next_rng() % static_cast<uint64_t>(leaves.size());
+        auto other_idx = next_rng() % leaves.size();
         auto other_leaf = leaves[other_idx];
-        g.emplace(sym, {leaf_id, other_leaf});
+        g.emplace(sym, {leaf_id, other_leaf}, disambig);
       }
     }
   }
@@ -295,7 +299,7 @@ inline void BuildBindIdentGraph(TestEGraph &g, int64_t num_binds, int64_t idents
     g.emplace(Op::Bind, {placeholder, sym_val, expr_val});
 
     for (int64_t j = 0; j < idents_per_sym; ++j) {
-      g.emplace(Op::Ident, {sym_val});
+      g.emplace(Op::Ident, {sym_val}, static_cast<uint64_t>(j));
     }
   }
 }

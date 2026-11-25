@@ -13,6 +13,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -542,51 +543,88 @@ template <typename Symbol>
 auto Pattern<Symbol>::compute_depth() const -> std::size_t {
   if (nodes_.empty()) return 0;
 
-  std::size_t max_depth = 0;
-  // Stack of (node_id, current_depth)
-  std::vector<std::pair<PatternNodeId, std::size_t>> stack;
-  stack.emplace_back(root_, 0);
+  constexpr std::size_t kUncomputed = std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> height(nodes_.size(), kUncomputed);
+  std::vector<std::pair<PatternNodeId, bool>> stack;
+  stack.emplace_back(root_, false);
 
   while (!stack.empty()) {
-    auto [node_id, current_depth] = stack.back();
+    auto [node_id, expanded] = stack.back();
     stack.pop_back();
+    auto const idx = node_id.value_of();
+    if (height[idx] != kUncomputed) continue;
 
-    max_depth = std::max(max_depth, current_depth);
-
-    auto const &node = nodes_[node_id.value_of()];
-    if (auto const *sym = std::get_if<SymbolWithChildren<Symbol>>(&node)) {
-      for (auto child_id : sym->children) {
-        stack.emplace_back(child_id, current_depth + 1);
-      }
+    auto const &node = nodes_[idx];
+    auto const *sym = std::get_if<SymbolWithChildren<Symbol>>(&node);
+    if (!sym || sym->children.empty()) {
+      height[idx] = 0;
+      continue;
     }
-    // PatternVar and Wildcard are leaves - no children to process
+
+    if (!expanded) {
+      stack.emplace_back(node_id, true);
+      for (auto child_id : sym->children) {
+        if (height[child_id.value_of()] == kUncomputed) {
+          stack.emplace_back(child_id, false);
+        }
+      }
+    } else {
+      std::size_t best_child = 0;
+      for (auto child_id : sym->children) {
+        best_child = std::max(best_child, height[child_id.value_of()]);
+      }
+      height[idx] = best_child + 1;
+    }
   }
 
-  return max_depth;
+  return height[root_.value_of()];
 }
 
 template <typename Symbol>
   requires ENodeSymbol<Symbol>
 auto Pattern<Symbol>::compute_var_slots() const -> VarSlotMap {
   VarSlotMap slots;
-  uint8_t next_slot = 0;
+  if (nodes_.empty()) return slots;
 
+  std::vector<bool> reachable(nodes_.size(), false);
+  std::vector<PatternNodeId> stack{root_};
+  reachable[root_.value_of()] = true;
+  while (!stack.empty()) {
+    auto const nid = stack.back();
+    stack.pop_back();
+    if (auto const *sym = std::get_if<SymbolWithChildren<Symbol>>(&nodes_[nid.value_of()])) {
+      for (auto child_id : sym->children) {
+        if (!reachable[child_id.value_of()]) {
+          reachable[child_id.value_of()] = true;
+          stack.push_back(child_id);
+        }
+      }
+    }
+  }
+
+  uint8_t next_slot = 0;
   auto assign_slot = [&](PatternVar var) {
     if (!slots.contains(var)) {
+      if (slots.size() > std::numeric_limits<uint8_t>::max()) {
+        throw std::overflow_error("Pattern too complex: variable slot limit exceeded");
+      }
       slots[var] = SlotIdx{next_slot++};
     }
   };
 
-  // Collect from pattern nodes (PatternVar nodes)
-  for (auto const &node : nodes_) {
-    if (auto const *var = std::get_if<PatternVar>(&node)) {
+  // Collect from reachable pattern nodes (PatternVar nodes)
+  for (std::size_t idx = 0; idx < nodes_.size(); ++idx) {
+    if (!reachable[idx]) continue;
+    if (auto const *var = std::get_if<PatternVar>(&nodes_[idx])) {
       assign_slot(*var);
     }
   }
 
-  // Collect from symbol node bindings
-  for (auto const &var : bindings_ | std::views::values) {
-    assign_slot(var);
+  // Collect from reachable symbol node bindings
+  for (auto const &[node_id, var] : bindings_) {
+    if (node_id.value_of() < reachable.size() && reachable[node_id.value_of()]) {
+      assign_slot(var);
+    }
   }
 
   return slots;

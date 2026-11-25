@@ -136,9 +136,9 @@ inline auto First(TIterable &&iterable) {
  * @return The first element of the `iterable` or the `empty_value`.
  */
 template <class TVal, class TIterable>
-inline TVal First(TIterable &&iterable, TVal &&empty_value) {
+inline std::decay_t<TVal> First(TIterable &&iterable, TVal &&empty_value) {
   if (iterable.begin() != iterable.end()) return *iterable.begin();
-  return empty_value;
+  return std::forward<TVal>(empty_value);
 }
 
 /**

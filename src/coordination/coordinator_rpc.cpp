@@ -62,11 +62,27 @@ void PromoteToMainRes::Load(PromoteToMainRes *self, memgraph::slk::Reader *reade
   memgraph::slk::Load(self, reader);
 }
 
+void DemoteMainToReplicaReqV1::Save(const DemoteMainToReplicaReqV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self, builder);
+}
+
+void DemoteMainToReplicaReqV1::Load(DemoteMainToReplicaReqV1 *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(self, reader);
+}
+
 void DemoteMainToReplicaReq::Save(const DemoteMainToReplicaReq &self, memgraph::slk::Builder *builder) {
   memgraph::slk::Save(self, builder);
 }
 
 void DemoteMainToReplicaReq::Load(DemoteMainToReplicaReq *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(self, reader);
+}
+
+void DemoteMainToReplicaResV1::Save(const DemoteMainToReplicaResV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self, builder);
+}
+
+void DemoteMainToReplicaResV1::Load(DemoteMainToReplicaResV1 *self, memgraph::slk::Reader *reader) {
   memgraph::slk::Load(self, reader);
 }
 
@@ -112,11 +128,27 @@ void ShowInstancesRes::Load(ShowInstancesRes *self, memgraph::slk::Reader *reade
 }
 
 // GetRoutingTable
+void GetRoutingTableReqV1::Save(const GetRoutingTableReqV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self, builder);
+}
+
+void GetRoutingTableReqV1::Load(GetRoutingTableReqV1 *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(self, reader);
+}
+
 void GetRoutingTableReq::Save(const GetRoutingTableReq &self, memgraph::slk::Builder *builder) {
   memgraph::slk::Save(self, builder);
 }
 
 void GetRoutingTableReq::Load(GetRoutingTableReq *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(self, reader);
+}
+
+void GetRoutingTableResV1::Save(const GetRoutingTableResV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self, builder);
+}
+
+void GetRoutingTableResV1::Load(GetRoutingTableResV1 *self, memgraph::slk::Reader *reader) {
   memgraph::slk::Load(self, reader);
 }
 
@@ -289,12 +321,30 @@ void Load(memgraph::coordination::PromoteToMainReq *self, memgraph::slk::Reader 
 }
 
 // DemoteMainToReplicaRpc
+void Save(const memgraph::coordination::DemoteMainToReplicaReqV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self.replication_client_info_, builder);
+}
+
+void Load(memgraph::coordination::DemoteMainToReplicaReqV1 *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(&self->replication_client_info_, reader);
+}
+
 void Save(const memgraph::coordination::DemoteMainToReplicaReq &self, memgraph::slk::Builder *builder) {
   memgraph::slk::Save(self.replication_client_info_, builder);
+  memgraph::slk::Save(self.main_uuid_, builder);
 }
 
 void Load(memgraph::coordination::DemoteMainToReplicaReq *self, memgraph::slk::Reader *reader) {
   memgraph::slk::Load(&self->replication_client_info_, reader);
+  memgraph::slk::Load(&self->main_uuid_, reader);
+}
+
+void Save(const memgraph::coordination::DemoteMainToReplicaResV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self.arg_, builder);
+}
+
+void Load(memgraph::coordination::DemoteMainToReplicaResV1 *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(&self->arg_, reader);
 }
 
 void Save(const memgraph::coordination::DemoteMainToReplicaRes &self, memgraph::slk::Builder *builder) {
@@ -372,12 +422,14 @@ void Load(memgraph::coordination::UpdateDataInstanceConfigReqV1 *self, memgraph:
 
 void Save(const memgraph::coordination::UpdateDataInstanceConfigReq &self, memgraph::slk::Builder *builder) {
   memgraph::slk::Save(self.deltas_batch_progress_size, builder);
-  memgraph::slk::Save(self.disable_writing, builder);
+  memgraph::slk::Save(self.disable_writing.value_or(false), builder);
 }
 
 void Load(memgraph::coordination::UpdateDataInstanceConfigReq *self, memgraph::slk::Reader *reader) {
   memgraph::slk::Load(&self->deltas_batch_progress_size, reader);
-  memgraph::slk::Load(&self->disable_writing, reader);
+  bool disable_writing = false;
+  memgraph::slk::Load(&disable_writing, reader);
+  self->disable_writing = disable_writing;
 }
 
 void Save(const memgraph::coordination::UpdateDataInstanceConfigResV1 &self, memgraph::slk::Builder *builder) {
@@ -410,12 +462,28 @@ void Load(memgraph::coordination::ShowInstancesRes *self, memgraph::slk::Reader 
 }
 
 // GetRoutingTableRpc
+void Save(const memgraph::coordination::GetRoutingTableReqV1 &self, memgraph::slk::Builder *builder) {
+  slk::Save(self.arg_, builder);
+}
+
+void Load(memgraph::coordination::GetRoutingTableReqV1 *self, memgraph::slk::Reader *reader) {
+  slk::Load(&self->arg_, reader);
+}
+
 void Save(const memgraph::coordination::GetRoutingTableReq &self, memgraph::slk::Builder *builder) {
   slk::Save(self.arg_, builder);
 }
 
 void Load(memgraph::coordination::GetRoutingTableReq *self, memgraph::slk::Reader *reader) {
   slk::Load(&self->arg_, reader);
+}
+
+void Save(const memgraph::coordination::GetRoutingTableResV1 &self, memgraph::slk::Builder *builder) {
+  memgraph::slk::Save(self.arg_, builder);
+}
+
+void Load(memgraph::coordination::GetRoutingTableResV1 *self, memgraph::slk::Reader *reader) {
+  memgraph::slk::Load(&self->arg_, reader);
 }
 
 void Save(const memgraph::coordination::GetRoutingTableRes &self, memgraph::slk::Builder *builder) {
@@ -451,25 +519,43 @@ void Save(const coordination::ReplicationLagRes &self, slk::Builder *builder) { 
 
 void Load(coordination::ReplicationLagRes *self, slk::Reader *reader) { slk::Load(&self->arg_, reader); }
 
+SLK_SINGLE_ARG_MSG(coordination::AddCoordinatorReqV1)
 SLK_SINGLE_ARG_MSG(coordination::AddCoordinatorReq)
+SLK_SINGLE_ARG_MSG(coordination::AddCoordinatorResV1)
 SLK_SINGLE_ARG_MSG(coordination::AddCoordinatorRes)
+SLK_SINGLE_ARG_MSG(coordination::RemoveCoordinatorReqV1)
 SLK_SINGLE_ARG_MSG(coordination::RemoveCoordinatorReq)
+SLK_SINGLE_ARG_MSG(coordination::RemoveCoordinatorResV1)
 SLK_SINGLE_ARG_MSG(coordination::RemoveCoordinatorRes)
+SLK_SINGLE_ARG_MSG(coordination::RegisterInstanceReqV1)
 SLK_SINGLE_ARG_MSG(coordination::RegisterInstanceReq)
+SLK_SINGLE_ARG_MSG(coordination::RegisterInstanceResV1)
 SLK_SINGLE_ARG_MSG(coordination::RegisterInstanceRes)
+SLK_SINGLE_ARG_MSG(coordination::UnregisterInstanceReqV1)
 SLK_SINGLE_ARG_MSG(coordination::UnregisterInstanceReq)
+SLK_SINGLE_ARG_MSG(coordination::UnregisterInstanceResV1)
 SLK_SINGLE_ARG_MSG(coordination::UnregisterInstanceRes)
+SLK_SINGLE_ARG_MSG(coordination::SetInstanceToMainReqV1)
 SLK_SINGLE_ARG_MSG(coordination::SetInstanceToMainReq)
+SLK_SINGLE_ARG_MSG(coordination::SetInstanceToMainResV1)
 SLK_SINGLE_ARG_MSG(coordination::SetInstanceToMainRes)
+SLK_SINGLE_ARG_MSG(coordination::DemoteInstanceReqV1)
 SLK_SINGLE_ARG_MSG(coordination::DemoteInstanceReq)
+SLK_SINGLE_ARG_MSG(coordination::DemoteInstanceResV1)
 SLK_SINGLE_ARG_MSG(coordination::DemoteInstanceRes)
+SLK_EMPTY_MSG(coordination::ForceResetReqV1)
 SLK_EMPTY_MSG(coordination::ForceResetReq)
+SLK_SINGLE_ARG_MSG(coordination::ForceResetResV1)
 SLK_SINGLE_ARG_MSG(coordination::ForceResetRes)
+SLK_EMPTY_MSG(coordination::YieldLeadershipReqV1)
 SLK_EMPTY_MSG(coordination::YieldLeadershipReq)
+SLK_SINGLE_ARG_MSG(coordination::YieldLeadershipResV1)
 SLK_SINGLE_ARG_MSG(coordination::YieldLeadershipRes)
 SLK_EMPTY_MSG(coordination::ShowCoordSettingsReq)
 SLK_SINGLE_ARG_MSG(coordination::ShowCoordSettingsRes)
+SLK_SINGLE_ARG_MSG(coordination::UpdateConfigReqV1)
 SLK_SINGLE_ARG_MSG(coordination::UpdateConfigReq)
+SLK_SINGLE_ARG_MSG(coordination::UpdateConfigResV1)
 SLK_SINGLE_ARG_MSG(coordination::UpdateConfigRes)
 SLK_EMPTY_MSG(coordination::CoordReplicationLagReqV1)
 SLK_EMPTY_MSG(coordination::CoordReplicationLagReq)

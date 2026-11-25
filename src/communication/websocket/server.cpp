@@ -11,10 +11,64 @@
 
 #include "communication/websocket/server.hpp"
 
-#include <spdlog/pattern_formatter.h>
+#include <cstdint>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <string>
+#include <string_view>
 
 namespace memgraph::communication::websocket {
+
+namespace {
+
+std::string SanitizeUtf8(std::string_view input) {
+  std::string out;
+  out.reserve(input.size());
+  size_t i = 0;
+  while (i < input.size()) {
+    const auto b0 = static_cast<uint8_t>(input[i]);
+    if (b0 < 0x80U) {
+      out.push_back(static_cast<char>(b0));
+      ++i;
+      continue;
+    }
+    size_t seq_len = 0;
+    uint32_t codepoint = 0;
+    uint32_t min_cp = 0;
+    if ((b0 & 0xE0U) == 0xC0U) {
+      seq_len = 2;
+      codepoint = b0 & 0x1FU;
+      min_cp = 0x80U;
+    } else if ((b0 & 0xF0U) == 0xE0U) {
+      seq_len = 3;
+      codepoint = b0 & 0x0FU;
+      min_cp = 0x800U;
+    } else if ((b0 & 0xF8U) == 0xF0U) {
+      seq_len = 4;
+      codepoint = b0 & 0x07U;
+      min_cp = 0x10000U;
+    }
+    bool valid = (seq_len > 0 && i + seq_len <= input.size());
+    for (size_t k = 1; valid && k < seq_len; ++k) {
+      const auto bk = static_cast<uint8_t>(input[i + k]);
+      if ((bk & 0xC0U) != 0x80U) {
+        valid = false;
+      } else {
+        codepoint = (codepoint << 6U) | (bk & 0x3FU);
+      }
+    }
+    if (valid && codepoint >= min_cp && codepoint <= 0x10FFFFU && (codepoint < 0xD800U || codepoint > 0xDFFFU)) {
+      out.append(input.data() + i, seq_len);
+      i += seq_len;
+    } else {
+      out.append("\xEF\xBF\xBD", 3);
+      ++i;
+    }
+  }
+  return out;
+}
+
+}  // namespace
 
 Server::~Server() {
   MG_ASSERT(!background_thread_ || (ioc_.stopped() && !background_thread_->joinable()),
@@ -49,50 +103,23 @@ bool Server::IsRunning() const { return !listener_->HasErrorHappened() && backgr
 
 bool Server::HasErrorHappened() const { return listener_->HasErrorHappened(); }
 
-std::optional<boost::asio::ip::tcp::endpoint> Server::GetEndpoint() const { return listener_->GetEndpoint(); };
-
-namespace {
-class QuoteEscapeFormatter : public spdlog::custom_flag_formatter {
- public:
-  void format(const spdlog::details::log_msg &msg, const std::tm & /*time*/, spdlog::memory_buf_t &dest) override {
-    for (const auto c : msg.payload) {
-      if (c == '"') {
-        static constexpr std::string_view escaped_quote = "\\\"";
-        dest.append(escaped_quote.data(), escaped_quote.data() + escaped_quote.size());
-      } else if (c == '\n') {
-        static constexpr std::string_view escaped_newline = "\\n";
-        dest.append(escaped_newline.data(), escaped_newline.data() + escaped_newline.size());
-      } else {
-        dest.push_back(c);
-      }
-    }
-  }
-
-  std::unique_ptr<custom_flag_formatter> clone() const override {
-    return spdlog::details::make_unique<QuoteEscapeFormatter>();
-  }
-};
-
-};  // namespace
+std::optional<boost::asio::ip::tcp::endpoint> Server::GetEndpoint() const { return listener_->GetEndpoint(); }
 
 void Server::LoggingSink::sink_it_(const spdlog::details::log_msg &msg) {
   const auto listener = listener_.lock();
   if (!listener) {
     return;
   }
-  using memory_buf_t = fmt::basic_memory_buffer<char, 250>;
-  memory_buf_t formatted;
-  base_sink<std::mutex>::formatter_->format(msg, formatted);
-  listener->WriteToAll(std::make_shared<std::string>(formatted.data(), formatted.size()));
+  const auto level_sv = spdlog::level::to_string_view(msg.level);
+  const std::string_view payload_sv{msg.payload.data(), msg.payload.size()};
+  nlohmann::json event = {
+      {"event", "log"},
+      {"level", std::string_view{level_sv.data(), level_sv.size()}},
+      {"message", SanitizeUtf8(payload_sv)},
+  };
+  listener->WriteToAll(std::make_shared<std::string>(event.dump()));
 }
 
-std::shared_ptr<Server::LoggingSink> Server::GetLoggingSink() {
-  auto formatter = std::make_unique<spdlog::pattern_formatter>();
-  formatter->add_flag<QuoteEscapeFormatter>('*').set_pattern(
-      R"json({"event": "log", "level": "%l", "message": "%*"})json");
-  auto sink = std::make_shared<LoggingSink>(listener_);
-  sink->set_formatter(std::move(formatter));
-  return sink;
-}
+std::shared_ptr<Server::LoggingSink> Server::GetLoggingSink() { return std::make_shared<LoggingSink>(listener_); }
 
 }  // namespace memgraph::communication::websocket

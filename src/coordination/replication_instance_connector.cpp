@@ -20,28 +20,38 @@
 
 namespace memgraph::coordination {
 
-TimedFailureDetector::TimedFailureDetector(uint32_t const instance_down_timeout_sec)
-    : instance_down_timeout_sec_(instance_down_timeout_sec), last_response_time_(std::chrono::system_clock::now()) {}
+namespace {
+auto SteadyNowNs() -> int64_t {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
 
-auto TimedFailureDetector::IsAlive() const -> bool { return is_alive_; }
+TimedFailureDetector::TimedFailureDetector(uint32_t const instance_down_timeout_sec)
+    : instance_down_timeout_sec_(instance_down_timeout_sec), last_response_steady_ns_(SteadyNowNs()) {}
+
+auto TimedFailureDetector::IsAlive() const -> bool { return is_alive_.load(std::memory_order_acquire); }
 
 auto TimedFailureDetector::LastSuccRespMs() const -> std::chrono::milliseconds {
   using std::chrono::duration_cast;
   using std::chrono::milliseconds;
-  using std::chrono::system_clock;
+  using std::chrono::nanoseconds;
 
-  return duration_cast<milliseconds>(system_clock::now() - last_response_time_);
+  const auto elapsed_ns = std::max<int64_t>(0, SteadyNowNs() - last_response_steady_ns_.load(std::memory_order_acquire));
+  return duration_cast<milliseconds>(nanoseconds{elapsed_ns});
 }
 
 auto TimedFailureDetector::Suspect() -> bool {
-  const auto elapsed_time = std::chrono::system_clock::now() - last_response_time_;
-  is_alive_ = elapsed_time < std::chrono::seconds{instance_down_timeout_sec_.load(std::memory_order_acquire)};
-  return is_alive_;
+  const auto elapsed_ns = std::max<int64_t>(0, SteadyNowNs() - last_response_steady_ns_.load(std::memory_order_acquire));
+  const bool alive =
+      std::chrono::nanoseconds{elapsed_ns} < std::chrono::seconds{instance_down_timeout_sec_.load(std::memory_order_acquire)};
+  is_alive_.store(alive, std::memory_order_release);
+  return alive;
 }
 
 auto TimedFailureDetector::Restore() -> void {
-  last_response_time_ = std::chrono::system_clock::now();
-  is_alive_ = true;
+  last_response_steady_ns_.store(SteadyNowNs(), std::memory_order_release);
+  is_alive_.store(true, std::memory_order_release);
 }
 
 void TimedFailureDetector::UpdateInstanceDownTimeoutSec(uint32_t const new_config) {

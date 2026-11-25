@@ -83,8 +83,8 @@ CoordinatorStateMachine::CoordinatorStateMachine(LoggerWrapper const logger, Log
 
 void CoordinatorStateMachine::UpdateStateMachineFromSnapshotDurability() {
   auto const end_iter = durability_->end(std::string{kSnapshotIdPrefix});
-  for (auto kv_store_snapshot_it = durability_->begin(std::string{kSnapshotIdPrefix}); kv_store_snapshot_it != end_iter;
-       ++kv_store_snapshot_it) {
+  auto kv_store_snapshot_it = durability_->begin(std::string{kSnapshotIdPrefix});
+  for (; kv_store_snapshot_it != end_iter; ++kv_store_snapshot_it) {
     auto const &[snapshot_key_id, snapshot_ctx_str] = *kv_store_snapshot_it;
     try {
       auto parsed_snapshot_id =
@@ -100,6 +100,10 @@ void CoordinatorStateMachine::UpdateStateMachineFromSnapshotDurability() {
       LOG_FATAL("Failed to deserialize snapshot with id: {}. Error: {}", snapshot_key_id, e.what());
     }
     logger_.Log(nuraft_log_level::TRACE, fmt::format("Deserialized snapshot with id: {}", snapshot_key_id));
+  }
+  if (kv_store_snapshot_it.HasError()) {
+    throw kvstore::KVStoreError(
+        fmt::format("Failed to scan coordinator snapshots on disk: {}", kv_store_snapshot_it.ErrorMessage()));
   }
 
   auto const last_commit_idx = last_committed_idx_.load(std::memory_order_acquire);
@@ -122,12 +126,16 @@ bool CoordinatorStateMachine::HandleMigration(LogStoreVersion stored_version) {
       return durability_->Put(kLastCommitedIdx, std::to_string(last_snapshot_commit_idx));
     }
     if (stored_version == LogStoreVersion::kV2) {
-      const auto maybe_last_commited_idx = durability_->Get(kLastCommitedIdx);
+      const auto maybe_last_commited_idx = durability_->GetStrict(kLastCommitedIdx);
       if (!maybe_last_commited_idx) {
+        if (maybe_last_commited_idx.error() == kvstore::KVStore::GetError::kReadError) {
+          logger_.Log(nuraft_log_level::ERROR, "Failed to read last committed index from coordinator durability.");
+          return false;
+        }
         logger_.Log(
             nuraft_log_level::ERROR,
             fmt::format(
-                "Failed to retrieve last committed index from disk, using last committed index from snapshot {}.",
+                "Missing last committed index on disk, initializing from last snapshot index {}.",
                 last_snapshot_commit_idx));
         return durability_->Put(kLastCommitedIdx, std::to_string(last_snapshot_commit_idx));
       }
@@ -265,10 +273,15 @@ auto CoordinatorStateMachine::pre_commit(ulong const /*log_idx*/, buffer & /*dat
 
 auto CoordinatorStateMachine::commit(ulong const log_idx, buffer &data) -> ptr<buffer> {
   logger_.Log(nuraft_log_level::TRACE, fmt::format("Commit: log_idx={}, data.size()={}", log_idx, data.size()));
-  cluster_state_.DoAction(DecodeLog(data));
-  durability_->Put(kLastCommitedIdx, std::to_string(log_idx));
-  last_committed_idx_.store(log_idx, std::memory_order_release);
-  logger_.Log(nuraft_log_level::TRACE, fmt::format("Last commit index: {}", log_idx));
+  auto decoded = DecodeLog(data);
+  auto const cur_committed = last_committed_idx_.load(std::memory_order_acquire);
+  auto const next_committed = std::max<uint64_t>(cur_committed, log_idx);
+  if (!durability_->Put(kLastCommitedIdx, std::to_string(next_committed))) {
+    throw kvstore::KVStoreError(fmt::format("Failed to persist coordinator commit index {}", next_committed));
+  }
+  cluster_state_.DoAction(std::move(decoded));
+  last_committed_idx_.store(next_committed, std::memory_order_release);
+  logger_.Log(nuraft_log_level::TRACE, fmt::format("Last commit index: {}", next_committed));
   ptr<buffer> ret = buffer::alloc(sizeof(log_idx));
   buffer_serializer bs_ret(ret);
   bs_ret.put_u64(log_idx);
@@ -277,8 +290,21 @@ auto CoordinatorStateMachine::commit(ulong const log_idx, buffer &data) -> ptr<b
 
 auto CoordinatorStateMachine::commit_config(ulong const log_idx, ptr<cluster_config> & /*new_conf*/) -> void {
   logger_.Log(nuraft_log_level::TRACE, fmt::format("Commit config: log_idx={}", log_idx));
-  durability_->Put(kLastCommitedIdx, std::to_string(log_idx));
-  last_committed_idx_.store(log_idx, std::memory_order_release);
+  auto const cur_committed = last_committed_idx_.load(std::memory_order_acquire);
+  auto const next_committed = std::max<uint64_t>(cur_committed, log_idx);
+  if (!durability_->Put(kLastCommitedIdx, std::to_string(next_committed))) {
+    throw kvstore::KVStoreError(fmt::format("Failed to persist coordinator config commit index {}", next_committed));
+  }
+  last_committed_idx_.store(next_committed, std::memory_order_release);
+}
+
+void CoordinatorStateMachine::ReplayCommittedLog(ulong const log_idx, buffer &data) {
+  logger_.Log(nuraft_log_level::TRACE, fmt::format("Replay committed log: log_idx={}", log_idx));
+  cluster_state_.DoAction(DecodeLog(data));
+}
+
+void CoordinatorStateMachine::ReplayCommittedConfig(ulong const log_idx, ptr<cluster_config> & /*new_conf*/) {
+  logger_.Log(nuraft_log_level::TRACE, fmt::format("Replay committed config: log_idx={}", log_idx));
 }
 
 auto CoordinatorStateMachine::rollback(ulong const log_idx, buffer &data) -> void {
@@ -327,23 +353,35 @@ auto CoordinatorStateMachine::save_logical_snp_obj(snapshot &snapshot, ulong &ob
 
   ptr<buffer> const snp_buf = snapshot.serialize();
   auto ss = snapshot::deserialize(*snp_buf);
-  if (obj_id == 0) {
-    CreateSnapshotInternal(ss);
+  auto const snp_idx = snapshot.get_last_log_idx();
+  if (obj_id == 0 && !is_last_obj) {
+    // Stage the incoming snapshot header without writing local cluster_state_ to snapshots_ or RocksDB.
+    auto ll = std::lock_guard{snapshots_lock_};
+    staged_snapshots_[snp_idx] = std::move(ss);
   } else {
     auto cluster_state = CoordinatorClusterState::Deserialize(data);
 
     auto ll = std::lock_guard{snapshots_lock_};
-    auto const entry = snapshots_.find(snapshot.get_last_log_idx());
-    MG_ASSERT(entry != snapshots_.end());
-    auto const snapshot_ptr = snapshot::deserialize(*snp_buf);
+    if (obj_id > 0 && !staged_snapshots_.contains(snp_idx) && !snapshots_.contains(snp_idx)) {
+      throw StoreSnapshotToDiskException("Received snapshot payload for un-staged snapshot index {}.", snp_idx);
+    }
+    auto const ctx = cs_new<SnapshotCtx>(ss, std::move(cluster_state));
     nlohmann::json json;
-    to_json(json, SnapshotCtx{snapshot_ptr, cluster_state});
-    auto const ok = durability_->Put(fmt::format("{}{}", kSnapshotIdPrefix, snapshot.get_last_log_idx()), json.dump());
+    to_json(json, *ctx);
+    auto const ok = durability_->Put(fmt::format("{}{}", kSnapshotIdPrefix, snp_idx), json.dump());
     if (!ok) {
       throw StoreSnapshotToDiskException("Failed to store snapshot to disk.");
     }
-    entry->second->snapshot_ = snapshot_ptr;
-    entry->second->cluster_state_ = cluster_state;
+    snapshots_[snp_idx] = ctx;
+    staged_snapshots_.erase(snp_idx);
+
+    while (snapshots_.size() > MAX_SNAPSHOTS) {
+      auto snapshot_current = snapshots_.begin()->first;
+      if (auto const del_ok = durability_->Delete(fmt::format("{}{}", kSnapshotIdPrefix, snapshot_current)); !del_ok) {
+        throw DeleteSnapshotFromDiskException("Failed to delete snapshot with id {} from disk.", snapshot_current);
+      }
+      snapshots_.erase(snapshots_.begin());
+    }
   }
   obj_id++;
 }
@@ -354,11 +392,19 @@ auto CoordinatorStateMachine::apply_snapshot(snapshot &s) -> bool {
 
   auto const entry = snapshots_.find(s.get_last_log_idx());
   if (entry == snapshots_.end()) return false;
-  if (!durability_->Get(fmt::format("{}{}", kSnapshotIdPrefix, s.get_last_log_idx())).has_value()) {
+  auto const disk_snp = durability_->GetStrict(fmt::format("{}{}", kSnapshotIdPrefix, s.get_last_log_idx()));
+  if (!disk_snp.has_value()) {
     throw NoSnapshotOnDiskException("Failed to retrieve snapshot with id {} from disk.", s.get_last_log_idx());
   }
 
+  auto const new_commit_idx =
+      std::max<uint64_t>(last_committed_idx_.load(std::memory_order_acquire), s.get_last_log_idx());
+  if (!durability_->Put(kLastCommitedIdx, std::to_string(new_commit_idx))) {
+    return false;
+  }
+
   cluster_state_ = entry->second->cluster_state_;
+  last_committed_idx_.store(new_commit_idx, std::memory_order_release);
   return true;
 }
 

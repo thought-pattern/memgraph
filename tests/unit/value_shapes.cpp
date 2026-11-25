@@ -207,15 +207,15 @@ auto VectorIndexIds() -> std::vector<PropertyValue> {
   // other than a double's.
   using Data = PropertyValue::VectorIndexIdData;
   using Ids = utils::small_vector<std::uint64_t>;
-  using Coordinates = utils::small_vector<float>;
-  auto constexpr kNaNCoordinate = std::numeric_limits<float>::quiet_NaN();
+  using Coordinates = utils::small_vector<double>;
+  auto constexpr kNaNCoordinate = std::numeric_limits<double>::quiet_NaN();
 
   return {
       PropertyValue(Data{.ids = Ids{}, .vector = Coordinates{}}),
-      PropertyValue(Data{.ids = Ids{0}, .vector = Coordinates{0.0F, 1.0F}}),
-      PropertyValue(Data{.ids = Ids{0, 1}, .vector = Coordinates{1.0F, 2.0F}}),
-      PropertyValue(Data{.ids = Ids{0}, .vector = Coordinates{1.0F, kNaNCoordinate}}),
-      PropertyValue(Data{.ids = Ids{0}, .vector = Coordinates{std::numeric_limits<float>::infinity()}}),
+      PropertyValue(Data{.ids = Ids{0}, .vector = Coordinates{0.0, 1.0}}),
+      PropertyValue(Data{.ids = Ids{0, 1}, .vector = Coordinates{1.0, 2.0}}),
+      PropertyValue(Data{.ids = Ids{0}, .vector = Coordinates{1.0, kNaNCoordinate}}),
+      PropertyValue(Data{.ids = Ids{0}, .vector = Coordinates{std::numeric_limits<double>::infinity()}}),
   };
 }
 

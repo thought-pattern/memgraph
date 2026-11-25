@@ -974,10 +974,10 @@ int main(int argc, char **argv) {
     }
 
     auto maybe_ssl = memgraph::flags::TlsConfigFromClusterFlags();
-    if (!maybe_ssl.has_value()) {
-      spdlog::warn(memgraph::utils::MessageWithLink(
-          "Running HA without intra-cluster TLS. Replication, coordinator, and management traffic is unencrypted.",
-          "https://memgr.ph/cluster-tls"));
+    if (!memgraph::coordination::HasValidClusterMutualTls(maybe_ssl)) {
+      throw std::runtime_error(
+          "High-availability management listeners require intra-cluster mutual TLS "
+          "(--cluster-cert-file, --cluster-key-file, and --cluster-ca-file).");
     }
 
     if (is_coordinator_instance) {

@@ -73,7 +73,7 @@ struct VectorEdgeIndexRecoveryInfo {
 /// is its own vector and wins over any map entry. Tag IDs are not trusted during recovery.
 struct VectorEdgeIndexRecovery {
   using EdgeVectors =
-      boost::unordered_flat_map<PropertyId, boost::unordered_flat_map<Gid, utils::small_vector<float>, std::hash<Gid>>,
+      boost::unordered_flat_map<PropertyId, boost::unordered_flat_map<Gid, utils::small_vector<double>, std::hash<Gid>>,
                                 std::hash<PropertyId>>;
 
   /// Called on WAL EdgeSetProperty: captures tag→edge_vectors[p][gid] or erases (list/null) when p has a
@@ -241,6 +241,8 @@ class VectorEdgeIndex {
   /// vectors. See VectorIndex::DropIndex for why the caller needs it.
   std::optional<DroppedIndexCapture> DropIndex(std::string_view index_name, NameIdMapper *name_id_mapper,
                                                ProgressCallback const &on_progress = {});
+  std::optional<DroppedIndexCapture> DropIndex(std::string_view index_name, NameIdMapper *name_id_mapper,
+                                               ProgressCallback const &on_progress, bool enforce_memory_limit);
 
   /// @brief Reinstalls an edge index previously evicted by DropIndex.
   void RestoreIndex(DroppedIndexCapture &&capture);
@@ -281,8 +283,8 @@ class VectorEdgeIndex {
   bool IndexExists(std::string_view index_name) const;
 
   /// @brief Retrieves the vector from an edge index entry.
-  utils::small_vector<float> GetVectorPropertyFromEdgeIndex(Edge *edge, std::string_view index_name,
-                                                            NameIdMapper *name_id_mapper) const;
+  utils::small_vector<double> GetVectorPropertyFromEdgeIndex(Edge *edge, std::string_view index_name,
+                                                             NameIdMapper *name_id_mapper) const;
 
   /// Reconstruct an edge's indexed vector into `out` (resized to the index dimension); false if the index or entry is
   /// absent. Looked up by index id. Zero owning PropertyValue.
@@ -297,6 +299,9 @@ class VectorEdgeIndex {
 
   /// @brief Serializes all vector edge indices to a durability encoder in one pass.
   void SerializeAllVectorEdgeIndices(durability::BaseEncoder *encoder, std::unordered_set<uint64_t> &mapped_ids) const;
+  void SerializeAllVectorEdgeIndices(durability::BaseEncoder *encoder, std::unordered_set<uint64_t> &mapped_ids,
+                                     Transaction const *transaction, utils::SkipListDb<Vertex> *vertices,
+                                     uint64_t unused_edge_gid) const;
 
  private:
   /// @brief Sets up a new vector edge index structure without populating it.
@@ -304,7 +309,9 @@ class VectorEdgeIndex {
 
   /// @brief Adds a single edge to the index, converting its property to VectorIndexId.
   void AddEdgeToIndex(uint64_t index_id, Edge *edge, EdgeTypeId edge_type, Vertex *from_vertex, Vertex *to_vertex,
-                      NameIdMapper *name_id_mapper, std::optional<std::size_t> thread_id = std::nullopt);
+                      NameIdMapper *name_id_mapper, std::optional<std::size_t> thread_id = std::nullopt,
+                      std::vector<std::pair<Edge *, PropertyValue>> *original_properties = nullptr,
+                      std::vector<Edge *> *newly_tracked_endpoints = nullptr);
 
   /// @brief Removes an edge from a vector index.
   void RemoveEdgeFromIndex(Edge *edge, uint64_t index_id);

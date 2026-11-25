@@ -262,7 +262,12 @@ void DataInstanceManagementServerHandlers::SwapMainUUIDHandler(replication::Repl
 
   auto &repl_data = std::get<replication::RoleReplicaData>(locked_repl_state->ReplicationData());
   spdlog::info("Set replica data UUID to main uuid {}", std::string(req.uuid));
-  locked_repl_state->TryPersistRoleReplica(repl_data.config, req.uuid);
+  if (!locked_repl_state->TryPersistRoleReplica(repl_data.config, req.uuid)) {
+    spdlog::error("Failed to persist main UUID {} on replica; rejecting SwapMainUUID.", std::string(req.uuid));
+    replication_coordination_glue::SwapMainUUIDRes const rpc_res{false};
+    rpc::SendFinalResponse(rpc_res, request_version, res_builder);
+    return;
+  }
   repl_data.uuid_ = req.uuid;
 
   replication_coordination_glue::SwapMainUUIDRes const rpc_res{true};
@@ -435,9 +440,11 @@ void DataInstanceManagementServerHandlers::UpdateDataInstanceConfigHandler(
 
     // The writing flag only exists on the main-role state; touching it on a replica would assert. Replicas reject
     // writes regardless of this flag, so the coordinator's intent is simply ignored there.
-    // An upgraded V1 request carries no disable_writing instruction, so only V2+ modifies writing_enabled_.
-    if (locked_repl_state->IsMain() && request_version >= coordination::UpdateDataInstanceConfigReq::kVersion) {
-      if (req.disable_writing) {
+    // An upgraded V1 request carries no disable_writing instruction, so only V2+ with an explicit flag modifies
+    // writing_enabled_.
+    if (locked_repl_state->IsMain() && request_version >= coordination::UpdateDataInstanceConfigReq::kVersion &&
+        req.disable_writing.has_value()) {
+      if (*req.disable_writing) {
         locked_repl_state->DisableWritingOnMain();
       } else {
         locked_repl_state->EnableWritingOnMain();

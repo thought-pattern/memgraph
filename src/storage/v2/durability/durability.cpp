@@ -135,9 +135,17 @@ std::optional<std::vector<SnapshotDurabilityInfo>> GetSnapshotFiles(const std::f
     return snapshot_files;
   }
 
+  bool saw_corrupt_snapshot = false;
   std::error_code error_code;
   for (const auto &item : std::filesystem::directory_iterator(snapshot_directory, error_code)) {
-    if (!ValidateDurabilityFile(item)) continue;
+    if (!item.is_regular_file()) {
+      spdlog::trace("{} is not a regular file", item.path());
+      continue;
+    }
+    if (!utils::HasReadAccess(item.path())) {
+      spdlog::error("Durability file '{}' is not readable, check file ownership and read permissions!", item.path());
+      return std::nullopt;
+    }
 
     try {
       auto info = ReadSnapshotInfo(item.path());
@@ -147,11 +155,15 @@ std::optional<std::vector<SnapshotDurabilityInfo>> GetSnapshotFiles(const std::f
         spdlog::warn("Skipping snapshot file '{}' because UUIDs does not match!", item.path());
       }
     } catch (const RecoveryFailure &e) {
+      saw_corrupt_snapshot = true;
       spdlog::error("Couldn't read snapshot info in GetSnapshotFiles for file {}: {}", e.what(), item.path());
     }
   }
   if (error_code) {
     spdlog::error("Couldn't recover data because an error occurred: {}!", error_code.message());
+    return std::nullopt;
+  }
+  if (saw_corrupt_snapshot && snapshot_files.empty()) {
     return std::nullopt;
   }
 
@@ -168,36 +180,57 @@ std::optional<std::vector<WalDurabilityInfo>> GetWalFiles(const std::filesystem:
     return wal_files;
   }
 
-  // There could be multiple "current" WAL files, the "_current" tag just means that the previous session didn't
-  // finalize. We cannot skip based on name, will be able to skip based on invalid data or sequence number, so the
-  // actual current wal will be skipped
-
   std::error_code error_code;
 
   for (const auto &item : std::filesystem::directory_iterator(wal_directory, error_code)) {
-    if (!ValidateDurabilityFile(item)) continue;
+    if (!item.is_regular_file()) {
+      spdlog::trace("{} is not a regular file", item.path());
+      continue;
+    }
+    if (!utils::HasReadAccess(item.path())) {
+      spdlog::error("Durability file '{}' is not readable, check file ownership and read permissions!", item.path());
+      return std::nullopt;
+    }
+
+    std::error_code size_ec;
+    auto const file_size = std::filesystem::file_size(item.path(), size_ec);
+    if (size_ec) {
+      spdlog::error("Couldn't inspect WAL file '{}': {}", item.path(), size_ec.message());
+      return std::nullopt;
+    }
+    bool const is_current_file = item.path().filename().string().ends_with("_current");
+    if (current_seq_num && is_current_file && file_size == 0) {
+      continue;
+    }
+
+    WalHeader header;
+    try {
+      header = ReadWalHeader(item.path());
+    } catch (const RecoveryFailure &e) {
+      spdlog::error("Failed to read WAL header for {}: {}", item.path(), e.what());
+      return std::nullopt;
+    }
+
+    if ((!uuid.empty() && header.uuid != uuid) || (current_seq_num && header.seq_num >= *current_seq_num)) {
+      spdlog::trace("Wal file {} won't be used. UUID: {}. Header UUID: {}. Current seq num: {}. Header seq num: {}.",
+                    item.path(),
+                    uuid,
+                    header.uuid,
+                    current_seq_num,
+                    header.seq_num);
+      continue;
+    }
+
+    bool const unfinalized_current = is_current_file && !header.summary.has_value();
+    if (unfinalized_current && file_size == header.offset_deltas) {
+      continue;
+    }
 
     try {
-      auto header = ReadWalHeader(item.path());
-      if ((!uuid.empty() && header.uuid != uuid) || (current_seq_num && header.seq_num >= *current_seq_num)) {
-        spdlog::trace("Wal file {} won't be used. UUID: {}. Header UUID: {}. Current seq num: {}. Header seq num: {}.",
-                      item.path(),
-                      uuid,
-                      header.uuid,
-                      current_seq_num,
-                      header.seq_num);
-        continue;
-      }
-
-      // A file holding no complete transaction has no timestamps to offer, and ReadWalContents throwing for it is
-      // how it gets dropped here.
       auto info = ReadWalContents(item.path(), std::move(header));
-
       spdlog::trace(
           "Read wal file {} with following info: storage_uuid: {}, epoch id: {}, from timestamp {}, to_timestamp "
-          "{}, "
-          "sequence "
-          "number {}.",
+          "{}, sequence number {}.",
           item.path(),
           info.uuid,
           info.epoch_id,
@@ -212,7 +245,13 @@ std::optional<std::vector<WalDurabilityInfo>> GetWalFiles(const std::filesystem:
                              item.path());
       spdlog::trace("Wal file {} will be used.", item.path());
     } catch (const RecoveryFailure &e) {
-      spdlog::warn("Failed to read WAL file {}. Error: {}", item.path(), e.what());
+      std::string_view const msg{e.what()};
+      if (unfinalized_current && msg.find("No complete transactions in unfinalized WAL") != std::string_view::npos) {
+        spdlog::warn("Skipping unfinalized WAL file {} with no completed transactions.", item.path());
+        continue;
+      }
+      spdlog::error("Failed to read WAL file {}. Error: {}", item.path(), e.what());
+      return std::nullopt;
     }
   }
 
@@ -435,8 +474,10 @@ void RecoverIndicesAndStats(RecoveredIndicesAndConstraints::IndicesMetadata &ind
       try {
         // TODO: parallel execution
         text_index.RecoverIndex(index_info, vertices->access(), name_id_mapper, updater, on_progress);
+      } catch (const std::exception &e) {
+        throw RecoveryFailure("Failed to recover {} '{}': {}", index_type, index_info.index_name, e.what());
       } catch (...) {
-        throw RecoveryFailure(fmt::format("The {} must be created here!", index_type).c_str());
+        throw RecoveryFailure("Failed to recover {} '{}': unknown exception", index_type, index_info.index_name);
       }
       spdlog::info("{} {} on :{} is recreated from metadata",
                    index_type,
@@ -589,6 +630,10 @@ void RecoverDerivedState(utils::SkipListDb<Vertex> *vertices, [[maybe_unused]] u
                          properties_on_edges,
                          GetParallelExecInfo(recovery_info, config, db_arena_pool),
                          on_progress);
+  if (auto *mem_unique_constraints =
+          dynamic_cast<InMemoryUniqueConstraints *>(constraints->unique_constraints_.get())) {
+    mem_unique_constraints->SetPropertyDecodeContext(indices, name_id_mapper);
+  }
   RecoverConstraints(indices_constraints.constraints,
                      constraints,
                      vertices,
@@ -640,8 +685,10 @@ std::optional<RecoveryInfo> Recovery::RecoverData(
   if (!snapshot_files.empty()) {
     spdlog::info("Try recovering from snapshot directory {}.", snapshot_directory_);
 
-    // UUID used for durability is the UUID of the last snapshot file.
-    uuid.set(snapshot_files.back().uuid);
+    // Select the active database UUID from the most recently created snapshot lineage, then recover the snapshot of
+    // that UUID with the greatest durable transaction timestamp (snapshot_files is sorted by durable_timestamp).
+    auto const &newest_named_snapshot = *std::ranges::max_element(snapshot_files, {}, &SnapshotDurabilityInfo::path);
+    uuid.set(newest_named_snapshot.uuid);
     auto const last_snapshot_uuid_str = std::string{uuid};
 
     spdlog::trace("UUID of the last snapshot file: {}", last_snapshot_uuid_str);
@@ -756,8 +803,14 @@ std::optional<RecoveryInfo> Recovery::RecoverData(
     spdlog::info("Trying to load WAL files.");
 
     for (const auto &wal_file : wal_files) {
-      if (previous_seq_num && (wal_file.seq_num - *previous_seq_num) > 1) {
-        throw RecoveryFailure("You are missing a WAL file with the sequence number {}!", *previous_seq_num + 1);
+      if (previous_seq_num) {
+        if (wal_file.seq_num <= *previous_seq_num) {
+          throw RecoveryFailure("Conflicting WAL files share sequence number {}!", wal_file.seq_num);
+        }
+        if ((wal_file.seq_num - *previous_seq_num) > 1 &&
+            (!snapshot_durable_timestamp || wal_file.from_timestamp > *snapshot_durable_timestamp)) {
+          throw RecoveryFailure("You are missing a WAL file with the sequence number {}!", *previous_seq_num + 1);
+        }
       }
       previous_seq_num = wal_file.seq_num;
 

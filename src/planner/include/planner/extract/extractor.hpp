@@ -16,12 +16,14 @@
 #include <deque>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include <cassert>
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "utils/logging.hpp"
 
@@ -172,63 +174,148 @@ template <typename Symbol, typename Analysis, typename CostModel>
     return it->second ? &*it->second : nullptr;
   }
 
-  auto const &eclass = egraph.eclass(eclass_id);
+  auto materialize_if_lazy = [](CostResult &cr) {
+    if constexpr (requires(CostResult const &c) { c.alts(); }) {
+      (void)cr.alts();
+    }
+  };
 
-  // Mark this e-class as "in progress" with nullopt frontier to detect cycles.
-  // Iterator is stable for the duration of this function: the upfront reserve
-  // prevents rehash, and erasure of unrelated entries leaves other buckets in
-  // place (open addressing).
-  auto sentinel_it = out.emplace(eclass_id, std::nullopt).first;
-  MG_ASSERT(out.bucket_count() == initial_bucket_count, "sentinel emplace triggered rehash");
-
-  auto eclass_frontier = std::optional<CostResult>{};
-
-  // Per-frame buffer; nested recursive frames get their own slot.
-  auto [guard, children_frontiers] = ctx.frontier_buffer_pool.acquire();
-  for (auto const &enode_id : eclass.nodes()) {
-    auto const &enode = egraph.get_enode(enode_id);
-
-    // Single pass: recurse and capture the returned pointer in one go.  No
-    // rehash can happen (see reserve above), so the pointer stays valid for
-    // the remainder of this function.  We always recurse for *every* child
-    // even when one turns out cyclic: the recursion's side effect (caching
-    // a non-cyclic sibling's frontier) is observable by other enodes / the
-    // resolver.  Only the pointer collection stops once we know the cost
-    // model won't be called for this enode.
-    children_frontiers.clear();
-    children_frontiers.reserve(enode.children().size());
-    auto has_uncomputable_child = false;
-    for (auto child : enode.children()) {
-      auto const *child_frontier = ComputeFrontiers(egraph, cost_model, child, ctx);
-      if (!child_frontier) {
-        has_uncomputable_child = true;
-        continue;
+  auto eval_eclass_once = [&](EClassId target_id) -> std::optional<CostResult> {
+    auto const &ec = egraph.eclass(target_id);
+    auto [guard, children_frontiers] = ctx.frontier_buffer_pool.acquire();
+    std::optional<CostResult> merged{};
+    for (auto const &enode_id : ec.nodes()) {
+      auto const &enode = egraph.get_enode(enode_id);
+      children_frontiers.clear();
+      children_frontiers.reserve(enode.children().size());
+      bool missing_child = false;
+      for (auto child : enode.children()) {
+        auto const child_it = out.find(child);
+        if (child_it == out.end() || !child_it->second) {
+          missing_child = true;
+          break;
+        }
+        children_frontiers.push_back(&*child_it->second);
       }
-      if (!has_uncomputable_child) children_frontiers.push_back(child_frontier);
+      if (missing_child) continue;
+      auto enode_frontier = cost_model(enode, enode_id, children_frontiers);
+      if (!merged) {
+        merged = std::move(enode_frontier);
+      } else {
+        merged->merge_in_place(std::move(enode_frontier));
+      }
     }
-    if (has_uncomputable_child) continue;
+    return merged;
+  };
 
-    auto enode_frontier = cost_model(enode, enode_id, children_frontiers);
+  boost::unordered_flat_map<EClassId, std::uint32_t> dfn;
+  boost::unordered_flat_map<EClassId, std::uint32_t> low;
+  boost::unordered_flat_set<EClassId> on_stack;
+  std::vector<EClassId> scc_stack;
+  std::uint32_t timer = 0;
 
-    if (!eclass_frontier) {
-      eclass_frontier = std::move(enode_frontier);
-    } else {
-      eclass_frontier->merge_in_place(std::move(enode_frontier));
+  auto dfs = [&](this auto const &self, EClassId cur_id) -> CostResult const * {
+    if (auto const it = out.find(cur_id); it != out.end() && !on_stack.contains(cur_id)) {
+      return it->second ? &*it->second : nullptr;
     }
-  }
 
-  // Each recursive child also asserts bucket_count stability at its own emplace
-  // site, so a rehash anywhere in the subtree fires the assertion at the source.
-  // Re-checking here makes the iterator-stability invariant locally evident.
-  MG_ASSERT(out.bucket_count() == initial_bucket_count, "rehash during child recursion invalidated sentinel_it");
+    auto const my_dfn = ++timer;
+    dfn.emplace(cur_id, my_dfn);
+    low.emplace(cur_id, my_dfn);
+    on_stack.insert(cur_id);
+    scc_stack.push_back(cur_id);
 
-  if (eclass_frontier) {
-    sentinel_it->second = std::move(eclass_frontier);
-    return &*sentinel_it->second;
-  }
+    auto sentinel_it = out.emplace(cur_id, std::nullopt).first;
+    MG_ASSERT(out.bucket_count() == initial_bucket_count, "sentinel emplace triggered rehash");
 
-  out.erase(sentinel_it);
-  return nullptr;
+    auto const &ec = egraph.eclass(cur_id);
+    auto eclass_frontier = std::optional<CostResult>{};
+    {
+      auto [guard, children_frontiers] = ctx.frontier_buffer_pool.acquire();
+      for (auto const &enode_id : ec.nodes()) {
+        auto const &enode = egraph.get_enode(enode_id);
+        children_frontiers.clear();
+        children_frontiers.reserve(enode.children().size());
+        auto has_uncomputable_child = false;
+        for (auto child : enode.children()) {
+          CostResult const *child_frontier = nullptr;
+          if (on_stack.contains(child)) {
+            low[cur_id] = std::min(low[cur_id], dfn[child]);
+            auto const child_it = out.find(child);
+            child_frontier = (child_it != out.end() && child_it->second) ? &*child_it->second : nullptr;
+          } else {
+            child_frontier = self(child);
+            if (on_stack.contains(child)) {
+              low[cur_id] = std::min(low[cur_id], low[child]);
+            }
+          }
+          if (!child_frontier) {
+            has_uncomputable_child = true;
+            continue;
+          }
+          if (!has_uncomputable_child) children_frontiers.push_back(child_frontier);
+        }
+        if (has_uncomputable_child) continue;
+
+        auto enode_frontier = cost_model(enode, enode_id, children_frontiers);
+        if (!eclass_frontier) {
+          eclass_frontier = std::move(enode_frontier);
+        } else {
+          eclass_frontier->merge_in_place(std::move(enode_frontier));
+        }
+      }
+    }
+
+    MG_ASSERT(out.bucket_count() == initial_bucket_count, "rehash during child recursion invalidated sentinel_it");
+    if (eclass_frontier) {
+      sentinel_it->second = std::move(eclass_frontier);
+    }
+
+    if (low[cur_id] == my_dfn) {
+      std::vector<EClassId> comp;
+      while (true) {
+        auto const member = scc_stack.back();
+        scc_stack.pop_back();
+        on_stack.erase(member);
+        comp.push_back(member);
+        if (member == cur_id) break;
+      }
+
+      if (comp.size() > 1) {
+        for (EClassId member : comp) {
+          if (auto &slot = out.find(member)->second) {
+            materialize_if_lazy(*slot);
+          }
+        }
+        for (std::size_t pass = 0; pass + 1 < comp.size(); ++pass) {
+          for (EClassId member : comp) {
+            auto recomputed = eval_eclass_once(member);
+            if (!recomputed) continue;
+            materialize_if_lazy(*recomputed);
+            auto &slot = out.find(member)->second;
+            if (!slot) {
+              slot = std::move(*recomputed);
+            } else {
+              slot->merge_in_place(std::move(*recomputed));
+              materialize_if_lazy(*slot);
+            }
+          }
+        }
+      }
+
+      for (EClassId member : comp) {
+        if (auto it = out.find(member); it != out.end() && !it->second) {
+          out.erase(it);
+        }
+      }
+      auto const final_it = out.find(cur_id);
+      return (final_it != out.end() && final_it->second) ? &*final_it->second : nullptr;
+    }
+
+    return sentinel_it->second ? &*sentinel_it->second : nullptr;
+  };
+
+  return dfs(eclass_id);
 }
 
 // ============================================================================
@@ -279,7 +366,9 @@ void DfsPostOrder(Key root, boost::unordered_flat_map<Key, std::uint32_t, KeyHas
   auto visit = [&](this auto const &self, Key key) -> std::uint32_t {
     auto [it, inserted] = seen.try_emplace(key, kCycleSentinel);
     if (!inserted) {
-      assert(it->second != kCycleSentinel && "cycle in DfsPostOrder");
+      if (it->second == kCycleSentinel) {
+        throw std::logic_error("Cycle detected in DfsPostOrder during plan resolution");
+      }
       return it->second;
     }
     auto entry = make_entry(key, self);

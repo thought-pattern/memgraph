@@ -13,43 +13,32 @@
 //
 // Usage:
 //   ./corpus_profile <corpus_file> [--iterations N]
-//
-// Run with perf:
-//   perf record -g ./corpus_profile <corpus_file> --iterations 100000
-//   perf report
 
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
-#include <fmt/format.h>
-
-#include "fuzz_common.hpp"
-#include "planner/pattern/match.hpp"
-#include "planner/pattern/match_index.hpp"
-#include "planner/pattern/vm/compiler.hpp"
-#include "planner/pattern/vm/executor.hpp"
-#include "planner/rewrite/rule.hpp"
-
-import memgraph.planner.core.egraph;
+#include "fuzz_pattern_corpus.hpp"
 
 namespace memgraph::planner::core {
 
-// Import fuzz types into this namespace
-using fuzz::FuzzAnalysis;
+using fuzz::FuzzPatternSession;
+using fuzz::FuzzSessionOptions;
 using fuzz::FuzzSymbol;
 using fuzz::FuzzTypedEGraph;
-using fuzz::MultiPatternGenerator;
 using fuzz::pattern_to_memgraph;
 using fuzz::pattern_to_string;
-using fuzz::PatternASTPtr;
-
-// Import planner sub-namespace types
 using pattern::Match;
 using pattern::MatcherContext;
 using pattern::MatcherIndex;
@@ -57,27 +46,36 @@ using pattern::Pattern;
 using rewrite::RewriteRule;
 using rewrite::RuleContext;
 
-// Profile runner
+inline auto parse_positive_iterations(std::string_view raw) -> std::optional<int> {
+  if (raw.empty()) return std::nullopt;
+  int value = 0;
+  auto const [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), value);
+  if (ec != std::errc{} || ptr != raw.data() + raw.size() || value <= 0) {
+    return std::nullopt;
+  }
+  return value;
+}
+
 class ProfileRunner {
  public:
-  bool setup(uint8_t const *data, size_t size) {
-    egraph_ = EGraph<FuzzSymbol, FuzzAnalysis>{};
-    created_ids_.clear();
+  bool setup(uint8_t const *data, std::size_t size) {
+    FuzzSessionOptions opts;
+    opts.run_oracle_checks = false;
+    opts.skip_egglog = true;
+    opts.abort_on_failure = false;
 
-    size_t pos = 0;
-    execute_operation(0, data, pos, size);
-
-    while (pos < size && pos < 1000) {
-      uint8_t const op = data[pos++];
-      execute_operation(op, data, pos, size);
+    session_ = std::make_unique<FuzzPatternSession>(std::move(opts));
+    if (!session_->replay_stream(data, size)) {
+      return false;
     }
 
-    if (current_patterns_ast_.empty() || created_ids_.empty()) return false;
+    auto const &asts = session_->current_patterns_ast();
+    if (asts.empty() || session_->created_ids().empty()) return false;
 
-    egraph_.rebuild(ctx_);
+    session_->rebuild();
 
     patterns_.clear();
-    for (auto const &ast : current_patterns_ast_) {
+    for (auto const &ast : asts) {
       patterns_.push_back(pattern_to_memgraph(ast));
     }
 
@@ -85,10 +83,9 @@ class ProfileRunner {
       if (p.num_vars() == 0) return false;
     }
 
-    // Pre-compile for VM
     std::vector<Pattern<FuzzSymbol>> patterns_copy;
-    patterns_copy.reserve(current_patterns_ast_.size());
-    for (auto const &ast : current_patterns_ast_) {
+    patterns_copy.reserve(asts.size());
+    for (auto const &ast : asts) {
       patterns_copy.push_back(pattern_to_memgraph(ast));
     }
 
@@ -99,22 +96,28 @@ class ProfileRunner {
     vm_rule_ = std::make_unique<RewriteRule<FuzzTypedEGraph>>(
         std::move(rule_builder).apply([this](RuleContext<FuzzTypedEGraph> &, Match const &) { ++match_count_; }));
 
-    // Print info
-    std::cerr << "E-graph: " << egraph_.num_classes() << " classes, " << egraph_.num_nodes() << " nodes\n";
+    auto const &egraph = session_->egraph();
+    std::cerr << "E-graph: " << egraph.num_classes() << " classes, " << egraph.num_nodes() << " nodes\n";
     std::cerr << "Patterns:\n";
-    for (size_t i = 0; i < current_patterns_ast_.size(); ++i) {
-      std::cerr << "  " << (i + 1) << ": " << pattern_to_string(current_patterns_ast_[i]) << "\n";
+    for (std::size_t i = 0; i < asts.size(); ++i) {
+      std::cerr << "  " << (i + 1) << ": " << pattern_to_string(asts[i]) << "\n";
     }
 
     return true;
   }
 
   void run_vm(int iterations) {
-    MatcherIndex index(egraph_);
-    pattern::vm::VMExecutor vm_executor(egraph_);
-    MatcherContext matcher_ctx;  // NOLINT(misc-const-correctness) - mutated by match()
+    if (iterations <= 0) {
+      throw std::invalid_argument("iterations must be positive");
+    }
+    auto &egraph = session_->egraph();
+    auto &typed_egraph = session_->typed_egraph();
+
+    MatcherIndex index(egraph);
+    pattern::vm::VMExecutor vm_executor(egraph);
+    MatcherContext matcher_ctx;  // NOLINT(misc-const-correctness)
     std::vector<EClassId> new_eclasses;
-    RuleContext rule_ctx(typed_egraph_, new_eclasses);
+    RuleContext<FuzzTypedEGraph> rule_ctx(typed_egraph, new_eclasses);
 
     for (int i = 0; i < iterations; ++i) {
       match_count_ = 0;
@@ -125,82 +128,10 @@ class ProfileRunner {
   }
 
   [[nodiscard]] auto match_count() const -> std::size_t { return match_count_; }
+  [[nodiscard]] auto session() const -> FuzzPatternSession const & { return *session_; }
 
  private:
-  void execute_operation(uint8_t op, uint8_t const *data, size_t &pos, size_t size) {
-    switch (op % 6) {
-      case 0:
-        create_leaf_node(data, pos, size);
-        break;
-      case 1:
-        create_compound_node(data, pos, size);
-        break;
-      case 2:
-        merge_classes(data, pos, size);
-        break;
-      case 3:
-        rebuild();
-        break;
-      case 4:
-        set_pattern(data, pos, size);
-        break;
-      default:
-        break;
-    }
-  }
-
-  void create_leaf_node(uint8_t const *data, size_t &pos, size_t size) {
-    if (pos >= size) return;
-    uint8_t const symbol = data[pos++] % 5;
-    uint64_t const disambiguator = pos < size ? data[pos++] : 0;
-    auto sym = static_cast<FuzzSymbol>(symbol);
-    auto info = egraph_.emplace(sym, disambiguator);
-    created_ids_.push_back(info.eclass_id);
-  }
-
-  void create_compound_node(uint8_t const *data, size_t &pos, size_t size) {
-    if (pos + 2 >= size || created_ids_.empty()) return;
-    uint8_t const symbol_idx = data[pos++] % 6;
-    auto sym = static_cast<FuzzSymbol>(10 + symbol_idx);
-    size_t const arity = [&] {
-      if (sym == FuzzSymbol::Ternary) return size_t{3};
-      if (sym == FuzzSymbol::Plus || sym == FuzzSymbol::Mul) return size_t{2};
-      return size_t{1};
-    }();
-    if (pos + arity > size || created_ids_.size() < arity) return;
-
-    utils::small_vector<EClassId> children;
-    for (size_t i = 0; i < arity; ++i) {
-      uint8_t const child_idx = data[pos++] % created_ids_.size();
-      children.push_back(egraph_.find(created_ids_[child_idx]));
-    }
-    auto info = egraph_.emplace(sym, children);
-    created_ids_.push_back(info.eclass_id);
-  }
-
-  void merge_classes(uint8_t const *data, size_t &pos, size_t size) {
-    if (pos + 2 > size || created_ids_.size() < 2) return;
-    uint8_t const idx1 = data[pos++] % created_ids_.size();
-    uint8_t const idx2 = data[pos++] % created_ids_.size();
-    if (idx1 != idx2) egraph_.merge(created_ids_[idx1], created_ids_[idx2]);
-  }
-
-  void rebuild() { egraph_.rebuild(ctx_); }
-
-  void set_pattern(uint8_t const *data, size_t &pos, size_t size) {
-    if (pos >= size) return;
-    auto result = pattern_gen_.generate(data, pos, size);
-    current_patterns_ast_ = std::move(result.patterns);
-  }
-
-  // The rewrite engine drives the typed wrapper; `egraph_` aliases the core it
-  // owns so the building operations act on the same graph.
-  FuzzTypedEGraph typed_egraph_;
-  EGraph<FuzzSymbol, FuzzAnalysis> &egraph_ = typed_egraph_.core();
-  ProcessingContext<FuzzSymbol> ctx_;
-  std::vector<EClassId> created_ids_;
-  MultiPatternGenerator pattern_gen_;
-  std::vector<PatternASTPtr> current_patterns_ast_;
+  std::unique_ptr<FuzzPatternSession> session_;
   std::vector<Pattern<FuzzSymbol>> patterns_;
   std::unique_ptr<RewriteRule<FuzzTypedEGraph>> vm_rule_;
   std::size_t match_count_ = 0;
@@ -220,8 +151,20 @@ int main(int argc, char *argv[]) try {
   int iterations = 10000;
 
   for (int i = 2; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
-      iterations = std::stoi(argv[++i]);
+    if (std::strcmp(argv[i], "--iterations") == 0) {
+      if (i + 1 >= argc) {
+        std::cerr << "Missing value after --iterations\n";
+        return 1;
+      }
+      auto parsed = parse_positive_iterations(argv[++i]);
+      if (!parsed) {
+        std::cerr << "Invalid --iterations value '" << argv[i] << "': expected a positive integer\n";
+        return 1;
+      }
+      iterations = *parsed;
+    } else {
+      std::cerr << "Unknown argument: " << argv[i] << "\n";
+      return 1;
     }
   }
 

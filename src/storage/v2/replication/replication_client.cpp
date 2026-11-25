@@ -347,23 +347,31 @@ void ReplicationStorageClient::TryCheckReplicaStateAsync(Storage *main_storage, 
     SetMaybeBehind();
     return;
   }
+  // Clone the protector BEFORE setting check_queued_ so an allocation throw never strands check_queued_ == true.
+  auto cloned_protector = protector.clone();
   // At most one check is pending per replica; the pending one observes any state change made since it was queued.
   if (check_queued_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
-  auto const queued = client_.maintenance_pool_.AddTask(
-      [main_storage, protector = protector.clone(), arena_pool = main_storage->DbArenaPool(), this]() {
-        utils::OnScopeExit const release_slot{[this] { check_queued_.store(false, std::memory_order_release); }};
-        try {
-          const memory::DbArenaScope db_arena_scope{arena_pool};
-          this->TryCheckReplicaStateSync(main_storage, *protector);
-        } catch (...) {
-          // The task runs raw on the maintenance worker; the frequent check retries a MAYBE_BEHIND
-          // replica.
-          spdlog::error("State check of replica {} failed.", client_.name_);
-          this->SetMaybeBehind();
-        }
-      });
+  bool queued = false;
+  try {
+    queued = client_.maintenance_pool_.AddTask(
+        [main_storage, protector = std::move(cloned_protector), arena_pool = main_storage->DbArenaPool(), this]() {
+          utils::OnScopeExit const release_slot{[this] { check_queued_.store(false, std::memory_order_release); }};
+          try {
+            const memory::DbArenaScope db_arena_scope{arena_pool};
+            this->TryCheckReplicaStateSync(main_storage, *protector);
+          } catch (...) {
+            // The task runs raw on the maintenance worker; the frequent check retries a MAYBE_BEHIND
+            // replica.
+            spdlog::error("State check of replica {} failed.", client_.name_);
+            this->SetMaybeBehind();
+          }
+        });
+  } catch (...) {
+    check_queued_.store(false, std::memory_order_release);
+    throw;
+  }
   if (!queued) {
     // The pool is shut down, so the task never runs. The storage client is destroyed right after the pool.
     check_queued_.store(false, std::memory_order_release);
@@ -434,40 +442,44 @@ auto ReplicationStorageClient::StartTransactionReplication(Storage *storage, Dat
     return std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
   }
   metrics::ScopedHistogramTimer const timer{metrics::Metrics().global.start_txn_replication_seconds};
-  auto locked_state = replica_state_.Lock();
-  spdlog::trace(
-      "Starting transaction replication for replica {} in state {}", client_.name_, StateToString(*locked_state));
+  bool check_behind_after_unlock = false;
+  std::optional<std::expected<ReplicaStream, StartTxnReplicationError>> result;
+  {
+    auto locked_state = replica_state_.Lock();
+    spdlog::trace(
+        "Starting transaction replication for replica {} in state {}", client_.name_, StateToString(*locked_state));
 
-  MG_ASSERT(client_.mode_ != replication_coordination_glue::ReplicationMode::ASYNC,
-            "ASYNC replicas must not start transaction replication");
+    MG_ASSERT(client_.mode_ != replication_coordination_glue::ReplicationMode::ASYNC,
+              "ASYNC replicas must not start transaction replication");
 
-  switch (*locked_state) {
-    using enum ReplicaState;
-    case RECOVERY: {
-      spdlog::debug("Replica {} is behind MAIN instance", client_.name_);
-      return std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
-    }
-    case REPLICATING: {
-      spdlog::debug("Replica {} missed a transaction", client_.name_);
-      // We missed a transaction because we're still replicating
-      // the previous transaction. We will go to MAYBE_BEHIND state so that frequent heartbeat enqueues the recovery
-      // task to the queue.
-      *locked_state = MAYBE_BEHIND;
-      return std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
-    }
-    case MAYBE_BEHIND: {
-      spdlog::error(
-          utils::MessageWithLink("Couldn't replicate data to {}.", client_.name_, "https://memgr.ph/replication"));
-      TryCheckReplicaStateAsync(storage, protector);
-      return std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
-    }
-    case DIVERGED_FROM_MAIN: {
-      spdlog::error(utils::MessageWithLink("Couldn't replicate data to {} since replica has diverged from main.",
-                                           client_.name_,
-                                           "https://memgr.ph/replication"));
-      return std::unexpected{StartTxnReplicationError{ReplicaDivergedErr{}}};
-    }
-    case READY: {
+    switch (*locked_state) {
+      using enum ReplicaState;
+      case RECOVERY: {
+        spdlog::debug("Replica {} is behind MAIN instance", client_.name_);
+        return std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
+      }
+      case REPLICATING: {
+        spdlog::debug("Replica {} missed a transaction", client_.name_);
+        // We missed a transaction because we're still replicating
+        // the previous transaction. We will go to MAYBE_BEHIND state so that frequent heartbeat enqueues the recovery
+        // task to the queue.
+        *locked_state = MAYBE_BEHIND;
+        return std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
+      }
+      case MAYBE_BEHIND: {
+        spdlog::error(
+            utils::MessageWithLink("Couldn't replicate data to {}.", client_.name_, "https://memgr.ph/replication"));
+        check_behind_after_unlock = true;
+        result = std::unexpected{StartTxnReplicationError{ReplicaNotInSyncErr{}}};
+        break;
+      }
+      case DIVERGED_FROM_MAIN: {
+        spdlog::error(utils::MessageWithLink("Couldn't replicate data to {} since replica has diverged from main.",
+                                             client_.name_,
+                                             "https://memgr.ph/replication"));
+        return std::unexpected{StartTxnReplicationError{ReplicaDivergedErr{}}};
+      }
+      case READY: {
       try {
         metrics::ScopedHistogramTimer const timer{metrics::Metrics().global.replica_stream_seconds};
         // Block for SYNC and STRICT_SYNC replicas until we obtain the RPC lock.
@@ -492,7 +504,12 @@ auto ReplicationStorageClient::StartTransactionReplication(Storage *storage, Dat
     }
     default:
       LOG_FATAL("Unknown replica state when starting transaction replication.");
+    }
   }
+  if (check_behind_after_unlock) {
+    TryCheckReplicaStateAsync(storage, protector);
+  }
+  return std::move(*result);
 }
 
 // RPC lock released at the end of this function

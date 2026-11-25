@@ -113,20 +113,25 @@ bool ValidateCongruenceClosure(EGraph<Symbol, Analysis> &egraph) {
 
 template <typename Symbol, typename Analysis>
 bool ValidateParentChildRelationships(EGraph<Symbol, Analysis> &egraph) {
-  // Single pass: collect all parent->child relationships from nodes
+  // First pass: collect live parent->child and expected child->parents sets
   std::unordered_map<ENodeId, std::unordered_set<EClassId>> node_to_children;
+  std::unordered_map<EClassId, std::unordered_set<ENodeId>> expected_parents;
 
   for (auto const &[class_id, eclass] : egraph.canonical_classes()) {
     for (auto enode_id : eclass.nodes()) {
       auto const &enode = egraph.get_enode(enode_id);
+      auto &children_set = node_to_children[enode_id];
       for (auto child_id : enode.children()) {
-        node_to_children[enode_id].insert(egraph.find(child_id));
+        auto canonical_child = egraph.find(child_id);
+        children_set.insert(canonical_child);
+        expected_parents[canonical_child].insert(enode_id);
       }
     }
   }
 
-  // Now validate: each parent reference should match actual children
+  // Second pass: compare recorded parents against the complete expected parent set
   for (auto const &[class_id, eclass] : egraph.canonical_classes()) {
+    std::unordered_set<ENodeId> recorded_parents;
     for (auto enode_id : eclass.parents()) {
       auto canonical_parent = egraph.find(enode_id);
 
@@ -136,10 +141,32 @@ bool ValidateParentChildRelationships(EGraph<Symbol, Analysis> &egraph) {
         return false;
       }
 
-      // Check if this parent node actually references this child class
-      if (auto it = node_to_children.find(enode_id); it != node_to_children.end() && !it->second.contains(class_id)) {
+      auto it = node_to_children.find(enode_id);
+      if (it == node_to_children.end()) {
+        std::cerr << "Recorded parent e-node " << enode_id << " is not a live e-node in any canonical class\n";
+        return false;
+      }
+
+      if (!it->second.contains(class_id)) {
         std::cerr << "Parent e-node doesn't reference child e-class " << class_id << "\n";
         return false;
+      }
+
+      recorded_parents.insert(enode_id);
+    }
+
+    auto const exp_it = expected_parents.find(class_id);
+    std::size_t const exp_count = (exp_it != expected_parents.end()) ? exp_it->second.size() : 0;
+    if (recorded_parents.size() != exp_count) {
+      std::cerr << "Missing recorded parent link(s) on child e-class " << class_id << "\n";
+      return false;
+    }
+    if (exp_it != expected_parents.end()) {
+      for (auto exp_enode : exp_it->second) {
+        if (!recorded_parents.contains(exp_enode)) {
+          std::cerr << "Expected parent e-node " << exp_enode << " missing from child e-class " << class_id << "\n";
+          return false;
+        }
       }
     }
   }

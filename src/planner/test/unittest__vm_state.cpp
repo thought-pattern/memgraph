@@ -60,15 +60,17 @@ TEST(PatternVM_State, BindSlotValueChange) {
                .binding_order = kIdentityOrder2,
                .slot_to_order = kIdentitySlotToOrder2});
 
-  // First candidate: (100, 200)
+  // First candidate: (100, 200) - mark slot 1 as seen and verify duplicate rejection first
   EXPECT_TRUE(state.try_bind(0, EClassId{100})) << "First bind of slot 0 should succeed";
   EXPECT_TRUE(state.try_bind(1, EClassId{200})) << "First bind of slot 1 should succeed";
+  state.mark_seen(1);
+  EXPECT_FALSE(state.try_bind(1, EClassId{200})) << "Marked slot 1 value must be rejected before prefix changes";
 
   state.pc = 0;
 
-  // Different value for slot 0 - should clear seen_per_slot[1]
+  // Different value for slot 0 - must clear seen_per_slot[1]
   EXPECT_TRUE(state.try_bind(0, EClassId{101})) << "New value for slot 0 should succeed";
-  // Same value 200 for slot 1, but prefix changed
+  // Same value 200 for slot 1, now allowed because prefix changed
   EXPECT_TRUE(state.try_bind(1, EClassId{200})) << "Same slot 1 value with different prefix should succeed";
 }
 

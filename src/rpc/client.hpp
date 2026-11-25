@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <concepts>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -295,7 +296,7 @@ class Client {
 
     slk::Builder *GetBuilder() { return &req_builder_; }
 
-    typename TRequestResponse::Response SendAndWaitProgress() {
+    typename TRequestResponse::Response SendAndWaitProgress(std::function<void()> on_request_sent = {}) {
       auto final_res_type = TRequestResponse::Response::kType;
       auto req_type = TRequestResponse::Request::kType;
 
@@ -304,6 +305,9 @@ class Client {
 
       // Finalize the request.
       req_builder_.Finalize();
+      if (on_request_sent) {
+        on_request_sent();
+      }
       spdlog::trace("[RpcClient] sent {}, version {}, to {}",
                     req_type_name,
                     TRequestResponse::Request::kVersion,

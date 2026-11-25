@@ -101,7 +101,7 @@ class VectorEdgeIndexTest : public testing::Test {
   PropertyValue MakeEmptyVectorEdgeIndexProperty(Storage::Accessor *accessor) {
     const auto index_id = accessor->GetNameIdMapper()->NameToId(test_index.data());
     return PropertyValue(PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{index_id},
-                                                          .vector = memgraph::utils::small_vector<float>{}});
+                                                          .vector = memgraph::utils::small_vector<double>{}});
   }
 
   void ExpectPlainEmptyList(Gid edge_gid, std::optional<std::size_t> expected_index_size) {
@@ -1139,9 +1139,9 @@ TEST_F(VectorEdgeIndexRecoveryTest, RecoverAllVectorEdgeIndicesResolvesEachEdgeS
   add_edge(203, kType1, stale_tag());
 
   VectorEdgeIndexRecovery::EdgeVectors ev;
-  ev[kProp].emplace(Gid::FromUint(200), memgraph::utils::small_vector<float>{9.0F, 10.0F});
-  ev[kProp].emplace(Gid::FromUint(201), memgraph::utils::small_vector<float>{5.0F, 6.0F});
-  ev[kProp].emplace(Gid::FromUint(202), memgraph::utils::small_vector<float>{7.0F, 8.0F});
+  ev[kProp].emplace(Gid::FromUint(200), memgraph::utils::small_vector<double>{9.0, 10.0});
+  ev[kProp].emplace(Gid::FromUint(201), memgraph::utils::small_vector<double>{5.0, 6.0});
+  ev[kProp].emplace(Gid::FromUint(202), memgraph::utils::small_vector<double>{7.0, 8.0});
 
   EXPECT_NO_THROW(RecoverAll(infos, ev));
 
@@ -1159,7 +1159,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, RecoverAllVectorEdgeIndicesResolvesEachEdgeS
     EXPECT_TRUE(std::ranges::is_permutation(prop.ValueVectorIndexIds(),
                                             memgraph::utils::small_vector<uint64_t>{idx_a_id, idx_b_id}));
     EXPECT_EQ(vector_edge_index_.GetVectorPropertyFromEdgeIndex(&*it, "idx_a", &name_id_mapper_),
-              (memgraph::utils::small_vector<float>{3.0F, 4.0F}));
+              (memgraph::utils::small_vector<double>{3.0, 4.0}));
   }
   {
     auto it = edges_acc.find(Gid::FromUint(201));
@@ -1178,7 +1178,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, RecoverAllVectorEdgeIndicesResolvesEachEdgeS
     ASSERT_TRUE(prop.IsVectorIndexId());
     EXPECT_EQ(prop.ValueVectorIndexIds(), (memgraph::utils::small_vector<uint64_t>{idx_b_id}));
     EXPECT_EQ(vector_edge_index_.GetVectorPropertyFromEdgeIndex(&*it, "idx_b", &name_id_mapper_),
-              (memgraph::utils::small_vector<float>{7.0F, 8.0F}));
+              (memgraph::utils::small_vector<double>{7.0, 8.0}));
   }
   {
     auto it = edges_acc.find(Gid::FromUint(203));
@@ -1261,7 +1261,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, UpdateOnSetEdgePropertyEmptyTagBecomesEmptyL
   std::vector<VectorEdgeIndexRecoveryInfo> infos{VectorEdgeIndexRecoveryInfo{.spec = CreateSpec()}};
   VectorEdgeIndexRecovery::EdgeVectors ev;
   Edge edge(Gid::FromUint(77), nullptr);
-  ev[kProp].emplace(edge.gid, memgraph::utils::small_vector<float>{1.0F, 2.0F});
+  ev[kProp].emplace(edge.gid, memgraph::utils::small_vector<double>{1.0, 2.0});
 
   PropertyValue empty_tag(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{42}, .vector = {}});
@@ -1281,7 +1281,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, UpdateOnSetEdgePropertyCapturesVectorWhenSpe
   std::vector<VectorEdgeIndexRecoveryInfo> infos{VectorEdgeIndexRecoveryInfo{.spec = CreateSpec()}};
   VectorEdgeIndexRecovery::EdgeVectors ev;
 
-  memgraph::utils::small_vector<float> raw_vec{1.0F, 2.0F};
+  memgraph::utils::small_vector<double> raw_vec{1.0, 2.0};
   PropertyValue tag_value(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{42}, .vector = raw_vec});
 
@@ -1306,7 +1306,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, UpdateOnSetEdgePropertyOrphanTagConvertedToL
   std::vector<VectorEdgeIndexRecoveryInfo> infos;
   VectorEdgeIndexRecovery::EdgeVectors ev;
 
-  memgraph::utils::small_vector<float> raw_vec{3.0F, 4.0F};
+  memgraph::utils::small_vector<double> raw_vec{3.0, 4.0};
   PropertyValue tag_value(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{99}, .vector = raw_vec});
 
@@ -1329,7 +1329,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, UpdateOnIndexDropRestoresTagsToPlainLists) {
   std::vector<VectorEdgeIndexRecoveryInfo> infos{VectorEdgeIndexRecoveryInfo{.spec = std::move(spec)}};
 
   VectorEdgeIndexRecovery::EdgeVectors ev;
-  ev[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<float>{7.0F, 8.0F});
+  ev[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<double>{7.0, 8.0});
 
   auto acc = edges_.access();
   auto e0 = acc.find(Gid::FromUint(0));
@@ -1369,7 +1369,7 @@ TEST_F(VectorEdgeIndexRecoveryTest, UpdateOnIndexDropPreservesEdgeVectorsForSurv
   std::vector<VectorEdgeIndexRecoveryInfo> infos{VectorEdgeIndexRecoveryInfo{.spec = CreateSpec("idx_a")},
                                                  VectorEdgeIndexRecoveryInfo{.spec = std::move(spec_b)}};
   VectorEdgeIndexRecovery::EdgeVectors ev;
-  ev[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<float>{1.0F, 2.0F});
+  ev[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<double>{1.0, 2.0});
 
   auto acc = edges_.access();
   auto e0 = acc.find(Gid::FromUint(0));

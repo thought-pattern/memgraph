@@ -448,7 +448,7 @@ void DiskStorage::LoadVerticesFromLabelIndexStorageToEdgeImportCache(Transaction
   rocksdb::Slice ts(strTs);
   ro.timestamp = &ts;
   auto it = std::unique_ptr<rocksdb::Iterator>(disk_index_transaction->GetIterator(ro));
-  std::string label_prefix{label.ToString()};
+  std::string label_prefix = utils::SerializeLabelIndexPrefix(label);
 
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     std::string key = it->key().ToString();
@@ -503,7 +503,7 @@ void DiskStorage::LoadVerticesFromLabelPropertyIndexStorageToEdgeImportCache(Tra
   ro.timestamp = &ts;
   auto it = std::unique_ptr<rocksdb::Iterator>(disk_index_transaction->GetIterator(ro));
 
-  const std::string label_property_prefix = label.ToString() + "|" + property.ToString();
+  const std::string label_property_prefix = utils::SerializeLabelPropertyIndexPrefix(label, property);
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     std::string key = it->key().ToString();
     std::string value = it->value().ToString();
@@ -733,12 +733,15 @@ void DiskStorage::LoadVerticesFromDiskLabelIndex(Transaction *transaction, Label
   ro.timestamp = &ts;
   auto index_it = std::unique_ptr<rocksdb::Iterator>(disk_index_transaction->GetIterator(ro));
 
-  const auto serialized_label = label.ToString();
+  const auto serialized_label_prefix = utils::SerializeLabelIndexPrefix(label);
   for (index_it->SeekToFirst(); index_it->Valid(); index_it->Next()) {
     std::string key = index_it->key().ToString();
+    if (!key.starts_with(serialized_label_prefix)) {
+      continue;
+    }
     Gid curr_gid = Gid::FromString(utils::ExtractGidFromLabelIndexStorage(key));
     spdlog::trace("Loaded vertex with key: {} from label index storage", key);
-    if (key.starts_with(serialized_label) && !gids.contains(curr_gid)) {
+    if (!gids.contains(curr_gid)) {
       // We should pass it->timestamp().ToString() instead of "0"
       // This is hack until RocksDB will support timestamp() in WBWI iterator
       LoadVertexToLabelIndexCache(
@@ -789,9 +792,12 @@ void DiskStorage::LoadVerticesFromDiskLabelPropertyIndex(Transaction *transactio
   ro.timestamp = &ts;
   auto index_it = std::unique_ptr<rocksdb::Iterator>(disk_index_transaction->GetIterator(ro));
 
-  const auto label_property_prefix = label.ToString() + "|" + property.ToString();
+  const auto label_property_prefix = utils::SerializeLabelPropertyIndexPrefix(label, property);
   for (index_it->SeekToFirst(); index_it->Valid(); index_it->Next()) {
     std::string key = index_it->key().ToString();
+    if (!key.starts_with(label_property_prefix)) {
+      continue;
+    }
     Gid curr_gid = Gid::FromString(utils::ExtractGidFromLabelPropertyIndexStorage(key));
     if (label_property_filter(key, label_property_prefix, gids, curr_gid)) {
       // We should pass it->timestamp().ToString() instead of "0"
@@ -818,14 +824,16 @@ void DiskStorage::LoadVerticesFromDiskLabelPropertyIndexWithPointValueLookup(
   ro.timestamp = &ts;
   auto index_it = std::unique_ptr<rocksdb::Iterator>(disk_index_transaction->GetIterator(ro));
 
-  const auto label_property_prefix = label.ToString() + "|" + property.ToString();
+  const auto label_property_prefix = utils::SerializeLabelPropertyIndexPrefix(label, property);
   for (index_it->SeekToFirst(); index_it->Valid(); index_it->Next()) {
     std::string key = index_it->key().ToString();
+    if (!key.starts_with(label_property_prefix)) {
+      continue;
+    }
     std::string it_value = index_it->value().ToString();
     Gid curr_gid = Gid::FromString(utils::ExtractGidFromLabelPropertyIndexStorage(key));
     PropertyStore properties = utils::DeserializePropertiesFromLabelPropertyIndexStorage(it_value);
-    if (key.starts_with(label_property_prefix) && !gids.contains(curr_gid) &&
-        properties.IsPropertyEqual(property, value)) {
+    if (!gids.contains(curr_gid) && properties.IsPropertyEqual(property, value)) {
       // We should pass it->timestamp().ToString() instead of "0"
       // This is hack until RocksDB will support timestamp() in WBWI iterator
       LoadVertexToLabelPropertyIndexCache(
@@ -879,16 +887,18 @@ void DiskStorage::LoadVerticesFromDiskLabelPropertyIndexForIntervalSearch(
   ro.timestamp = &ts;
   auto index_it = std::unique_ptr<rocksdb::Iterator>(disk_index_transaction->GetIterator(ro));
 
-  const std::string label_property_prefix = label.ToString() + "|" + property.ToString();
+  const std::string label_property_prefix = utils::SerializeLabelPropertyIndexPrefix(label, property);
   for (index_it->SeekToFirst(); index_it->Valid(); index_it->Next()) {
     std::string key_str = index_it->key().ToString();
+    if (!key_str.starts_with(label_property_prefix)) {
+      continue;
+    }
     std::string it_value_str = index_it->value().ToString();
     Gid curr_gid = Gid::FromString(utils::ExtractGidFromLabelPropertyIndexStorage(key_str));
     /// TODO: andi this will be optimized
     PropertyStore properties = utils::DeserializePropertiesFromLabelPropertyIndexStorage(it_value_str);
     PropertyValue prop_value = properties.GetProperty(property);
-    if (!key_str.starts_with(label_property_prefix) || gids.contains(curr_gid) ||
-        !IsPropertyValueWithinInterval(prop_value, lower_bound, upper_bound)) {
+    if (gids.contains(curr_gid) || !IsPropertyValueWithinInterval(prop_value, lower_bound, upper_bound)) {
       continue;
     }
     // We should pass it->timestamp().ToString() instead of "0"
@@ -2383,8 +2393,8 @@ utils::small_vector<uint64_t> DiskStorage::DiskAccessor::GetVectorIndexIdsForVer
   return {};
 }
 
-utils::small_vector<float> DiskStorage::DiskAccessor::GetVectorFromVectorIndex(Vertex * /*vertex*/,
-                                                                               std::string_view /*index_name*/) const {
+utils::small_vector<double> DiskStorage::DiskAccessor::GetVectorFromVectorIndex(Vertex * /*vertex*/,
+                                                                                std::string_view /*index_name*/) const {
   throw utils::NotYetImplemented("Vector index related operations are not yet supported using on-disk storage mode. {}",
                                  kErrorMessage);
 }

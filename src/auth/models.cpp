@@ -782,13 +782,32 @@ nlohmann::json SerializePropertyMap(std::unordered_map<std::string, PropertyPerm
   return props_json;
 }
 
+uint8_t ParsePropertyPermissionMask(nlohmann::json const &perm_json, std::string_view field_name) {
+  auto it = perm_json.find(field_name);
+  if (it == perm_json.end()) return 0;
+  if (!it->is_number_integer()) {
+    throw AuthException("Couldn't load property access permissions data!");
+  }
+  const auto raw = it->get<int64_t>();
+  const auto max_mask = static_cast<int64_t>(std::to_underlying(kAllPropertyPermissionTypes));
+  if (raw < 0 || raw > max_mask) {
+    throw AuthException("Couldn't load property access permissions data!");
+  }
+  return static_cast<uint8_t>(raw);
+}
+
 void DeserializePropertyMap(nlohmann::json const &props_json,
                             std::unordered_map<std::string, PropertyPermission> &out) {
+  if (!props_json.is_object()) {
+    throw AuthException("Couldn't load property access permissions data!");
+  }
   for (auto const &[prop, perm_json] : props_json.items()) {
-    if (!perm_json.is_object()) continue;
+    if (!perm_json.is_object()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
     auto &perm = out[prop];
-    perm.grants = static_cast<PropertyPermissionType>(perm_json.value("grants", uint8_t{0}));
-    perm.denies = static_cast<PropertyPermissionType>(perm_json.value("denies", uint8_t{0}));
+    perm.grants = static_cast<PropertyPermissionType>(ParsePropertyPermissionMask(perm_json, "grants"));
+    perm.denies = static_cast<PropertyPermissionType>(ParsePropertyPermissionMask(perm_json, "denies"));
   }
 }
 }  // namespace
@@ -824,29 +843,53 @@ nlohmann::json PropertyAccessPermissions::Serialize() const {
 }
 
 PropertyAccessPermissions PropertyAccessPermissions::Deserialize(nlohmann::json const &data) {
+  if (!data.is_object()) {
+    throw AuthException("Couldn't load property access permissions data!");
+  }
   PropertyAccessPermissions result;
-  if (!data.is_object()) return result;
 
-  if (data.contains("global") && data["global"].is_object()) {
-    DeserializePropertyMap(data["global"], result.global_);
+  if (auto global_it = data.find("global"); global_it != data.end()) {
+    if (!global_it->is_object()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+    DeserializePropertyMap(*global_it, result.global_);
   }
 
-  if (data.contains("rules") && data["rules"].is_array()) {
-    for (auto const &rule_json : data["rules"]) {
+  if (auto rules_it = data.find("rules"); rules_it != data.end()) {
+    if (!rules_it->is_array()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+    for (auto const &rule_json : *rules_it) {
       if (!rule_json.is_object()) {
         throw AuthException("Couldn't load property access rule data!");
       }
       PropertyAccessRule rule;
-      if (rule_json.contains(kSymbols)) {
-        for (auto const &e : rule_json[kSymbols]) {
+      if (auto symbols_it = rule_json.find(kSymbols); symbols_it != rule_json.end()) {
+        if (!symbols_it->is_array()) {
+          throw AuthException("Couldn't load property access rule data!");
+        }
+        for (auto const &e : *symbols_it) {
+          if (!e.is_string()) {
+            throw AuthException("Couldn't load property access rule data!");
+          }
           rule.entities.insert(e.get<std::string>());
         }
       }
-      if (rule_json.contains(kMatching)) {
-        rule.matching_mode = rule_json[kMatching] == "EXACTLY" ? MatchingMode::EXACTLY : MatchingMode::ANY;
+      if (auto match_it = rule_json.find(kMatching); match_it != rule_json.end()) {
+        if (!match_it->is_string()) {
+          throw AuthException("Couldn't load property access rule data!");
+        }
+        const auto mode_str = match_it->get<std::string>();
+        if (mode_str != "ANY" && mode_str != "EXACTLY") {
+          throw AuthException("Couldn't load property access rule data!");
+        }
+        rule.matching_mode = mode_str == "EXACTLY" ? MatchingMode::EXACTLY : MatchingMode::ANY;
       }
-      if (rule_json.contains("properties") && rule_json["properties"].is_object()) {
-        DeserializePropertyMap(rule_json["properties"], rule.properties);
+      if (auto props_it = rule_json.find("properties"); props_it != rule_json.end()) {
+        if (!props_it->is_object()) {
+          throw AuthException("Couldn't load property access rule data!");
+        }
+        DeserializePropertyMap(*props_it, rule.properties);
       }
       result.rules_.push_back(std::move(rule));
     }
@@ -872,13 +915,21 @@ nlohmann::json PropertyAccessHandler::Serialize() const {
 }
 
 PropertyAccessHandler PropertyAccessHandler::Deserialize(nlohmann::json const &data) {
-  PropertyAccessHandler handler;
-  if (!data.is_object()) return handler;
-  if (data.contains(kLabelPropertyPermissions) && data[kLabelPropertyPermissions].is_object()) {
-    handler.label_properties_ = PropertyAccessPermissions::Deserialize(data[kLabelPropertyPermissions]);
+  if (!data.is_object()) {
+    throw AuthException("Couldn't load property access permissions data!");
   }
-  if (data.contains(kEdgeTypePropertyPermissions) && data[kEdgeTypePropertyPermissions].is_object()) {
-    handler.edge_type_properties_ = PropertyAccessPermissions::Deserialize(data[kEdgeTypePropertyPermissions]);
+  PropertyAccessHandler handler;
+  if (auto label_it = data.find(kLabelPropertyPermissions); label_it != data.end()) {
+    if (!label_it->is_object()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+    handler.label_properties_ = PropertyAccessPermissions::Deserialize(*label_it);
+  }
+  if (auto edge_it = data.find(kEdgeTypePropertyPermissions); edge_it != data.end()) {
+    if (!edge_it->is_object()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+    handler.edge_type_properties_ = PropertyAccessPermissions::Deserialize(*edge_it);
   }
   return handler;
 }
@@ -980,6 +1031,31 @@ void MigratePropertyAccessDefaults(PropertyAccessHandler &handler) {
   handler.label_properties().GrantGlobal("*", kAllPropertyPermissionTypes);
   handler.edge_type_properties().GrantGlobal("*", kAllPropertyPermissionTypes);
 }
+
+PropertyAccessHandler DeserializeEntityPropertyAccess(const nlohmann::json &data) {
+  if (auto ver_it = data.find(kVersion); ver_it != data.end()) {
+    if (!ver_it->is_number_integer()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+    const int ver = ver_it->get<int>();
+    if (ver < 1) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+  }
+  auto property_it = data.find(kPropertyAccessPermissions);
+  if (property_it != data.end()) {
+    if (!property_it->is_object()) {
+      throw AuthException("Couldn't load property access permissions data!");
+    }
+    return PropertyAccessHandler::Deserialize(*property_it);
+  }
+  if (auto ver_it = data.find(kVersion); ver_it != data.end() && ver_it->get<int>() > kCurrentEntityVersion) {
+    throw AuthException("Couldn't load property access permissions data!");
+  }
+  PropertyAccessHandler property_access_handler{};
+  MigratePropertyAccessDefaults(property_access_handler);
+  return property_access_handler;
+}
 }  // namespace
 #endif
 
@@ -1027,13 +1103,7 @@ Role Role::Deserialize(const nlohmann::json &data) {
   } else {
     spdlog::warn("Role without impersonation information; defaulting to no impersonation ability.");
   }
-  PropertyAccessHandler property_access_handler{};
-  auto property_it = data.find(kPropertyAccessPermissions);
-  if (property_it != data.end() && property_it->is_object()) {
-    property_access_handler = PropertyAccessHandler::Deserialize(*property_it);
-  } else {
-    MigratePropertyAccessDefaults(property_access_handler);
-  }
+  PropertyAccessHandler property_access_handler = DeserializeEntityPropertyAccess(data);
 
   auto role = Role{*role_name_it,
                    permissions,
@@ -1494,13 +1564,7 @@ User User::Deserialize(const nlohmann::json &data) {
     spdlog::warn("User without impersonation information; defaulting to no impersonation ability.");
   }
 
-  PropertyAccessHandler property_access_handler{};
-  auto property_it = data.find(kPropertyAccessPermissions);
-  if (property_it != data.end() && property_it->is_object()) {
-    property_access_handler = PropertyAccessHandler::Deserialize(*property_it);
-  } else {
-    MigratePropertyAccessDefaults(property_access_handler);
-  }
+  PropertyAccessHandler property_access_handler = DeserializeEntityPropertyAccess(data);
 
   auto user = User{*username_it,
                    std::move(password_hash),
@@ -1755,6 +1819,51 @@ PropertyAccessPermissions Roles::GetPropertyEdgeTypePermissions(std::optional<st
     }
   }
   return combined;
+}
+
+const std::string &Roles::GetMain() const {
+  static const std::string empty_db;
+  if (roles_.empty()) {
+    return empty_db;
+  }
+
+  std::vector<const Role *> ordered_roles;
+  ordered_roles.reserve(roles_.size());
+  for (const auto &role : roles_) {
+    ordered_roles.push_back(&role);
+  }
+  std::ranges::sort(ordered_roles, [](const Role *lhs, const Role *rhs) { return lhs->rolename() < rhs->rolename(); });
+
+  std::vector<const Role *> usable_roles;
+  usable_roles.reserve(ordered_roles.size());
+  std::set<std::string_view> distinct_dbs;
+  for (const Role *role : ordered_roles) {
+    const auto &candidate = role->db_access().ConfiguredMain();
+    if (!candidate.empty() && role->HasAccess(candidate) && HasAccess(candidate)) {
+      usable_roles.push_back(role);
+      distinct_dbs.insert(candidate);
+    }
+  }
+
+  if (usable_roles.empty()) {
+    throw AuthException("No access to any configured default database across assigned roles.");
+  }
+
+  if (distinct_dbs.size() > 1) {
+    std::string summary;
+    for (size_t idx = 0; idx < usable_roles.size(); ++idx) {
+      if (idx > 0) summary += ", ";
+      summary += usable_roles[idx]->rolename() + " -> " + usable_roles[idx]->db_access().ConfiguredMain();
+    }
+    spdlog::warn(
+        "Assigned roles specify conflicting accessible default databases ({}); deterministically selecting '{}' from "
+        "role '{}'.",
+        summary,
+        usable_roles.front()->db_access().ConfiguredMain(),
+        usable_roles.front()->rolename());
+  }
+
+  return usable_roles.front()->db_access().ConfiguredMain();
 }
 #endif  // MG_ENTERPRISE
 

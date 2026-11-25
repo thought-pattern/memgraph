@@ -25,6 +25,7 @@
 #include "storage/v2/edge_ref.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indices/text_index_utils.hpp"
+#include "storage/v2/inmemory/unique_constraints.hpp"
 #include "storage/v2/schema_info_glue.hpp"
 #include "storage/v2/storage.hpp"
 #include "storage/v2/transaction.hpp"
@@ -107,6 +108,12 @@ Storage::Storage(Config config, StorageMode storage_mode, PlanInvalidatorPtr inv
         };
         return std::make_unique<DefaultDatabaseProtector>();
       }} {
+  if (storage_mode == StorageMode::IN_MEMORY_TRANSACTIONAL || storage_mode == StorageMode::IN_MEMORY_ANALYTICAL) {
+    auto *mem_unique_constraints =
+        static_cast<InMemoryUniqueConstraints *>(constraints_.unique_constraints_.get());
+    mem_unique_constraints->SetPropertyDecodeContext(&indices_, name_id_mapper_.get());
+    constraints_.MakeUpdater()(mem_unique_constraints->GetActiveConstraints());
+  }
   spdlog::info("Created database with {} storage mode.", StorageModeToString(storage_mode));
 }
 

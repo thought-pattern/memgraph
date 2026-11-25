@@ -555,8 +555,8 @@ class Interpreter final {
    * @throw query::QueryException
    */
   template <typename TStream>
-  std::map<std::string, TypedValue> Pull(TStream *result_stream, std::optional<int> n = {},
-                                         std::optional<int> qid = {});
+  std::map<std::string, TypedValue> Pull(TStream *result_stream, std::optional<int64_t> n = {},
+                                         std::optional<int64_t> qid = {});
 
   void BeginTransaction(QueryExtras const &extras = {});
 
@@ -826,26 +826,32 @@ class Interpreter final {
 };
 
 template <typename TStream>
-std::map<std::string, TypedValue> Interpreter::Pull(TStream *result_stream, std::optional<int> n,
-                                                    std::optional<int> qid) {
+std::map<std::string, TypedValue> Interpreter::Pull(TStream *result_stream, std::optional<int64_t> n,
+                                                    std::optional<int64_t> qid) {
   // Update the TLS arena index used to route allocations to the correct database arena.
   // The previous arena is restored on scope exit so pool threads are unaffected.
   std::optional<memory::DbArenaScope> plan_cache_db_arena_scope;
   if (current_db_.db_acc_) {
     plan_cache_db_arena_scope.emplace(current_db_.db_acc_->get());
   }
-  MG_ASSERT(in_explicit_transaction_ || !qid, "qid can be only used in explicit transaction!");
+  if (!in_explicit_transaction_ && qid) {
+    throw InvalidArgumentsException("qid", "qid can only be used in an explicit transaction!");
+  }
 
-  const int qid_value = qid ? *qid : static_cast<int>(query_executions_.size() - 1);
-  if (qid_value < 0 || qid_value >= query_executions_.size()) {
+  const int64_t qid_value = qid ? *qid : static_cast<int64_t>(query_executions_.size()) - 1;
+  if (qid_value < 0 || static_cast<size_t>(qid_value) >= query_executions_.size()) {
     throw InvalidArgumentsException("qid", "Query with specified ID does not exist!");
   }
 
-  if (n && n < 0) {
+  if (n && *n < 0) {
     throw InvalidArgumentsException("n", "Cannot fetch negative number of results!");
   }
+  if (n && *n > std::numeric_limits<int>::max()) {
+    throw InvalidArgumentsException("n", "Requested number of results exceeds maximum batch size!");
+  }
+  const std::optional<int> bounded_n = n ? std::optional<int>{static_cast<int>(*n)} : std::nullopt;
 
-  auto &query_execution = query_executions_[qid_value];
+  auto &query_execution = query_executions_[static_cast<size_t>(qid_value)];
 
   MG_ASSERT(query_execution && query_execution->prepared_query, "Query already finished executing!");
 
@@ -867,7 +873,7 @@ std::map<std::string, TypedValue> Interpreter::Pull(TStream *result_stream, std:
     // Wrap the (statically polymorphic) stream type into a common type which
     // the handler knows.
     AnyStream stream{result_stream, query_execution->resource()};
-    const auto maybe_res = query_execution->prepared_query->query_handler(&stream, n);
+    const auto maybe_res = query_execution->prepared_query->query_handler(&stream, bounded_n);
     // Stream is using execution memory of the query_execution which
     // can be deleted after its execution so the stream should be cleared
     // first.

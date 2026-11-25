@@ -89,7 +89,7 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
     throw ClientError("client sent invalid query");
   }
 
-  bolt_map_t Pull(std::optional<int> n, std::optional<int> qid) {
+  bolt_map_t Pull(std::optional<int64_t> n, std::optional<int64_t> /*qid*/) {
     if (should_abort_) {
       throw memgraph::query::HintedAbortError(memgraph::query::AbortReason::TERMINATED);
     }
@@ -102,7 +102,7 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
       static const std::array elements{1, 2, 3};
       static size_t global_counter = 0;
 
-      int local_counter = 0;
+      int64_t local_counter = 0;
       for (; global_counter < elements.size() && (!n || local_counter < *n); ++global_counter) {
         encoder_.MessageRecord(std::vector<Value>{Value(elements[global_counter])});
         ++local_counter;
@@ -130,7 +130,7 @@ class TestSession final : public Session<TestInputStream, TestOutputStream> {
     }
   }
 
-  bolt_map_t Discard(std::optional<int> /*unused*/, std::optional<int> /*unused*/) { return {}; }
+  bolt_map_t Discard(std::optional<int64_t> /*unused*/, std::optional<int64_t> /*unused*/) { return {}; }
 
   void BeginTransaction(const bolt_map_t &extra) {
     if (extra.contains("tx_metadata")) {

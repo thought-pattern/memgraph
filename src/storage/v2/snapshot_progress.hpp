@@ -14,13 +14,18 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace memgraph::storage {
 
+struct SnapshotProgressView;
+
 struct SnapshotProgress {
   enum class Phase : uint8_t { IDLE, EDGES, VERTICES, INDICES, CONSTRAINTS, FINALIZING };
 
+  std::atomic<uint64_t> seq{0};
+  std::atomic<bool> running{false};
   std::atomic<Phase> phase{Phase::IDLE};
   std::atomic<uint64_t> items_done{0};
   std::atomic<uint64_t> items_total{0};
@@ -30,31 +35,45 @@ struct SnapshotProgress {
   std::atomic<int64_t> start_steady_ms{0};
 
   void Start() {
-    start_steady_ms.store(
+    auto const steady_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-            .count(),
-        std::memory_order_release);
-    start_time_us.store(
+            .count();
+    auto const wall_us =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
-            .count(),
-        std::memory_order_release);
+            .count();
+    seq.fetch_add(1, std::memory_order_acq_rel);
+    phase.store(Phase::IDLE, std::memory_order_release);
+    items_done.store(0, std::memory_order_release);
+    items_total.store(0, std::memory_order_release);
+    start_steady_ms.store(steady_ms, std::memory_order_release);
+    start_time_us.store(wall_us, std::memory_order_release);
+    running.store(true, std::memory_order_release);
+    seq.fetch_add(1, std::memory_order_release);
   }
 
   void SetPhase(Phase p, uint64_t total) {
+    seq.fetch_add(1, std::memory_order_acq_rel);
     items_done.store(0, std::memory_order_release);
     items_total.store(total, std::memory_order_release);
     phase.store(p, std::memory_order_release);
+    seq.fetch_add(1, std::memory_order_release);
   }
 
-  void AddItemsDone(uint64_t n = 1) { items_done.fetch_add(n, std::memory_order_relaxed); }
+  void AddItemsDone(uint64_t n = 1) { items_done.fetch_add(n, std::memory_order_acq_rel); }
 
   void Reset() {
+    seq.fetch_add(1, std::memory_order_acq_rel);
+    running.store(false, std::memory_order_release);
     phase.store(Phase::IDLE, std::memory_order_release);
     items_done.store(0, std::memory_order_release);
     items_total.store(0, std::memory_order_release);
     start_time_us.store(0, std::memory_order_release);
     start_steady_ms.store(0, std::memory_order_release);
+    seq.fetch_add(1, std::memory_order_release);
   }
+
+  SnapshotProgressView GetView() const noexcept;
+  std::optional<SnapshotProgressView> TryGetView() const noexcept;
 
   static std::string_view PhaseToString(Phase phase);
 };
@@ -66,6 +85,45 @@ struct SnapshotProgressView {
   int64_t start_time_us;
   int64_t start_steady_ms;
 };
+
+inline SnapshotProgressView SnapshotProgress::GetView() const noexcept {
+  while (true) {
+    auto const s1 = seq.load(std::memory_order_acquire);
+    if ((s1 & 1U) != 0U) {
+      continue;
+    }
+    SnapshotProgressView const view{.phase = phase.load(std::memory_order_acquire),
+                                    .items_done = items_done.load(std::memory_order_acquire),
+                                    .items_total = items_total.load(std::memory_order_acquire),
+                                    .start_time_us = start_time_us.load(std::memory_order_acquire),
+                                    .start_steady_ms = start_steady_ms.load(std::memory_order_acquire)};
+    std::atomic_thread_fence(std::memory_order_acquire);
+    auto const s2 = seq.load(std::memory_order_acquire);
+    if (s1 == s2) {
+      return view;
+    }
+  }
+}
+
+inline std::optional<SnapshotProgressView> SnapshotProgress::TryGetView() const noexcept {
+  while (true) {
+    auto const s1 = seq.load(std::memory_order_acquire);
+    if ((s1 & 1U) != 0U) {
+      continue;
+    }
+    auto const is_running = running.load(std::memory_order_acquire);
+    SnapshotProgressView const view{.phase = phase.load(std::memory_order_acquire),
+                                    .items_done = items_done.load(std::memory_order_acquire),
+                                    .items_total = items_total.load(std::memory_order_acquire),
+                                    .start_time_us = start_time_us.load(std::memory_order_acquire),
+                                    .start_steady_ms = start_steady_ms.load(std::memory_order_acquire)};
+    std::atomic_thread_fence(std::memory_order_acquire);
+    auto const s2 = seq.load(std::memory_order_acquire);
+    if (s1 == s2) {
+      return is_running ? std::optional<SnapshotProgressView>{view} : std::nullopt;
+    }
+  }
+}
 
 /// RAII helper that batches progress increments into a local counter,
 /// flushing to the atomic every `kBatchSize` items. Destructor flushes

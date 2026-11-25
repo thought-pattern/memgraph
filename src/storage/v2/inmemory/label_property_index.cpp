@@ -588,8 +588,12 @@ bool RegisterIntoIndicesMap(IndicesMap &indices_map, AllIndicesVec &all_indexes,
   all_indexes = std::make_shared<Vec>(std::move(new_all_indexes));
   using EntryDetailT = typename ReverseLookup::mapped_type::mapped_type;
   auto const de = EntryDetailT{&it3->first, &it3->second};
+  utils::small_vector<PropertyId, 4> seen_roots;
   for (auto &&property_path : properties) {
-    reverse_lookup[property_path[0]].insert({label, de});
+    if (!std::ranges::contains(seen_roots, property_path[0])) {
+      seen_roots.push_back(property_path[0]);
+      reverse_lookup[property_path[0]].insert({label, de});
+    }
   }
   return true;
 }
@@ -652,7 +656,7 @@ auto InMemoryLabelPropertyIndex::PopulateIndex(
   } catch (const PopulateCancel &) {
     std::ignore = DropIndex(label, properties, updater, order);
     return std::unexpected{IndexPopulateError::Cancellation};
-  } catch (const utils::OutOfMemoryException &) {
+  } catch (...) {
     std::ignore = DropIndex(label, properties, updater, order);
     throw;
   }
@@ -714,7 +718,7 @@ void InMemoryLabelPropertyIndex::ActiveIndices::UpdateOnAddLabel(LabelId added_l
     auto &[index_props, _] = each;
     if (!prop_ids) prop_ids = vertex_after_update->properties.ExtractPropertyIds();
     auto vector_has_property = [&](PropertyId index_prop) { return r::binary_search(*prop_ids, index_prop); };
-    return r::any_of(index_props[0], vector_has_property);
+    return r::any_of(index_props, [&](PropertyPath const &path) { return !path.empty() && vector_has_property(path[0]); });
   };
 
   auto const insert_into = [&](auto &indices_map) {
@@ -749,7 +753,7 @@ void InMemoryLabelPropertyIndex::ActiveIndices::UpdateOnRemoveLabel(LabelId remo
     auto &[index_props, _] = each;
     if (!prop_ids) prop_ids = vertex_before_update->properties.ExtractPropertyIds();
     auto vector_has_property = [&](PropertyId index_prop) { return r::binary_search(*prop_ids, index_prop); };
-    return r::any_of(index_props[0], vector_has_property);
+    return r::any_of(index_props, [&](PropertyPath const &path) { return !path.empty() && vector_has_property(path[0]); });
   };
 
   auto const remove_from = [&](auto &indices_map) {
@@ -1078,6 +1082,8 @@ uint64_t InMemoryLabelPropertyIndex::RemoveObsoleteEntries(Storage *storage, uin
   CleanupAllIndices();
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
+  auto const duplicate_horizon =
+      static_cast<InMemoryStorage const *>(storage)->IndexDuplicateHorizon(oldest_active_start_timestamp);
 
   uint64_t swept = 0;
   auto const remove_from = [&](auto const &all_indexes) {
@@ -1110,7 +1116,7 @@ uint64_t InMemoryLabelPropertyIndex::RemoveObsoleteEntries(Storage *storage, uin
                 // older than it sees neither.
                 const bool redundant_duplicate =
                     has_next && it->vertex == next_it->vertex && it->values == next_it->values &&
-                    (!preserve_recent_entries || next_it->timestamp < oldest_active_start_timestamp);
+                    (!preserve_recent_entries || next_it->timestamp < duplicate_horizon);
                 if (redundant_duplicate || !AnyVersionHasLabelProperties(*it->vertex,
                                                                          label_id,
                                                                          property_paths,
@@ -1274,6 +1280,8 @@ uint64_t InMemoryLabelPropertyIndex::ActiveIndices::ApproximateVertexCount(
     LabelId label, std::span<PropertyPath const> properties, std::span<PropertyValueRange const> bounds) const {
   auto result = WithFoundIndex(label, properties, [&](auto &index) -> uint64_t {
     auto acc = index.skiplist.access();
+    auto const total_size = acc.size();
+    if (total_size == 0) return 0;
     auto in_bounds_for_all_prefix = [&](auto const &entry) {
       constexpr auto within_bounds = [](PropertyValue const &value, PropertyValueRange const &bounds) -> bool {
         return bounds.IsValueInRange(value);
@@ -1281,7 +1289,19 @@ uint64_t InMemoryLabelPropertyIndex::ActiveIndices::ApproximateVertexCount(
       auto value_within_bounds = [&](auto &&p) { return std::apply(within_bounds, p); };
       return std::ranges::all_of(std::ranges::views::zip(entry.values, bounds), value_within_bounds);
     };
-    return std::ranges::count_if(acc.sampling_range(), in_bounds_for_all_prefix);
+    uint64_t total_sampled = 0;
+    uint64_t matched_sampled = 0;
+    for (auto const &entry : acc.sampling_range()) {
+      ++total_sampled;
+      if (in_bounds_for_all_prefix(entry)) {
+        ++matched_sampled;
+      }
+    }
+    if (total_sampled == 0) {
+      return static_cast<uint64_t>(std::ranges::count_if(acc, in_bounds_for_all_prefix));
+    }
+    return static_cast<uint64_t>((static_cast<__uint128_t>(matched_sampled) * total_size + total_sampled / 2) /
+                                 total_sampled);
   });
   DMG_ASSERT(
       result, "Index for label {} and properties {} doesn't exist", label.AsUint(), JoinPropertiesAsString(properties));
@@ -1552,13 +1572,12 @@ void InMemoryLabelPropertyIndex::CleanupAllIndices() {
 template <typename EntryT>
 void InMemoryLabelPropertyIndex::ChunkedIterable<EntryT>::Iterator::AdvanceUntilValid() {
   constexpr bool is_desc = EntryT::kOrder == IndexOrder::DESC;
-  auto const end = typename utils::SkipListDb<EntryT>::ChunkedIterator{};
 
   // Stepping is all this iterator can do about a rejected entry. It walks the lowest level so that
   // it never passes a node another thread has marked, which a seek over the skip list would, and it
   // has a chunk end to stay within that a seek does not know about.
   while (AdvanceUntilValid_(index_iterator_,
-                            end,
+                            chunk_end_,
                             current_vertex_,
                             current_vertex_accessor_,
                             self_->storage_,

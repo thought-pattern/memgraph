@@ -19,6 +19,7 @@
 
 #include "auth/models.hpp"
 #include "utils/join_vector.hpp"
+#include "utils/message.hpp"
 
 namespace memgraph::glue {
 
@@ -34,6 +35,10 @@ std::expected<CoordinatorSSOAuthenticator::AuthResult, SSORejection> Coordinator
     return std::unexpected{SSORejection::kModuleFailed};
   }
   if (identity->roles.empty()) {
+    spdlog::warn("Rejecting coordinator SSO login for scheme '{}': the auth module authenticated '{}' with no mapped "
+                 "roles.",
+                 scheme,
+                 identity->username);
     return std::unexpected{SSORejection::kNoRolesReturned};
   }
 
@@ -67,6 +72,17 @@ std::expected<CoordinatorSSOAuthenticator::AuthResult, SSORejection> Coordinator
         utils::JoinVector(identity->roles, ", "));
     return std::unexpected{SSORejection::kRoleWithoutPrivilege};
   }
+
+  if (identity->username.empty()) {
+    spdlog::warn(utils::MessageWithLink(
+        "The coordinator SSO module returned no username; queries from this session will be recorded without a "
+        "principal.",
+        "https://memgr.ph/sso"));
+  }
+  spdlog::info("Coordinator SSO login succeeded for scheme '{}' as '{}' with roles: {}.",
+               scheme,
+               identity->username,
+               utils::JoinVector(identity->roles, ", "));
   return AuthResult{
       .effective_mask = effective_mask, .roles = std::move(identity->roles), .username = std::move(identity->username)};
 }

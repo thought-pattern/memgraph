@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <unordered_map>
 
@@ -40,9 +41,10 @@ class LruList {
 
   ~LruList() { Clear(); }
 
-  Node<TKey, TValue> *AddPageToHead(const TKey &key, const TValue &value) {
-    auto *page = new Node<TKey, TValue>{key, value};
+  void LinkPageToHead(Node<TKey, TValue> *page) noexcept {
+    page->prev = nullptr;
     if (!front_ && !rear_) {
+      page->next = nullptr;
       front_ = rear_ = page;
     } else {
       MG_ASSERT(front_ != nullptr && rear_ != nullptr, "Both front_ and rear_ must be valid");
@@ -50,6 +52,11 @@ class LruList {
       front_->prev = page;
       front_ = page;
     }
+  }
+
+  Node<TKey, TValue> *AddPageToHead(const TKey &key, const TValue &value) {
+    auto *page = new Node<TKey, TValue>{key, value};
+    LinkPageToHead(page);
     return page;
   }
 
@@ -134,6 +141,10 @@ class LruCache {
   /// Inserts given key, value pair to cache. If key already exists in a
   /// cache, then the value is overwritten.
   void Insert(const TKey &key, const TValue &value) {
+    if (capacity_ == 0) {
+      return;
+    }
+
     auto found = access_map_.find(key);
     if (found != access_map_.end()) {
       // if key already present, update value and move page to head
@@ -142,16 +153,17 @@ class LruCache {
       return;
     }
 
-    if (access_map_.size() == capacity_) {
+    auto page_holder = std::unique_ptr<impl::Node<TKey, TValue>>(new impl::Node<TKey, TValue>{key, value});
+    access_map_.emplace(key, page_holder.get());
+
+    if (access_map_.size() > capacity_ && !lru_order_.IsEmpty()) {
       // remove rear page
       auto to_del_key = lru_order_.Rear()->key;
       access_map_.erase(to_del_key);
       lru_order_.RemoveRearPage();
     }
 
-    // add new page to head to List
-    auto *page = lru_order_.AddPageToHead(key, value);
-    access_map_.emplace(key, page);
+    lru_order_.LinkPageToHead(page_holder.release());
   }
 
   void Clear() {

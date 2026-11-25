@@ -67,7 +67,7 @@ class StoreClusterConfigException final : public utils::BasicException {
 
   template <class... Args>
   explicit StoreClusterConfigException(fmt::format_string<Args...> fmt, Args &&...args) noexcept
-      : DeleteSnapshotFromDiskException(fmt::format(fmt, std::forward<Args>(args)...)) {}
+      : StoreClusterConfigException(fmt::format(fmt, std::forward<Args>(args)...)) {}
 
   SPECIALIZE_GET_EXCEPTION_NAME(StoreClusterConfigException)
 };

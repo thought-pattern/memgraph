@@ -11,24 +11,41 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 
 namespace memgraph::utils {
 
 // This class is threadsafe.
 class Timer {
  public:
-  Timer() : start_time_(std::chrono::steady_clock::now()) {}
+  Timer() noexcept : start_ns_(NowNs()) {}
 
-  template <typename TDuration = std::chrono::duration<double>>
-  TDuration Elapsed() const {
-    return std::chrono::duration_cast<TDuration>(std::chrono::steady_clock::now() - start_time_);
+  Timer(Timer const &other) noexcept : start_ns_(other.start_ns_.load(std::memory_order_relaxed)) {}
+
+  Timer &operator=(Timer const &other) noexcept {
+    if (this != &other) {
+      start_ns_.store(other.start_ns_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
   }
 
-  void ResetStartTime() { start_time_ = std::chrono::steady_clock::now(); }
+  template <typename TDuration = std::chrono::duration<double>>
+  TDuration Elapsed() const noexcept {
+    auto const elapsed_ns = NowNs() - start_ns_.load(std::memory_order_relaxed);
+    return std::chrono::duration_cast<TDuration>(std::chrono::nanoseconds(elapsed_ns));
+  }
+
+  void ResetStartTime() noexcept { start_ns_.store(NowNs(), std::memory_order_relaxed); }
 
  private:
-  std::chrono::steady_clock::time_point start_time_;
+  static int64_t NowNs() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  std::atomic<int64_t> start_ns_;
 };
 
 }  // namespace memgraph::utils

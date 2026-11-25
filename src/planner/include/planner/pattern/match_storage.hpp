@@ -32,9 +32,9 @@ class PatternMatch {
  private:
   friend class MatchArena;
 
-  explicit PatternMatch(uint32_t offset) : offset_(offset) {}
+  explicit PatternMatch(std::size_t offset) : offset_(offset) {}
 
-  uint32_t offset_ = 0;
+  std::size_t offset_ = 0;
 };
 
 /// Append-only pool for pattern match bindings. Bulk-freed via clear().
@@ -43,7 +43,7 @@ class PatternMatch {
 class MatchArena {
  public:
   auto intern(std::span<EClassId const> bindings) -> PatternMatch {
-    auto const offset = PatternMatch{static_cast<uint32_t>(pool_.size())};
+    auto const offset = PatternMatch{pool_.size()};
     pool_.insert(pool_.end(), bindings.begin(), bindings.end());
     return offset;
   }

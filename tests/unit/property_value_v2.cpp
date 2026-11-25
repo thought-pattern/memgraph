@@ -1258,15 +1258,15 @@ TEST(PropertyValue, ExternalPropertyValueToPropertyValue) {
 TEST(PropertyValue, PlaceAVectorCoordinateThatIsANaN) {
   // A vector holds its coordinates as floats, which carry a NaN of their own, so a pair of them is
   // one the sorted container an index keeps still has to be given an answer for.
-  auto const nan = std::numeric_limits<float>::quiet_NaN();
-  auto const vector_of = [](std::initializer_list<float> coordinates) {
-    memgraph::utils::small_vector<float> data(coordinates.begin(), coordinates.end());
+  auto const nan = std::numeric_limits<double>::quiet_NaN();
+  auto const vector_of = [](std::initializer_list<double> coordinates) {
+    memgraph::utils::small_vector<double> data(coordinates.begin(), coordinates.end());
     PropertyValue::vector_index_id_t ids{1UL};
     return PropertyValue{PropertyValue::VectorIndexIdData{ids, std::move(data)}};
   };
 
-  auto const with_nan = vector_of({1.0f, nan, 3.0f});
-  auto const plain = vector_of({1.0f, 2.0f, 3.0f});
+  auto const with_nan = vector_of({1.0, nan, 3.0});
+  auto const plain = vector_of({1.0, 2.0, 3.0});
 
   EXPECT_EQ(with_nan, with_nan) << "a vector holding a NaN is not equivalent to itself";
   EXPECT_TRUE(with_nan > plain) << "a NaN coordinate sorts after every number, as a NaN does alone";

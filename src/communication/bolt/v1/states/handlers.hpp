@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -101,10 +103,13 @@ inline std::pair<std::string, std::string> ExceptionToErrorMessage(const std::ex
           "should be in database logs."};
 }
 
+template <typename TSession>
+inline State HandleFailure(TSession &session, const std::exception &e);
+
 namespace details {
 
 template <bool is_pull, typename TSession>
-State HandlePullDiscard(TSession &session, std::optional<int> n, std::optional<int> qid) {
+State HandlePullDiscard(TSession &session, std::optional<int64_t> n, std::optional<int64_t> qid) {
   try {
     map_t summary;
     if constexpr (is_pull) {
@@ -168,8 +173,8 @@ State HandlePullDiscardV4(TSession &session, const State state, const Marker mar
     // Same as `unexpected RUN` case.
     return State::Close;
   }
-  std::optional<int> n;
-  std::optional<int> qid;
+  std::optional<int64_t> n;
+  std::optional<int64_t> qid;
   Value extra;
   if (!session.decoder_.ReadValue(&extra, Value::Type::Map)) {
     spdlog::trace("Couldn't read extra field!");
@@ -177,15 +182,29 @@ State HandlePullDiscardV4(TSession &session, const State state, const Marker mar
   }
   const auto &extra_map = extra.ValueMap();
   auto n_it = extra_map.find("n");
-  if (n_it != extra_map.end() && n_it->second.IsInt()) {
-    if (const auto n_value = n_it->second.ValueInt(); n_value != kPullAll) {
+  if (n_it != extra_map.end()) {
+    if (!n_it->second.IsInt()) {
+      return HandleFailure(session, ClientError("Expected integer value for 'n' in result fetch!"));
+    }
+    const auto n_value = n_it->second.ValueInt();
+    if (n_value != kPullAll) {
+      if (n_value < 0 || n_value > std::numeric_limits<int>::max()) {
+        return HandleFailure(session, ClientError("Requested result batch size 'n' is out of range!"));
+      }
       n = n_value;
     }
   }
 
   auto qid_it = extra_map.find("qid");
-  if (qid_it != extra_map.end() && qid_it->second.IsInt()) {
-    if (const auto qid_value = qid_it->second.ValueInt(); qid_value != kPullLast) {
+  if (qid_it != extra_map.end()) {
+    if (!qid_it->second.IsInt()) {
+      return HandleFailure(session, ClientError("Expected integer value for 'qid' in result fetch!"));
+    }
+    const auto qid_value = qid_it->second.ValueInt();
+    if (qid_value != kPullLast) {
+      if (qid_value < 0) {
+        return HandleFailure(session, ClientError("Query with specified ID does not exist!"));
+      }
       qid = qid_value;
     }
   }
@@ -520,34 +539,55 @@ State HandleGoodbye(TSession &session) {
   throw SessionClosedException("Closing connection.");
 }
 
+enum class RouteDbStatus : uint8_t {
+  kOk,
+  kDecodeError,
+  kMalformedField,
+};
+
+struct RouteDbParseResult {
+  RouteDbStatus status{RouteDbStatus::kDecodeError};
+  std::optional<std::string> db{};
+  map_t extra{};
+};
+
 template <typename TSession, int bolt_major, int bolt_minor = 0>
-auto ReadDB(TSession &session) -> std::optional<std::string> {
+auto ReadRouteDB(TSession &session) -> RouteDbParseResult {
   // The ROUTE message carries the database name differently across Bolt versions: 4.3 sends it as a standalone
-  // string field, while 4.4+ (and all of 5.x) moved it inside the trailing `extra` map. The third struct field
-  // must be consumed regardless so the decoder stays aligned, hence the explicit branch per layout.
+  // string/null field, while 4.4+ (and all of 5.x) moved it inside the trailing `extra` map.
   if constexpr (bolt_major == 5 || (bolt_major == 4 && bolt_minor >= 4)) {
     Value extra;
     if (!session.decoder_.ReadValue(&extra, Value::Type::Map)) {
       spdlog::trace("Couldn't read extra field!");
-      return std::nullopt;
+      return {RouteDbStatus::kDecodeError, std::nullopt, {}};
     }
-    auto const extra_map = extra.ValueMap();
+    auto extra_map = std::move(extra.ValueMap());
     auto const db_it = extra_map.find("db");
-    if (db_it == extra_map.end() || !db_it->second.IsString()) {
-      spdlog::trace("Couldn't read db field inside extra!");
-      return std::nullopt;
+    if (db_it == extra_map.end() || db_it->second.type() == Value::Type::Null) {
+      return {RouteDbStatus::kOk, std::nullopt, std::move(extra_map)};
     }
-    return db_it->second.ValueString();
+    if (!db_it->second.IsString()) {
+      spdlog::trace("Malformed db field inside extra!");
+      return {RouteDbStatus::kMalformedField, std::nullopt, {}};
+    }
+    return {RouteDbStatus::kOk, db_it->second.ValueString(), std::move(extra_map)};
   }
   if constexpr (bolt_major == 4 && bolt_minor == 3) {
     Value val_db;
-    if (!session.decoder_.ReadValue(&val_db, Value::Type::String)) {
+    if (!session.decoder_.ReadValue(&val_db)) {
       spdlog::trace("Couldn't read db field!");
-      return std::nullopt;
+      return {RouteDbStatus::kDecodeError, std::nullopt, {}};
     }
-    return val_db.ValueString();
+    if (val_db.type() == Value::Type::Null) {
+      return {RouteDbStatus::kOk, std::nullopt, {}};
+    }
+    if (!val_db.IsString()) {
+      spdlog::trace("Malformed db field in Bolt 4.3 ROUTE message!");
+      return {RouteDbStatus::kMalformedField, std::nullopt, {}};
+    }
+    return {RouteDbStatus::kOk, val_db.ValueString(), {}};
   }
-  return std::nullopt;
+  return {RouteDbStatus::kDecodeError, std::nullopt, {}};
 }
 
 template <typename TSession, int bolt_major, int bolt_minor = 0>
@@ -569,11 +609,17 @@ State HandleRoute(TSession &session, const Marker marker) {
     return State::Close;
   }
 
-  auto const db = ReadDB<TSession, bolt_major, bolt_minor>(session);
+  auto route_db = ReadRouteDB<TSession, bolt_major, bolt_minor>(session);
+  if (route_db.status == RouteDbStatus::kDecodeError) {
+    return State::Close;
+  }
+  if (route_db.status == RouteDbStatus::kMalformedField) {
+    return HandleFailure(session, ClientError("Malformed 'db' field in ROUTE message!"));
+  }
 
 #ifdef MG_ENTERPRISE
   try {
-    if (auto res = session.Route(routing.ValueMap(), bookmarks.ValueList(), db, {});
+    if (auto res = session.Route(routing.ValueMap(), bookmarks.ValueList(), route_db.db, route_db.extra);
         !session.encoder_.MessageSuccess(std::move(res))) {
       spdlog::trace("Couldn't send result of routing!");
       return State::Close;

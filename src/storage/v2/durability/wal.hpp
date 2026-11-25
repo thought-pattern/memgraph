@@ -74,6 +74,7 @@ struct WalHeader {
   /// Absent while the file is still being written, and for files written before kWalHeader. Deriving the same facts for
   /// such a file means parsing its deltas with ReadWalInfo.
   std::optional<WalSummary> summary;
+  bool summary_corrupted{false};
 };
 
 /// Structure used to hold information about a WAL.

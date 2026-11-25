@@ -30,6 +30,8 @@
 #include "coordination/replication_instance_client.hpp"
 #include "coordination/replication_instance_connector.hpp"
 #include "utils/resource_lock.hpp"
+#include "utils/spin_lock.hpp"
+#include "utils/synchronized.hpp"
 #include "utils/thread_pool.hpp"
 #include "utils/tls.hpp"
 
@@ -123,8 +125,9 @@ class CoordinatorInstance {
 
   auto GetRoutingTable(std::string_view db_name) const -> RoutingTable;
 
-  // Leader-local read backing the GetRoutingTable forwarding RPC.
-  auto GetRoutingTableAsLeader(std::string_view db_name) const -> RoutingTable;
+  // Leader-local read backing the GetRoutingTable forwarding RPC; returns nullopt if this coordinator is no longer the
+  // Raft leader when the forwarded request arrives.
+  auto GetRoutingTableAsLeader(std::string_view db_name) const -> std::optional<RoutingTable>;
 
   auto GetInstanceForFailover() const -> std::optional<std::string>;
 
@@ -266,8 +269,9 @@ class CoordinatorInstance {
   std::atomic<bool> is_shutting_down_{false};
 
   // Resources - order matters for destruction!
-  // NOTE: Must be std::list because we rely on pointer stability.
-  std::list<ReplicationInstanceConnector> repl_instances_;
+  // Held by shared_ptr so leadership transitions, reconciliation, and unregistration can detach connectors under
+  // coord_instance_lock_ and stop health-check threads after releasing the lock without use-after-free.
+  std::list<std::shared_ptr<ReplicationInstanceConnector>> repl_instances_;
   mutable utils::ResourceLock coord_instance_lock_{};
 
   // Connectors are used by raft state via observer.

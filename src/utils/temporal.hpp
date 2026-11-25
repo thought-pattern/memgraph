@@ -551,12 +551,12 @@ struct ZonedDateTime {
   std::chrono::microseconds SysMicrosecondsSinceEpoch() const;
 
   std::chrono::seconds SysSecondsSinceEpoch() const {
-    return std::chrono::duration_cast<std::chrono::seconds>(zoned_time.get_sys_time().time_since_epoch());
+    return std::chrono::floor<std::chrono::seconds>(zoned_time.get_sys_time().time_since_epoch());
   }
 
   std::chrono::nanoseconds SysSubSecondsAsNanoseconds() const {
     const auto time_since_epoch = zoned_time.get_sys_time().time_since_epoch();
-    const auto full_seconds = std::chrono::duration_cast<std::chrono::seconds>(time_since_epoch);
+    const auto full_seconds = std::chrono::floor<std::chrono::seconds>(time_since_epoch);
     return std::chrono::duration_cast<std::chrono::nanoseconds>(time_since_epoch - full_seconds);
   }
 

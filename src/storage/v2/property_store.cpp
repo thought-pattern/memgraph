@@ -1252,7 +1252,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
         vector_index_ids.push_back(*id);
       }
       value = PropertyValue(
-          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<float>{}});
+          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<double>{}});
       return true;
     }
   }
@@ -1358,7 +1358,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
       }
       return std::optional<PropertyValue>{
           std::in_place,
-          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<float>{}}};
+          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<double>{}}};
     }
   }
   return std::nullopt;
@@ -2368,16 +2368,26 @@ std::optional<utils::DecompressedBuffer> DecompressBuffer(DecodedBufferConst con
   //                   |--- -> compressed data
   // 0  1  2  3  4  5  6  (positions)
 
+  auto const data_offset = sizeof(uint32_t) + 1;
+  auto buffer_size = buffer_info.view.size_bytes();
+  if (buffer_size < data_offset) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
+
   uint32_t original_size = 0;
   auto const *data = buffer_info.view.data();
   memcpy(&original_size, data, sizeof(uint32_t));
 
   // we have to restore the original size of the compressed buffer + the size of the original buffer
   auto modifier = data[sizeof(uint32_t)];
-  auto buffer_size = buffer_info.view.size_bytes();
+  if (modifier >= 8 || (modifier != 0 && buffer_size < 8)) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
   auto compressed_size = (modifier != 0) ? (buffer_size - 8 + modifier) : buffer_size;
+  if (compressed_size < data_offset || compressed_size > buffer_size) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
 
-  auto data_offset = sizeof(uint32_t) + 1;
   auto compressed_buffer = std::span(data + data_offset, compressed_size - data_offset);
   auto const *compressor = utils::Compressor::GetInstance();
   auto decompressed_buffer = compressor->Decompress(compressed_buffer, original_size);
@@ -3125,7 +3135,11 @@ bool PropertyStore::InitProperties(const std::map<storage::PropertyId, storage::
 }
 
 bool PropertyStore::InitProperties(std::vector<std::pair<storage::PropertyId, storage::PropertyValue>> properties) {
-  std::ranges::sort(properties);
+  std::ranges::sort(properties, {}, &std::pair<storage::PropertyId, storage::PropertyValue>::first);
+  if (std::ranges::adjacent_find(properties, {}, &std::pair<storage::PropertyId, storage::PropertyValue>::first) !=
+      properties.end()) {
+    return false;
+  }
 
   return DoInitProperties(properties);
 }

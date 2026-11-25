@@ -91,7 +91,8 @@ class Consumer final {
   ConsumerThreadFactory thread_factory_;
 
   mutable std::atomic<bool> is_running_{false};
-  mutable pulsar_client::MessageId last_message_id_{pulsar_client::MessageId::earliest()};  // Protected by is_running_
+  mutable std::optional<pulsar_client::MessageId> last_message_id_;   // Protected by is_running_
+  mutable std::optional<pulsar_client::MessageId> preview_start_id_;  // Protected by is_running_
   std::thread thread_;
 };
 }  // namespace memgraph::integrations::pulsar

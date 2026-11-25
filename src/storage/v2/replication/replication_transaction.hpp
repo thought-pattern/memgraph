@@ -40,7 +40,7 @@ class TransactionReplication {
   TransactionReplication(uint64_t durability_commit_timestamp, Storage *storage, CommitArgs const &commit_args,
                          ReplicationStorageClientList &clients);
 
-  ~TransactionReplication() = default;
+  ~TransactionReplication() noexcept { DrainShipFutures(); }
 
   using ShipResult = std::expected<void, io::network::ClientCommunicationError>;
 

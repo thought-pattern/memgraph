@@ -26,7 +26,8 @@ namespace memgraph::coordination {
 
 DataInstanceManagementServer::DataInstanceManagementServer(const ManagementServerConfig &config,
                                                            std::optional<utils::TlsConfig> const &tls_config)
-    : rpc_server_context_{communication::CreateServerContext(tls_config)},
+    : has_mutual_tls_{HasValidClusterMutualTls(tls_config)},
+      rpc_server_context_{communication::CreateServerContext(tls_config)},
       rpc_server_{config.endpoint, &rpc_server_context_, kDataInstanceManagementServerThreads} {}
 
 DataInstanceManagementServer::~DataInstanceManagementServer() { Shutdown(); }
@@ -45,7 +46,14 @@ bool DataInstanceManagementServer::Shutdown() {
   return false;
 }
 
-bool DataInstanceManagementServer::Start() { return rpc_server_.Start(); }
+bool DataInstanceManagementServer::Start() {
+  if (!has_mutual_tls_ || !rpc_server_context_.use_ssl()) {
+    spdlog::error(
+        "Refusing to start data instance management server without intra-cluster mutual TLS (cert, key, and CA).");
+    return false;
+  }
+  return rpc_server_.Start();
+}
 
 }  // namespace memgraph::coordination
 #endif

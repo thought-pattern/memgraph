@@ -213,9 +213,17 @@ class TTL final {
   void Disable() {
     enabled_ = false;
     wanted_ = false;
+    owns_label_property_index_ = false;
+    owns_edge_property_index_ = false;
     info_ = {};
     ttl_.Stop();
   }
+
+  bool OwnsLabelPropertyIndex() const noexcept { return owns_label_property_index_; }
+  void SetOwnsLabelPropertyIndex(bool owns) noexcept { owns_label_property_index_ = owns; }
+
+  bool OwnsEdgePropertyIndex() const noexcept { return owns_edge_property_index_; }
+  void SetOwnsEdgePropertyIndex(bool owns) noexcept { owns_edge_property_index_ = owns; }
 
   /**
    * @brief Whether the last command was ENABLE TTL (true) or STOP TTL (false). Snapshots record it;
@@ -270,6 +278,8 @@ class TTL final {
   utils::Scheduler ttl_;             //!< background thread
   TtlInfo info_{};                   //!< configuration
   bool enabled_{false};              //!< feature enabler
+  bool owns_label_property_index_{false};
+  bool owns_edge_property_index_{false};
   std::atomic<bool> wanted_{false};  //!< asked to run rather than stopped
   std::mutex wanted_mutex_;          //!< makes reading or setting wanted_ and pausing or resuming ttl_ one step
   Storage *storage_ptr_{};

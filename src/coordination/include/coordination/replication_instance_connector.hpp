@@ -35,8 +35,8 @@ class TimedFailureDetector {
 
  private:
   std::atomic<uint32_t> instance_down_timeout_sec_{5};
-  std::chrono::system_clock::time_point last_response_time_;
-  bool is_alive_{true};
+  std::atomic<int64_t> last_response_steady_ns_{0};
+  std::atomic<bool> is_alive_{true};
 };
 
 // Class used for managing the connection from coordinator to the data instance.

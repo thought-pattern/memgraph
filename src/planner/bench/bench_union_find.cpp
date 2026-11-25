@@ -9,11 +9,12 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import memgraph.planner.core.union_find;
-
+#include <array>
 #include <vector>
 
 #include <benchmark/benchmark.h>
+
+import memgraph.planner.core.union_find;
 
 constexpr auto kRangeLow = 64;
 constexpr auto kRangeHigh = 1024 * 4;
@@ -59,25 +60,44 @@ void BM_UnionFind_Find(benchmark::State &state) {
 }
 
 void BM_UnionFind_Find_OnAChain(benchmark::State &state) {
-  UnionFind uf;
+  constexpr std::size_t kTreesPerSample = 16;
+  auto const n = static_cast<std::size_t>(state.range(0));
+  std::size_t expected_depth = 0;
+  for (std::size_t span = 1; (span * 2) <= n; span *= 2) {
+    ++expected_depth;
+  }
+
+  std::array<UnionFind, kTreesPerSample> trees;
   std::vector<uint32_t> ids;
-
-  ids.reserve(state.range(0));
-  for (int i = 0; i < state.range(0); ++i) {
-    ids.push_back(uf.MakeSet());
-  }
-
-  for (size_t i = 0; i < (state.range(0) - 1); ++i) {
-    uf.UnionSets(ids[i], ids[i + 1]);
-  }
+  ids.reserve(n);
 
   for (auto _ : state) {  // NOLINT(clang-analyzer-deadcode.DeadStores)
-    // Benchmark find on the first element (should trigger path halving)
-    for (int i = 0; i < 1000; ++i) {
-      benchmark::DoNotOptimize(uf.Find(ids[0]));
+    state.PauseTiming();
+    for (auto &uf : trees) {
+      uf.Clear();
+      ids.clear();
+      for (std::size_t i = 0; i < n; ++i) {
+        ids.push_back(uf.MakeSet());
+      }
+      // Pairwise tournament unions build a binomial tree of height floor(log2(n))
+      // with ids[0] at the deepest leaf, without compressing ids[0] during setup.
+      for (std::size_t stride = 1; stride < n; stride *= 2) {
+        for (std::size_t idx = stride - 1; idx + stride < n; idx += stride * 2) {
+          uf.UnionSets(ids[idx], ids[idx + stride]);
+        }
+      }
+      if (uf.Depth(ids[0]) != expected_depth) {
+        state.SkipWithError("UnionFind tree depth did not match expected logarithmic chain height");
+        return;
+      }
+    }
+    state.ResumeTiming();
+
+    for (auto &uf : trees) {
+      benchmark::DoNotOptimize(uf.Find(0));
     }
   }
-  state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * 1000);
+  state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * kTreesPerSample));
   state.SetComplexityN(state.range(0));
 }
 

@@ -1003,17 +1003,20 @@ TEST_F(PatternVM_Matching, MultiPattern_MultipleJoinMatches) {
   auto placeholder = leaf(Op::Const, 0);
   auto sym_val = leaf(Op::Const, 1);
   auto expr_val = leaf(Op::Const, 2);
-  node(Op::Bind, placeholder, sym_val, expr_val);
-  auto ident1 = node(Op::Ident, sym_val);
-  auto ident2 = node(Op::Ident, sym_val);
+  auto bind_node = node(Op::Bind, placeholder, sym_val, expr_val);
+  auto ident1 = egraph.emplace(Op::Ident, {sym_val}, 1).eclass_id;
+  auto ident2 = egraph.emplace(Op::Ident, {sym_val}, 2).eclass_id;
+  ASSERT_NE(egraph.find(ident1), egraph.find(ident2));
   rebuild_index();
 
   use_patterns(TestPattern::build(kTestRoot, Op::Bind, {Wildcard{}, Var{kVarX}, Var{kVarY}}),
                TestPattern::build(kVarZ, Op::Ident, {Var{kVarX}}));
   run_compiled();
 
-  bool idents_same = (egraph.find(ident1) == egraph.find(ident2));
-  EXPECT_EQ(matches.size(), idents_same ? 1u : 2u);
+  verify({
+      {{kTestRoot, bind_node}, {kVarX, sym_val}, {kVarY, expr_val}, {kVarZ, ident1}},
+      {{kTestRoot, bind_node}, {kVarX, sym_val}, {kVarY, expr_val}, {kVarZ, ident2}},
+  });
 }
 
 TEST_F(PatternVM_Matching, Dedup_WideEClass) {

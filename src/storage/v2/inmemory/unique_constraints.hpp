@@ -33,12 +33,19 @@
 
 namespace memgraph::storage {
 
+class Indices;
+class NameIdMapper;
 struct Transaction;
 class Storage;
 
 class InMemoryUniqueConstraints : public UniqueConstraints {
  public:
   explicit InMemoryUniqueConstraints(metrics::GaugeHandle gauge = {}) : gauge_{gauge} {}
+
+  void SetPropertyDecodeContext(Indices *indices, NameIdMapper *name_id_mapper) noexcept {
+    indices_ = indices;
+    name_id_mapper_ = name_id_mapper;
+  }
 
   struct Entry {
     std::vector<PropertyValue> values;
@@ -59,8 +66,8 @@ class InMemoryUniqueConstraints : public UniqueConstraints {
     auto operator()(const utils::SkipListDb<Vertex>::Accessor &vertex_accessor,
                     utils::SkipListDb<Entry>::Accessor &constraint_accessor, const LabelId &label,
                     const std::set<PropertyId> &properties, ProgressCallback const &on_progress = {},
-                    CheckCancelFunction const &cancel_check = neverCancel) const
-        -> std::expected<void, ConstraintViolation>;
+                    CheckCancelFunction const &cancel_check = neverCancel, Indices *indices = nullptr,
+                    NameIdMapper *name_id_mapper = nullptr) const -> std::expected<void, ConstraintViolation>;
 
     const durability::ParallelizedSchemaCreationInfo &parallel_exec_info;
   };
@@ -69,8 +76,8 @@ class InMemoryUniqueConstraints : public UniqueConstraints {
     auto operator()(const utils::SkipListDb<Vertex>::Accessor &vertex_accessor,
                     utils::SkipListDb<Entry>::Accessor &constraint_accessor, const LabelId &label,
                     const std::set<PropertyId> &properties, ProgressCallback const &on_progress = {},
-                    CheckCancelFunction const &cancel_check = neverCancel) const
-        -> std::expected<void, ConstraintViolation>;
+                    CheckCancelFunction const &cancel_check = neverCancel, Indices *indices = nullptr,
+                    NameIdMapper *name_id_mapper = nullptr) const -> std::expected<void, ConstraintViolation>;
   };
 
   // constraints are created and dropped with read only access
@@ -102,7 +109,8 @@ class InMemoryUniqueConstraints : public UniqueConstraints {
   /// Provides snapshot-based access for a transaction's lifetime.
   class ActiveConstraints final : public UniqueConstraints::ActiveConstraints {
    public:
-    explicit ActiveConstraints(ContainerPtr snapshot = std::make_shared<Container>());
+    explicit ActiveConstraints(ContainerPtr snapshot = std::make_shared<Container>(), Indices *indices = nullptr,
+                               NameIdMapper *name_id_mapper = nullptr);
 
     auto ListConstraints(uint64_t start_timestamp) const
         -> std::vector<std::pair<LabelId, std::set<PropertyId>>> override;
@@ -124,6 +132,8 @@ class InMemoryUniqueConstraints : public UniqueConstraints {
 
    private:
     ContainerPtr container_;
+    Indices *indices_{nullptr};
+    NameIdMapper *name_id_mapper_{nullptr};
     // Sorted, and borrowed by every transaction started against this snapshot.
     std::vector<PropertyId> constrained_properties_;
     std::vector<LabelId> constrained_labels_;
@@ -223,6 +233,8 @@ class InMemoryUniqueConstraints : public UniqueConstraints {
   void ReleaseRetiredConstraints();
 
   metrics::GaugeHandle gauge_{};
+  Indices *indices_{nullptr};
+  NameIdMapper *name_id_mapper_{nullptr};
   utils::Synchronized<ContainerPtr, utils::WritePrioritizedRWLock> container_{std::make_shared<Container const>()};
   // Dropped constraints awaiting reclamation. A reader that took an ActiveConstraints snapshot before the DROP can
   // still be iterating one of these, so the refcount -- not this list -- decides when the memory actually goes.

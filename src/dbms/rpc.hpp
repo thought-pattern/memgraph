@@ -13,14 +13,22 @@
 
 #include <utility>
 
+#include "dbms/tenant_profiles.hpp"
 #include "rpc/messages.hpp"
 #include "slk/streams.hpp"
 #include "storage/v2/config.hpp"
 #include "utils/typeinfo.hpp"
 #include "utils/uuid.hpp"
 
+namespace memgraph::slk {
+
+void Save(const memgraph::dbms::TenantProfiles::Profile &self, memgraph::slk::Builder *builder);
+
+void Load(memgraph::dbms::TenantProfiles::Profile *self, memgraph::slk::Reader *reader);
+
+}  // namespace memgraph::slk
+
 #ifdef MG_ENTERPRISE
-#include "dbms/tenant_profiles.hpp"
 
 namespace memgraph::storage::replication {
 
@@ -309,10 +317,6 @@ void Load(memgraph::storage::replication::RenameDatabaseReq *self, memgraph::slk
 void Save(const memgraph::storage::replication::RenameDatabaseRes &self, memgraph::slk::Builder *builder);
 
 void Load(memgraph::storage::replication::RenameDatabaseRes *self, memgraph::slk::Reader *reader);
-
-void Save(const memgraph::dbms::TenantProfiles::Profile &self, memgraph::slk::Builder *builder);
-
-void Load(memgraph::dbms::TenantProfiles::Profile *self, memgraph::slk::Reader *reader);
 
 void Save(const memgraph::storage::replication::TenantProfileReq &self, memgraph::slk::Builder *builder);
 

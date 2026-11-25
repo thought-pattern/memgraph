@@ -166,7 +166,8 @@ class PatternsCompilerBase {
 
   /// Per-entry metadata for fragment scheduling (Symbol-agnostic).
   struct FragmentInfo {
-    boost::unordered_flat_set<PatternVar> eclass_vars;  // Vars bound at eclass level
+    boost::unordered_flat_set<PatternVar> eclass_vars;  // Vars bound by EclassIter + ParentWalk
+    boost::unordered_flat_set<PatternVar> enode_vars;   // Vars bound by EnodeVerify
     bool has_parent_walk;
     bool has_enode_verify;
   };
@@ -181,8 +182,8 @@ class PatternsCompilerBase {
   VarSlotMap slot_map_;
   boost::unordered_flat_map<PatternVar, EClassReg> var_to_reg_;  // Maps vars to eclass registers
   std::vector<SlotIdx> binding_order_;                           // Order in which slots are bound
-  uint8_t next_eclass_reg_{0};
-  uint8_t next_enode_reg_{0};
+  std::size_t next_eclass_reg_{0};
+  std::size_t next_enode_reg_{0};
 };
 
 // =============================================================================
@@ -382,6 +383,29 @@ auto PatternsCompiler<Symbol>::compile_patterns(std::span<Pattern<Symbol> const>
     return CompiledMatcher<Symbol>{};
   }
 
+  // Validate reachable symbol arity across all supplied patterns before filtering or emitting bytecode.
+  for (auto const &pat : patterns) {
+    if (pat.empty()) continue;
+    std::vector<bool> seen(pat.size(), false);
+    std::vector<PatternNodeId> stack{pat.root()};
+    seen[pat.root().value_of()] = true;
+    while (!stack.empty()) {
+      auto const nid = stack.back();
+      stack.pop_back();
+      if (auto const *sym = std::get_if<SymbolWithChildren<Symbol>>(&pat[nid])) {
+        if (sym->children.size() > std::numeric_limits<uint8_t>::max()) {
+          throw std::overflow_error("Pattern too complex: symbol arity limit exceeded");
+        }
+        for (auto child_id : sym->children) {
+          if (!seen[child_id.value_of()]) {
+            seen[child_id.value_of()] = true;
+            stack.push_back(child_id);
+          }
+        }
+      }
+    }
+  }
+
   // Filter out patterns that contribute no bindings or checks (e.g., pure wildcards,
   // symbols with only wildcard children). Such patterns cannot affect match results.
   auto effective = std::vector<Pattern<Symbol>>{};
@@ -401,6 +425,9 @@ auto PatternsCompiler<Symbol>::compile_patterns(std::span<Pattern<Symbol> const>
   auto const plan = compute_emit_plan(effective);
 
   auto backtrack_addr = emit_patterns(effective, plan);
+  if (binding_order_.empty()) {
+    return CompiledMatcher<Symbol>{};
+  }
 
   // Emit yield and continue loop
   emit(Instruction::yield(binding_order_.back()));
@@ -566,6 +593,26 @@ auto PatternsCompiler<Symbol>::compute_emit_plan(std::span<Pattern<Symbol> const
   }
 
   // Step 2: Build per-entry metadata for fragment scheduling.
+  auto collect_subtree_vars = [](Pattern<Symbol> const &pat,
+                                 PatternNodeId start_id,
+                                 boost::unordered_flat_set<PatternVar> &out) {
+    std::vector<PatternNodeId> stack{start_id};
+    while (!stack.empty()) {
+      auto const nid = stack.back();
+      stack.pop_back();
+      if (auto const *v = std::get_if<PatternVar>(&pat[nid])) {
+        out.insert(*v);
+      } else if (auto const *sym = std::get_if<SymbolWithChildren<Symbol>>(&pat[nid])) {
+        if (auto b = pat.binding_for(nid)) {
+          out.insert(*b);
+        }
+        for (auto child_id : sym->children) {
+          stack.push_back(child_id);
+        }
+      }
+    }
+  };
+
   auto info = std::vector<FragmentInfo>(plan.entries.size());
 
   for (auto const &[i, pe] : plan.entries | std::views::enumerate) {
@@ -579,9 +626,23 @@ auto PatternsCompiler<Symbol>::compute_emit_plan(std::span<Pattern<Symbol> const
       if (auto binding = pat.binding_for(step.node_id)) {
         fi.eclass_vars.insert(*binding);
       }
+      if (auto const *step_sym = std::get_if<SymbolWithChildren<Symbol>>(&pat[step.node_id])) {
+        for (std::size_t c_idx = 0; c_idx < step_sym->children.size(); ++c_idx) {
+          if (c_idx != step.child_idx) {
+            collect_subtree_vars(pat, step_sym->children[c_idx], fi.eclass_vars);
+          }
+        }
+      }
     }
     fi.has_parent_walk = !pe.entry.path_to_root.empty();
-    fi.has_enode_verify = std::holds_alternative<SymbolWithChildren<Symbol>>(pat[pe.entry.node]);
+    if (auto const *entry_sym = std::get_if<SymbolWithChildren<Symbol>>(&pat[pe.entry.node])) {
+      fi.has_enode_verify = true;
+      for (auto child_id : entry_sym->children) {
+        collect_subtree_vars(pat, child_id, fi.enode_vars);
+      }
+    } else {
+      fi.has_enode_verify = false;
+    }
   }
 
   // Step 3: Schedule fragments (Symbol-agnostic greedy algorithm).

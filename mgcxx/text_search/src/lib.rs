@@ -126,6 +126,11 @@ mod ffi {
         // threads (the C++ side does exactly this, without a lock). Mutating ops (add/delete/commit/
         // rollback) keep `&mut Context` and are serialized by the C++ write_mutex.
         fn aggregate(context: &Context, input: &SearchInput) -> Result<DocumentOutput>;
+        fn aggregate_pinned(
+            context: &Context,
+            searcher: &SearcherContext,
+            input: &SearchInput,
+        ) -> Result<DocumentOutput>;
         fn acquire_searcher(context: &Context) -> Result<Box<SearcherContext>>;
         fn search_gids_pinned(
             context: &Context,
@@ -1167,10 +1172,19 @@ const REGEX_CACHE_CAPACITY: usize = 256;
 // autocomplete reuses patterns heavily. On a miss we compile off-lock and only hold the lock for
 // the small get/put. The automaton is independent of index/searcher, so caching by pattern is exact.
 fn compiled_regex(context: &ffi::Context, pattern: &str) -> Result<Arc<Regex>, std::io::Error> {
-    if let Some(regex) = context.tantivyContext.regex_cache.lock().unwrap_or_else(|p| p.into_inner()).get(pattern) {
+    // Indexed tokens in `all` are lowercased by Tantivy's default analyzer, so wrap in `(?i:...)` to fold
+    // letter case inside the regex engine without altering uppercase escape classes like `\D`, `\S`, or `\W`.
+    let case_insensitive_pattern = format!("(?i:{})", pattern);
+    if let Some(regex) = context
+        .tantivyContext
+        .regex_cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&case_insensitive_pattern)
+    {
         return Ok(regex.clone());
     }
-    let regex = Arc::new(Regex::new(pattern).map_err(|e| {
+    let regex = Arc::new(Regex::new(&case_insensitive_pattern).map_err(|e| {
         Error::new(
             ErrorKind::Other,
             format!(
@@ -1184,7 +1198,7 @@ fn compiled_regex(context: &ffi::Context, pattern: &str) -> Result<Arc<Regex>, s
         .regex_cache
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .put(pattern.to_string(), regex.clone());
+        .put(case_insensitive_pattern, regex.clone());
     Ok(regex)
 }
 
@@ -1537,14 +1551,14 @@ fn regex_search_edge_gids_pinned(
     Ok(ffi::EdgeGidScoreOutput { docs })
 }
 
-fn aggregate(
+fn aggregate_with_searcher(
     context: &ffi::Context,
+    searcher: &tantivy::Searcher,
     input: &ffi::SearchInput,
 ) -> Result<ffi::DocumentOutput, std::io::Error> {
     let index_path = &context.tantivyContext.index_path;
     let index = &context.tantivyContext.index;
     let schema = &context.tantivyContext.schema;
-    let reader = &context.tantivyContext.index_reader;
 
     let search_fields = search_get_fields(&input.search_fields, schema, index_path)?;
     let query_parser = QueryParser::for_index(index, search_fields);
@@ -1557,7 +1571,6 @@ fn aggregate(
             ));
         }
     };
-    let searcher = reader.searcher();
     let agg_req: Aggregations = serde_json::from_str(&input.aggregation_query)?;
     let collector = AggregationCollector::from_aggs(agg_req, Default::default());
     let agg_res: AggregationResults = match searcher.search(&query, &collector) {
@@ -1577,6 +1590,22 @@ fn aggregate(
         data: res.to_string(),
         score: 0.0, // Aggregation results don't have individual document scores
     })
+}
+
+fn aggregate(
+    context: &ffi::Context,
+    input: &ffi::SearchInput,
+) -> Result<ffi::DocumentOutput, std::io::Error> {
+    let searcher = context.tantivyContext.index_reader.searcher();
+    aggregate_with_searcher(context, &searcher, input)
+}
+
+fn aggregate_pinned(
+    context: &ffi::Context,
+    searcher_ctx: &SearcherContext,
+    input: &ffi::SearchInput,
+) -> Result<ffi::DocumentOutput, std::io::Error> {
+    aggregate_with_searcher(context, &searcher_ctx.searcher, input)
 }
 
 fn get_num_docs(context: &ffi::Context) -> Result<u64, std::io::Error> {

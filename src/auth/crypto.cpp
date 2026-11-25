@@ -26,6 +26,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <span>
 #include <sstream>
@@ -161,25 +162,34 @@ constexpr auto SALT_SIZE_DURABLE = SALT_SIZE * 2;
 #if OPENSSL_VERSION_MAJOR >= 3
 std::string HashPasswordOpenSSL3(std::string_view password, const uint64_t number_of_iterations,
                                  std::string_view salt) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
+  unsigned char hash[SHA256_DIGEST_LENGTH]{};
 
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  EVP_MD *md = EVP_MD_fetch(nullptr, kSha256DigestName, nullptr);
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx{EVP_MD_CTX_new(), &EVP_MD_CTX_free};
+  std::unique_ptr<EVP_MD, decltype(&EVP_MD_free)> md{EVP_MD_fetch(nullptr, kSha256DigestName, nullptr), &EVP_MD_free};
+  if (!ctx || !md) {
+    throw AuthException("Couldn't initialize SHA-256 password hash context!");
+  }
 
-  EVP_DigestInit_ex(ctx, md, nullptr);
+  if (EVP_DigestInit_ex(ctx.get(), md.get(), nullptr) != 1) {
+    throw AuthException("Couldn't initialize SHA-256 digest!");
+  }
 
   if (!salt.empty()) {
     DMG_ASSERT(salt.size() == SALT_SIZE);
-    EVP_DigestUpdate(ctx, salt.data(), salt.size());
+    if (EVP_DigestUpdate(ctx.get(), salt.data(), salt.size()) != 1) {
+      throw AuthException("Couldn't hash password salt!");
+    }
   }
 
-  for (auto i = 0; i < number_of_iterations; i++) {
-    EVP_DigestUpdate(ctx, password.data(), password.size());
+  for (uint64_t i = 0; i < number_of_iterations; i++) {
+    if (EVP_DigestUpdate(ctx.get(), password.data(), password.size()) != 1) {
+      throw AuthException("Couldn't hash password!");
+    }
   }
-  EVP_DigestFinal_ex(ctx, hash, nullptr);
-
-  EVP_MD_free(md);
-  EVP_MD_CTX_free(ctx);
+  unsigned int digest_len = 0;
+  if (EVP_DigestFinal_ex(ctx.get(), hash, &digest_len) != 1 || digest_len != SHA256_DIGEST_LENGTH) {
+    throw AuthException("Couldn't finalize SHA-256 password hash!");
+  }
 
   std::stringstream result_stream;
 
@@ -196,20 +206,28 @@ std::string HashPasswordOpenSSL3(std::string_view password, const uint64_t numbe
 #else
 std::string HashPasswordOpenSSL1_1(std::string_view password, const uint64_t number_of_iterations,
                                    std::string_view salt) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
+  unsigned char hash[SHA256_DIGEST_LENGTH]{};
 
   SHA256_CTX sha256;
-  SHA256_Init(&sha256);
+  if (SHA256_Init(&sha256) != 1) {
+    throw AuthException("Couldn't initialize SHA-256 digest!");
+  }
 
   if (!salt.empty()) {
     DMG_ASSERT(salt.size() == SALT_SIZE);
-    SHA256_Update(&sha256, salt.data(), salt.size());
+    if (SHA256_Update(&sha256, salt.data(), salt.size()) != 1) {
+      throw AuthException("Couldn't hash password salt!");
+    }
   }
 
-  for (auto i = 0; i < number_of_iterations; i++) {
-    SHA256_Update(&sha256, password.data(), password.size());
+  for (uint64_t i = 0; i < number_of_iterations; i++) {
+    if (SHA256_Update(&sha256, password.data(), password.size()) != 1) {
+      throw AuthException("Couldn't hash password!");
+    }
   }
-  SHA256_Final(hash, &sha256);
+  if (SHA256_Final(hash, &sha256) != 1) {
+    throw AuthException("Couldn't finalize SHA-256 password hash!");
+  }
 
   std::stringstream ss;
   for (unsigned char salt_char : salt) {
@@ -422,6 +440,40 @@ std::optional<std::string> UsesPbkdf2(std::string_view str) {
   return fmt::format("{}{}", salt, key);
 }
 
+bool IsValidLowerHex(std::string_view hex) {
+  return std::ranges::all_of(hex, [](char ch) { return ('0' <= ch && ch <= '9') || ('a' <= ch && ch <= 'f'); });
+}
+
+bool IsValidBcryptHash(std::string_view candidate) {
+  if (candidate.size() != 60) {
+    return false;
+  }
+  if (candidate[0] != '$' || candidate[1] != '2' ||
+      (candidate[2] != 'a' && candidate[2] != 'b' && candidate[2] != 'x' && candidate[2] != 'y') ||
+      candidate[3] != '$' || !('0' <= candidate[4] && candidate[4] <= '9') ||
+      !('0' <= candidate[5] && candidate[5] <= '9') || candidate[6] != '$') {
+    return false;
+  }
+  const int cost = (candidate[4] - '0') * 10 + (candidate[5] - '0');
+  if (cost < 4 || cost > 31) {
+    return false;
+  }
+  constexpr auto is_bcrypt_b64 = [](char ch) noexcept {
+    return ch == '.' || ch == '/' || ('A' <= ch && ch <= 'Z') || ('a' <= ch && ch <= 'z') || ('0' <= ch && ch <= '9');
+  };
+  if (!std::ranges::all_of(candidate.substr(7), is_bcrypt_b64)) {
+    return false;
+  }
+  // 22nd salt character (index 28) encodes the trailing 2 bits of the 128-bit salt; unused bits must be zero (.Oeu),
+  // and 31st digest character (index 59) encodes the trailing 4 bits of the 184-bit digest (.CGKOSWaeimquy26).
+  constexpr std::string_view kValidSaltTail = ".Oeu";
+  if (kValidSaltTail.find(candidate[28]) == std::string_view::npos) {
+    return false;
+  }
+  const std::string candidate_str{candidate};
+  return bcrypt_checkpw("", candidate_str.c_str()) != -1;
+}
+
 // Returns the hash a pre-hashed literal of `algo` holds, in its stored form.
 std::optional<std::string> UsesAlgo(std::string_view str, PasswordHashAlgorithm algo) {
   if (algo == PasswordHashAlgorithm::PBKDF2_SHA256) {
@@ -430,13 +482,27 @@ std::optional<std::string> UsesAlgo(std::string_view str, PasswordHashAlgorithm 
   // header = algo name + :
   const auto header = std::string{AsString(algo)} + ":";
   const auto hash_size = HashSize(algo).unsalted;  // Support only unsalted hashes
-  if (str.size() == header.size() + hash_size) {
-    int i = 0;
-    if (std::ranges::all_of(header, [&](const auto ch) { return tolower(ch) == str[i++]; })) {
-      return std::string{str.substr(header.size())};
+  if (str.size() != header.size() + hash_size) {
+    return {};
+  }
+  std::size_t idx = 0;
+  if (!std::ranges::all_of(header, [&](const char ch) {
+        return std::tolower(static_cast<unsigned char>(ch)) ==
+               std::tolower(static_cast<unsigned char>(str[idx++]));
+      })) {
+    return {};
+  }
+  const auto payload = str.substr(header.size());
+  if (algo == PasswordHashAlgorithm::BCRYPT) {
+    if (!IsValidBcryptHash(payload)) {
+      return {};
+    }
+  } else {
+    if (!IsValidLowerHex(payload)) {
+      return {};
     }
   }
-  return {};
+  return std::string{payload};
 }
 
 constexpr std::array kUserDefinedHashAlgos{PasswordHashAlgorithm::BCRYPT,

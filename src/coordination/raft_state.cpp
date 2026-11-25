@@ -272,8 +272,9 @@ RaftState::RaftState(CoordinatorInstanceInitConfig const &config, BecomeLeaderCb
     return;
   }
   auto *coordinator_log_store = static_cast<CoordinatorLogStore *>(log_store.get());
+  auto const replay_start = last_commit_index_snapshot + 1;
   auto log_entries =
-      coordinator_log_store->GetAllEntriesRange(last_commit_index_snapshot, last_committed_index_state_machine_ + 1);
+      coordinator_log_store->GetAllEntriesRange(replay_start, last_committed_index_state_machine_ + 1);
 
   for (auto const &[log_id, log] : log_entries) {
     if (log == nullptr) {
@@ -283,14 +284,16 @@ RaftState::RaftState(CoordinatorInstanceInitConfig const &config, BecomeLeaderCb
     spdlog::trace("Applying log entry from log store with index {}", log_id);
     if (log->get_val_type() == nuraft::log_val_type::conf) {
       auto cluster_config = state_manager_->load_config();
-      state_machine_->commit_config(log_id, cluster_config);
+      state_machine_->ReplayCommittedConfig(log_id, cluster_config);
     } else {
-      state_machine_->commit(log_id, log->get_buf());
+      state_machine_->ReplayCommittedLog(log_id, log->get_buf());
     }
   }
 
   if (log_store_durability.stored_log_store_version_ != kActiveVersion) {
-    log_store_durability.durability_store_->Put(kLogStoreVersion, std::to_string(static_cast<int>(kActiveVersion)));
+    if (!log_store_durability.durability_store_->Put(kLogStoreVersion, std::to_string(static_cast<int>(kActiveVersion)))) {
+      throw kvstore::KVStoreError("Failed to persist active coordinator log store version");
+    }
   }
 }
 

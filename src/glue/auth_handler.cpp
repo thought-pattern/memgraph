@@ -930,19 +930,26 @@ std::vector<query::RolenameResult> AuthQueryHandler::GetRolenamesForUser(
 
 std::vector<memgraph::query::TypedValue> AuthQueryHandler::GetUsernamesForRole(
     const std::string &rolename, memgraph::auth::AuthTransaction *auth_tx) {
+  return GetUsernamesForRoleWithDiagnostics(rolename, auth_tx).usernames;
+}
+
+query::RoleMemberNamesResult AuthQueryHandler::GetUsernamesForRoleWithDiagnostics(
+    const std::string &rolename, memgraph::auth::AuthTransaction *auth_tx) {
   try {
     auto locked_auth = ReadLock(auth_tx);
     auto role = locked_auth->GetRole(rolename);
     if (!role) {
       throw memgraph::query::QueryRuntimeException("Role '{}' doesn't exist.", rolename);
     }
-    std::vector<memgraph::query::TypedValue> usernames;
-    const auto &users = locked_auth->AllUsersForRole(rolename);
-    usernames.reserve(users.size());
-    for (const auto &user : users) {
-      usernames.emplace_back(user.username());
+    auto listing = locked_auth->ListUsersForRole(rolename);
+    query::RoleMemberNamesResult result;
+    result.usernames.reserve(listing.users.size());
+    for (const auto &user : listing.users) {
+      result.usernames.emplace_back(user.username());
     }
-    return usernames;
+    result.unreadable_entries = std::move(listing.unreadable_entries);
+    result.complete = listing.complete;
+    return result;
   } catch (const memgraph::auth::AuthException &e) {
     throw memgraph::query::QueryRuntimeException(e.what());
   }
@@ -1656,9 +1663,13 @@ void AuthQueryHandler::CreateProfile(const std::string &profile_name,
       } break;
     }
   }
-  auto locked_auth = layer_.Lock();
-  if (!locked_auth->CreateProfile(profile_name, std::move(limits), usernames, system_tx)) {
-    throw memgraph::query::QueryRuntimeException("Profile '{}' already exists.", profile_name);
+  try {
+    auto locked_auth = layer_.Lock();
+    if (!locked_auth->CreateProfile(profile_name, std::move(limits), usernames, system_tx)) {
+      throw memgraph::query::QueryRuntimeException("Profile '{}' already exists.", profile_name);
+    }
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
   }
 }
 
@@ -1681,17 +1692,31 @@ void AuthQueryHandler::UpdateProfile(const std::string &profile_name,
       } break;
     }
   }
-  auto locked_auth = layer_.Lock();
-  const auto &profile = locked_auth->UpdateProfile(profile_name, limits, system_tx);
-  if (!profile) {
-    throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+  try {
+    auto locked_auth = layer_.Lock();
+    const auto &profile = locked_auth->UpdateProfile(profile_name, limits, system_tx);
+    if (!profile) {
+      throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+    }
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
   }
 }
 
 void AuthQueryHandler::DropProfile(const std::string &profile_name, system::Transaction *system_tx) {
-  auto locked_auth = layer_.Lock();
-  if (locked_auth->DropProfile(profile_name, system_tx) != auth::UserProfiles::DropResult::kDropped) {
-    throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+  try {
+    auto locked_auth = layer_.Lock();
+    switch (locked_auth->DropProfile(profile_name, system_tx)) {
+      case auth::UserProfiles::DropResult::kDropped:
+        return;
+      case auth::UserProfiles::DropResult::kAbsent:
+        throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+      case auth::UserProfiles::DropResult::kFailed:
+        throw memgraph::query::QueryRuntimeException("Failed to delete resource profile '{}' from storage.",
+                                                     profile_name);
+    }
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
   }
 }
 
@@ -1749,8 +1774,16 @@ void AuthQueryHandler::RevokeProfile(const std::string &user_or_role, system::Tr
 }
 
 std::optional<std::string> AuthQueryHandler::GetProfileForUser(const std::string &user_or_role) {
-  auto locked_auth = layer_.ReadLock();
-  return locked_auth->GetProfileForUsername(user_or_role);
+  try {
+    auto locked_auth = layer_.ReadLock();
+    auto profile = locked_auth->GetProfileForUsername(user_or_role);
+    if (!profile && !locked_auth->HasUser(user_or_role)) {
+      throw memgraph::query::QueryRuntimeException("User '{}' does not exist.", user_or_role);
+    }
+    return profile;
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
+  }
 }
 
 std::vector<std::string> AuthQueryHandler::GetUsernamesForProfile(const std::string &profile_name) {

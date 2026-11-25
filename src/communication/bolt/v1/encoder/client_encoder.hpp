@@ -32,6 +32,9 @@ namespace memgraph::communication::bolt {
 template <typename Buffer>
 class ClientEncoder : private BaseEncoder<Buffer> {
  private:
+  using BaseEncoder<Buffer>::CanEncodeList;
+  using BaseEncoder<Buffer>::CanEncodeMap;
+  using BaseEncoder<Buffer>::CanEncodeString;
   using BaseEncoder<Buffer>::WriteRAW;
   using BaseEncoder<Buffer>::WriteList;
   using BaseEncoder<Buffer>::WriteMap;
@@ -58,6 +61,7 @@ class ClientEncoder : private BaseEncoder<Buffer> {
    *          when flushing, false otherwise
    */
   bool MessageInit(const map_t &extra) {
+    if (!CanEncodeMap(extra)) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct1));
     WriteRAW(std::to_underlying(Signature::Init));
     WriteMap(extra);
@@ -84,6 +88,7 @@ class ClientEncoder : private BaseEncoder<Buffer> {
    *          when flushing, false otherwise
    */
   bool MessageRun(std::string_view statement, const map_t &parameters, const map_t &extra, bool have_more = true) {
+    if (!CanEncodeString(statement) || !CanEncodeMap(parameters) || !CanEncodeMap(extra)) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct3));
     WriteRAW(std::to_underlying(Signature::Run));
     WriteString(statement);
@@ -110,6 +115,7 @@ class ClientEncoder : private BaseEncoder<Buffer> {
    *          when flushing, false otherwise
    */
   bool MessageDiscard(const map_t &extra) {
+    if (!CanEncodeMap(extra)) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct1));
     WriteRAW(std::to_underlying(Signature::Discard));
     WriteMap(extra);
@@ -132,6 +138,7 @@ class ClientEncoder : private BaseEncoder<Buffer> {
    *          when flushing, false otherwise
    */
   bool MessagePull(const map_t &extra) {
+    if (!CanEncodeMap(extra)) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct1));
     WriteRAW(std::to_underlying(Signature::Pull));
     WriteMap(extra);
@@ -176,6 +183,7 @@ class ClientEncoder : private BaseEncoder<Buffer> {
    *          when flushing, false otherwise
    */
   bool MessageRoute(const map_t &routing, const std::vector<Value> &bookmarks, const std::optional<std::string> &db) {
+    if (!CanEncodeMap(routing) || !CanEncodeList(bookmarks) || (db && !CanEncodeString(*db))) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct3));
     WriteRAW(std::to_underlying(Signature::Route));
     WriteMap(routing);

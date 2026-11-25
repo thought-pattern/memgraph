@@ -34,22 +34,36 @@ struct ParseRes {
 #ifdef MG_ENTERPRISE
 class RuntimeConfig {
  public:
+  struct RoutingConfig {
+    std::optional<std::string> db{};
+    std::optional<std::string> imp_user{};
+    friend bool operator==(const RoutingConfig &, const RoutingConfig &) = default;
+  };
+
   explicit RuntimeConfig(SessionHL *session) : session_(session) {}
 
   void Configure(const bolt_map_t &run_time_info, bool in_explicit_tx);
 
-  // Invalidate Configure()'s "run_time_info unchanged => skip" cache on LOGOFF so re-used
-  // connections fully re-derive user + db even when the next session's metadata matches the previous one's.
-  void ResetForConnectionReuse() { previous_run_time_info_.reset(); }
+  // Invalidate Configure()'s routing cache on LOGOFF so re-used connections fully
+  // re-derive principal + db even when the next session's metadata matches the previous one's.
+  void ResetForConnectionReuse() {
+    previous_routing_config_.reset();
+    db_selected_by_use_ = false;
+  }
 
-  void OnUseDatabase() { db_selected_by_use_ = true; }
+  void OnUseDatabase() {
+    db_selected_by_use_ = true;
+    if (previous_routing_config_) {
+      previous_routing_config_->db.reset();
+    }
+  }
 
  private:
   // True if the bound database matches run_time_info's "db"; with no "db", a live one is required unless USE chose it.
   bool BoundDbMatches(const bolt_map_t &run_time_info) const;
 
   SessionHL *session_;
-  std::optional<bolt_map_t> previous_run_time_info_;
+  std::optional<RoutingConfig> previous_routing_config_;
   bool db_selected_by_use_{false};
 };
 #endif
@@ -105,9 +119,9 @@ class SessionHL final : public memgraph::communication::bolt::Session<memgraph::
              std::optional<std::string> const &db, bolt_map_t const &extra) -> bolt_map_t;
 #endif
 
-  bolt_map_t Pull(std::optional<int> n, std::optional<int> qid);
+  bolt_map_t Pull(std::optional<int64_t> n, std::optional<int64_t> qid);
 
-  bolt_map_t Discard(std::optional<int> n, std::optional<int> qid);
+  bolt_map_t Discard(std::optional<int64_t> n, std::optional<int64_t> qid);
 
   void Abort();
 

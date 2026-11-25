@@ -237,6 +237,7 @@ class BindIdentRewriteRuleFixture : public RewriterFixtureBase {
   using benchmark::Fixture::SetUp;
   int64_t num_binds_ = 0;
   int64_t idents_per_sym_ = 0;
+  std::size_t observed_matches_ = 0;
   std::unique_ptr<TestRewriteRule> rule_;
 
   void SetUp(const benchmark::State &state) override {
@@ -249,21 +250,33 @@ class BindIdentRewriteRuleFixture : public RewriterFixtureBase {
     rule_ = std::make_unique<TestRewriteRule>(TestRewriteRule::Builder{"bind_ident"}
                                                   .pattern(PatternBind(), "bind")
                                                   .pattern(PatternIdent(), "ident")
-                                                  .apply([](TestRuleContext &, Match const &) {
-                                                    // No-op apply: this benchmark measures match cost only.
+                                                  .apply([this](TestRuleContext &, Match const &) {
+                                                    ++observed_matches_;
                                                   }));
   }
 };
 
 BENCHMARK_DEFINE_F(BindIdentRewriteRuleFixture, Apply)(benchmark::State &state) {
   TestVMExecutor vm_executor(egraph_);
+  auto const expected_matches = static_cast<std::size_t>(num_binds_ * idents_per_sym_);
+  observed_matches_ = 0;
+  rewrite_context_.clear_new_eclasses();
+  rule_->match(*matcher_, vm_executor, rewrite_context_.matcher_ctx());
+  (void)rule_->apply(rewrite_context_.rule_ctx(), rewrite_context_.matcher_ctx());
+  if (observed_matches_ != expected_matches) {
+    state.SkipWithError("Bind/Ident rule match count did not equal num_binds * idents_per_sym");
+    return;
+  }
+
   for (auto _ : state) {
+    observed_matches_ = 0;
     rewrite_context_.clear_new_eclasses();
     rule_->match(*matcher_, vm_executor, rewrite_context_.matcher_ctx());
     auto rewrites = rule_->apply(rewrite_context_.rule_ctx(), rewrite_context_.matcher_ctx());
     benchmark::DoNotOptimize(rewrites);
+    benchmark::DoNotOptimize(observed_matches_);
   }
-  state.SetItemsProcessed(state.iterations() * num_binds_ * idents_per_sym_);
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_matches));
 }
 
 BENCHMARK_REGISTER_F(BindIdentRewriteRuleFixture, Apply)
@@ -297,13 +310,22 @@ class BindIdentVMFusedFixture : public MatcherFixtureBase {
 
 BENCHMARK_DEFINE_F(BindIdentVMFusedFixture, ParentTraversal)(benchmark::State &state) {
   VMExecutor executor(egraph_);
+  auto const expected_matches = static_cast<std::size_t>(num_binds_ * idents_per_sym_);
+  match_context_.clear();
+  matches_.clear();
+  executor.execute(*compiled_, *matcher_, match_context_.arena(), matches_);
+  if (matches_.size() != expected_matches) {
+    state.SkipWithError("Bind/Ident fused match count did not equal num_binds * idents_per_sym");
+    return;
+  }
+
   for (auto _ : state) {
     match_context_.clear();
     matches_.clear();
     executor.execute(*compiled_, *matcher_, match_context_.arena(), matches_);
     benchmark::DoNotOptimize(matches_);
   }
-  state.SetItemsProcessed(state.iterations() * num_binds_ * idents_per_sym_);
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_matches));
 }
 
 BENCHMARK_REGISTER_F(BindIdentVMFusedFixture, ParentTraversal)
@@ -336,19 +358,32 @@ class VMHighParentFixture : public MatcherFixtureBase {
     parents_f_ = state.range(0);
     parents_neg_ = state.range(1);
     SetupGraphAndMatcher([this](TestEGraph &g) { BuildHighParentHub(g, parents_f_, parents_neg_); });
-    pattern_ = compiler_.compile(PatternNeg());
+    std::array patterns = {
+        TestPattern::build(kVarX, Op::Var),
+        TestPattern::build(kVarNegRoot, Op::Neg, {Var{kVarX}}),
+    };
+    pattern_ = compiler_.compile(patterns);
   }
 };
 
 BENCHMARK_DEFINE_F(VMHighParentFixture, Match)(benchmark::State &state) {
   VMExecutor executor(egraph_);
+  auto const expected_matches = static_cast<std::size_t>(parents_neg_);
+  match_context_.clear();
+  matches_.clear();
+  executor.execute(*pattern_, *matcher_, match_context_.arena(), matches_);
+  if (matches_.size() != expected_matches) {
+    state.SkipWithError("HighParent match count did not equal parents_neg");
+    return;
+  }
+
   for (auto _ : state) {
     match_context_.clear();
     matches_.clear();
     executor.execute(*pattern_, *matcher_, match_context_.arena(), matches_);
     benchmark::DoNotOptimize(matches_);
   }
-  state.SetItemsProcessed(state.iterations() * parents_neg_);
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_matches));
 }
 
 BENCHMARK_REGISTER_F(VMHighParentFixture, Match)
@@ -410,19 +445,35 @@ class VMParentDiversityFixture : public MatcherFixtureBase {
     num_leaves_ = state.range(0);
     parents_per_leaf_ = state.range(1);
     SetupGraphAndMatcher([this](TestEGraph &g) { BuildParentDiversity(g, num_leaves_, parents_per_leaf_, 42); });
-    pattern_ = compiler_.compile(PatternNeg());
+    pattern_ = compiler_.compile(TestPattern::build(kVarNegRoot, Op::Neg, {Var{kVarX}}));
   }
 };
 
 BENCHMARK_DEFINE_F(VMParentDiversityFixture, Match)(benchmark::State &state) {
   VMExecutor executor(egraph_);
+  std::size_t expected_neg_nodes = 0;
+  for (auto const &[_, eclass] : egraph_.canonical_classes()) {
+    for (auto enode_id : eclass.nodes()) {
+      if (egraph_.get_enode(enode_id).symbol() == Op::Neg) {
+        ++expected_neg_nodes;
+      }
+    }
+  }
+  match_context_.clear();
+  matches_.clear();
+  executor.execute(*pattern_, *matcher_, match_context_.arena(), matches_);
+  if (expected_neg_nodes == 0 || matches_.size() != expected_neg_nodes) {
+    state.SkipWithError("ParentDiversity fixture did not produce expected Neg matches");
+    return;
+  }
+
   for (auto _ : state) {
     match_context_.clear();
     matches_.clear();
     executor.execute(*pattern_, *matcher_, match_context_.arena(), matches_);
     benchmark::DoNotOptimize(matches_);
   }
-  state.SetItemsProcessed(state.iterations());
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_neg_nodes));
 }
 
 BENCHMARK_REGISTER_F(VMParentDiversityFixture, Match)

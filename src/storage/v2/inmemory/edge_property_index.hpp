@@ -100,7 +100,8 @@ class InMemoryEdgePropertyIndex : public EdgePropertyIndex {
 
     Iterable(utils::SkipListDb<Entry>::Accessor index_accessor,
              utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, EdgePin edge_pin, PropertyId property,
-             PropertyValueRange const &range, View view, Storage *storage, Transaction *transaction, Gid max_gid);
+             PropertyValueRange const &range, View view, Storage *storage, Transaction *transaction, Gid max_gid,
+             bool allow_whole_type_span = true);
 
     class Iterator {
      public:
@@ -159,18 +160,30 @@ class InMemoryEdgePropertyIndex : public EdgePropertyIndex {
     ChunkedIterable(utils::SkipListDb<Entry>::Accessor index_accessor,
                     utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, EdgePin edge_pin, PropertyId property,
                     PropertyValueRange const &range, View view, Storage *storage, Transaction *transaction,
-                    size_t num_chunks, Gid max_gid);
+                    size_t num_chunks, Gid max_gid, bool allow_whole_type_span = true);
 
     class Iterator {
      public:
-      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator index_iterator)
+      struct EndTag {};
+
+      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator index_iterator,
+               utils::SkipListDb<Entry>::ChunkedIterator chunk_end)
           : self_(self),
             index_iterator_(index_iterator),
+            chunk_end_(chunk_end),
             current_edge_accessor_(EdgeRef{nullptr}, EdgeTypeId{}, nullptr, nullptr, self_->storage_,
                                    self_->transaction_),
             current_edge_(nullptr) {
         AdvanceUntilValid();
       }
+
+      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator chunk_end, EndTag)
+          : self_(self),
+            index_iterator_(chunk_end),
+            chunk_end_(chunk_end),
+            current_edge_accessor_(EdgeRef{nullptr}, EdgeTypeId{}, nullptr, nullptr, self_->storage_,
+                                   self_->transaction_),
+            current_edge_(nullptr) {}
 
       EdgeAccessor const &operator*() const { return current_edge_accessor_; }
 
@@ -189,6 +202,7 @@ class InMemoryEdgePropertyIndex : public EdgePropertyIndex {
 
       ChunkedIterable *self_;
       utils::SkipListDb<Entry>::ChunkedIterator index_iterator_;
+      utils::SkipListDb<Entry>::ChunkedIterator chunk_end_;
       EdgeAccessor current_edge_accessor_;
       EdgeRef current_edge_{nullptr};
     };
@@ -199,7 +213,7 @@ class InMemoryEdgePropertyIndex : public EdgePropertyIndex {
 
      public:
       Chunk(ChunkedIterable *self, utils::SkipListDb<Entry>::Chunk &chunk)
-          : begin_{self, chunk.begin()}, end_{self, chunk.end()} {}
+          : begin_{self, chunk.begin(), chunk.end()}, end_{self, chunk.end(), Iterator::EndTag{}} {}
 
       Iterator begin() { return begin_; }
 

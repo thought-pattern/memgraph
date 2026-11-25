@@ -14,6 +14,7 @@
 #include <array>
 
 #include "communication/bolt/v1/codes.hpp"
+#include "communication/bolt/v1/mg_types.hpp"
 #include "communication/bolt/v1/value.hpp"
 #include "utils/logging.hpp"
 
@@ -31,37 +32,45 @@ Client::Client(communication::ClientContext &context) : client_{&context} {}
 
 void Client::Connect(const io::network::Endpoint &endpoint, const std::string &username, const std::string &password,
                      const std::string &client_name) {
+  encoder_buffer_.Clear();
   if (!client_.Connect(endpoint)) {
     throw ClientFatalException("Couldn't connect to {}!", endpoint.SocketAddress());
   }
 
   if (!client_.Write(kPreamble, true)) {
     spdlog::error("Couldn't send preamble!");
+    Close();
     throw ServerCommunicationException();
   }
 
   if (!client_.Write(kBoltV43Version, true)) {
     spdlog::error("Couldn't send protocol version!");
+    Close();
     throw ServerCommunicationException();
   }
 
   for (int i = 0; i < 3; ++i) {
     if (!client_.Write(kEmptyBoltVersion, i != 2)) {
       spdlog::error("Couldn't send protocol version!");
+      Close();
       throw ServerCommunicationException();
     }
   }
 
   if (!client_.Read(kBoltV43Version.size())) {
     spdlog::error("Couldn't get negotiated protocol version!");
+    Close();
     throw ServerCommunicationException();
   }
 
   if (memcmp(kBoltV43Version.data(), client_.GetData(), kBoltV43Version.size()) != 0) {
     spdlog::error("Server negotiated unsupported protocol version!");
+    Close();
     throw ClientFatalException("The server negotiated an usupported protocol version!");
   }
   client_.ShiftData(kBoltV43Version.size());
+  decoder_.UpdateVersion(4);
+  encoder_.UpdateVersion(4);
 
   if (!encoder_.MessageInit({{"user_agent", client_name},
                              {"scheme", "basic"},
@@ -69,6 +78,7 @@ void Client::Connect(const io::network::Endpoint &endpoint, const std::string &u
                              {"credentials", password},
                              {"routing", {}}})) {
     spdlog::error("Couldn't send init message!");
+    Close();
     throw ServerCommunicationException();
   }
 
@@ -76,10 +86,12 @@ void Client::Connect(const io::network::Endpoint &endpoint, const std::string &u
   Value metadata;
   if (!ReadMessage(signature, metadata)) {
     spdlog::error("Couldn't read init message response!");
+    Close();
     throw ServerCommunicationException();
   }
   if (signature != Signature::Success) {
     spdlog::error("Handshake failed!");
+    Close();
     throw ClientFatalException("Handshake with the server failed!");
   }
 
@@ -91,20 +103,28 @@ QueryData Client::Execute(std::string_view query, const map_t &parameters, const
     throw ClientFatalException("You must first connect to the server before using the client!");
   }
 
-  spdlog::debug("Sending run message with statement: '{}'; parameters: {}", query, parameters);
+  if (spdlog::should_log(spdlog::level::debug)) {
+    const auto [redacted_query, redacted_params] = RedactBoltQueryAndParams(query, parameters);
+    spdlog::debug("Sending run message with statement: '{}'; parameters: {}", redacted_query, redacted_params);
+  }
 
   // It is super critical from performance point of view to send the pull message right after the run message. Otherwise
   // the performance will degrade multiple magnitudes.
-  encoder_.MessageRun(query, parameters, extra);
-  encoder_.MessagePull({{"n", Value(-1)}});
+  if (!encoder_.MessageRun(query, parameters, extra) || !encoder_.MessagePull({{"n", Value(-1)}})) {
+    spdlog::error("Couldn't send run/pull request!");
+    Close();
+    throw ServerCommunicationException();
+  }
 
   spdlog::debug("Reading run message response");
   Signature signature{};
   Value fields;
   if (!ReadMessage(signature, fields)) {
+    Close();
     throw ServerCommunicationException();
   }
   if (fields.type() != Value::Type::Map) {
+    Close();
     throw ServerMalformedDataException();
   }
 
@@ -112,6 +132,7 @@ QueryData Client::Execute(std::string_view query, const map_t &parameters, const
     HandleFailure<ClientQueryException>(fields.ValueMap());
   }
   if (signature != Signature::Success) {
+    Close();
     throw ServerMalformedDataException();
   }
 
@@ -121,34 +142,41 @@ QueryData Client::Execute(std::string_view query, const map_t &parameters, const
   std::vector<std::vector<Value>> records;
   while (true) {
     if (!GetMessage()) {
+      Close();
       throw ServerCommunicationException();
     }
     if (!decoder_.ReadMessageHeader(&signature, &marker)) {
+      Close();
       throw ServerCommunicationException();
     }
     if (signature == Signature::Record) {
       Value record;
       if (!decoder_.ReadValue(&record, Value::Type::List)) {
+        Close();
         throw ServerCommunicationException();
       }
       records.emplace_back(std::move(record.ValueList()));
     } else if (signature == Signature::Success) {
       if (!decoder_.ReadValue(&metadata)) {
+        Close();
         throw ServerCommunicationException();
       }
       break;
     } else if (signature == Signature::Failure) {
       Value data;
       if (!decoder_.ReadValue(&data, Value::Type::Map)) {
+        Close();
         throw ServerCommunicationException();
       }
       HandleFailure<ClientQueryException>(data.ValueMap());
     } else {
+      Close();
       throw ServerMalformedDataException();
     }
   }
 
   if (metadata.type() != Value::Type::Map) {
+    Close();
     throw ServerMalformedDataException();
   }
 
@@ -158,12 +186,14 @@ QueryData Client::Execute(std::string_view query, const map_t &parameters, const
 
   auto fields_it = header.find("fields");
   if (fields_it == header.end() || fields_it->second.type() != Value::Type::List) {
+    Close();
     throw ServerMalformedDataException();
   }
   auto &field_vector = fields_it->second.ValueList();
 
   for (auto &field_item : field_vector) {
     if (field_item.type() != Value::Type::String) {
+      Close();
       throw ServerMalformedDataException();
     }
     ret.fields.emplace_back(std::move(field_item.ValueString()));
@@ -184,7 +214,11 @@ void Client::Reset() {
 
   spdlog::debug("Sending reset message");
 
-  encoder_.MessageReset();
+  if (!encoder_.MessageReset()) {
+    spdlog::error("Couldn't send reset message!");
+    Close();
+    throw ServerCommunicationException();
+  }
 
   Signature signature{};
   Value fields;
@@ -192,12 +226,14 @@ void Client::Reset() {
   // That means some of the messages sent might get ignored.
   while (true) {
     if (!ReadMessage(signature, fields)) {
+      Close();
       throw ServerCommunicationException();
     }
     if (signature == Signature::Success) {
       break;
     }
     if (signature != Signature::Ignored) {
+      Close();
       throw ServerMalformedDataException();
     }
   }
@@ -209,17 +245,25 @@ std::optional<map_t> Client::Route(const map_t &routing, const std::vector<Value
     throw ClientFatalException("You must first connect to the server before using the client!");
   }
 
-  spdlog::debug("Sending route message with routing: {}; bookmarks: {}; db: {}",
-                routing,
-                bookmarks,
-                db.has_value() ? *db : Value());
+  if (spdlog::should_log(spdlog::level::debug)) {
+    const auto redacted_routing = RedactBoltValue(Value{routing});
+    spdlog::debug("Sending route message with routing: {}; bookmarks: {}; db: {}",
+                  redacted_routing.ValueMap(),
+                  bookmarks,
+                  db.has_value() ? Value(*db) : Value());
+  }
 
-  encoder_.MessageRoute(routing, bookmarks, db);
+  if (!encoder_.MessageRoute(routing, bookmarks, db)) {
+    spdlog::error("Couldn't send route message!");
+    Close();
+    throw ServerCommunicationException();
+  }
 
   spdlog::debug("Reading route message response");
   Signature signature{};
   Value fields;
   if (!ReadMessage(signature, fields) || fields.type() != Value::Type::Map) {
+    Close();
     throw ServerCommunicationException();
   }
   if (signature == Signature::Ignored) {
@@ -229,12 +273,17 @@ std::optional<map_t> Client::Route(const map_t &routing, const std::vector<Value
     HandleFailure(fields.ValueMap());
   }
   if (signature != Signature::Success) {
+    Close();
     throw ServerMalformedDataException{};
   }
   return fields.ValueMap();
 }
 
-void Client::Close() { client_.Close(); };
+void Client::Close() {
+  encoder_buffer_.Clear();
+  client_.ClearData();
+  client_.Close();
+}
 
 bool Client::GetMessage() {
   client_.ClearData();

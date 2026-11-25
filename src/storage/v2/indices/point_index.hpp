@@ -125,11 +125,11 @@ struct PointIndexStorage {
   void RestorePointIndex(LabelId label, PropertyId property, std::shared_ptr<PointIndex const> index);
 
   // Transaction (establish what to collect + able to build next index)
-  auto CreatePointIndexContext() const -> PointIndexContext { return PointIndexContext{indexes_}; }
+  auto CreatePointIndexContext() const -> PointIndexContext { return PointIndexContext{LoadIndexes()}; }
 
   /// Returns the current active indices snapshot for use in transactions.
   auto GetActiveIndices() -> std::shared_ptr<PointIndexActiveIndices> {
-    return std::make_shared<ActiveIndices>(indexes_);
+    return std::make_shared<ActiveIndices>(LoadIndexes());
   }
 
   // Commit
@@ -147,11 +147,17 @@ struct PointIndexStorage {
   void PublishActiveIndices(ActiveIndicesUpdater const &updater);
 
  private:
-  // Invariant: `indexes_` is only mutated under UNIQUE storage access (see the MG_ASSERTs in
-  // InMemoryAccessor::CreatePointIndex / DropPointIndex and in DropGraphClearIndices). Reads from
-  // other contexts (regular READ/WRITE accessors, DatabaseInfoQuery) MUST go through the published
-  // snapshot in `ActiveIndicesStore` -- UNIQUE excludes READ/WRITE, which is what makes direct
-  // access to `indexes_` from commit-time hot paths race-free.
+  auto LoadIndexes() const -> std::shared_ptr<index_container_t> {
+    std::lock_guard<std::mutex> const lock{indexes_mutex_};
+    return indexes_;
+  }
+
+  void StoreIndexes(std::shared_ptr<index_container_t> next) {
+    std::lock_guard<std::mutex> const lock{indexes_mutex_};
+    indexes_ = std::move(next);
+  }
+
+  mutable std::mutex indexes_mutex_;
   std::shared_ptr<index_container_t> indexes_ = std::make_shared<index_container_t>();
 };
 

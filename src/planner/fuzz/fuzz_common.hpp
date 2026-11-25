@@ -360,7 +360,7 @@ class PatternGenerator {
   auto generate(uint8_t const *data, size_t &pos, size_t size, int depth = 0) -> PatternASTPtr {
     if (pos >= size || depth > max_depth_) {
       // Generate a simple variable
-      return PatternAST::make_var(next_var_id_++);
+      return PatternAST::make_var(alloc_fresh_var());
     }
 
     uint8_t type = data[pos++] % 10;
@@ -374,22 +374,21 @@ class PatternGenerator {
           // Reuse existing variable (repeated var pattern)
           var_id = used_vars_[data[pos++] % used_vars_.size()];
         } else {
-          var_id = next_var_id_++;
-          used_vars_.push_back(var_id);
+          var_id = alloc_fresh_var();
         }
         return PatternAST::make_var(var_id);
       }
 
       case 2: {
         // Leaf symbol pattern (A, B, C, D, E)
-        if (pos >= size) return PatternAST::make_var(next_var_id_++);
+        if (pos >= size) return PatternAST::make_var(alloc_fresh_var());
         auto sym = static_cast<FuzzSymbol>(data[pos++] % 5);
         return PatternAST::make_sym(sym);
       }
 
       case 3: {
         // Unary pattern: F(?x), G(?x), H(?x)
-        if (pos >= size) return PatternAST::make_var(next_var_id_++);
+        if (pos >= size) return PatternAST::make_var(alloc_fresh_var());
         auto sym = static_cast<FuzzSymbol>(10 + (data[pos++] % 3));  // F, G, H
         auto child = generate(data, pos, size, depth + 1);
         return PatternAST::make_sym(sym, {child});
@@ -397,7 +396,7 @@ class PatternGenerator {
 
       case 4: {
         // Binary pattern: Plus(?x, ?y), Mul(?x, ?y)
-        if (pos >= size) return PatternAST::make_var(next_var_id_++);
+        if (pos >= size) return PatternAST::make_var(alloc_fresh_var());
         auto sym = static_cast<FuzzSymbol>(13 + (data[pos++] % 2));  // Plus, Mul
         auto left = generate(data, pos, size, depth + 1);
         auto right = generate(data, pos, size, depth + 1);
@@ -407,7 +406,7 @@ class PatternGenerator {
       case 5: {
         // Repeated variable pattern: F(?x), where ?x already used
         if (used_vars_.empty()) {
-          used_vars_.push_back(next_var_id_++);
+          (void)alloc_fresh_var();
         }
         auto var_id = used_vars_[0];  // Reuse first var
         if (pos >= size) return PatternAST::make_var(var_id);
@@ -427,10 +426,9 @@ class PatternGenerator {
         // Nested repeated variable: Plus(?x, Plus(?x, ?y)) or Mul(?x, Mul(?x, ?y))
         // The same variable appears at two different depths, tests equality constraints
         // across nested structures.
-        if (pos >= size) return PatternAST::make_var(next_var_id_++);
+        if (pos >= size) return PatternAST::make_var(alloc_fresh_var());
         auto sym = static_cast<FuzzSymbol>(13 + (data[pos++] % 2));  // Plus or Mul
-        uint8_t shared_var = next_var_id_++;
-        used_vars_.push_back(shared_var);
+        uint8_t shared_var = alloc_fresh_var();
         auto inner_right = generate(data, pos, size, depth + 2);
         auto inner = PatternAST::make_sym(sym, {PatternAST::make_var(shared_var), inner_right});
         return PatternAST::make_sym(sym, {PatternAST::make_var(shared_var), inner});
@@ -439,9 +437,9 @@ class PatternGenerator {
       case 8: {
         // Same leaf in both children: Plus(A, A) or Mul(B, B)
         // Tests matching when both children must be the same leaf symbol.
-        if (pos >= size) return PatternAST::make_var(next_var_id_++);
+        if (pos >= size) return PatternAST::make_var(alloc_fresh_var());
         auto outer_sym = static_cast<FuzzSymbol>(13 + (data[pos++] % 2));  // Plus or Mul
-        if (pos >= size) return PatternAST::make_var(next_var_id_++);
+        if (pos >= size) return PatternAST::make_var(alloc_fresh_var());
         auto leaf_sym = static_cast<FuzzSymbol>(data[pos++] % 5);  // A-E
         return PatternAST::make_sym(outer_sym, {PatternAST::make_sym(leaf_sym), PatternAST::make_sym(leaf_sym)});
       }
@@ -450,7 +448,7 @@ class PatternGenerator {
         // DAG pattern: Plus(F(?x), G(?x)), same variable in disjoint subtrees
         // Tests that the matcher correctly handles shared variables across branches.
         if (used_vars_.empty()) {
-          used_vars_.push_back(next_var_id_++);
+          (void)alloc_fresh_var();
         }
         auto shared_var = used_vars_[0];
         if (pos >= size) return PatternAST::make_var(shared_var);
@@ -465,7 +463,7 @@ class PatternGenerator {
       }
 
       default:
-        return PatternAST::make_var(next_var_id_++);
+        return PatternAST::make_var(alloc_fresh_var());
     }
   }
 
@@ -475,13 +473,33 @@ class PatternGenerator {
     max_depth_ = 3;  // restored to default on each reset
   }
 
+  /// Begin another pattern in the same multi-pattern group, preserving both
+  /// `max_depth_` and the monotonic `next_var_id_` allocator so fresh variables
+  /// cannot collide with variables from earlier patterns.
+  void start_next_pattern() { used_vars_.clear(); }
+
+  [[nodiscard]] auto max_depth() const -> int { return max_depth_; }
+
   /// Get used vars for sharing across patterns
   [[nodiscard]] auto get_used_vars() const -> std::vector<uint8_t> const & { return used_vars_; }
 
   /// Force a specific set of vars as "already used" for shared variable generation
-  void set_used_vars(std::vector<uint8_t> vars) { used_vars_ = std::move(vars); }
+  void set_used_vars(std::vector<uint8_t> vars) {
+    used_vars_ = std::move(vars);
+    for (auto v : used_vars_) {
+      if (v >= next_var_id_) {
+        next_var_id_ = static_cast<uint8_t>(v + 1);
+      }
+    }
+  }
 
  private:
+  auto alloc_fresh_var() -> uint8_t {
+    uint8_t id = next_var_id_++;
+    used_vars_.push_back(id);
+    return id;
+  }
+
   uint8_t next_var_id_ = 0;
   int max_depth_ = 3;
   std::vector<uint8_t> used_vars_;
@@ -509,39 +527,35 @@ class MultiPatternGenerator {
     // Determine number of patterns (1-3)
     uint8_t num_patterns = 1 + (data[pos++] % 3);
 
-    // Set fuzz-driven max depth (2–6) for all patterns in this batch
+    // Reset group state first, then apply the fuzz-driven max depth (2-6) for the whole group
+    pattern_gen_.reset();
     if (pos < size) {
       pattern_gen_.set_max_depth(data[pos++]);
     }
 
     // Generate first pattern
-    pattern_gen_.reset();
     result.patterns.push_back(pattern_gen_.generate(data, pos, size));
     auto shared_vars = pattern_gen_.get_used_vars();
 
-    // Generate remaining patterns, sharing some variables from previous patterns
+    // Generate remaining patterns, sharing only explicitly selected variables
     for (uint8_t i = 1; i < num_patterns && pos < size; ++i) {
-      pattern_gen_.reset();
+      pattern_gen_.start_next_pattern();
 
-      // Force some vars to be shared (use vars from previous patterns)
-      if (!shared_vars.empty()) {
-        // Pick 1-2 vars to share
-        uint8_t num_shared = 1 + (pos < size ? data[pos++] % 2 : 0);
+      // Optionally seed 0-2 variables from previous patterns for intentional joins
+      if (!shared_vars.empty() && pos < size && (data[pos] % 3) != 0) {
+        uint8_t num_shared = 1 + (data[pos++] % 2);
         std::vector<uint8_t> to_share;
         for (uint8_t j = 0; j < num_shared && j < shared_vars.size(); ++j) {
           to_share.push_back(shared_vars[j % shared_vars.size()]);
         }
-        pattern_gen_.set_used_vars(to_share);
-
-        // Track which vars are actually shared
-        for (auto v : to_share) {
-          result.shared_vars.insert(v);
-        }
+        pattern_gen_.set_used_vars(std::move(to_share));
+      } else if (!shared_vars.empty() && pos < size) {
+        ++pos;
       }
 
       result.patterns.push_back(pattern_gen_.generate(data, pos, size));
 
-      // Update shared_vars pool with new vars
+      // Update candidate pool with newly allocated variables
       for (auto v : pattern_gen_.get_used_vars()) {
         if (std::ranges::find(shared_vars, v) == shared_vars.end()) {
           shared_vars.push_back(v);
@@ -549,8 +563,40 @@ class MultiPatternGenerator {
       }
     }
 
+    // Compute exact set of variables appearing in at least two patterns
+    auto collect_ast_vars = [](PatternASTPtr const &root) {
+      std::set<uint8_t> vars;
+      auto walk = [&](auto &self, PatternASTPtr const &node) -> void {
+        std::visit(
+            [&](auto const &n) {
+              using T = std::decay_t<decltype(n)>;
+              if constexpr (std::is_same_v<T, PatternAST::Variable>) {
+                vars.insert(n.id);
+              } else {
+                for (auto const &child : n.children) {
+                  self(self, child);
+                }
+              }
+            },
+            node->node);
+      };
+      walk(walk, root);
+      return vars;
+    };
+
+    std::set<uint8_t> seen_in_any;
+    for (auto const &pat_ast : result.patterns) {
+      for (auto v : collect_ast_vars(pat_ast)) {
+        if (!seen_in_any.insert(v).second) {
+          result.shared_vars.insert(v);
+        }
+      }
+    }
+
     return result;
   }
+
+  [[nodiscard]] auto max_depth() const -> int { return pattern_gen_.max_depth(); }
 
  private:
   PatternGenerator pattern_gen_;

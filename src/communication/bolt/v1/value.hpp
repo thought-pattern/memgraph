@@ -135,6 +135,8 @@ struct Path {
    * right-to-left.
    */
   std::vector<int64_t> indices;
+
+  [[nodiscard]] bool HasValidStructure() const noexcept;
 };
 
 using storage::CrsToSrid;
@@ -213,9 +215,9 @@ class Value {
     new (&zoned_date_time_v) utils::ZonedDateTime(zoned_date_time);
   }
 
-  Value(const storage::Point2d &point_2d) : type_(Type::Point2d) { new (&point_2d_v) storage::Point2d(point_2d); }
+  Value(const storage::Point2d &point_2d) : type_(Type::Point2d) { new (&point_2d_v) Point2d{point_2d}; }
 
-  Value(const storage::Point3d &point_3d) : type_(Type::Point3d) { new (&point_3d_v) storage::Point3d(point_3d); }
+  Value(const storage::Point3d &point_3d) : type_(Type::Point3d) { new (&point_3d_v) Point3d{point_3d}; }
 
   // move constructors for non-primitive values
   Value(std::string &&value) noexcept : type_(Type::String) { new (&string_v) std::string(std::move(value)); }
@@ -297,6 +299,10 @@ class Value {
   friend std::ostream &operator<<(std::ostream &os, const Value &value);
 
  private:
+  void DestroyActiveMember() noexcept;
+  void CopyConstructFrom(const Value &other);
+  void MoveConstructFrom(Value &&other) noexcept;
+
   Type type_;
 
   // storage for the value of the property
@@ -342,5 +348,7 @@ std::ostream &operator<<(std::ostream &os, const Path &path);
 std::ostream &operator<<(std::ostream &os, const Point2d &point_2d);
 std::ostream &operator<<(std::ostream &os, const Point3d &point_3d);
 std::ostream &operator<<(std::ostream &os, const Value &value);
+std::ostream &operator<<(std::ostream &os, const std::vector<Value> &values);
+std::ostream &operator<<(std::ostream &os, const map_t &values);
 std::ostream &operator<<(std::ostream &os, const Value::Type type);
 }  // namespace memgraph::communication::bolt

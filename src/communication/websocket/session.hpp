@@ -11,9 +11,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
+#include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <variant>
 
 #include <boost/asio/dispatch.hpp>
@@ -39,7 +43,7 @@ class Session : public std::enable_shared_from_this<Session> {
     return std::shared_ptr<Session>{new Session{std::forward<Args>(args)...}};
   }
 
-  bool Run();
+  void Run(std::function<void(std::shared_ptr<Session>)> on_accepted = {});
   void Write(std::shared_ptr<std::string> message);
   bool IsConnected() const;
 
@@ -48,6 +52,10 @@ class Session : public std::enable_shared_from_this<Session> {
   using SSLWebSocket = boost::beast::websocket::stream<boost::beast::ssl_stream<boost::beast::tcp_stream>>;
 
   explicit Session(tcp::socket &&socket, ServerContext &context, AuthenticationInterface &auth);
+
+  void ConfigureAndAcceptWebSocket();
+  void OnSslHandshake(boost::beast::error_code ec);
+  void OnAccept(boost::beast::error_code ec);
 
   void DoWrite();
   void OnWrite(boost::beast::error_code ec, size_t bytes_transferred);
@@ -58,7 +66,8 @@ class Session : public std::enable_shared_from_this<Session> {
   void DoClose();
   void OnClose(boost::beast::error_code ec);
 
-  bool IsAuthenticated() const;
+  bool IsAuthenticated();
+  void RevokeAndShutdown();
 
   std::expected<void, std::string> Authorize(const nlohmann::json &creds);
 
@@ -83,10 +92,11 @@ class Session : public std::enable_shared_from_this<Session> {
   std::deque<std::shared_ptr<std::string>> messages_;
   std::shared_ptr<std::string> in_flight_;
   boost::asio::strand<PlainWebSocket::executor_type> strand_;
+  std::function<void(std::shared_ptr<Session>)> on_accepted_;
+  std::unique_ptr<AuthenticationInterface::SessionAuth> session_auth_;
   std::atomic<bool> connected_{false};
-  bool authenticated_{false};
+  bool was_authorized_{false};
   bool close_{false};
   bool overflow_reported_{false};
-  AuthenticationInterface &auth_;
 };
 }  // namespace memgraph::communication::websocket

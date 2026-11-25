@@ -481,15 +481,7 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
       }
     }
 
-    if (config_.track_label_counts) {
-      auto label_counts_acc = label_counts_.Lock();
-      for (auto const &vertex : vertices_.access()) {
-        if (vertex.deleted()) continue;
-        for (auto const label : vertex.labels) {
-          ++(*label_counts_acc)[label];
-        }
-      }
-    }
+    RebuildLabelCounts();
 
   } else if (config_.durability.snapshot_wal_mode != Config::Durability::SnapshotWalMode::DISABLED ||
              config_.durability.snapshot_on_exit) {
@@ -646,8 +638,31 @@ InMemoryStorage::~InMemoryStorage() {
 void InMemoryStorage::UpdateLabelCount(LabelId const label, int64_t const change) {
   if (config_.track_label_counts) {
     auto label_counts_acc = label_counts_.Lock();
-    auto &count = (*label_counts_acc)[label];
-    count += change;
+    auto it = label_counts_acc->find(label);
+    if (it == label_counts_acc->end()) {
+      if (change > 0) {
+        label_counts_acc->emplace(label, change);
+      }
+      return;
+    }
+    it->second += change;
+    if (it->second <= 0) {
+      label_counts_acc->erase(it);
+    }
+  }
+}
+
+void InMemoryStorage::RebuildLabelCounts() {
+  auto label_counts_acc = label_counts_.Lock();
+  label_counts_acc->clear();
+  if (!config_.track_label_counts) {
+    return;
+  }
+  for (auto const &vertex : vertices_.access()) {
+    if (vertex.deleted()) continue;
+    for (auto const label : vertex.labels) {
+      ++(*label_counts_acc)[label];
+    }
   }
 }
 
@@ -2536,7 +2551,7 @@ utils::small_vector<uint64_t> InMemoryStorage::InMemoryAccessor::GetVectorIndexI
   return in_memory->indices_.vector_index_.GetVectorIndexIdsForVertex(vertex, property);
 }
 
-utils::small_vector<float> InMemoryStorage::InMemoryAccessor::GetVectorFromVectorIndex(
+utils::small_vector<double> InMemoryStorage::InMemoryAccessor::GetVectorFromVectorIndex(
     Vertex *vertex, std::string_view index_name) const {
   auto *in_memory = static_cast<InMemoryStorage *>(storage_);
   return in_memory->indices_.vector_index_.GetVectorPropertyFromIndex(
@@ -3173,6 +3188,8 @@ void InMemoryStorage::SetStorageMode(StorageMode new_storage_mode) {
         auto const engine_guard = std::unique_lock{engine_lock_};
         return std::pair{std::string{repl_storage_state_.epoch_.id()}, repl_storage_state_.history};
       });
+      snapshot_progress_.Start();
+      auto const reset_mode_change_progress = utils::OnScopeExit{[this] { snapshot_progress_.Reset(); }};
       const auto snapshot_path = durability::CreateSnapshot(this,
                                                             txn,
                                                             recovery_.snapshot_directory_,
@@ -4688,9 +4705,9 @@ std::expected<std::filesystem::path, InMemoryStorage::CreateSnapshotError> InMem
   }
   snapshot_progress_.Start();
   auto const clear_snapshot_running_on_exit = utils::OnScopeExit{[&] {
-    // Clear `running` first so readers stop trusting the fields before they are wiped.
-    snapshot_running_.store(false, std::memory_order_release);
+    // Reset progress atomically first so readers never observe torn fields, then release the writer guard.
     snapshot_progress_.Reset();
+    snapshot_running_.store(false, std::memory_order_release);
   }};
 
   // This is to make sure SHOW SNAPSHOTS, CREATE SNAPSHOT, and some replication
@@ -4787,31 +4804,15 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
   }
 
   auto const uri_str = uri.string();
-  const auto local_path = recovery_.snapshot_directory_ / uri.filename();
-  const bool file_in_local_dir = local_path == uri;
-
-  auto handler_error = [&]() {
-    // If file was copied over, delete...
-    if (!file_in_local_dir) file_retainer_.DeleteFile(local_path);
-  };
+  const auto canonical_local_path = recovery_.snapshot_directory_ / uri.filename();
+  const bool file_in_local_dir = canonical_local_path == uri;
 
   constexpr auto url_matcher = ctre::starts_with<"(https?|ftp)://">;
   constexpr auto s3_matcher = ctre::starts_with<"s3://">;
+  const bool is_url = static_cast<bool>(url_matcher(uri_str));
+  const bool is_s3 = !is_url && static_cast<bool>(s3_matcher(uri_str));
 
-  if (url_matcher(uri_str)) {
-    constexpr auto file_mode = "wbx";
-    utils::FileUniquePtr file(std::fopen(local_path.string().data(), file_mode), &std::fclose);
-
-    if (!requests::CreateAndDownloadFile(
-            uri_str, std::move(file), memgraph::flags::run_time::GetFileDownloadConnTimeoutSec())) {
-      // Delete the empty or partially written file
-      handler_error();
-      return std::unexpected{InMemoryStorage::RecoverSnapshotError::DownloadFailure};
-    }
-
-    spdlog::trace("Downloaded snapshot file from {} to {}", uri_str, local_path.string());
-
-  } else if (s3_matcher(uri_str)) {
+  if (is_s3) {
     DMG_ASSERT(s3_config.has_value(), "S3Config doesn't have a value");
     if (auto const res = s3_config->Validate(); res.has_value()) {
       switch (*res) {
@@ -4830,25 +4831,66 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
         }
       }
     }
-    if (auto const res = utils::GetS3Object(uri, *s3_config, local_path.string()); !res.has_value()) {
-      spdlog::error(res.error().message);
-      return std::unexpected{InMemoryStorage::RecoverSnapshotError::S3GetFailure};
-    }
-
-  } else {  // local filesystem path
+  } else if (!is_url) {  // local filesystem path
     if (!std::filesystem::exists(uri) || std::filesystem::is_directory(uri)) {
       return std::unexpected{InMemoryStorage::RecoverSnapshotError::MissingFile};
     }
+  }
 
-    // Copy to local snapshot dir
-    std::error_code ec{};
-    if (!file_in_local_dir) {
-      std::filesystem::copy_file(uri, local_path, std::filesystem::copy_options::overwrite_existing, ec);
-      if (ec) {
-        spdlog::warn("Failed to copy snapshot into local snapshots directory. Err: {}", ec.message());
-        return std::unexpected{InMemoryStorage::RecoverSnapshotError::CopyFailure};
-      }
+  // Validate that the storage permits recovery BEFORE staging or touching any file in snapshot_directory_.
+  if (!force && repl_storage_state_.commit_ts_info_.load(std::memory_order_acquire).ldt_ != kTimestampInitialId) {
+    return std::unexpected{InMemoryStorage::RecoverSnapshotError::NonEmptyStorage};
+  }
+
+  const auto local_path =
+      file_in_local_dir ? canonical_local_path
+                        : (recovery_.snapshot_directory_ / fmt::format(".recover_staging_{}", std::string{utils::UUID{}}));
+  bool staged_file_created = false;
+
+  auto handler_error = [&]() {
+    if (!file_in_local_dir && staged_file_created) {
+      file_retainer_.DeleteFile(local_path);
+      staged_file_created = false;
     }
+  };
+
+  if (is_url) {
+    utils::EnsureDir(recovery_.snapshot_directory_);
+    constexpr auto file_mode = "wbx";
+    utils::FileUniquePtr file(std::fopen(local_path.string().c_str(), file_mode), &std::fclose);
+    if (!file) {
+      spdlog::warn("Failed to open staging file {} for snapshot download", local_path);
+      return std::unexpected{InMemoryStorage::RecoverSnapshotError::DownloadFailure};
+    }
+    staged_file_created = true;
+
+    if (!requests::CreateAndDownloadFile(
+            uri_str, std::move(file), memgraph::flags::run_time::GetFileDownloadConnTimeoutSec())) {
+      // Delete the empty or partially written staged file
+      handler_error();
+      return std::unexpected{InMemoryStorage::RecoverSnapshotError::DownloadFailure};
+    }
+
+    spdlog::trace("Downloaded snapshot file from {} to {}", uri_str, local_path.string());
+
+  } else if (is_s3) {
+    utils::EnsureDir(recovery_.snapshot_directory_);
+    staged_file_created = true;
+    if (auto const res = utils::GetS3Object(uri, *s3_config, local_path.string()); !res.has_value()) {
+      spdlog::error(res.error().message);
+      handler_error();
+      return std::unexpected{InMemoryStorage::RecoverSnapshotError::S3GetFailure};
+    }
+
+  } else if (!file_in_local_dir) {  // external local filesystem path: stage without clobbering existing snapshots
+    utils::EnsureDir(recovery_.snapshot_directory_);
+    std::error_code ec{};
+    std::filesystem::copy_file(uri, local_path, std::filesystem::copy_options::none, ec);
+    if (ec) {
+      spdlog::warn("Failed to stage snapshot into local snapshots directory. Err: {}", ec.message());
+      return std::unexpected{InMemoryStorage::RecoverSnapshotError::CopyFailure};
+    }
+    staged_file_created = true;
   }
 
   auto file_locker = file_retainer_.AddLocker();
@@ -4856,11 +4898,6 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
 
   if (force) {
     Clear();
-  } else {
-    if (repl_storage_state_.commit_ts_info_.load(std::memory_order_acquire).ldt_ != kTimestampInitialId) {
-      handler_error();
-      return std::unexpected{InMemoryStorage::RecoverSnapshotError::NonEmptyStorage};
-    }
   }
 
   // When creating a snapshot, we first lock the snapshot, then create the accessor, so no need for the snapshot lock
@@ -4971,12 +5008,14 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
       }
     }
 
-    // Move all snapshot files except the newest one to the old directory
+    // Move all snapshot files except the active recovered one to the old directory
     auto const snapshot_files = utils::GetFilesFromDir(recovery_.snapshot_directory_);
     for (const auto &snapshot_path : snapshot_files) {
       // Delete file if old dir won't be used anymore
       if (!use_old_dir) {
-        file_retainer_.DeleteFile(snapshot_path);
+        if (local_path != snapshot_path) {
+          file_retainer_.DeleteFile(snapshot_path);
+        }
         continue;
       }
       // Move to .old if enable_backup_dir is true
@@ -5632,6 +5671,9 @@ void InMemoryStorage::Clear(std::function<void()> const &on_progress) {
 
   // Reset helper classes
   enum_store_.clear();
+  description_store_.Clear();
+  ttl_.Disable();
+  label_counts_.WithLock([](auto &counts) { counts.clear(); });
 
   // Replication epoch and timestamp reset
   repl_storage_state_.epoch_.SetEpoch(std::string(utils::UUID{}));

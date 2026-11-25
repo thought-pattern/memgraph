@@ -101,43 +101,54 @@ auto ZlibCompressor::Compress(std::span<uint8_t const> uncompressed_data) const 
   }
   auto original_size = static_cast<uint32_t>(uncompressed_data.size_bytes());
 
-  // this is an estimate on what size we expect compression to be
   auto const compress_bound = compressBound(original_size);
-  auto const buffer_size = static_cast<uint32_t>(compress_bound);
+  if (compress_bound > std::numeric_limits<std::size_t>::max()) {
+    return std::nullopt;
+  }
+  auto const scratch_capacity = static_cast<std::size_t>(compress_bound);
 
-  // Use DB-aware allocator and wrap in RAII struct immediately.
-  // If we return early, result's destructor handles the cleanup.
   memgraph::memory::DbAwareAllocator<uint8_t> alloc;
-  CompressedBuffer result(alloc.allocate(buffer_size), buffer_size, original_size);
+  struct ScratchGuard {
+    memgraph::memory::DbAwareAllocator<uint8_t> *alloc;
+    uint8_t *ptr;
+    std::size_t capacity;
+    ~ScratchGuard() {
+      if (ptr != nullptr) {
+        alloc->deallocate(ptr, capacity);
+      }
+    }
+  };
+  ScratchGuard scratch{&alloc, alloc.allocate(scratch_capacity), scratch_capacity};
 
   auto compression_level =
       CompressionLevelToZlibCompressionLevel(static_cast<CompressionLevel>(memgraph::flags::ParseCompressionLevel()));
 
-  auto actual_size = compress_bound;
-  const int z_res =
-      compress2(result.view().data(), &actual_size, uncompressed_data.data(), original_size, compression_level);
+  uLongf actual_size = compress_bound;
+  const int z_res = compress2(scratch.ptr, &actual_size, uncompressed_data.data(), original_size, compression_level);
 
-  if (z_res != Z_OK) {
+  if (z_res != Z_OK || actual_size > std::numeric_limits<uint32_t>::max()) {
     return std::nullopt;
   }
 
   if (actual_size == compress_bound) {
-    return result;
+    auto *adopted = std::exchange(scratch.ptr, nullptr);
+    return CompressedBuffer{adopted, static_cast<uint32_t>(actual_size), original_size};
   }
 
-  // If actual size is smaller, create a new buffer of the exact size; result
-  // frees the original larger buffer when it goes out of scope.
   auto new_buffer_size = static_cast<uint32_t>(actual_size);
   CompressedBuffer final_buffer(alloc.allocate(new_buffer_size), new_buffer_size, original_size);
-  std::copy_n(result.view().data(), new_buffer_size, final_buffer.view().data());
+  std::copy_n(scratch.ptr, new_buffer_size, final_buffer.view().data());
 
   return final_buffer;
 }
 
 auto ZlibCompressor::Decompress(std::span<uint8_t const> compressed_data, uint32_t original_size) const
     -> std::optional<DecompressedBuffer> {
-  if (compressed_data.empty() || original_size == 0) {
+  if (compressed_data.empty() && original_size == 0) {
     return DecompressedBuffer{nullptr, 0};
+  }
+  if (compressed_data.empty() || original_size == 0) {
+    return std::nullopt;
   }
 
   memgraph::memory::DbAwareAllocator<uint8_t> alloc;
@@ -148,7 +159,9 @@ auto ZlibCompressor::Decompress(std::span<uint8_t const> compressed_data, uint32
   auto const z_res =
       uncompress(result.view().data(), &original_size_tmp, compressed_data.data(), compressed_data.size_bytes());
 
-  if (z_res != Z_OK) return std::nullopt;
+  if (z_res != Z_OK || original_size_tmp != static_cast<uLongf>(original_size)) {
+    return std::nullopt;
+  }
 
   return result;
 }

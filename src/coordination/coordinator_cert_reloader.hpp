@@ -18,8 +18,10 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>  // X509_STORE, X509_STORE_free
+#include <sys/stat.h>
 
 #include <atomic>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
@@ -77,14 +79,25 @@ class CoordinatorCertReloader {
   // built from the CA file — so `CertCb` applies it all to the per-connection
   // SSL and never mutates a shared SSL_CTX. Exposed publicly only so
   // `ReloadPrepared` can name it; callers never construct one manually.
+  struct FileIdentity {
+    bool valid{false};
+    dev_t dev{0};
+    ino_t ino{0};
+    off_t size{0};
+    int64_t mtime_sec{0};
+    int64_t mtime_nsec{0};
+
+    friend bool operator==(FileIdentity const &, FileIdentity const &) = default;
+  };
+
   struct CertData {
     X509Ptr leaf;
     std::vector<X509Ptr> chain;  // intermediates, may be empty
     EvpKeyPtr key;
     X509StorePtr verify_store;  // trust store built from the CA file
-    std::filesystem::file_time_type cert_mtime{};
-    std::filesystem::file_time_type key_mtime{};
-    std::filesystem::file_time_type ca_mtime{};
+    FileIdentity cert_id{};
+    FileIdentity key_id{};
+    FileIdentity ca_id{};
   };
 
   // Two-phase reload entry points. `Prepare` reads cert/key/CA from disk into a

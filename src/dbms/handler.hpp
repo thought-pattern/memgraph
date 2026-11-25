@@ -42,11 +42,11 @@ class Handler {
   struct string_hash {
     using is_transparent = void;
 
-    [[nodiscard]] size_t operator()(const char *s) const { return std::hash<std::string_view>{}(s); }
+    [[nodiscard]] size_t operator()(const char *s) const noexcept { return std::hash<std::string_view>{}(s); }
 
-    [[nodiscard]] size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
+    [[nodiscard]] size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
 
-    [[nodiscard]] size_t operator()(const std::string &s) const { return std::hash<std::string>{}(s); }
+    [[nodiscard]] size_t operator()(const std::string &s) const noexcept { return std::hash<std::string>{}(s); }
   };
 
   using container_type = std::unordered_map<std::string, utils::Gatekeeper<T>, string_hash, std::equal_to<>>;
@@ -323,10 +323,12 @@ class Handler {
       return std::unexpected{RenameError::ALREADY_EXISTS};
     }
 
-    // Move the gatekeeper to the new name
-    auto gatekeeper = std::move(old_itr->second);
-    items_.erase(old_itr);
-    items_.emplace(new_name, std::move(gatekeeper));
+    // Allocate the replacement key string BEFORE extracting old_itr so an allocation failure leaves
+    // items_ untouched (strong exception safety).
+    std::string prepared_key{new_name};
+    auto nh = items_.extract(old_itr);
+    nh.key() = std::move(prepared_key);
+    items_.insert(std::move(nh));
     return {};
   }
 

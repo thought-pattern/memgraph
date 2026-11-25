@@ -40,6 +40,12 @@ struct RolenameResult {
   bool is_builtin{false};
 };
 
+struct RoleMemberNamesResult {
+  std::vector<memgraph::query::TypedValue> usernames;
+  std::vector<std::string> unreadable_entries;
+  bool complete{true};
+};
+
 class AuthQueryHandler {
  public:
   AuthQueryHandler() = default;
@@ -158,6 +164,13 @@ class AuthQueryHandler {
   /// @throw QueryRuntimeException if an error ocurred.
   virtual std::vector<memgraph::query::TypedValue> GetUsernamesForRole(const std::string &rolename,
                                                                        auth::AuthTransaction *auth_tx) = 0;
+
+  virtual RoleMemberNamesResult GetUsernamesForRoleWithDiagnostics(const std::string &rolename,
+                                                                   auth::AuthTransaction *auth_tx) {
+    return RoleMemberNamesResult{.usernames = GetUsernamesForRole(rolename, auth_tx),
+                                 .unreadable_entries = {},
+                                 .complete = true};
+  }
 
   /// @throw QueryRuntimeException if an error ocurred.
   virtual void SetRoles(const std::string &username, const std::vector<std::string> &roles,

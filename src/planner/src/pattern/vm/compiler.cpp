@@ -52,17 +52,17 @@ auto PatternsCompilerBase::emit_iter_loop(Instruction iter_instr, Instruction ne
 }
 
 auto PatternsCompilerBase::alloc_eclass_reg() -> EClassReg {
-  if (next_eclass_reg_ == std::numeric_limits<strong::underlying_type_t<EClassReg>>::max()) {
+  if (next_eclass_reg_ > std::numeric_limits<strong::underlying_type_t<EClassReg>>::max()) {
     throw std::overflow_error("Pattern too complex: e-class register limit exceeded");
   }
-  return EClassReg{std::exchange(next_eclass_reg_, static_cast<uint8_t>(next_eclass_reg_ + 1))};
+  return EClassReg{static_cast<uint8_t>(next_eclass_reg_++)};
 }
 
 auto PatternsCompilerBase::alloc_enode_reg() -> ENodeReg {
-  if (next_enode_reg_ == std::numeric_limits<strong::underlying_type_t<ENodeReg>>::max()) {
+  if (next_enode_reg_ > std::numeric_limits<strong::underlying_type_t<ENodeReg>>::max()) {
     throw std::overflow_error("Pattern too complex: e-node register limit exceeded");
   }
-  return ENodeReg{std::exchange(next_enode_reg_, static_cast<uint8_t>(next_enode_reg_ + 1))};
+  return ENodeReg{static_cast<uint8_t>(next_enode_reg_++)};
 }
 
 auto PatternsCompilerBase::get_slot(PatternVar var) const -> SlotIdx { return slot_map_.at(var); }
@@ -153,12 +153,14 @@ void PatternsCompilerBase::schedule_fragments(EmitPlan &plan, std::span<Fragment
       plan.fragments.push_back({i, Fragment::EnodeVerify});
     }
     enode_done[i] = true;
+    eclass_available.insert(info[i].enode_vars.begin(), info[i].enode_vars.end());
   };
 
   for (std::size_t i = 0; i < n; ++i) {
-    if (eclass_done[i]) continue;
-
-    emit_eclass_frags(i);
+    if (!eclass_done[i]) {
+      assert(eclass_deps_met(i) && "Join variable must be bound by an earlier pattern fragment");
+      emit_eclass_frags(i);
+    }
 
     for (std::size_t j = i + 1; j < n; ++j) {
       if (!eclass_done[j] && eclass_deps_met(j)) {
@@ -166,7 +168,9 @@ void PatternsCompilerBase::schedule_fragments(EmitPlan &plan, std::span<Fragment
       }
     }
 
-    emit_enode_frag(i);
+    if (!enode_done[i]) {
+      emit_enode_frag(i);
+    }
   }
 
   for (std::size_t i = 0; i < n; ++i) {

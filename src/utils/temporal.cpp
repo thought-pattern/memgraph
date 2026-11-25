@@ -542,14 +542,14 @@ int64_t LocalDateTime::MicrosecondsSinceEpoch() const {
 
 int64_t LocalDateTime::SecondsSinceEpoch() const {
   namespace chrono = std::chrono;
-  return chrono::duration_cast<chrono::seconds>(chrono::microseconds(MicrosecondsSinceEpoch())).count();
+  return chrono::floor<chrono::seconds>(chrono::microseconds(MicrosecondsSinceEpoch())).count();
 }
 
 int64_t LocalDateTime::SubSecondsAsNanoseconds() const {
   namespace chrono = std::chrono;
-  return chrono::duration_cast<chrono::nanoseconds>(chrono::microseconds(MicrosecondsSinceEpoch()) -
-                                                    chrono::seconds(SecondsSinceEpoch()))
-      .count();
+  const auto total_us = chrono::microseconds(MicrosecondsSinceEpoch());
+  const auto whole_seconds = chrono::floor<chrono::seconds>(total_us);
+  return chrono::duration_cast<chrono::nanoseconds>(total_us - whole_seconds).count();
 }
 
 // NOTE: Should be removed, but too many tests relly on it

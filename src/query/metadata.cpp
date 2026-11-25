@@ -118,6 +118,8 @@ constexpr std::string_view GetCodeString(const NotificationCode code) {
       return "CreateRole"sv;
     case NotificationCode::DEPRECATED_QUERY:
       return "DeprecatedQuery"sv;
+    case NotificationCode::INCOMPLETE_AUTH_LISTING:
+      return "IncompleteAuthListing"sv;
   }
 }
 }  // namespace

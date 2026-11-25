@@ -412,7 +412,7 @@ class DiskStorage final : public Storage {
 
     utils::small_vector<uint64_t> GetVectorIndexIdsForVertex(Vertex *vertex, PropertyId property) override;
 
-    utils::small_vector<float> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const override;
+    utils::small_vector<double> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const override;
     std::expected<void, storage::StorageIndexDefinitionError> CreateVectorEdgeIndex(
         VectorEdgeIndexSpec spec, ProgressCallback const &on_progress) override;
 
@@ -466,14 +466,15 @@ class DiskStorage final : public Storage {
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
 
-      // Drop indices
-      auto index_result = DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-      if (!index_result) {
-        // Silently fail if vertex index already dropped
+      if (storage_->ttl_.OwnsLabelPropertyIndex()) {
+        auto index_result = DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
+        if (!index_result) {
+          // Silently fail if vertex index already dropped
+        }
       }
 
-      // Check if edge TTL was enabled and drop edge index if needed
-      if (storage_->ttl_.Config().should_run_edge_ttl) {
+      // Check if edge TTL was enabled and drop edge index only when TTL created it
+      if (storage_->ttl_.Config().should_run_edge_ttl && storage_->ttl_.OwnsEdgePropertyIndex()) {
         auto edge_index_result = DropGlobalEdgeIndex(ttl_property);
         if (!edge_index_result) {
           // Silently fail if edge index already dropped
@@ -495,11 +496,16 @@ class DiskStorage final : public Storage {
     void ConfigureTtl(const storage::ttl::TtlInfo &ttl_info, TTLReplicationArgs /*repl_args*/ = {}) override {
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
+      auto const ttl_path = std::vector<storage::PropertyPath>{{ttl_property}};
 
       // If TTL is not enabled, create required indices and enable TTL
       if (!storage_->ttl_.Enabled()) {
-        // Create label+property index for TTL
-        (void)CreateIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
+        bool const label_index_existed =
+            storage_->indices_.label_property_index_->GetActiveIndices()->IndexExists(ttl_label, ttl_path);
+        if (!label_index_existed) {
+          (void)CreateIndex(ttl_label, ttl_path);
+        }
+        storage_->ttl_.SetOwnsLabelPropertyIndex(!label_index_existed);
         storage_->ttl_.Enable();
       }
 

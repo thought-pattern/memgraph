@@ -32,6 +32,7 @@
 #include "coordination/coordination_observer.hpp"
 #include "coordination/coordinator_cluster_state.hpp"
 #include "coordination/coordinator_communication_config.hpp"
+#include "coordination/coordinator_exceptions.hpp"
 #include "coordination/coordinator_instance.hpp"
 #include "coordination/coordinator_instance_management_server.hpp"
 #include "coordination/coordinator_instance_management_server_handlers.hpp"
@@ -59,18 +60,18 @@ namespace {
 using memgraph::coordination::ReplicationInstanceConnector;
 
 auto FindReplicationInstance(std::string_view replication_instance_name,
-                             std::list<ReplicationInstanceConnector> const &repl_instances)
-    -> std::optional<std::reference_wrapper<const ReplicationInstanceConnector>> {
-  auto const repl_instance =
-      std::ranges::find_if(repl_instances, [replication_instance_name](ReplicationInstanceConnector const &instance) {
-        return instance.InstanceName() == replication_instance_name;
+                             std::list<std::shared_ptr<ReplicationInstanceConnector>> const &repl_instances)
+    -> std::shared_ptr<ReplicationInstanceConnector> {
+  auto const repl_instance = std::ranges::find_if(
+      repl_instances, [replication_instance_name](std::shared_ptr<ReplicationInstanceConnector> const &instance) {
+        return instance->InstanceName() == replication_instance_name;
       });
 
   if (repl_instance != repl_instances.end()) {
-    return std::ref(*repl_instance);
+    return *repl_instance;
   }
 
-  return std::nullopt;
+  return nullptr;
 }
 }  // namespace
 
@@ -98,6 +99,10 @@ CoordinatorInstance::CoordinatorInstance(CoordinatorInstanceInitConfig const &co
       coordinator_management_server_{ManagementServerConfig{io::network::Endpoint{
                                          kDefaultManagementServerIp, static_cast<uint16_t>(config.management_port)}},
                                      config.tls_config} {
+  if (!HasValidClusterMutualTls(config.tls_config)) {
+    throw RaftServerStartException(
+        "Coordinator management server requires intra-cluster mutual TLS (cert, key, and CA).");
+  }
   // Delay constructing of Raft state until everything is constructed in coordinator instance
   // since raft state will call become leader callback or become follower callback on construction.
   // If something is not yet constructed in coordinator instance, we get UB
@@ -108,39 +113,21 @@ CoordinatorInstance::CoordinatorInstance(CoordinatorInstanceInitConfig const &co
 
   // Last thing to contruct is the server and RPC handlers (that use instance and raft state)
   CoordinatorInstanceManagementServerHandlers::Register(coordinator_management_server_, *this);
-  MG_ASSERT(coordinator_management_server_.Start(), "Management server on coordinator couldn't be started.");
+  if (!coordinator_management_server_.Start()) {
+    throw RaftServerStartException("Management server on coordinator couldn't be started.");
+  }
 }
 
 CoordinatorInstance::~CoordinatorInstance() {
-  // Coordinator instance can be stuck in infinite loop of doing reconciliation of cluster state. We need to notify
-  // thread that we are shutting down, and we need to stop state checks and thread pool before anything is destructed
-  // otherwise thread pool can get task become leader, when raft_state_ ptr is already destructed
-  // Order is important:
-  // 1. Thread pool might be running with reconcile cluster state, or become follower, so we should shut that down
-  // 2. Await shutdown of coordinator thread pool so that coordinator can't become follower or do reconcile cluster
-  // state
-  // 3. State checks running, we need to stop them before raft_state_ is destroyed
-
-  // Step 1: Set our shutdown flag to prevent new work from being started
   ShuttingDown();
-
-  // Step 2: Shutdown thread pool and wait for in-flight tasks to complete
-  // This is safe now because:
-  // - RaftState callbacks won't add new tasks (PrepareForShutdown was called)
-  // - is_shutting_down_ flag prevents our callbacks from doing real work
   thread_pool_.ShutDown();
 
-  // Here we cannot have any scheduled task with a callback nor can we add new tasks (since the is_shutting_down flag is
-  // set) But RaftState is still alive and could call the callbacks. This is fine because raft_state_ is a unique
-  // pointer and will be destroyed after this function. NOTE: Make sure lifetime of objects in the raft state callbacks
-  // are not exceeded.
-
-  // Step 3: Stop state checks on replication instances
-  // No lock needed because:
-  // - ReconcileClusterState can't be running (thread pool is shut down)
-  // - Coordinator can't become follower (RaftState callbacks are disabled)
-  // - User queries can't be running (memgraph awaits server shutdown before calling destructor)
-  std::ranges::for_each(repl_instances_, [](auto &repl_instance) { repl_instance.StopStateCheck(); });
+  std::list<std::shared_ptr<ReplicationInstanceConnector>> to_stop;
+  {
+    auto lock = std::unique_lock{coord_instance_lock_};
+    to_stop.swap(repl_instances_);
+  }
+  std::ranges::for_each(to_stop, [](auto &repl_instance) { repl_instance->StopStateCheck(); });
 }
 
 auto CoordinatorInstance::GetBecomeLeaderCallback() -> std::function<void()> {
@@ -174,20 +161,21 @@ auto CoordinatorInstance::GetBecomeFollowerCallback() -> std::function<void()> {
         return;
       }
       spdlog::info("Executing become follower callback in thread {}.", std::this_thread::get_id());
-      // We need to stop checks before taking a lock because deadlock can happen if instances wait
-      // to take a lock in state check, and this thread already has a lock and waits for instance to
-      // be done with state check
-      std::ranges::for_each(repl_instances_, [](auto &&repl_instance) {
+      // Detach connectors under the lock and join health checks outside the lock while shared_ptr keeps them alive.
+      std::list<std::shared_ptr<ReplicationInstanceConnector>> to_stop;
+      {
+        auto lock = std::unique_lock{coord_instance_lock_};
+        to_stop.swap(repl_instances_);
+      }
+      std::ranges::for_each(to_stop, [](auto &repl_instance) {
         spdlog::trace("Stopping state check for instance {} in thread {}.",
-                      repl_instance.InstanceName(),
+                      repl_instance->InstanceName(),
                       std::this_thread::get_id());
-        repl_instance.StopStateCheck();
+        repl_instance->StopStateCheck();
         spdlog::trace("Stopped state check for instance {} in thread {}.",
-                      repl_instance.InstanceName(),
+                      repl_instance->InstanceName(),
                       std::this_thread::get_id());
       });
-      auto lock = std::unique_lock{coord_instance_lock_};
-      repl_instances_.clear();
     });
   };
 }
@@ -209,7 +197,7 @@ auto CoordinatorInstance::YieldLeadershipAsLeader() const -> YieldLeadershipStat
 }
 
 auto CoordinatorInstance::YieldLeadership() const -> YieldLeadershipStatus {
-  if (auto const res = ForwardToLeader<YieldLeadershipRpc, YieldLeadershipStatus>(); res.has_value()) {
+  if (auto const res = ForwardStatusToLeader<YieldLeadershipRpc, YieldLeadershipStatus>(); res.has_value()) {
     return *res;
   }
 
@@ -295,10 +283,10 @@ auto CoordinatorInstance::ShowInstancesAsLeader() const -> std::optional<std::ve
 
   auto get_instance_status = [&](auto const &instance) -> InstanceStatus {
     auto maybe_connector = FindReplicationInstance(instance.config.instance_name, repl_instances_);
-    DMG_ASSERT(maybe_connector.has_value(),
+    DMG_ASSERT(maybe_connector != nullptr,
                "Couldn't find ReplicationInstanceConnector for instance {}",
                instance.config.instance_name);
-    auto &connector = maybe_connector->get();
+    auto &connector = *maybe_connector;
 
     return {.instance_name = instance.config.instance_name,
             .management_server = instance.config.ManagementSocketAddress(),  // show non-resolved IP
@@ -435,13 +423,15 @@ auto CoordinatorInstance::ReconcileClusterState_() -> ReconcileClusterStateStatu
     return ReconcileClusterStateStatus::SHUTTING_DOWN;
   }
 
-  // Ordering is important here, we must stop frequent check before
-  // taking lock to avoid deadlock between us stopping thread and thread wanting to take lock but can't because
-  // we have it
-  std::ranges::for_each(repl_instances_, [](auto &&repl_instance) {
-    spdlog::trace("Stopping state checks for instance {}.", repl_instance.InstanceName());
-    repl_instance.StopStateCheck();
-    spdlog::trace("Stopped state check for instance {}.", repl_instance.InstanceName());
+  std::list<std::shared_ptr<ReplicationInstanceConnector>> to_stop;
+  {
+    auto stop_lock = std::unique_lock{coord_instance_lock_};
+    to_stop.swap(repl_instances_);
+  }
+  std::ranges::for_each(to_stop, [](auto &repl_instance) {
+    spdlog::trace("Stopping state checks for instance {}.", repl_instance->InstanceName());
+    repl_instance->StopStateCheck();
+    spdlog::trace("Stopped state check for instance {}.", repl_instance->InstanceName());
   });
   auto lock = std::unique_lock{coord_instance_lock_};
   repl_instances_.clear();
@@ -466,14 +456,13 @@ auto CoordinatorInstance::ReconcileClusterState_() -> ReconcileClusterStateStatu
   }
 
   std::ranges::for_each(raft_state_data_instances, [this](auto const &data_instance) {
-    auto &instance = repl_instances_.emplace_back(data_instance.config,
-                                                  this,
-                                                  raft_state_->GetInstanceDownTimeoutSec(),
-                                                  raft_state_->GetInstanceHealthCheckFrequencySec(),
-                                                  tls_config_
-
-    );
-    instance.StartStateCheck();
+    auto &instance = repl_instances_.emplace_back(
+        std::make_shared<ReplicationInstanceConnector>(data_instance.config,
+                                                       this,
+                                                       raft_state_->GetInstanceDownTimeoutSec(),
+                                                       raft_state_->GetInstanceHealthCheckFrequencySec(),
+                                                       tls_config_));
+    instance->StartStateCheck();
   });
 
   if (num_mains == 1) {
@@ -482,7 +471,7 @@ auto CoordinatorInstance::ReconcileClusterState_() -> ReconcileClusterStateStatu
     auto main_instance = std::ranges::begin(current_mains);
     spdlog::trace("Found main instance {}.", main_instance->config.instance_name);
     for (auto &instance : repl_instances_) {
-      instance.StartStateCheck();
+      instance->StartStateCheck();
     }
     return ReconcileClusterStateStatus::SUCCESS;
   }
@@ -493,7 +482,7 @@ auto CoordinatorInstance::ReconcileClusterState_() -> ReconcileClusterStateStatu
     switch (TryFailover()) {
       case FailoverStatus::SUCCESS: {
         for (auto &instance : repl_instances_) {
-          instance.StartStateCheck();
+          instance->StartStateCheck();
         }
         spdlog::info("Exiting ReconcileClusterState_. Cluster is in healthy state.");
         return ReconcileClusterStateStatus::SUCCESS;
@@ -521,9 +510,14 @@ auto CoordinatorInstance::TryVerifyOrCorrectClusterState() -> ReconcileClusterSt
   // try to forward the request to the current leader.
   if (!status.compare_exchange_strong(
           expected, CoordinatorStatus::LEADER_NOT_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    if (raft_state_->IsLeader()) {
+      return ReconcileClusterStateStatus::NOT_LEADER_ANYMORE;
+    }
     if (auto const leader = FindClientConnector(leader_id); leader != nullptr) {
-      return leader->SendRpc<ForceResetRpc>().value_or(false) ? ReconcileClusterStateStatus::SUCCESS
-                                                              : ReconcileClusterStateStatus::LEADER_FAILED;
+      if (auto const res = leader->SendRpc<ForceResetRpc>(); res.has_value() && res->has_value()) {
+        return **res;
+      }
+      return ReconcileClusterStateStatus::LEADER_FAILED;
     }
 
     return ReconcileClusterStateStatus::LEADER_NOT_FOUND;
@@ -582,7 +576,7 @@ auto CoordinatorInstance::SetReplicationInstanceToMain(std::string_view new_main
   auto lock = std::lock_guard{coord_instance_lock_};
 
   if (auto const res =
-          ForwardToLeader<SetInstanceToMainRpc, SetInstanceToMainCoordinatorStatus>(std::string{new_main_name});
+          ForwardStatusToLeader<SetInstanceToMainRpc, SetInstanceToMainCoordinatorStatus>(std::string{new_main_name});
       res.has_value()) {
     return *res;
   }
@@ -609,7 +603,7 @@ auto CoordinatorInstance::SetReplicationInstanceToMain(std::string_view new_main
   }
 
   auto const is_new_main_connector = [new_main_name](auto const &instance) {
-    return instance.InstanceName() == new_main_name;
+    return instance->InstanceName() == new_main_name;
   };
 
   auto new_main_connector = std::ranges::find_if(repl_instances_, is_new_main_connector);
@@ -646,7 +640,7 @@ auto CoordinatorInstance::SetReplicationInstanceToMain(std::string_view new_main
   for (auto const &instance : repl_instances_) {
     if (!is_new_main_connector(instance)) {
       // Even if swapping doesn't succeed here, we will do it again in the callbacks.
-      instance.SendSwapAndUpdateUUID(new_main_uuid);
+      instance->SendSwapAndUpdateUUID(new_main_uuid);
     }
   }
 
@@ -659,7 +653,7 @@ auto CoordinatorInstance::SetReplicationInstanceToMain(std::string_view new_main
 
   // The new main comes up writeable unless the cluster is deliberately in read-only mode.
   auto const writing_enabled = !raft_state_->GetGlobalReadOnly();
-  if (!new_main_connector->SendRpc<PromoteToMainRpc>(new_main_uuid, std::move(repl_clients_info), writing_enabled)) {
+  if (!(*new_main_connector)->SendRpc<PromoteToMainRpc>(new_main_uuid, std::move(repl_clients_info), writing_enabled)) {
     spdlog::warn(
         "Failed to promote instance {} to main. The change is however peristed in Raft so promotion will be tried "
         "again in the reconciliation loop. No need for you to retry the operation.",
@@ -675,7 +669,8 @@ auto CoordinatorInstance::DemoteInstanceToReplica(std::string_view instance_name
   metrics::Metrics().global.demote_instance->Increment();
   auto lock = std::lock_guard{coord_instance_lock_};
 
-  if (auto const res = ForwardToLeader<DemoteInstanceRpc, DemoteInstanceCoordinatorStatus>(std::string{instance_name});
+  if (auto const res =
+          ForwardStatusToLeader<DemoteInstanceRpc, DemoteInstanceCoordinatorStatus>(std::string{instance_name});
       res.has_value()) {
     return *res;
   }
@@ -684,7 +679,7 @@ auto CoordinatorInstance::DemoteInstanceToReplica(std::string_view instance_name
     return DemoteInstanceCoordinatorStatus::NOT_LEADER;
   }
 
-  auto const name_matches = [instance_name](auto &&instance) { return instance.InstanceName() == instance_name; };
+  auto const name_matches = [instance_name](auto const &instance) { return instance->InstanceName() == instance_name; };
 
   auto repl_instance = std::ranges::find_if(repl_instances_, name_matches);
   if (repl_instance == repl_instances_.end()) {
@@ -711,7 +706,7 @@ auto CoordinatorInstance::DemoteInstanceToReplica(std::string_view instance_name
     return DemoteInstanceCoordinatorStatus::RAFT_LOG_ERROR;
   }
 
-  if (!repl_instance->SendRpc<DemoteMainToReplicaRpc>(data_instance->config.replication_client_info)) {
+  if (!(*repl_instance)->SendRpc<DemoteMainToReplicaRpc>(data_instance->config.replication_client_info)) {
     spdlog::warn(
         "Failed to demote instance {} to replica. Operation still persisted in Raft, demotion will be tried in the "
         "reconciliation loop again",
@@ -728,7 +723,7 @@ auto CoordinatorInstance::RegisterReplicationInstance(DataInstanceConfig const &
   // TODO: (andi) Can I move further down this lock
   auto lock = std::lock_guard{coord_instance_lock_};
 
-  if (auto const res = ForwardToLeader<RegisterInstanceRpc, RegisterInstanceCoordinatorStatus>(config);
+  if (auto const res = ForwardStatusToLeader<RegisterInstanceRpc, RegisterInstanceCoordinatorStatus>(config);
       res.has_value()) {
     return *res;
   }
@@ -786,11 +781,12 @@ auto CoordinatorInstance::RegisterReplicationInstance(DataInstanceConfig const &
     return RegisterInstanceCoordinatorStatus::RAFT_LOG_ERROR;
   }
 
-  auto *new_instance = &repl_instances_.emplace_back(config,
+  auto new_instance = repl_instances_.emplace_back(
+      std::make_shared<ReplicationInstanceConnector>(config,
                                                      this,
                                                      raft_state_->GetInstanceDownTimeoutSec(),
                                                      raft_state_->GetInstanceHealthCheckFrequencySec(),
-                                                     tls_config_);
+                                                     tls_config_));
 
   // Try sending RPC now but the failure is not fatal, we will try again in the reconciliation loop
   // From the user's perspective, as soon as the log is committed to Raft logs, the in-memory state will eventually
@@ -807,15 +803,15 @@ auto CoordinatorInstance::RegisterReplicationInstance(DataInstanceConfig const &
   if (auto const main_name = raft_state_->TryGetCurrentMainName(); main_name.has_value()) {
     // Find main from the cache
     auto const maybe_current_main = FindReplicationInstance(*main_name, repl_instances_);
-    DMG_ASSERT(maybe_current_main.has_value(), "Couldn't find instance {} in local storage.", *main_name);
+    DMG_ASSERT(maybe_current_main != nullptr, "Couldn't find instance {} in local storage.", *main_name);
 
-    if (auto const &current_main = maybe_current_main->get();
+    if (auto const &current_main = *maybe_current_main;
         !current_main.SendRpc<RegisterReplicaOnMainRpc>(curr_main_uuid, config.replication_client_info)) {
       spdlog::warn(
           "Failed to register instance {} on the current main instance {}. The operation is still persisted in Raft "
           "logs and will be retried in the next iteration of the reconciliation loop.",
           config.instance_name,
-          main_name);
+          *main_name);
     }
   }
 
@@ -829,7 +825,7 @@ auto CoordinatorInstance::UnregisterReplicationInstance(std::string_view instanc
     -> UnregisterInstanceCoordinatorStatus {
   metrics::Metrics().global.unregister_repl_instance->Increment();
   if (auto const res =
-          ForwardToLeader<UnregisterInstanceRpc, UnregisterInstanceCoordinatorStatus>(std::string{instance_name});
+          ForwardStatusToLeader<UnregisterInstanceRpc, UnregisterInstanceCoordinatorStatus>(std::string{instance_name});
       res.has_value()) {
     return *res;
   }
@@ -838,66 +834,73 @@ auto CoordinatorInstance::UnregisterReplicationInstance(std::string_view instanc
     return UnregisterInstanceCoordinatorStatus::NOT_LEADER;
   }
 
-  auto lock = std::lock_guard{coord_instance_lock_};
+  std::shared_ptr<ReplicationInstanceConnector> removed_connector;
+  {
+    auto lock = std::lock_guard{coord_instance_lock_};
 
-  auto maybe_instance = FindReplicationInstance(instance_name, repl_instances_);
-  if (!maybe_instance) {
-    return UnregisterInstanceCoordinatorStatus::NO_INSTANCE_WITH_NAME;
-  }
-
-  auto const &inst_to_remove = maybe_instance->get();
-
-  auto const is_current_main = [this](auto const &instance) {
-    return raft_state_->IsCurrentMain(instance.InstanceName()) && instance.IsAlive();
-  };
-
-  // Cannot unregister current main
-  if (is_current_main(inst_to_remove)) {
-    return UnregisterInstanceCoordinatorStatus::IS_MAIN;
-  }
-
-  auto new_data_instances = raft_state_->GetDataInstancesContext();
-  auto const [first, last] = std::ranges::remove_if(new_data_instances, [instance_name](auto const &data_instance) {
-    return data_instance.config.instance_name == instance_name;
-  });
-  new_data_instances.erase(first, last);
-
-  // NOLINTNEXTLINE
-  CoordinatorClusterStateDelta const delta_state{.data_instances_ = std::move(new_data_instances)};
-
-  // Append new cluster state.
-  if (!raft_state_->AppendLogAndWaitForCommit(delta_state)) {
-    return UnregisterInstanceCoordinatorStatus::RAFT_LOG_ERROR;
-  }
-
-  auto curr_main = std::ranges::find_if(repl_instances_, is_current_main);
-  // If there is no main in the cluster, we still persist the operation in the Raft and future main will unregister it
-  // at some point later
-  if (curr_main != repl_instances_.end()) {
-    // Even if RPC fails, this is still a success from user's perspective because we will retry this operation in the
-    // reconciliation loop. Best effort RPC handling
-    if (!curr_main->SendRpc<UnregisterReplicaRpc>(instance_name)) {
-      spdlog::warn(
-          "Failed to unregister replica {} from the current main. The operation is still persisted in Raft log and RPC "
-          "will be sent again automatically in the next iteration of the reconciliation loop",
-          instance_name);
-    } else {
-      spdlog::info("Replica {} successfully unregistered from the current main.", instance_name);
+    auto maybe_instance = FindReplicationInstance(instance_name, repl_instances_);
+    if (maybe_instance == nullptr) {
+      return UnregisterInstanceCoordinatorStatus::NO_INSTANCE_WITH_NAME;
     }
+
+    auto const &inst_to_remove = *maybe_instance;
+
+    auto const is_current_main = [this](ReplicationInstanceConnector const &instance) {
+      return raft_state_->IsCurrentMain(instance.InstanceName()) && instance.IsAlive();
+    };
+
+    // Cannot unregister current main
+    if (is_current_main(inst_to_remove)) {
+      return UnregisterInstanceCoordinatorStatus::IS_MAIN;
+    }
+
+    auto new_data_instances = raft_state_->GetDataInstancesContext();
+    auto const [first, last] = std::ranges::remove_if(new_data_instances, [instance_name](auto const &data_instance) {
+      return data_instance.config.instance_name == instance_name;
+    });
+    new_data_instances.erase(first, last);
+
+    // NOLINTNEXTLINE
+    CoordinatorClusterStateDelta const delta_state{.data_instances_ = std::move(new_data_instances)};
+
+    // Append new cluster state.
+    if (!raft_state_->AppendLogAndWaitForCommit(delta_state)) {
+      return UnregisterInstanceCoordinatorStatus::RAFT_LOG_ERROR;
+    }
+
+    auto curr_main = std::ranges::find_if(
+        repl_instances_, [&](auto const &conn_ptr) { return is_current_main(*conn_ptr); });
+    if (curr_main != repl_instances_.end()) {
+      if (!(*curr_main)->SendRpc<UnregisterReplicaRpc>(instance_name)) {
+        spdlog::warn(
+            "Failed to unregister replica {} from the current main. The operation is still persisted in Raft log and "
+            "RPC will be sent again automatically in the next iteration of the reconciliation loop",
+            instance_name);
+      } else {
+        spdlog::info("Replica {} successfully unregistered from the current main.", instance_name);
+      }
+    }
+
+    for (auto it = repl_instances_.begin(); it != repl_instances_.end(); ++it) {
+      if ((*it)->InstanceName() == instance_name) {
+        removed_connector = std::move(*it);
+        repl_instances_.erase(it);
+        break;
+      }
+    }
+    replicas_num_txns_cache_.erase(std::string{instance_name});
   }
 
-  // We can delete connector for the instance we are removing indepedently from the RPC result
-  std::erase_if(repl_instances_,
-                [instance_name](auto const &instance) { return instance.InstanceName() == instance_name; });
-  // Update cache entry
-  replicas_num_txns_cache_.erase(std::string{instance_name});
+  if (removed_connector != nullptr) {
+    removed_connector->StopStateCheck();
+  }
 
   return UnregisterInstanceCoordinatorStatus::SUCCESS;
 }
 
 auto CoordinatorInstance::RemoveCoordinatorInstance(int coordinator_id) const -> RemoveCoordinatorInstanceStatus {
   metrics::Metrics().global.remove_coord_instance->Increment();
-  if (auto const res = ForwardToLeader<RemoveCoordinatorRpc, RemoveCoordinatorInstanceStatus>(coordinator_id);
+  if (auto const res = ForwardStatusToLeader<RemoveCoordinatorRpc, RemoveCoordinatorInstanceStatus>(coordinator_id);
       res.has_value()) {
     return *res;
   }
@@ -939,9 +942,11 @@ auto CoordinatorInstance::RemoveCoordinatorInstance(int coordinator_id) const ->
   // NOLINTNEXTLINE
   CoordinatorClusterStateDelta const delta_state{.coordinator_instances_ = std::move(coordinator_instances_context)};
 
-  // If we managed to remove it from the NuRaft configuration but not to our app logs. If this fails, not good.
   if (!raft_state_->AppendLogAndWaitForCommit(delta_state)) {
-    LOG_FATAL("Couldn't append application log when removing coordinator {} from the cluster. ", coordinator_id);
+    spdlog::error(
+        "Couldn't append application log when removing coordinator {} from the cluster; retry to reconcile.",
+        coordinator_id);
+    return RemoveCoordinatorInstanceStatus::RAFT_LOG_ERROR;
   }
   spdlog::info("Removed coordinator {} from local coordinator instance.", coordinator_id);
 
@@ -950,7 +955,7 @@ auto CoordinatorInstance::RemoveCoordinatorInstance(int coordinator_id) const ->
 
 auto CoordinatorInstance::AddCoordinatorInstance(CoordinatorInstanceConfig const &config) const
     -> AddCoordinatorInstanceStatus {
-  if (auto const res = ForwardToLeader<AddCoordinatorRpc, AddCoordinatorInstanceStatus>(config); res.has_value()) {
+  if (auto const res = ForwardStatusToLeader<AddCoordinatorRpc, AddCoordinatorInstanceStatus>(config); res.has_value()) {
     return *res;
   }
 
@@ -1001,22 +1006,26 @@ auto CoordinatorInstance::AddNewCoordinator(
     std::vector<CoordinatorInstanceContext> const &coordinator_instances_context) const
     -> AddCoordinatorInstanceStatus {
   auto const coordinator_instances_aux = raft_state_->GetCoordinatorInstancesAux();
+  auto const mgmt_server = config.management_server.SocketAddress();
+  auto const coord_server = config.coordinator_server.SocketAddress();
 
-  {
-    auto const existing_coord = std::ranges::find_if(
-        coordinator_instances_aux,
-        [coordinator_id = config.coordinator_id](auto const &coord) { return coord.id == coordinator_id; });
-
-    if (existing_coord != coordinator_instances_aux.end()) {
-      return AddCoordinatorInstanceStatus::ID_ALREADY_EXISTS;
+  auto const self_in_raft = std::ranges::find_if(
+      coordinator_instances_aux,
+      [coordinator_id = config.coordinator_id](auto const &coord) { return coord.id == coordinator_id; });
+  bool const already_in_raft = self_in_raft != coordinator_instances_aux.end();
+  if (already_in_raft) {
+    if (self_in_raft->management_server != mgmt_server || self_in_raft->coordinator_server != coord_server) {
+      return AddCoordinatorInstanceStatus::DIFF_NETWORK_CONFIG;
     }
+    spdlog::info(
+        "Coordinator {} is already present in the Raft configuration, reconciling missing application context.",
+        config.coordinator_id);
   }
 
   {
     auto const existing_coord = std::ranges::find_if(
-        coordinator_instances_aux, [mgmt_server = config.management_server.SocketAddress()](auto const &coord) {
-          return coord.management_server == mgmt_server;
-        });
+        coordinator_instances_aux,
+        [&](auto const &coord) { return coord.id != config.coordinator_id && coord.management_server == mgmt_server; });
 
     if (existing_coord != coordinator_instances_aux.end()) {
       return AddCoordinatorInstanceStatus::MGMT_ENDPOINT_ALREADY_EXISTS;
@@ -1025,8 +1034,8 @@ auto CoordinatorInstance::AddNewCoordinator(
 
   {
     auto const existing_coord = std::ranges::find_if(
-        coordinator_instances_aux, [coord_server = config.coordinator_server.SocketAddress()](auto const &coord) {
-          return coord.coordinator_server == coord_server;
+        coordinator_instances_aux, [&](auto const &coord) {
+          return coord.id != config.coordinator_id && coord.coordinator_server == coord_server;
         });
 
     if (existing_coord != coordinator_instances_aux.end()) {
@@ -1034,21 +1043,19 @@ auto CoordinatorInstance::AddNewCoordinator(
     }
   }
 
-  // We only need to add coordinator instance on Raft level if it's some new instance
-  if (auto const res = raft_state_->AddCoordinatorInstance(config); res != AddCoordinatorInstanceStatus::SUCCESS) {
-    return res;
+  if (!already_in_raft) {
+    if (auto const res = raft_state_->AddCoordinatorInstance(config); res != AddCoordinatorInstanceStatus::SUCCESS) {
+      return res;
+    }
   }
   // NOLINTNEXTLINE
   CoordinatorClusterStateDelta const delta_state{.coordinator_instances_ = coordinator_instances_context};
 
-  // If we managed to add the instance to the NuRaft configuration but not to our app logs that is a fatal failure
   if (!raft_state_->AppendLogAndWaitForCommit(delta_state)) {
-    LOG_FATAL(
-        "Couldn't append application log when adding coordinator {} to the cluster. Please restart your instance "
-        "with "
-        "a fresh data directory and try again. If you already partially connected a cluster, please delete data "
-        "directories of other coordinators too.",
+    spdlog::error(
+        "Couldn't append application log when adding coordinator {} to the cluster; retry ADD COORDINATOR to reconcile.",
         config.coordinator_id);
+    return AddCoordinatorInstanceStatus::RAFT_LOG_ERROR;
   }
   return AddCoordinatorInstanceStatus::SUCCESS;
 }
@@ -1166,12 +1173,12 @@ auto CoordinatorInstance::SetCoordinatorSetting(std::string_view const setting_n
   if (setting_name == kInstanceDownTimeoutSec) {
     auto guard = std::lock_guard{coord_instance_lock_};
     for (auto const &repl_instance_connector : repl_instances_) {
-      repl_instance_connector.UpdateInstanceDownTimeoutSec(raft_state_->GetInstanceDownTimeoutSec());
+      repl_instance_connector->UpdateInstanceDownTimeoutSec(raft_state_->GetInstanceDownTimeoutSec());
     }
   } else if (setting_name == kInstanceHealthCheckFreqSec) {
     auto guard = std::lock_guard{coord_instance_lock_};
     for (auto const &repl_instance_connector : repl_instances_) {
-      repl_instance_connector.UpdateHealthCheckFrequencySec(raft_state_->GetInstanceHealthCheckFrequencySec());
+      repl_instance_connector->UpdateHealthCheckFrequencySec(raft_state_->GetInstanceHealthCheckFrequencySec());
     }
   }
 
@@ -1373,8 +1380,8 @@ void CoordinatorInstance::InstanceSuccessCallback(std::string_view instance_name
     return;
   }
   auto maybe_instance = FindReplicationInstance(instance_name, repl_instances_);
-  MG_ASSERT(maybe_instance.has_value(), "Couldn't find instance {} in local storage.", instance_name);
-  auto const &instance = maybe_instance->get();
+  MG_ASSERT(maybe_instance != nullptr, "Couldn't find instance {} in local storage.", instance_name);
+  auto const &instance = *maybe_instance;
 
   spdlog::trace("Instance {} performing success callback in thread {}.", instance_name, std::this_thread::get_id());
 
@@ -1402,18 +1409,18 @@ void CoordinatorInstance::InstanceSuccessCallback(std::string_view instance_name
             !instance_state.inner_state.replicas_num_txns->contains(raft_replica_instance.config.instance_name)) {
           auto replica_inmem_instance =
               FindReplicationInstance(raft_replica_instance.config.instance_name, repl_instances_);
-          MG_ASSERT(replica_inmem_instance.has_value(), "Inconsistency found between in-memory state and Raft logs");
+          MG_ASSERT(replica_inmem_instance != nullptr, "Inconsistency found between in-memory state and Raft logs");
 
           if (instance.SendRpc<RegisterReplicaOnMainRpc>(curr_main_uuid,
-                                                         replica_inmem_instance->get().GetReplicationClientInfo())) {
+                                                         replica_inmem_instance->GetReplicationClientInfo())) {
             spdlog::info("Replica {} successfully registered on the current main {}",
-                         replica_inmem_instance->get().InstanceName(),
+                         replica_inmem_instance->InstanceName(),
                          instance_name);
           } else {
             spdlog::warn(
                 "Failed to register replica {} on the current main {}. The operation will be retried in the next "
                 "iteration of the reconciliation loop.",
-                replica_inmem_instance->get().InstanceName(),
+                replica_inmem_instance->InstanceName(),
                 instance_name);
           }
         }
@@ -1541,8 +1548,8 @@ void CoordinatorInstance::InstanceFailCallback(std::string_view instance_name) {
     return;
   }
   auto const maybe_instance = FindReplicationInstance(instance_name, repl_instances_);
-  MG_ASSERT(maybe_instance.has_value(), "Couldn't find instance {} in local storage.", instance_name);
-  auto const &instance = maybe_instance->get();
+  MG_ASSERT(maybe_instance != nullptr, "Couldn't find instance {} in local storage.", instance_name);
+  auto const &instance = *maybe_instance;
 
   spdlog::trace("Instance {} performing fail callback in thread {}.", instance_name, std::this_thread::get_id());
   instance.OnFailPing();
@@ -1703,17 +1710,28 @@ auto CoordinatorInstance::ChooseMostUpToDateInstance(
 auto CoordinatorInstance::GetRoutingTable(std::string_view const db_name) const -> RoutingTable {
   // Unlike the other reads, a leader which isn't yet ready still answers from its own Raft state: routing clients need
   // an answer during the leadership transition, and the state machine is already caught up at that point.
-  if (raft_state_->GetMyCoordinatorId() == raft_state_->GetLeaderId()) {
-    return GetRoutingTableAsLeader(db_name);
+  if (auto local = GetRoutingTableAsLeader(db_name); local.has_value()) {
+    return std::move(*local);
   }
 
-  // An unreachable leader means we have no routing table to report.
-  return SendReadToLeader<GetRoutingTableRpc>(std::string{db_name}).value_or(RoutingTable{});
+  // An unreachable leader or a receiver that stepped down in transit means we have no routing table to report.
+  if (auto forwarded = SendReadToLeader<GetRoutingTableRpc>(std::string{db_name});
+      forwarded.has_value() && forwarded->has_value()) {
+    return std::move(**forwarded);
+  }
+  return RoutingTable{};
 }
 
-auto CoordinatorInstance::GetRoutingTableAsLeader(std::string_view const db_name) const -> RoutingTable {
-  // Lock needed because we are reading replicas' lag
+auto CoordinatorInstance::GetRoutingTableAsLeader(std::string_view const db_name) const
+    -> std::optional<RoutingTable> {
+  if (!raft_state_->IsLeader() || raft_state_->GetMyCoordinatorId() != raft_state_->GetLeaderId()) {
+    return std::nullopt;
+  }
+  // Lock needed because we are reading replicas' lag; re-verify leadership after taking the lock.
   auto lock = std::shared_lock{coord_instance_lock_};
+  if (!raft_state_->IsLeader() || raft_state_->GetMyCoordinatorId() != raft_state_->GetLeaderId()) {
+    return std::nullopt;
+  }
   return raft_state_->GetRoutingTable(db_name, replicas_num_txns_cache_);
 }
 
@@ -1724,7 +1742,7 @@ auto CoordinatorInstance::GetInstanceForFailover() const -> std::optional<std::s
     return std::nullopt;
   }
 
-  auto const get_instance_info = [](auto const &instance) {
+  auto const get_instance_info = [](ReplicationInstanceConnector const &instance) {
     return instance.GetClient().SendGetDatabaseHistoriesRpc();
   };
 
@@ -1736,7 +1754,8 @@ auto CoordinatorInstance::GetInstanceForFailover() const -> std::optional<std::s
 
   auto const max_allowed_lag = raft_state_->GetMaxFailoverReplicaLag();
 
-  for (auto const &instance : repl_instances_) {
+  for (auto const &instance_ptr : repl_instances_) {
+    auto const &instance = *instance_ptr;
     auto const &instance_name = instance.InstanceName();
 
     bool const skip_instance = [&instance_name, sync_failover_only, &data_instances]() {
@@ -1764,27 +1783,43 @@ auto CoordinatorInstance::GetInstanceForFailover() const -> std::optional<std::s
       auto instance_info = *maybe_instance_info;
 
       bool replica_behind{false};
-      for (const auto &[db_uuid, num_committed_txns] : instance_info.dbs_info) {
-        auto const main_db_info = main_num_txns_cache_.find(db_uuid);
-        // If database got deleted on main but that change still isn't replicated, we cannot conclude that replica is
-        // too far behind using such a condition
-        if (main_db_info == main_num_txns_cache_.end()) {
-          spdlog::trace("No entry for db: {}", db_uuid);
-          continue;
-        }
-
-        if (main_db_info->second > num_committed_txns && main_db_info->second - num_committed_txns > max_allowed_lag) {
+      // Verify every database present in the main's cached state exists on this candidate replica.
+      for (const auto &[main_db_uuid, main_committed_txns] : main_num_txns_cache_) {
+        bool const has_main_db = std::ranges::any_of(instance_info.dbs_info, [&main_db_uuid](auto const &entry) {
+          auto const &[db_uuid, _] = entry;
+          return db_uuid == main_db_uuid;
+        });
+        if (!has_main_db) {
           spdlog::info(
-              "Instance {} won't be used in a failover because it's too much behind the current main. Main has "
-              "committed "
-              "{} txns, while instance {} has committed {} txns for the database {}",
+              "Instance {} won't be used in a failover because it is missing main database {} (main committed {} txns).",
               instance_name,
-              main_db_info->second,
-              instance_name,
-              num_committed_txns,
-              main_db_info->first);
+              main_db_uuid,
+              main_committed_txns);
           replica_behind = true;
           break;
+        }
+      }
+
+      if (!replica_behind) {
+        for (const auto &[db_uuid, num_committed_txns] : instance_info.dbs_info) {
+          auto const main_db_info = main_num_txns_cache_.find(db_uuid);
+          if (main_db_info == main_num_txns_cache_.end()) {
+            spdlog::trace("No entry for db: {}", db_uuid);
+            continue;
+          }
+
+          if (main_db_info->second > num_committed_txns && main_db_info->second - num_committed_txns > max_allowed_lag) {
+            spdlog::info(
+                "Instance {} won't be used in a failover because it's too much behind the current main. Main has "
+                "committed {} txns, while instance {} has committed {} txns for the database {}",
+                instance_name,
+                main_db_info->second,
+                instance_name,
+                num_committed_txns,
+                main_db_info->first);
+            replica_behind = true;
+            break;
+          }
         }
       }
 
@@ -1848,7 +1883,8 @@ auto CoordinatorInstance::ShowReplicationLagAsLeader() const -> ReplicationLagRe
   // leadership-change and (un)registration paths.
   auto lock = std::shared_lock{coord_instance_lock_};
 
-  for (auto const &repl_instance : repl_instances_) {
+  for (auto const &repl_instance_ptr : repl_instances_) {
+    auto const &repl_instance = *repl_instance_ptr;
     auto const &instance_name = repl_instance.InstanceName();
     if (!raft_state_->IsCurrentMain(instance_name)) {
       continue;
@@ -1896,7 +1932,7 @@ auto CoordinatorInstance::GetTelemetryJson() const -> nlohmann::json {
 }
 
 auto CoordinatorInstance::UpdateConfig(UpdateInstanceConfig const &config) -> UpdateConfigStatus {
-  if (auto const res = ForwardToLeader<UpdateConfigRpc, UpdateConfigStatus>(config); res.has_value()) {
+  if (auto const res = ForwardStatusToLeader<UpdateConfigRpc, UpdateConfigStatus>(config); res.has_value()) {
     return *res;
   }
 

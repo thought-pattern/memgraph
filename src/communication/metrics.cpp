@@ -32,10 +32,13 @@ nlohmann::json BoltMetrics::Info::ToJson() const {
 
   res[kName] = name;
   res[kSupportedBoltVersions] = nlohmann::json::array();
-  for (const auto &sbv : supported_bolt_v) {
-    res[kSupportedBoltVersions].push_back(sbv);
+  {
+    std::lock_guard lock{version_mtx_};
+    for (const auto &sbv : supported_bolt_v_) {
+      res[kSupportedBoltVersions].push_back(sbv);
+    }
+    res[kBoltVersion] = bolt_v_;
   }
-  res[kBoltVersion] = bolt_v;
   res[kConnectionTypes] = {{ConnectionTypeStr((ConnectionType)0), connection_types[0].load()},
                            {ConnectionTypeStr((ConnectionType)1), connection_types[1].load()}};
   res[kSessions] = sessions.load();
@@ -48,6 +51,10 @@ nlohmann::json BoltMetrics::ToJson() {
   auto res = nlohmann::json::array();
   for (const auto &[_, client_info] : info) {
     res.push_back(client_info.ToJson());
+  }
+  if (aggregated_other_.sessions.load() > 0 || aggregated_other_.queries.load() > 0 ||
+      aggregated_other_.ActiveSessions() > 0) {
+    res.push_back(aggregated_other_.ToJson());
   }
   return res;
 }

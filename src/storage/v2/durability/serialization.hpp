@@ -62,8 +62,11 @@ class Encoder final : public BaseEncoder {
   std::expected<void, utils::FileWriteError> Initialize(const std::filesystem::path &path);
   std::expected<void, utils::FileWriteError> Initialize(const std::filesystem::path &path, std::string_view magic,
                                                         uint64_t version);
+  std::expected<void, utils::FileWriteError> InitializeNew(const std::filesystem::path &path, std::string_view magic,
+                                                           uint64_t version);
 
   bool OpenExisting(const std::filesystem::path &path);
+  bool OpenForPatch(const std::filesystem::path &path);
 
   void Close();
   // Main write function, the only one that is allowed to write to the `file_`
@@ -209,8 +212,13 @@ class Decoder final : public BaseDecoder {
 
   auto CrcAccValue() -> uint32_t override { return file_.CrcValue(); }
 
+  void ClearTruncatedRead() noexcept { truncated_read_ = false; }
+  [[nodiscard]] bool TruncatedRead() const noexcept { return truncated_read_; }
+  void MarkTruncatedRead() noexcept { truncated_read_ = true; }
+
  private:
   utils::InputFile file_;
+  bool truncated_read_{false};
 };
 
 }  // namespace memgraph::storage::durability

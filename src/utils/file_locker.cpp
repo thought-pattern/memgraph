@@ -41,18 +41,22 @@ void FileRetainer::DeleteFile(const std::filesystem::path &path) {
     files_for_deletion_.WithLock([&](auto &files) { files.emplace(std::move(absolute_path)); });
     return;
   }
-  auto guard = std::unique_lock{main_lock_};
+  auto guard = std::unique_lock{main_lock_, std::try_to_lock};
+  if (!guard.owns_lock() || active_accessors_.load(std::memory_order_acquire)) {
+    files_for_deletion_.WithLock([&](auto &files) { files.emplace(std::move(absolute_path)); });
+    return;
+  }
   DeleteOrAddToQueue(absolute_path);
 }
 
-void FileRetainer::RenameFile(const std::filesystem::path &orig, const std::filesystem::path &dest) {
+bool FileRetainer::RenameFile(const std::filesystem::path &orig, const std::filesystem::path &dest) {
   if (!std::filesystem::exists(orig)) {
     spdlog::error("Origin file {} doesn't exist.", orig);
-    return;
+    return false;
   }
   if (std::filesystem::exists(dest)) {
     spdlog::error("Destination file {} exist.", dest);
-    return;
+    return false;
   }
 
   auto absolute_orig = std::filesystem::absolute(orig);
@@ -61,16 +65,17 @@ void FileRetainer::RenameFile(const std::filesystem::path &orig, const std::file
   if (active_accessors_.load(std::memory_order_acquire)) {
     utils::CopyFile(absolute_orig, absolute_dest);
     files_for_deletion_.WithLock([&](auto &files) { files.emplace(std::move(absolute_orig)); });
-    return;
+    return true;
   }
 
-  auto guard = std::unique_lock{main_lock_};
-  if (FileLocked(absolute_orig)) {
+  auto guard = std::unique_lock{main_lock_, std::try_to_lock};
+  if (!guard.owns_lock() || active_accessors_.load(std::memory_order_acquire) || FileLocked(absolute_orig)) {
     utils::CopyFile(absolute_orig, absolute_dest);
     files_for_deletion_.WithLock([&](auto &files) { files.emplace(std::move(absolute_orig)); });
   } else {
     utils::RenamePath(absolute_orig, absolute_dest);
   }
+  return true;
 }
 
 FileRetainer::FileLocker FileRetainer::AddLocker() {
@@ -172,9 +177,15 @@ FileRetainer::FileLockerAccessor FileRetainer::FileLocker::Access() {
 
 ////// FileLockerAccessor //////
 FileRetainer::FileLockerAccessor::FileLockerAccessor(FileRetainer *retainer, size_t locker_id)
-    : file_retainer_{retainer}, retainer_guard_{retainer->main_lock_}, locker_id_{locker_id} {
-  file_retainer_->active_accessors_.fetch_add(1, std::memory_order_acq_rel);
-}
+    : file_retainer_{retainer},
+      active_accessor_guard_{retainer},
+      retainer_guard_{retainer->main_lock_},
+      locker_id_{locker_id} {}
+
+FileRetainer::FileLockerAccessor::FileLockerAccessor(FileLockerAccessor &&other) noexcept = default;
+
+FileRetainer::FileLockerAccessor &FileRetainer::FileLockerAccessor::operator=(FileLockerAccessor &&other) noexcept =
+    default;
 
 FileRetainer::FileLockerAccessor::ret_type FileRetainer::FileLockerAccessor::IsPathLocked(
     const std::filesystem::path &path) {
@@ -200,8 +211,6 @@ FileRetainer::FileLockerAccessor::ret_type FileRetainer::FileLockerAccessor::Rem
   return file_retainer_->lockers_.WithLock([&](auto &lockers) { return lockers[locker_id_].RemovePath(path); });
 }
 
-FileRetainer::FileLockerAccessor::~FileLockerAccessor() {
-  file_retainer_->active_accessors_.fetch_sub(1, std::memory_order_acq_rel);
-}
+FileRetainer::FileLockerAccessor::~FileLockerAccessor() = default;
 
 }  // namespace memgraph::utils

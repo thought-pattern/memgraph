@@ -31,17 +31,18 @@ namespace memgraph::storage {
 namespace {
 inline void TryInsertEdgeTypeIndex(Vertex &from_vertex, EdgeTypeId edge_type, auto &&index_accessor,
                                    ProgressCallback const &on_progress) {
-  if (from_vertex.deleted()) {
+  if (from_vertex.deleted() || from_vertex.out_edges.empty()) {
+    if (on_progress) on_progress();
     return;
   }
 
   for (auto const &[type, to_vertex, edge_ref] : from_vertex.out_edges) {
+    if (on_progress) on_progress();
     if (type != edge_type) continue;
     if (to_vertex->deleted()) {
       continue;
     }
     index_accessor.insert({&from_vertex, to_vertex, edge_ref.ptr, 0});
-    if (on_progress) on_progress();
   }
 }
 
@@ -77,6 +78,7 @@ inline void TryInsertEdgeTypeIndex(Vertex &from_vertex, EdgeTypeId edge_type, au
     }
   }
   if (!exists || deleted || edges.empty()) {
+    if (on_progress) on_progress();
     return;
   }
 
@@ -160,7 +162,7 @@ auto InMemoryEdgeTypeIndex::PopulateIndex(EdgeTypeId edge_type, utils::SkipListD
   } catch (const PopulateCancel &) {
     (void)DropIndex(edge_type, updater);
     return std::unexpected{IndexPopulateError::Cancellation};
-  } catch (const utils::OutOfMemoryException &) {
+  } catch (...) {
     (void)DropIndex(edge_type, updater);
     throw;
   }
@@ -259,6 +261,8 @@ uint64_t InMemoryEdgeTypeIndex::RemoveObsoleteEntries(Storage *storage, uint64_t
   auto const edge_pin = static_cast<InMemoryStorage const *>(storage)->MakeEdgePin();
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
+  auto const duplicate_horizon =
+      static_cast<InMemoryStorage const *>(storage)->IndexDuplicateHorizon(oldest_active_start_timestamp);
   return SweepArmedIndexes(
       arming,
       token,
@@ -284,8 +288,7 @@ uint64_t InMemoryEdgeTypeIndex::RemoveObsoleteEntries(Storage *storage, uint64_t
           // entries for one edge is redundant only once the newer one is visible to every reader.
           const bool redundant_duplicate =
               has_next && it->from_vertex == next_it->from_vertex && it->to_vertex == next_it->to_vertex &&
-              it->edge == next_it->edge &&
-              (!preserve_recent_entries || next_it->timestamp < oldest_active_start_timestamp);
+              it->edge == next_it->edge && (!preserve_recent_entries || next_it->timestamp < duplicate_horizon);
           if (redundant_duplicate || !AnyVersionIsVisible(it->edge, oldest_active_start_timestamp)) {
             edges_acc.remove(*it);
           }
@@ -466,10 +469,8 @@ InMemoryEdgeTypeIndex::ChunkedIterable::ChunkedIterable(
 }
 
 void InMemoryEdgeTypeIndex::ChunkedIterable::Iterator::AdvanceUntilValid() {
-  // NOTE: Using the skiplist end here to not store the end iterator in the class
-  // The higher level != end will still be correct
   AdvanceUntilValid_(index_iterator_,
-                     utils::SkipListDb<InMemoryEdgeTypeIndex::Entry>::ChunkedIterator{},
+                     chunk_end_,
                      current_edge_,
                      current_edge_accessor_,
                      self_->transaction_,

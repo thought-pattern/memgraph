@@ -11,11 +11,15 @@
 
 #include "communication/client.hpp"
 
+#include <arpa/inet.h>
+#include <poll.h>
 #include <array>
+#include <cerrno>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #include <spdlog/spdlog.h>
 
 #include "buffer.hpp"
@@ -81,7 +85,7 @@ bool Client::Connect(const io::network::Endpoint &endpoint) {
   }};
 
   if (context_->use_ssl()) {
-    if (auto r = SetupSslObjects(); !r) {
+    if (auto r = SetupSslObjects(endpoint); !r) {
       spdlog::error("Couldn't set up client SSL objects: {}", r.error());
       return false;
     }
@@ -113,7 +117,7 @@ bool Client::Connect(const io::network::Endpoint &endpoint) {
   return true;
 }
 
-auto Client::SetupSslObjects() -> std::expected<void, std::string> {
+auto Client::SetupSslObjects(const io::network::Endpoint &endpoint) -> std::expected<void, std::string> {
   // Release SSL objects left over from any prior Connect call on this Client.
   ReleaseSslObjects();
 
@@ -127,6 +131,38 @@ auto Client::SetupSslObjects() -> std::expected<void, std::string> {
   ssl_ = SSL_new(ssl_context_->native_handle());
   if (ssl_ == nullptr) {
     return std::unexpected{"SSL_new returned nullptr"};
+  }
+
+  std::string host = endpoint.GetAddress();
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+    host = host.substr(1, host.size() - 2);
+  }
+  in_addr ipv4_addr{};
+  in6_addr ipv6_addr{};
+  const bool is_ip = !host.empty() && (::inet_pton(AF_INET, host.c_str(), &ipv4_addr) == 1 ||
+                                       ::inet_pton(AF_INET6, host.c_str(), &ipv6_addr) == 1);
+  if (!host.empty() && !is_ip) {
+    (void)SSL_set_tlsext_host_name(ssl_, host.c_str());
+  }
+
+  if ((SSL_get_verify_mode(ssl_) & SSL_VERIFY_PEER) != 0) {
+    if (host.empty()) {
+      return std::unexpected{"Peer certificate verification requires a non-empty target host or IP address"};
+    }
+    X509_VERIFY_PARAM *verify_param = SSL_get0_param(ssl_);
+    if (verify_param == nullptr) {
+      return std::unexpected{"SSL_get0_param returned nullptr"};
+    }
+    if (is_ip) {
+      if (X509_VERIFY_PARAM_set1_ip_asc(verify_param, host.c_str()) != 1) {
+        return std::unexpected{fmt::format("Failed to configure peer IP verification for '{}'", host)};
+      }
+    } else {
+      X509_VERIFY_PARAM_set_hostflags(verify_param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      if (SSL_set1_host(ssl_, host.c_str()) != 1) {
+        return std::unexpected{fmt::format("Failed to configure peer hostname verification for '{}'", host)};
+      }
+    }
   }
 
   // Create a new BIO (block I/O) SSL object so that OpenSSL can communicate
@@ -257,20 +293,19 @@ auto Client::Read(size_t len, bool exactly_len, const std::optional<int> timeout
         return std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now())
             .count();
       });
-      if (remaining_timeout_ms && *remaining_timeout_ms < 0) {
+      if (remaining_timeout_ms && *remaining_timeout_ms <= 0) {
         return std::unexpected{io::network::ClientCommunicationError::TIMEOUT_ERROR};
       }
       // Read raw data from the socket.
       if (remaining_timeout_ms && !socket_.WaitForReadyRead(remaining_timeout_ms)) {
         return std::unexpected{io::network::ClientCommunicationError::TIMEOUT_ERROR};
       }
-      auto got = socket_.Read(buff.data, len - received);
+      auto got = socket_.Read(buff.data, len - received, remaining_timeout_ms.has_value());
 
+      if (got < 0 && (errno == EINTR || (remaining_timeout_ms && (errno == EAGAIN || errno == EWOULDBLOCK)))) {
+        continue;
+      }
       if (got <= 0) {
-        // If `read` returns 0 the server has closed the connection. If `read`
-        // returns -1 all of the errors that could be found in `errno` are
-        // fatal errors (because we are using a blocking socket) so return a
-        // read failure.
         return std::unexpected{io::network::ClientCommunicationError::GENERIC_ERROR};
       }
 
@@ -278,7 +313,7 @@ auto Client::Read(size_t len, bool exactly_len, const std::optional<int> timeout
       buffer_.write_end()->Written(got);
       received += got;
     }
-  } while (received < len && exactly_len);
+  } while (received == 0 || (exactly_len && received < len));
   return {};
 }
 

@@ -34,13 +34,14 @@ inline std::vector<std::string> StringifySupportedVersions(uint8_t *data) {
   uint8_t n_chunks = 4;
   auto stringify_version = [](uint8_t major, uint8_t minor) { return fmt::format("{}.{}", major, minor); };
   for (uint8_t i = 0; i < n_chunks; ++i) {
-    const uint32_t full_version = *((uint32_t *)data);
+    uint32_t full_version = 0;
+    std::memcpy(&full_version, data, sizeof(full_version));
     if (full_version == 0) break;
     if (data[1] != 0) {  // Supports a range of versions
-      uint8_t range = data[range_i];
-      auto max_minor = data[minor_i];
-      for (uint8_t r = 0; r <= range; ++r) {
-        res.push_back(stringify_version(data[major_i], max_minor - r));
+      const uint8_t max_minor = data[minor_i];
+      const uint8_t range = std::min(data[range_i], max_minor);
+      for (uint16_t r = 0; r <= range; ++r) {
+        res.push_back(stringify_version(data[major_i], static_cast<uint8_t>(max_minor - r)));
       }
     } else {
       res.push_back(stringify_version(data[major_i], data[minor_i]));
@@ -70,8 +71,8 @@ inline bool CopyProtocolInformationIfSupportedWithOffset(auto data_position, uin
   if (bolt_range_version.major == 0 || bolt_range_version.minor == 0) return false;
   bolt_range_version.offset = std::min(bolt_range_version.offset, bolt_range_version.minor);
 
-  for (uint8_t i{0U}; i <= bolt_range_version.offset; i++) {
-    uint8_t current_minor = bolt_range_version.minor - i;
+  for (uint16_t i{0U}; i <= bolt_range_version.offset; ++i) {
+    const auto current_minor = static_cast<uint8_t>(bolt_range_version.minor - i);
     if (CopyProtocolInformationIfSupported(static_cast<uint16_t>((bolt_range_version.major << 8U) + current_minor),
                                            protocol)) {
       return true;
@@ -123,6 +124,7 @@ State StateHandshakeRun(TSession &session) {
   session.version_.major = protocol[3];
   if (!session.version_.major) {
     spdlog::trace("Server doesn't support any of the requested versions!");
+    static_cast<void>(session.output_stream_.Write(protocol));
     return State::Close;
   }
 

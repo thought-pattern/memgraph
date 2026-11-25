@@ -639,10 +639,11 @@ TEST_F(Rewrite, ThreePatternChain_IncompleteChainDoesNotFire) {
 
 TEST_F(Rewrite, MultiPattern_RequiresAllPatternsMatch) {
   // Multi-pattern rule requires ALL patterns to match for the rule to fire.
+  std::size_t callback_invocations = 0;
   auto rule = TestRewriteRule::Builder{"needs_both"}
                   .pattern(TestPattern::build(Op::F, {Var{kVarX}}))
                   .pattern(TestPattern::build(Op::F2, {Var{kVarX}, Var{kVarY}}))
-                  .apply([](TestRuleContext &, Match const &) {});
+                  .apply([&callback_invocations](TestRuleContext &, Match const &) { ++callback_invocations; });
   use_rules(rule);
 
   node(Op::F, leaf(Op::Var, 1));  // Only F exists, not F2
@@ -650,6 +651,7 @@ TEST_F(Rewrite, MultiPattern_RequiresAllPatternsMatch) {
 
   saturate();
 
+  EXPECT_EQ(callback_invocations, 0u);
   expect_rewrites(0);
 }
 
@@ -797,11 +799,11 @@ TEST_F(Rewrite, MakeExisting_ReturnsSameEClass) {
                            });
   use_rules(try_duplicate);
 
-  rewriter().iterate_once();
+  auto const rewrites = rewriter().iterate_once();
 
   EXPECT_EQ(make_count, 1);
   EXPECT_TRUE(reused_existing);
-  expect_rewrites(0);
+  EXPECT_EQ(rewrites, 0u);
 }
 
 TEST_F(Rewrite, MergeUnlocksNewMatches) {
@@ -863,8 +865,11 @@ TEST_F(Rewrite, NoMatches_Saturates) {
 TEST_F(Rewrite, ZeroPatternRule_NeverFires) {
   leaf(Op::Var, 1);
   rebuild_index();
-  use_rules(TestRewriteRule::Builder{"empty"}.apply([](TestRuleContext &, Match const &) {}));
-  EXPECT_EQ(rewriter().iterate_once(), 0);
+  std::size_t callback_invocations = 0;
+  use_rules(TestRewriteRule::Builder{"empty"}.apply(
+      [&callback_invocations](TestRuleContext &, Match const &) { ++callback_invocations; }));
+  EXPECT_EQ(rewriter().iterate_once(), 0u);
+  EXPECT_EQ(callback_invocations, 0u);
 }
 
 TEST_F(Rewrite, PerRuleStatistics_Tracked) {
@@ -941,31 +946,42 @@ TEST_F(Rewrite, VM_FallbackForMultiPatternRules) {
 }
 
 TEST_F(Rewrite, VM_VariablePatternRoot_FallbackToAllCandidates) {
-  // When pattern root is a variable (not a symbol), we can't use
-  // symbol index and must iterate all e-classes.
+  // When pattern root is a bare variable (not a symbol), the VM cannot use
+  // the symbol index and must iterate all e-classes via IterAllEClasses.
   auto var_root_rule = TestRewriteRule::Builder{"var_root"}
-                           .pattern(TestPattern::build(kVarRoot, Op::Var))
+                           .pattern(make_var_pattern(kVarRoot))
                            .apply([](TestRuleContext &ctx, Match const &match) {
-                             // Just mark this as matched by creating a node
                              ctx.Make<Op::F>(std::vector<EClassId>{match[kVarRoot]});
                            });
+  ASSERT_FALSE(var_root_rule.compiled().code().empty());
+  EXPECT_EQ(var_root_rule.compiled().code()[0].op, pattern::vm::VMOp::IterAllEClasses);
   use_rules(var_root_rule);
 
-  leaf(Op::Var, 1);
-  leaf(Op::Var, 2);
+  auto v = leaf(Op::Var, 1);
+  auto c = leaf(Op::Const, 2);
   rebuild_index();
 
   rewriter().iterate_once();
 
-  // Should have created F nodes for each Var
+  // Should have created F nodes wrapping both distinct symbol classes (Var and Const)
+  bool saw_var_child = false;
+  bool saw_const_child = false;
   std::size_t f_count = 0;
   for (auto const &[id, eclass] : egraph.canonical_classes()) {
     for (auto enode_id : eclass.nodes()) {
       auto const &enode = egraph.get_enode(enode_id);
-      if (enode.symbol() == Op::F) ++f_count;
+      if (enode.symbol() == Op::F) {
+        ++f_count;
+        ASSERT_EQ(enode.children().size(), 1u);
+        auto const child = egraph.find(enode.children()[0]);
+        if (child == egraph.find(v)) saw_var_child = true;
+        if (child == egraph.find(c)) saw_const_child = true;
+      }
     }
   }
-  EXPECT_EQ(f_count, 2);
+  EXPECT_EQ(f_count, 2u);
+  EXPECT_TRUE(saw_var_child);
+  EXPECT_TRUE(saw_const_child);
 }
 
 TEST_F(Rewrite, VM_ChainedRewrites_MultipleIterations) {

@@ -40,7 +40,7 @@ inline const auto kSmallestPoint2d = PropertyValue(Point2d{CoordinateReferenceSy
 inline const auto kSmallestPoint3d =
     PropertyValue(Point3d{CoordinateReferenceSystem::WGS84_3d, -180, -90, -std::numeric_limits<double>::infinity()});
 inline const auto kSmallestVectorIndexId = PropertyValue(
-    PropertyValue::VectorIndexIdData{.ids = utils::small_vector<uint64_t>{}, .vector = utils::small_vector<float>{}});
+    PropertyValue::VectorIndexIdData{.ids = utils::small_vector<uint64_t>{}, .vector = utils::small_vector<double>{}});
 /// A value nothing sorts below, used to start a scan that has no lower bound of
 /// its own.
 ///

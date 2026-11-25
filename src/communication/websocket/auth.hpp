@@ -11,14 +11,22 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 namespace memgraph::communication::websocket {
 
-// What a websocket session needs of whoever holds the users, stated so that the session does not
+// What a websocket session needs of whoever holds the accounts, stated so that the session does not
 // have to name the permission vocabulary it is asking about.
 class AuthenticationInterface {
  public:
+  class SessionAuth {
+   public:
+    virtual ~SessionAuth() = default;
+    virtual bool Authenticate(const std::string &username, const std::string &password) = 0;
+    virtual bool IsAuthorized() = 0;
+  };
+
   virtual bool Authenticate(const std::string &username, const std::string &password) const = 0;
 
   // Whether the authenticated party may use the websocket at all, which is the only question a
@@ -26,6 +34,34 @@ class AuthenticationInterface {
   virtual bool HasWebsocketPermission() const = 0;
 
   virtual bool AccessControlled() const = 0;
+
+  virtual std::unique_ptr<SessionAuth> CreateSessionAuth() const {
+    class DefaultSessionAuth final : public SessionAuth {
+     public:
+      explicit DefaultSessionAuth(const AuthenticationInterface &parent) : parent_(parent) {}
+
+      bool Authenticate(const std::string &username, const std::string &password) override {
+        signed_in_ = parent_.Authenticate(username, password);
+        return signed_in_;
+      }
+
+      bool IsAuthorized() override {
+        if (!signed_in_) {
+          return !parent_.AccessControlled();
+        }
+#ifdef MG_ENTERPRISE
+        return parent_.HasWebsocketPermission();
+#else
+        return true;
+#endif
+      }
+
+     private:
+      const AuthenticationInterface &parent_;
+      bool signed_in_{false};
+    };
+    return std::make_unique<DefaultSessionAuth>(*this);
+  }
 
   virtual ~AuthenticationInterface() = default;
 };

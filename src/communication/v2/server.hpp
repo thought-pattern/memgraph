@@ -199,10 +199,16 @@ inline void Server<TSession, TSessionContext>::OnAccept(boost::system::error_cod
     return OnAcceptError(ec);
   }
 
-  auto session = SessionHandler::Create(std::move(socket), session_context_, *server_context_, service_name_);
-  session->Start();
+  try {
+    auto session = SessionHandler::Create(std::move(socket), session_context_, *server_context_, service_name_);
+    session->Start();
+  } catch (const std::exception &e) {
+    spdlog::warn("{} failed to initialize accepted session: {}", service_name_, e.what());
+  }
 
-  DoAccept();
+  if (IsRunning() && acceptor_.is_open()) {
+    DoAccept();
+  }
 }
 
 template <typename TSession, typename TSessionContext>

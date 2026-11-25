@@ -46,9 +46,9 @@ double Haversine(Point3d const &point1, Point3d const &point2) {
   auto boost_p2 = pt{point2.x(), point2.y(), middle};
   auto distance_spherical = bg::distance(boost_p1, boost_p2);
 
-  // use Pythagoras' theorem, combining height difference
+  // use Pythagoras' theorem, combining height difference without intermediate squaring overflow
   auto height_diff = h1 - h2;
-  return std::sqrt(height_diff * height_diff + distance_spherical * distance_spherical);
+  return std::hypot(height_diff, distance_spherical);
 }
 
 double Distance(Point2d const &point1, Point2d const &point2) {

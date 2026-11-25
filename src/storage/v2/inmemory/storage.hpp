@@ -16,10 +16,12 @@
 #include <cstdint>
 #include <deque>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <string_view>
 #include <utility>
 #include "memory/db_arena_fwd.hpp"
@@ -173,6 +175,31 @@ class InMemoryStorage final : public Storage {
     EdgeTypeId edge_type;
   };
 
+ private:
+  struct SchemaUpdateData {
+    LocalSchemaTracking schema_diff;
+    SchemaInfoPostProcess post_process;
+    // Exclusive bound for deferred delta reconstruction (Transaction::SchemaReconstructionBound), captured at
+    // commit so ProcessTransaction rebuilds the pre-state the committing transaction saw.
+    uint64_t snapshot_bound;
+    // The local mint, which is what identifies this transaction's own deltas. Not the durable
+    // timestamp, for the reason GetState gives.
+    uint64_t local_commit_ts;
+    bool property_on_edges;
+
+    SchemaUpdateData(LocalSchemaTracking diff, SchemaInfoPostProcess post_proc, uint64_t bound, uint64_t local_commit,
+                     bool prop_on_edges)
+        : schema_diff(std::move(diff)),
+          post_process(std::move(post_proc)),
+          snapshot_bound(bound),
+          local_commit_ts(local_commit),
+          property_on_edges(prop_on_edges) {}
+  };
+
+  using PendingSchemaUpdatesMap = std::map<uint64_t, SchemaUpdateData, std::less<uint64_t>,
+                                           memory::DbAwareAllocator<std::pair<const uint64_t, SchemaUpdateData>>>;
+
+ public:
   class InMemoryAccessor : public Storage::Accessor {
    private:
     friend class InMemoryStorage;
@@ -189,6 +216,9 @@ class InMemoryStorage final : public Storage {
 
     // Hands this transaction's noted arming to the next collection cycle; see the definition.
     void PublishIndexArming();
+
+    [[nodiscard]] PendingSchemaUpdatesMap::node_type PrepareSchemaUpdateNode(uint64_t durability_commit_timestamp);
+    void QueueSchemaUpdate(PendingSchemaUpdatesMap::node_type &&prepared_node);
 
     std::optional<EdgeAccessor> CreateEdgeInternal(Vertex *from_vertex, Vertex *to_vertex, EdgeTypeId edge_type,
                                                    DeltaChainState from_state, DeltaChainState to_state,
@@ -621,7 +651,7 @@ class InMemoryStorage final : public Storage {
 
     utils::small_vector<uint64_t> GetVectorIndexIdsForVertex(Vertex *vertex, PropertyId property) override;
 
-    utils::small_vector<float> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const override;
+    utils::small_vector<double> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const override;
     std::expected<void, StorageIndexDefinitionError> DropVectorIndex(std::string_view index_name,
                                                                      ProgressCallback const &on_progress) override;
 
@@ -726,32 +756,49 @@ class InMemoryStorage final : public Storage {
       DMG_ASSERT(type() == UNIQUE, "TTL operations require unique access to the storage!");
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
+      auto const ttl_path = std::vector<storage::PropertyPath>{{ttl_property}};
 
       auto &ttl = storage_->ttl_;
 
       // If TTL is not enabled, create required indices and enable TTL
       if (!ttl.Enabled()) {
         if (repl_args.is_main) {
-          // Only if MAIN, do we proactivly make indexes
-          // REPLICA will recieve deltas from MAIN that will create the indexes
+          bool const label_index_existed =
+              storage_->indices_.label_property_index_->GetActiveIndices()->IndexExists(ttl_label, ttl_path);
+          bool const edge_index_existed =
+              !ttl_info.should_run_edge_ttl ||
+              storage_->indices_.edge_property_index_->GetActiveIndices()->IndexExists(ttl_property);
           if (GetPinnedStorageMode() == StorageMode::IN_MEMORY_TRANSACTIONAL) {
-            // Use non-blocking async indexer
             auto *mem_storage = static_cast<InMemoryStorage *>(storage_);
-            // Async index creation -> happens in separate transaction
-            mem_storage->async_indexer_.Enqueue(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-            if (ttl_info.should_run_edge_ttl) {
+            if (!label_index_existed) {
+              mem_storage->async_indexer_.Enqueue(ttl_label, ttl_path);
+            }
+            if (ttl_info.should_run_edge_ttl && !edge_index_existed) {
               mem_storage->async_indexer_.Enqueue(ttl_property);
             }
           } else {
-            // Create index with unique access in same transaction
-            (void)CreateIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-            // Create edge index if needed based on TTL configuration
-            if (ttl_info.should_run_edge_ttl) {
+            if (!label_index_existed) {
+              (void)CreateIndex(ttl_label, ttl_path);
+            }
+            if (ttl_info.should_run_edge_ttl && !edge_index_existed) {
               (void)CreateGlobalEdgeIndex(ttl_property);
             }
           }
+          ttl.SetOwnsLabelPropertyIndex(!label_index_existed);
+          ttl.SetOwnsEdgePropertyIndex(ttl_info.should_run_edge_ttl && !edge_index_existed);
         }
         ttl.Enable();
+      } else if (repl_args.is_main && ttl_info.should_run_edge_ttl && !ttl.Config().should_run_edge_ttl) {
+        bool const edge_index_existed =
+            storage_->indices_.edge_property_index_->GetActiveIndices()->IndexExists(ttl_property);
+        if (!edge_index_existed) {
+          if (GetPinnedStorageMode() == StorageMode::IN_MEMORY_TRANSACTIONAL) {
+            static_cast<InMemoryStorage *>(storage_)->async_indexer_.Enqueue(ttl_property);
+          } else {
+            (void)CreateGlobalEdgeIndex(ttl_property);
+          }
+          ttl.SetOwnsEdgePropertyIndex(true);
+        }
       }
 
       // Configure TTL
@@ -770,12 +817,11 @@ class InMemoryStorage final : public Storage {
       auto ttl_property = NameToProperty("ttl");
       auto &ttl = storage_->ttl_;
       if (repl_args.is_main) {
-        // Only if MAIN, do we proactivly drop indexes
-        // REPLICA will recieve deltas from MAIN that will drop the indexes
-        // Drop indices (silently fail if index already dropped )
-        (void)DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-        // Check if edge TTL was enabled and drop edge index if needed (silently fail if index already dropped)
-        if (ttl.Config().should_run_edge_ttl) {
+        // Only drop indexes that TTL created when enabled, leaving pre-existing indexes intact.
+        if (ttl.OwnsLabelPropertyIndex()) {
+          (void)DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
+        }
+        if (ttl.Config().should_run_edge_ttl && ttl.OwnsEdgePropertyIndex()) {
           (void)DropGlobalEdgeIndex(ttl_property);
         }
       }
@@ -819,6 +865,7 @@ class InMemoryStorage final : public Storage {
     // Bookkeeping
     durability::WalTxnDataPos wal_txn_positions_;
     bool needs_wal_update_{false};
+    bool pinned_periodic_original_start_ts_{false};
   };
 
   using Storage::Access;
@@ -865,22 +912,11 @@ class InMemoryStorage final : public Storage {
 
   std::optional<SnapshotFileInfo> ShowNextSnapshot();
 
-  SnapshotProgressView GetSnapshotProgress() const {
-    return {.phase = snapshot_progress_.phase.load(std::memory_order_acquire),
-            .items_done = snapshot_progress_.items_done.load(std::memory_order_acquire),
-            .items_total = snapshot_progress_.items_total.load(std::memory_order_acquire),
-            .start_time_us = snapshot_progress_.start_time_us.load(std::memory_order_acquire),
-            .start_steady_ms = snapshot_progress_.start_steady_ms.load(std::memory_order_acquire)};
-  }
+  SnapshotProgressView GetSnapshotProgress() const { return snapshot_progress_.GetView(); }
 
-  // Coherent read: nullopt unless a snapshot is running. Checks the flag after
-  // reading the fields so a snapshot ending mid-read reads as not-running, never
-  // a torn row.
-  std::optional<SnapshotProgressView> TryGetSnapshotProgress() const {
-    SnapshotProgressView progress = GetSnapshotProgress();
-    if (!snapshot_running_.load(std::memory_order_acquire)) return std::nullopt;
-    return progress;
-  }
+  // Coherent read: nullopt unless a snapshot is running. Sequence-synchronized across
+  // start, phase transitions, and reset so readers never observe fields from mixed phases or runs.
+  std::optional<SnapshotProgressView> TryGetSnapshotProgress() const { return snapshot_progress_.TryGetView(); }
 
   std::optional<GcRunInfoView> TryGetGcRunInfo() const { return gc_progress_.TryGetRunInfo(); }
 
@@ -911,6 +947,8 @@ class InMemoryStorage final : public Storage {
 
   void UpdateLabelCount(LabelId label, int64_t change) override;
 
+  void RebuildLabelCounts();
+
   // Wipe all storage state. Caller must hold main_lock_ exclusively.
   // Tearing down a large vertex/edge set takes minutes and reports nothing on its own, so `on_progress` lets a caller
   // that owes liveness to somebody else (an RPC handler under a peer timeout) observe that this is still advancing.
@@ -933,6 +971,27 @@ class InMemoryStorage final : public Storage {
   [[nodiscard]] std::optional<std::unique_lock<std::mutex>> LockCommitMutexIfNarrowing() const {
     if (!config_.experimental_commit_lock_narrowing) return std::nullopt;
     return std::unique_lock{commit_mutex_};
+  }
+
+  [[nodiscard]] uint64_t IndexDuplicateHorizon(uint64_t visibility_horizon) const noexcept {
+    return periodic_original_start_timestamps_.WithLock([visibility_horizon](auto const &ts_set) noexcept {
+      return ts_set.empty() ? visibility_horizon : std::min(visibility_horizon, *ts_set.begin());
+    });
+  }
+
+  void RegisterPeriodicOriginalStartTimestamp(uint64_t ts) {
+    periodic_original_start_timestamps_.WithLock([ts](auto &ts_set) { ts_set.insert(ts); });
+  }
+
+  void UnregisterPeriodicOriginalStartTimestamp(uint64_t ts) noexcept {
+    periodic_original_start_timestamps_.WithLock([ts](auto &ts_set) noexcept {
+      auto const it = ts_set.find(ts);
+      if (it != ts_set.end()) ts_set.erase(it);
+    });
+  }
+
+  [[nodiscard]] uint64_t MinWalOnlyRecoveryTimestamp() const noexcept {
+    return min_wal_only_recovery_timestamp_.load(std::memory_order_acquire);
   }
 
  private:
@@ -1207,33 +1266,14 @@ class InMemoryStorage final : public Storage {
                               utils::SpinLock>
       label_counts_;
 
-  struct SchemaUpdateData {
-    LocalSchemaTracking schema_diff;
-    SchemaInfoPostProcess post_process;
-    // Exclusive bound for deferred delta reconstruction (Transaction::SchemaReconstructionBound), captured at
-    // commit so ProcessTransaction rebuilds the pre-state the committing transaction saw.
-    uint64_t snapshot_bound;
-    // The local mint, which is what identifies this transaction's own deltas. Not the durable
-    // timestamp, for the reason GetState gives.
-    uint64_t local_commit_ts;
-    bool property_on_edges;
-
-    SchemaUpdateData(LocalSchemaTracking diff, SchemaInfoPostProcess post_proc, uint64_t bound, uint64_t local_commit,
-                     bool prop_on_edges)
-        : schema_diff(std::move(diff)),
-          post_process(std::move(post_proc)),
-          snapshot_bound(bound),
-          local_commit_ts(local_commit),
-          property_on_edges(prop_on_edges) {}
-  };
-
   // Keyed on the durable commit timestamp, which orders the queue on a replica as well, since a
   // replica applies transactions in its main's order.
-  std::map<uint64_t, SchemaUpdateData, std::less<uint64_t>,
-           memory::DbAwareAllocator<std::pair<const uint64_t, SchemaUpdateData>>>
-      pending_schema_updates_;
+  PendingSchemaUpdatesMap pending_schema_updates_;
   std::mutex schema_queue_mutex_;
+  std::mutex schema_process_mutex_;
   uint64_t last_processed_commit_ts_{0};
+  std::atomic<uint64_t> min_wal_only_recovery_timestamp_{0};
+  mutable utils::Synchronized<std::multiset<uint64_t>, utils::SpinLock> periodic_original_start_timestamps_{};
 
   void ProcessPendingSchemaUpdates(uint64_t up_to_commit_ts);
 };

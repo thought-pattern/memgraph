@@ -76,6 +76,8 @@ class Repository {
 
   static std::string ProfileKey(std::string_view profile_name) { return Key(kProfilePrefix, profile_name); }
 
+  static std::string PendingDbCleanupKey(std::string_view db_name) { return Key(kPendingDbCleanupPrefix, db_name); }
+
   /// Entity scans. Fn receives (name, value): the name has the prefix already stripped, so no caller needs to
   /// know the key format to take one apart.
   template <typename Fn>
@@ -103,6 +105,11 @@ class Repository {
     ForEachEntity(kProfilePrefix, std::forward<Fn>(fn));
   }
 
+  template <typename Fn>
+  void ForEachPendingDbCleanup(Fn &&fn) const {
+    ForEachEntity(kPendingDbCleanupPrefix, std::forward<Fn>(fn));
+  }
+
   bool HasAnyUser() const { return HasAny(kUserPrefix); }
 
   /// True when writes are buffering in a transaction's overlay rather than landing on disk.
@@ -114,6 +121,7 @@ class Repository {
   static constexpr std::string_view kRoleLinkPrefix = "link:";
   static constexpr std::string_view kMtLinkPrefix = "mtlink:";
   static constexpr std::string_view kProfilePrefix = "user_profile:";
+  static constexpr std::string_view kPendingDbCleanupPrefix = "pending_db_cleanup:";
 
   static std::string Key(std::string_view prefix, std::string_view name) { return std::string{prefix}.append(name); }
 

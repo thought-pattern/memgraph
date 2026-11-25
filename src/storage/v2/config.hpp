@@ -156,6 +156,8 @@ struct Config {
 
   bool register_metrics{true};
 
+  std::optional<int64_t> tenant_memory_limit{};
+
   friend bool operator==(const Config &lrh, const Config &rhs) = default;
 };
 

@@ -50,7 +50,11 @@ struct SnapshotDurabilityInfo {
   std::string uuid;
   uint64_t durable_timestamp;
 
-  auto operator<=>(const SnapshotDurabilityInfo &) const = default;
+  friend bool operator==(const SnapshotDurabilityInfo &, const SnapshotDurabilityInfo &) = default;
+  friend auto operator<=>(const SnapshotDurabilityInfo &lhs, const SnapshotDurabilityInfo &rhs) {
+    return std::tie(lhs.durable_timestamp, lhs.path, lhs.uuid) <=>
+           std::tie(rhs.durable_timestamp, rhs.path, rhs.uuid);
+  }
 };
 
 /// Get list of snapshot files with their UUID.

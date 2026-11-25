@@ -32,8 +32,8 @@ class DataQueue {
   bool done_{false};
   std::size_t maxSize_;
 
-  bool full() const {
-    DMG_ASSERT(!mutex_.try_lock(), "Lock should be taken before full() is invoked");
+  bool full(const std::unique_lock<std::mutex> &lock) const {
+    DMG_ASSERT(lock.owns_lock() && lock.mutex() == &mutex_, "Lock should be taken before full() is invoked");
 
     if (maxSize_ == 0) {
       return false;
@@ -63,7 +63,7 @@ class DataQueue {
   bool push(U &&item) {
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      writerCv_.wait(lock, [&] { return !full() || done_; });
+      writerCv_.wait(lock, [&] { return !full(lock) || done_; });
 
       if (done_) {
         return false;

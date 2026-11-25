@@ -128,9 +128,9 @@ bool HoldsANaN(PropertyValue const &value) {
       auto const &point = value.ValuePoint3d();
       return std::isnan(point.x()) || std::isnan(point.y()) || std::isnan(point.z());
     }
-    // A vector holds its coordinates as floats, which carry a NaN of their own.
+    // A vector holds its coordinates as doubles, which carry a NaN of their own.
     case VectorIndexId:
-      return std::ranges::any_of(value.ValueVectorIndexList(), [](float f) { return std::isnan(f); });
+      return std::ranges::any_of(value.ValueVectorIndexList(), [](double d) { return std::isnan(d); });
     // No other type has a number in it to be one.
     case Null:
     case Bool:
