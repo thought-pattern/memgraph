@@ -146,6 +146,10 @@ uint64_t CommitLog::OldestActive() {
 }
 
 bool CommitLog::IsFinished(uint64_t const id) const {
+  auto guard = std::lock_guard{lock_};
+  if (id < oldest_active_ || id < head_start_) {
+    return true;
+  }
   if (!head_) {
     return false;
   }
@@ -164,7 +168,7 @@ bool CommitLog::IsFinished(uint64_t const id) const {
   auto const field_idx = (id % kIdsInBlock) / kIdsInField;
   auto const bit_idx = id % kIdsInField;
 
-  return current->field[field_idx] & (1ULL << bit_idx);
+  return (current->field[field_idx] & (1ULL << bit_idx)) != 0;
 }
 
 void CommitLog::UpdateOldestActive() {

@@ -86,7 +86,7 @@ class CommitLog final {
   uint64_t head_start_{0};
   uint64_t next_start_{0};
   uint64_t oldest_active_{0};
-  utils::SpinLock lock_;
+  mutable utils::SpinLock lock_;
   utils::Allocator<Block> allocator_;
 };
 

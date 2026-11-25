@@ -12,11 +12,13 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <string_view>
 
 #include "utils/logging.hpp"
 #include "utils/skip_list.hpp"
+#include "utils/spin_lock.hpp"
 
 namespace memgraph::storage {
 
@@ -60,31 +62,35 @@ class NameIdMapper {
 
   /// @throw std::bad_alloc if unable to insert a new mapping
   virtual uint64_t NameToId(const std::string_view name) {
-    auto name_to_id_acc = name_to_id_.access();
-    auto found = name_to_id_acc.find(name);
-    uint64_t id;
-    if (found == name_to_id_acc.end()) {
-      uint64_t new_id = counter_.fetch_add(1, std::memory_order_acq_rel);
-      // Try to insert the mapping with the `new_id`, but use the id that is in
-      // the object itself. The object that cointains the mapping is designed to
-      // be a map, so that if the inserted name already exists `insert` will
-      // return an iterator to the existing item. This prevents assignment of
-      // two IDs to the same name when the mapping is being inserted
-      // concurrently from two threads. One ID is wasted in that case, though.
-      id = name_to_id_acc.insert({std::string(name), new_id}).first->id;
-    } else {
-      id = found->id;
+    {
+      auto name_to_id_acc = name_to_id_.access();
+      auto found = name_to_id_acc.find(name);
+      if (found != name_to_id_acc.end()) {
+        return found->id;
+      }
     }
-    auto id_to_name_acc = id_to_name_.access();
-    // We have to try to insert the ID to name mapping even if we are not the
-    // one who assigned the ID because we have to make sure that after this
-    // method returns that both mappings exist.
-    if (!id_to_name_acc.contains(id)) {
-      // We first try to find the `id` in the map to avoid making an unnecessary
-      // temporary memory allocation when the object already exists.
-      id_to_name_acc.insert({id, std::string(name)});
+
+    std::lock_guard const guard{write_lock_};
+    {
+      auto name_to_id_acc = name_to_id_.access();
+      auto found = name_to_id_acc.find(name);
+      if (found != name_to_id_acc.end()) {
+        return found->id;
+      }
     }
-    return id;
+
+    std::string rev_name{name};
+    std::string fwd_name{name};
+    const uint64_t new_id = counter_.load(std::memory_order_relaxed);
+    id_to_name_.access().insert({new_id, std::move(rev_name)});
+    try {
+      name_to_id_.access().insert({std::move(fwd_name), new_id});
+    } catch (...) {
+      id_to_name_.access().remove(new_id);
+      throw;
+    }
+    counter_.store(new_id + 1, std::memory_order_release);
+    return new_id;
   }
 
   /// This method unlike NameToId does not insert the new property id if not found
@@ -118,6 +124,7 @@ class NameIdMapper {
   // back to empty (e.g. bringing up a broken database after recovery failure).
   // Must not be called while other threads hold references returned by IdToName.
   virtual void Clear() {
+    std::lock_guard const guard{write_lock_};
     name_to_id_.clear();
     id_to_name_.clear();
     counter_.store(0, std::memory_order_release);
@@ -133,6 +140,7 @@ class NameIdMapper {
     return result->name;
   }
 
+  mutable utils::SpinLock write_lock_{};
   std::atomic<uint64_t> counter_{0};
   utils::SkipListDb<MapNameToId> name_to_id_;
   utils::SkipListDb<MapIdToName> id_to_name_;

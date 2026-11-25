@@ -184,8 +184,9 @@ class DescriptionStore {
     std::vector<DescriptionEntry> result;
     const auto size = label_descriptions_.size() + edge_type_descriptions_.size() +
                       label_property_descriptions_.size() + edge_type_property_descriptions_.size() +
-                      property_descriptions_.size() + edge_type_pattern_descriptions_.size() +
-                      edge_type_pattern_property_descriptions_.size() + (database_description_ ? 1 : 0);
+                      property_descriptions_.size() + property_value_descriptions_.size() +
+                      edge_type_pattern_descriptions_.size() + edge_type_pattern_property_descriptions_.size() +
+                      (database_description_ ? 1 : 0);
     result.reserve(size);
 
     for (auto const &[ids, desc] : label_descriptions_) {
@@ -262,6 +263,8 @@ class DescriptionStore {
   static LabelIds SortedIds(std::span<LabelId const> labels) {
     LabelIds ids(labels.begin(), labels.end());
     std::ranges::sort(ids);
+    auto const dup = std::ranges::unique(ids);
+    ids.erase(dup.begin(), dup.end());
     return ids;
   }
 

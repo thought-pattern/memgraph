@@ -34,15 +34,16 @@ auto AdvanceToVisibleVertex(utils::SkipListDb<Vertex>::Iterator it, utils::SkipL
 
 AllVerticesIterable::Iterator::Iterator(AllVerticesIterable *self, utils::SkipListDb<Vertex>::Iterator it)
     : self_(self),
-      it_(AdvanceToVisibleVertex(it, self->vertices_accessor_.end(), &self->vertex_, self->storage_, self->transaction_,
+      it_(AdvanceToVisibleVertex(it, self->vertices_accessor_.end(), &vertex_, self->storage_, self->transaction_,
                                  self->view_, self->max_gid_)) {}
 
-VertexAccessor const &AllVerticesIterable::Iterator::operator*() const { return *self_->vertex_; }
+VertexAccessor const &AllVerticesIterable::Iterator::operator*() const { return *vertex_; }
 
 AllVerticesIterable::Iterator &AllVerticesIterable::Iterator::operator++() {
+  vertex_.reset();
   it_ = AdvanceToVisibleVertex(std::next(it_),
                                self_->vertices_accessor_.end(),
-                               &self_->vertex_,
+                               &vertex_,
                                self_->storage_,
                                self_->transaction_,
                                self_->view_,

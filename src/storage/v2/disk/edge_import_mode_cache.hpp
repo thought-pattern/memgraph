@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "memory/db_arena_fwd.hpp"
 #include "storage/v2/disk/label_index.hpp"
 #include "storage/v2/disk/label_property_index.hpp"
@@ -61,9 +63,12 @@ class EdgeImportModeCache final {
 
   void SetScannedAllVertices();
 
+  std::unique_lock<std::mutex> Lock() const { return std::unique_lock<std::mutex>{mutex_}; }
+
   utils::Synchronized<std::list<Transaction>, utils::SpinLock> &GetCommittedTransactions();
 
  private:
+  mutable std::mutex mutex_;
   utils::SkipListDb<Vertex> vertices_;
   utils::SkipListDb<Edge> edges_;
   Indices in_memory_indices_;

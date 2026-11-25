@@ -16,6 +16,7 @@
 namespace memgraph::storage {
 
 void GcProgress::Start(bool is_periodic, bool is_exclusive) {
+  const uint64_t run_id = next_run_id.fetch_add(1, std::memory_order_relaxed) + 1;
   start_steady_ms.store(
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
           .count(),
@@ -27,14 +28,16 @@ void GcProgress::Start(bool is_periodic, bool is_exclusive) {
   periodic.store(is_periodic, std::memory_order_release);
   exclusive_lock.store(is_exclusive, std::memory_order_release);
   phase.store(GcPhase::UNLINK, std::memory_order_release);
+  active_run_id.store(run_id, std::memory_order_release);
   running.store(true, std::memory_order_release);
 }
 
 void GcProgress::SetPhase(GcPhase p) { phase.store(p, std::memory_order_release); }
 
 void GcProgress::Reset() {
-  // Clear `running` first so readers stop trusting the fields before they are wiped.
+  // Clear `running` and `active_run_id` first so readers stop trusting the fields before they are wiped.
   running.store(false, std::memory_order_release);
+  active_run_id.store(0, std::memory_order_release);
   phase.store(GcPhase::IDLE, std::memory_order_release);
   exclusive_lock.store(false, std::memory_order_release);
   periodic.store(false, std::memory_order_release);
@@ -43,14 +46,20 @@ void GcProgress::Reset() {
 }
 
 std::optional<GcRunInfoView> GcProgress::TryGetRunInfo() const {
+  if (!running.load(std::memory_order_acquire)) return std::nullopt;
+  const uint64_t run_before = active_run_id.load(std::memory_order_acquire);
+  if (run_before == 0) return std::nullopt;
+
   GcRunInfoView info{.phase = phase.load(std::memory_order_acquire),
                      .exclusive_lock = exclusive_lock.load(std::memory_order_acquire),
                      .periodic = periodic.load(std::memory_order_acquire),
                      .start_time_us = start_time_us.load(std::memory_order_acquire),
                      .start_steady_ms = start_steady_ms.load(std::memory_order_acquire)};
-  // Check `running` after reading the fields so a run ending mid-read reads as
-  // not-running, never a torn row.
-  if (!running.load(std::memory_order_acquire)) return std::nullopt;
+  // Verify the same run remained active throughout the read so neither Start() nor Reset()
+  // can expose idle, zero-timed, or mixed-run fields.
+  if (!running.load(std::memory_order_acquire) || active_run_id.load(std::memory_order_acquire) != run_before) {
+    return std::nullopt;
+  }
   return info;
 }
 

@@ -498,7 +498,8 @@ class PropertyValueImpl {
 
   // move constructor
   PropertyValueImpl(PropertyValueImpl &&other) noexcept;
-  PropertyValueImpl(PropertyValueImpl &&other, allocator_type const &alloc) noexcept;
+  PropertyValueImpl(PropertyValueImpl &&other,
+                    allocator_type const &alloc) noexcept(alloc_trait::is_always_equal::value);
 
   // copy assignment
   /// @throw std::bad_alloc
@@ -572,10 +573,15 @@ class PropertyValueImpl {
                                &vector_index_id_v.val_.ids,
                                other.vector_index_id_v.val_.ids.begin(),
                                other.vector_index_id_v.val_.ids.end());
-        alloc_trait::construct(alloc_,
-                               &vector_index_id_v.val_.vector,
-                               other.vector_index_id_v.val_.vector.begin(),
-                               other.vector_index_id_v.val_.vector.end());
+        try {
+          alloc_trait::construct(alloc_,
+                                 &vector_index_id_v.val_.vector,
+                                 other.vector_index_id_v.val_.vector.begin(),
+                                 other.vector_index_id_v.val_.vector.end());
+        } catch (...) {
+          alloc_trait::destroy(alloc_, &vector_index_id_v.val_.ids);
+          throw;
+        }
         return;
     }
   }
@@ -1100,7 +1106,9 @@ inline std::weak_ordering CompareLists(const PropertyValueImpl<Alloc, KeyType, V
     // unordered, and it is placed as a NaN beside a list is.
     auto const cmp_result = CompareNumericValues(*val1, *val2);
     if (cmp_result == std::partial_ordering::unordered) {
-      return CompareDoublesNaNLast(AsDouble(*val1), AsDouble(*val2));
+      auto const nan_cmp = CompareDoublesNaNLast(AsDouble(*val1), AsDouble(*val2));
+      if (nan_cmp != std::weak_ordering::equivalent) return nan_cmp;
+      continue;
     }
     if (cmp_result == std::partial_ordering::less) return std::weak_ordering::less;
     if (cmp_result == std::partial_ordering::greater) return std::weak_ordering::greater;
@@ -1320,7 +1328,12 @@ inline PropertyValueImpl<Alloc, KeyType, VectorIndexIdType>::PropertyValueImpl(c
       return;
     case Type::VectorIndexId:
       alloc_trait::construct(alloc_, &vector_index_id_v.val_.ids, other.vector_index_id_v.val_.ids);
-      alloc_trait::construct(alloc_, &vector_index_id_v.val_.vector, other.vector_index_id_v.val_.vector);
+      try {
+        alloc_trait::construct(alloc_, &vector_index_id_v.val_.vector, other.vector_index_id_v.val_.vector);
+      } catch (...) {
+        alloc_trait::destroy(alloc_, &vector_index_id_v.val_.ids);
+        throw;
+      }
       return;
   }
 }
@@ -1330,8 +1343,8 @@ inline PropertyValueImpl<Alloc, KeyType, VectorIndexIdType>::PropertyValueImpl(P
     : PropertyValueImpl{std::move(other), other.alloc_} {}
 
 template <typename Alloc, typename KeyType, typename VectorIndexIdType>
-inline PropertyValueImpl<Alloc, KeyType, VectorIndexIdType>::PropertyValueImpl(PropertyValueImpl &&other,
-                                                                               allocator_type const &alloc) noexcept
+inline PropertyValueImpl<Alloc, KeyType, VectorIndexIdType>::PropertyValueImpl(
+    PropertyValueImpl &&other, allocator_type const &alloc) noexcept(alloc_trait::is_always_equal::value)
     : alloc_{alloc}, type_(other.type_) {
   switch (type_) {
     case Type::Null:
@@ -1380,7 +1393,12 @@ inline PropertyValueImpl<Alloc, KeyType, VectorIndexIdType>::PropertyValueImpl(P
       break;
     case Type::VectorIndexId:
       alloc_trait::construct(alloc_, &vector_index_id_v.val_.ids, std::move(other.vector_index_id_v.val_.ids));
-      alloc_trait::construct(alloc_, &vector_index_id_v.val_.vector, std::move(other.vector_index_id_v.val_.vector));
+      try {
+        alloc_trait::construct(alloc_, &vector_index_id_v.val_.vector, std::move(other.vector_index_id_v.val_.vector));
+      } catch (...) {
+        alloc_trait::destroy(alloc_, &vector_index_id_v.val_.ids);
+        throw;
+      }
       break;
   }
 }

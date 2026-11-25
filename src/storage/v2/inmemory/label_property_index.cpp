@@ -588,7 +588,7 @@ bool RegisterIntoIndicesMap(IndicesMap &indices_map, AllIndicesVec &all_indexes,
   all_indexes = std::make_shared<Vec>(std::move(new_all_indexes));
   using EntryDetailT = typename ReverseLookup::mapped_type::mapped_type;
   auto const de = EntryDetailT{&it3->first, &it3->second};
-  utils::small_vector<PropertyId, 4> seen_roots;
+  utils::small_vector<PropertyId> seen_roots;
   for (auto &&property_path : properties) {
     if (!std::ranges::contains(seen_roots, property_path[0])) {
       seen_roots.push_back(property_path[0]);

@@ -106,17 +106,50 @@ class DiskNameIdMapper final : public NameIdMapper {
   }
 
   void InitializeFromDisk() {
-    for (auto itr = name_to_id_storage_->begin(); itr != name_to_id_storage_->end(); ++itr) {
-      std::string name = itr->first;
-      uint64_t id = utils::ParseStringToUint<uint64_t>(itr->second);
+    uint64_t next_id = 0;
+    std::map<std::string, uint64_t> forward_entries;
+    std::map<uint64_t, std::string> reverse_entries;
+
+    auto fwd_itr = name_to_id_storage_->begin();
+    const auto fwd_end = name_to_id_storage_->end();
+    for (; fwd_itr != fwd_end; ++fwd_itr) {
+      std::string name = fwd_itr->first;
+      uint64_t id = utils::ParseStringToUint<uint64_t>(fwd_itr->second);
+      forward_entries.emplace(name, id);
       InsertNameIdEntryToCache(name, id);
-      counter_.fetch_add(1, std::memory_order_release);
-    }
-    for (auto itr = id_to_name_storage_->begin(); itr != id_to_name_storage_->end(); ++itr) {
-      uint64_t id = utils::ParseStringToUint<uint64_t>(itr->first);
-      std::string name = itr->second;
       InsertIdNameEntryToCache(id, name);
+      next_id = std::max(next_id, id + 1);
     }
+    if (fwd_itr.HasError()) {
+      throw kvstore::KVStoreError("Failed reading name_to_id disk store: {}", fwd_itr.ErrorMessage());
+    }
+
+    auto rev_itr = id_to_name_storage_->begin();
+    const auto rev_end = id_to_name_storage_->end();
+    for (; rev_itr != rev_end; ++rev_itr) {
+      uint64_t id = utils::ParseStringToUint<uint64_t>(rev_itr->first);
+      std::string name = rev_itr->second;
+      reverse_entries.emplace(id, name);
+      InsertIdNameEntryToCache(id, name);
+      InsertNameIdEntryToCache(name, id);
+      next_id = std::max(next_id, id + 1);
+    }
+    if (rev_itr.HasError()) {
+      throw kvstore::KVStoreError("Failed reading id_to_name disk store: {}", rev_itr.ErrorMessage());
+    }
+
+    for (const auto &[name, id] : forward_entries) {
+      if (!reverse_entries.contains(id)) {
+        MG_ASSERT(id_to_name_storage_->Put(std::to_string(id), name), "Failed to repair id_to_name entry on disk!");
+      }
+    }
+    for (const auto &[id, name] : reverse_entries) {
+      if (!forward_entries.contains(name)) {
+        MG_ASSERT(name_to_id_storage_->Put(name, std::to_string(id)), "Failed to repair name_to_id entry on disk!");
+      }
+    }
+
+    counter_.store(next_id, std::memory_order_release);
   }
 
   std::unique_ptr<kvstore::KVStore> name_to_id_storage_;

@@ -538,11 +538,14 @@ auto InMemoryUniqueConstraints::MultipleThreadsConstraintValidation::operator()(
   MG_ASSERT(!vertex_batches.empty(),
             "The size of batches should always be greater than zero if you want to use the parallel version of index "
             "creation!");
-  const auto thread_count = std::min(parallel_exec_info.thread_count, vertex_batches.size());
+  const auto thread_count =
+      std::min<std::size_t>(std::max<std::size_t>(1, parallel_exec_info.thread_count), vertex_batches.size());
 
   std::atomic<uint64_t> batch_counter = 0;
   std::atomic<bool> cancelled = false;
+  std::atomic<bool> has_exception = false;
   utils::Synchronized<std::optional<utils::OutOfMemoryException>, utils::SpinLock> oom{};
+  utils::Synchronized<std::exception_ptr, utils::SpinLock> unexpected_exception{};
   utils::Synchronized<std::expected<void, ConstraintViolation>, utils::RWSpinLock> result{};
   {
     std::vector<memory::DbAwareThread> threads;
@@ -559,7 +562,9 @@ auto InMemoryUniqueConstraints::MultipleThreadsConstraintValidation::operator()(
                             &on_progress,
                             &cancel_check,
                             &cancelled,
+                            &has_exception,
                             &oom,
+                            &unexpected_exception,
                             indices,
                             name_id_mapper]() {
                              do_per_thread_validation(result,
@@ -570,7 +575,9 @@ auto InMemoryUniqueConstraints::MultipleThreadsConstraintValidation::operator()(
                                                       on_progress,
                                                       cancel_check,
                                                       cancelled,
+                                                      has_exception,
                                                       oom,
+                                                      unexpected_exception,
                                                       constraint_accessor,
                                                       label,
                                                       properties,
@@ -582,6 +589,9 @@ auto InMemoryUniqueConstraints::MultipleThreadsConstraintValidation::operator()(
   // Out of memory first: unlike the other two it means the answer is unknown rather than known-and-negative.
   if (auto failure = oom.Lock(); failure->has_value()) {
     throw *std::move(*failure);
+  }
+  if (auto exc = unexpected_exception.Lock(); *exc) {
+    std::rethrow_exception(*exc);
   }
   // A violation is a real answer about the data, so it outranks having been asked to stop.
   auto validation_result = *result.Lock();
@@ -662,12 +672,12 @@ auto InMemoryUniqueConstraints::CreateConstraint(
     });
 
     if (!validation_result.has_value()) {
-      (void)DropConstraint(label, properties);
+      AbortUnpublishedConstraint(label, properties);
       return std::unexpected{validation_result.error()};
     }
     return CreationStatus::SUCCESS;
   } catch (...) {
-    (void)DropConstraint(label, properties);
+    AbortUnpublishedConstraint(label, properties);
     throw;
   }
 }
@@ -676,6 +686,11 @@ bool InMemoryUniqueConstraints::PublishConstraint(LabelId label, const std::set<
                                                   uint64_t commit_timestamp) {
   auto constraint = GetIndividualConstraint(label, properties);
   if (!constraint) return false;
+  IndividualConstraintPtr superseded;
+  container_.WithLock([&](ContainerPtr &) { superseded = std::move(constraint->fallback_on_abort); });
+  if (superseded) {
+    RetireConstraint(std::move(superseded));
+  }
   constraint->Publish(commit_timestamp, gauge_);
   return true;
 }
@@ -720,10 +735,40 @@ auto InMemoryUniqueConstraints::InstallConstraint_(LabelId label, const std::set
 void InMemoryUniqueConstraints::RestoreConstraint(LabelId label, const std::set<PropertyId> &properties,
                                                   IndividualConstraintPtr evicted) {
   if (!evicted) return;
-  // Concurrent CREATE under READ_ONLY may own the slot; discarding evicted is benign
-  // since the winning CREATE walks every labelled vertex during populate, so its
-  // skiplist holds the same logical entries.
-  (void)InstallConstraint_(label, properties, std::move(evicted));
+  container_.WithLock([&](ContainerPtr &container) {
+    auto label_it = container->find(label);
+    if (label_it != container->end()) {
+      auto props_it = label_it->second.find(properties);
+      if (props_it != label_it->second.end()) {
+        if (!props_it->second->status.IsReady()) {
+          props_it->second->fallback_on_abort = std::move(evicted);
+        }
+        return;
+      }
+    }
+    auto new_container = std::make_shared<Container>(*container);
+    (*new_container)[label][properties] = std::move(evicted);
+    container = std::move(new_container);
+  });
+}
+
+void InMemoryUniqueConstraints::AbortUnpublishedConstraint(LabelId label, const std::set<PropertyId> &properties) {
+  container_.WithLock([&](ContainerPtr &container) {
+    auto label_it = container->find(label);
+    if (label_it == container->end()) return;
+    auto props_it = label_it->second.find(properties);
+    if (props_it == label_it->second.end() || props_it->second->status.IsReady()) return;
+    auto fallback = std::move(props_it->second->fallback_on_abort);
+    auto new_container = std::make_shared<Container>(*container);
+    auto new_label_it = new_container->find(label);
+    if (fallback) {
+      (*new_label_it->second.find(properties)).second = std::move(fallback);
+    } else {
+      new_label_it->second.erase(properties);
+      if (new_label_it->second.empty()) new_container->erase(new_label_it);
+    }
+    container = std::move(new_container);
+  });
 }
 
 auto InMemoryUniqueConstraints::Validate(const std::unordered_set<Vertex const *> &vertices, const Transaction &tx,

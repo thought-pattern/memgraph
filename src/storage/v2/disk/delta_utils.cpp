@@ -16,6 +16,7 @@
 namespace memgraph::storage::disk {
 
 auto GetOldDiskKeyOrNull(Delta *head) -> std::optional<std::string_view> {
+  if (head == nullptr) return std::nullopt;
   while (head->next != nullptr) {
     head = head->next;
   }

@@ -45,6 +45,7 @@ class TypeConstraints {
     TypeConstraintKind type;
     ConstraintStatus status{};
     metrics::ScopedGauge gauge_{};
+    std::shared_ptr<IndividualConstraint> fallback_on_abort{};
   };
 
   using IndividualConstraintPtr = std::shared_ptr<IndividualConstraint>;
@@ -101,10 +102,14 @@ class TypeConstraints {
   /// existed for {label, property} or the type didn't match.
   [[nodiscard]] IndividualConstraintPtr DropConstraint(LabelId label, PropertyId property, TypeConstraintKind type);
 
-  /// Reinstalls a previously-evicted IndividualConstraint. No-op if the slot
-  /// has been reclaimed by a concurrent CREATE (constraint DDL runs under
-  /// READ_ONLY/UNIQUE, which does not serialize peers).
+  /// Reinstalls a previously-evicted IndividualConstraint. If an uncommitted
+  /// concurrent CREATE currently occupies the slot, attaches `evicted` as its
+  /// abort fallback so aborting the CREATE restores the committed rule.
   void RestoreConstraint(LabelId label, PropertyId property, IndividualConstraintPtr evicted);
+
+  /// Rolls back an unpublished POPULATING constraint, restoring any committed
+  /// constraint whose overlapping DROP aborted while this CREATE owned the slot.
+  void AbortUnpublishedConstraint(LabelId label, PropertyId property, TypeConstraintKind type);
 
   void DropGraphClearConstraints();
 

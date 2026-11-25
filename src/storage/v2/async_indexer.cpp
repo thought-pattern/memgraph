@@ -22,22 +22,34 @@ namespace memgraph::storage {
 AsyncIndexer::~AsyncIndexer() { cv_.notify_all(); }
 
 void AsyncIndexer::Enqueue(LabelId label) {
-  request_queue_.access().insert(label);
+  {
+    auto lock = std::unique_lock{mutex_};
+    request_queue_.access().insert(label);
+  }
   cv_.notify_all();
 }
 
 void AsyncIndexer::Enqueue(EdgeTypeId edge_type) {
-  request_queue_.access().insert(edge_type);
+  {
+    auto lock = std::unique_lock{mutex_};
+    request_queue_.access().insert(edge_type);
+  }
   cv_.notify_all();
 }
 
 void AsyncIndexer::Enqueue(LabelId label, PropertiesPaths properties) {
-  request_queue_.access().insert(LabelProperties{label, std::move(properties)});
+  {
+    auto lock = std::unique_lock{mutex_};
+    request_queue_.access().insert(LabelProperties{label, std::move(properties)});
+  }
   cv_.notify_all();
 }
 
 void AsyncIndexer::Enqueue(PropertyId property) {
-  request_queue_.access().insert(property);
+  {
+    auto lock = std::unique_lock{mutex_};
+    request_queue_.access().insert(property);
+  }
   cv_.notify_all();
 }
 
@@ -57,6 +69,10 @@ bool AsyncIndexer::IsIdle() const {
 bool AsyncIndexer::HasThreadStopped() const { return !index_creator_thread_.joinable() || thread_has_stopped_.load(); }
 
 void AsyncIndexer::Start(std::stop_token stop_token, Storage *storage) {
+  if (index_creator_thread_.joinable()) {
+    Shutdown();
+  }
+  thread_has_stopped_ = false;
   index_creator_thread_ = memory::DbAwareThread{
       storage->DbArenaPool(), [this, stop_token, storage](std::stop_token thread_stop_token) mutable {
         // the lock must be taken first because on destruction
@@ -79,8 +95,6 @@ void AsyncIndexer::Start(std::stop_token stop_token, Storage *storage) {
             return;
           }
 
-          auto access = request_queue_.access();
-          auto it_end = access.end();
           auto backoff = std::chrono::milliseconds(100);
 
           // Mark as processing when we have work to do
@@ -90,7 +104,27 @@ void AsyncIndexer::Start(std::stop_token stop_token, Storage *storage) {
             cv_.notify_all();  // wake CompleteRemaining waiters
           }};
 
-          for (auto it = access.begin(); it != it_end;) {
+          while (!cancel_check()) {
+            using QueueItem = std::variant<LabelId, EdgeTypeId, LabelProperties, PropertyId>;
+            std::optional<QueueItem> item;
+            {
+              auto access = request_queue_.access();
+              auto it = access.begin();
+              if (it != access.end()) {
+                item = *it;
+              }
+            }
+            if (!item.has_value()) {
+              break;
+            }
+
+            lock.unlock();
+            auto relock_on_exit = utils::OnScopeExit{[&lock]() {
+              if (!lock.owns_lock()) {
+                lock.lock();
+              }
+            }};
+
             try {
               auto protector = storage->make_database_protector();
               if (!protector) [[unlikely]] {
@@ -121,22 +155,39 @@ void AsyncIndexer::Start(std::stop_token stop_token, Storage *storage) {
                     [[maybe_unused]] auto result = storage_acc->CreateGlobalEdgeIndex(property, cancel_check);
                   }};
 
-              std::visit(create_index, *it);
+              std::visit(create_index, *item);
+
+              if (cancel_check()) {
+                return;
+              }
 
               // Need to commit to publish the new index
               // NOTE: only MAIN will enqueue async index creation, hence PrepareForCommitPhase will always be from MAIN
-
               [[maybe_unused]] auto result =
                   storage_acc->PrepareForCommitPhase(CommitArgs::make_main(std::move(protector)));
 
-              auto const next_it = std::next(it);
-              access.remove(*it);
-              it = next_it;
+              lock.lock();
+              request_queue_.access().remove(*item);
               backoff = std::chrono::milliseconds(100);
-            } catch (ReadOnlyAccessTimeout &) {
+            } catch (PopulateCancel const &) {
+              return;
+            } catch (ReadOnlyAccessTimeout const &) {
+              lock.lock();
+              if (cancel_check()) {
+                return;
+              }
               spdlog::info("Async index creation, was blocked by other transactions. Retrying in {} ms.",
                            backoff.count());
-              std::this_thread::sleep_for(backoff);
+              (void)cv_.wait_for(lock, backoff, [&] { return cancel_check(); });
+              backoff = std::min(backoff * 3 / 2, std::chrono::milliseconds(10'000));  // 1.5x multiplier, max 10s
+            } catch (UniqueAccessTimeout const &) {
+              lock.lock();
+              if (cancel_check()) {
+                return;
+              }
+              spdlog::info("Async index creation, was blocked by other transactions. Retrying in {} ms.",
+                           backoff.count());
+              (void)cv_.wait_for(lock, backoff, [&] { return cancel_check(); });
               backoff = std::min(backoff * 3 / 2, std::chrono::milliseconds(10'000));  // 1.5x multiplier, max 10s
             }
           }

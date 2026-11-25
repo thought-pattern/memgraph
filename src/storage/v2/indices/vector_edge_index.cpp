@@ -746,7 +746,7 @@ void VectorEdgeIndex::SerializeAllVectorEdgeIndices(durability::BaseEncoder *enc
       for (auto const *d = vertex.delta(); d != nullptr; d = d->next.load(std::memory_order_acquire)) {
         if (d->action == Delta::Action::ADD_OUT_EDGE && d->vertex_edge.edge.ptr != nullptr &&
             d->vertex_edge.edge.ptr->gid.AsUint() < unused_edge_gid) {
-          delta_edges.try_emplace(d->vertex_edge.edge.ptr, d->vertex_edge.type);
+          delta_edges.try_emplace(d->vertex_edge.edge.ptr, d->vertex_edge.edge_type);
         }
       }
     }

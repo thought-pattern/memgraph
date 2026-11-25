@@ -10,12 +10,14 @@
 // licenses/APL.txt.
 
 #include "storage/v2/constraints/existence_constraints.hpp"
+#include <charconv>
 #include <expected>
 #include "memory/db_arena_fwd.hpp"
 #include "metrics/prometheus_metrics.hpp"
 #include "storage/v2/constraints/utils.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/storage.hpp"
+#include "utils/exceptions.hpp"
 #include "utils/logging.hpp"
 #include "utils/rw_spin_lock.hpp"
 
@@ -116,6 +118,7 @@ bool ExistenceConstraints::PublishConstraint(LabelId label, PropertyId property,
     DMG_ASSERT(false, "Existence constraint not found during publish");
     return false;
   }
+  constraints_.WithLock([&](ContainerPtr &) { constraint->fallback_on_abort.reset(); });
   constraint->status.Commit(commit_timestamp);
   constraint->gauge_ = metrics::ScopedGauge{gauge_.gauge};
   return true;
@@ -136,9 +139,35 @@ ExistenceConstraints::IndividualConstraintPtr ExistenceConstraints::DropConstrai
 
 void ExistenceConstraints::RestoreConstraint(LabelId label, PropertyId property, IndividualConstraintPtr evicted) {
   if (!evicted) return;
-  // Concurrent CREATE under READ_ONLY may own the slot; discarding evicted is benign
-  // since the winning CREATE validated all existing rows.
-  (void)InstallConstraint_(label, property, std::move(evicted));
+  constraints_.WithLock([&](ContainerPtr &constraints) {
+    const ConstraintKey key{.label = label, .property = property};
+    auto it = constraints->find(key);
+    if (it != constraints->end()) {
+      if (!it->second->status.IsReady()) {
+        it->second->fallback_on_abort = std::move(evicted);
+      }
+      return;
+    }
+    auto new_constraints = std::make_shared<Container>(*constraints);
+    new_constraints->emplace(key, std::move(evicted));
+    constraints = std::move(new_constraints);
+  });
+}
+
+void ExistenceConstraints::AbortUnpublishedConstraint(LabelId label, PropertyId property) {
+  constraints_.WithLock([&](ContainerPtr &constraints) {
+    const ConstraintKey key{.label = label, .property = property};
+    auto it = constraints->find(key);
+    if (it == constraints->end() || it->second->status.IsReady()) return;
+    auto fallback = std::move(it->second->fallback_on_abort);
+    auto new_constraints = std::make_shared<Container>(*constraints);
+    if (fallback) {
+      (*new_constraints)[key] = std::move(fallback);
+    } else {
+      new_constraints->erase(key);
+    }
+    constraints = std::move(new_constraints);
+  });
 }
 
 [[nodiscard]] std::expected<void, ConstraintViolation> ExistenceConstraints::Validate(
@@ -183,16 +212,38 @@ void ExistenceConstraints::RestoreConstraint(LabelId label, PropertyId property,
 
 // only used for on disk
 void ExistenceConstraints::LoadExistenceConstraints(const std::vector<std::string> &keys) {
+  auto const parse_strict_u32 = [](std::string_view raw, std::string_view record) -> uint32_t {
+    if (raw.empty()) {
+      throw utils::BasicException(
+          "Corrupted existence-constraint metadata record '{}': expected '<label_id>,<property_id>'.", record);
+    }
+    uint32_t parsed{0U};
+    const char *const begin = raw.data();
+    const char *const end = begin + raw.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc{} || ptr != end) {
+      throw utils::BasicException(
+          "Corrupted existence-constraint metadata record '{}': invalid numeric identifier '{}'.", record, raw);
+    }
+    return parsed;
+  };
+
   constraints_.WithLock([&](ContainerPtr &constraints) {
     auto new_constraints = std::make_shared<Container>(*constraints);
     for (const auto &key : keys) {
+      if (key.empty()) continue;
       const std::vector<std::string> parts = utils::Split(key, ",");
-      auto constraint_key =
-          ConstraintKey{.label = LabelId::FromString(parts[0]), .property = PropertyId::FromString(parts[1])};
+      if (parts.size() != 2) {
+        throw utils::BasicException(
+            "Corrupted existence-constraint metadata record '{}': expected '<label_id>,<property_id>'.", key);
+      }
+      auto constraint_key = ConstraintKey{.label = LabelId::FromUint(parse_strict_u32(parts[0], key)),
+                                          .property = PropertyId::FromUint(parse_strict_u32(parts[1], key))};
       auto [it, inserted] = new_constraints->emplace(constraint_key, std::make_shared<IndividualConstraint>());
       if (inserted) {
         // Immediately commit with timestamp 0 so constraint is visible to all transactions
         it->second->status.Commit(kTimestampInitialId);
+        it->second->gauge_ = metrics::ScopedGauge{gauge_.gauge};
       }
     }
     constraints = std::move(new_constraints);
@@ -230,11 +281,14 @@ std::expected<void, ConstraintViolation> ExistenceConstraints::MultipleThreadsCo
   MG_ASSERT(!vertex_batches.empty(),
             "The size of batches should always be greater than zero if you want to use the parallel version of index "
             "creation!");
-  const auto thread_count = std::min(parallel_exec_info.thread_count, vertex_batches.size());
+  const auto thread_count =
+      std::min<std::size_t>(std::max<std::size_t>(1, parallel_exec_info.thread_count), vertex_batches.size());
 
   std::atomic<uint64_t> batch_counter = 0;
   std::atomic<bool> cancelled = false;
+  std::atomic<bool> has_exception = false;
   utils::Synchronized<std::optional<utils::OutOfMemoryException>, utils::SpinLock> oom{};
+  utils::Synchronized<std::exception_ptr, utils::SpinLock> unexpected_exception{};
   utils::Synchronized<std::expected<void, ConstraintViolation>, utils::RWSpinLock> maybe_error{};
   {
     std::vector<memory::DbAwareThread> threads;
@@ -251,7 +305,9 @@ std::expected<void, ConstraintViolation> ExistenceConstraints::MultipleThreadsCo
                             &on_progress,
                             &cancel_check,
                             &cancelled,
-                            &oom]() {
+                            &has_exception,
+                            &oom,
+                            &unexpected_exception]() {
                              do_per_thread_validation(maybe_error,
                                                       ValidateVertexOnConstraint,
                                                       vertex_batches,
@@ -260,7 +316,9 @@ std::expected<void, ConstraintViolation> ExistenceConstraints::MultipleThreadsCo
                                                       on_progress,
                                                       cancel_check,
                                                       cancelled,
+                                                      has_exception,
                                                       oom,
+                                                      unexpected_exception,
                                                       label,
                                                       property);
                            });
@@ -269,6 +327,9 @@ std::expected<void, ConstraintViolation> ExistenceConstraints::MultipleThreadsCo
   // Out of memory first: unlike the other two it means the answer is unknown rather than known-and-negative.
   if (auto failure = oom.Lock(); failure->has_value()) {
     throw *std::move(*failure);
+  }
+  if (auto exc = unexpected_exception.Lock(); *exc) {
+    std::rethrow_exception(*exc);
   }
   // A violation is a real answer about the data, so it outranks having been asked to stop.
   auto result = *maybe_error.Lock();

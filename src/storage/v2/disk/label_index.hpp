@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include <rocksdb/iterator.h>
 #include <rocksdb/utilities/transaction.h>
 
@@ -25,6 +27,7 @@ namespace memgraph::storage {
 class DiskLabelIndex : public storage::LabelIndex {
  public:
   using EntriesForDeletion = std::map<Gid, std::vector<LabelId>>;
+  using PerTxEntriesForDeletion = std::map<uint64_t, EntriesForDeletion>;
 
   explicit DiskLabelIndex(const Config &config);
 
@@ -48,17 +51,32 @@ class DiskLabelIndex : public storage::LabelIndex {
 
     auto GetAbortProcessor() const -> AbortProcessor override;
 
+    EntriesForDeletion ExtractEntriesForTransaction(uint64_t start_timestamp);
+
+    void ClearEntriesForTransaction(uint64_t start_timestamp);
+
     std::unordered_set<LabelId> index_;
-    EntriesForDeletion entries_for_deletion_;
+    mutable std::mutex deletion_mutex_;
+    PerTxEntriesForDeletion entries_for_deletion_;
   };
 
-  [[nodiscard]] bool CreateIndex(LabelId label, const std::vector<std::pair<std::string, std::string>> &vertices);
+  [[nodiscard]] bool CreateIndex(LabelId label, const std::vector<std::pair<std::string, std::string>> &vertices,
+                                 uint64_t commit_timestamp = 0);
 
   auto GetActiveIndices() const -> std::shared_ptr<LabelIndex::ActiveIndices> override;
 
   std::unique_ptr<rocksdb::Transaction> CreateRocksDBTransaction() const;
 
   std::unique_ptr<rocksdb::Transaction> CreateAllReadingRocksDBTransaction() const;
+
+  [[nodiscard]] bool StageSyncVertex(rocksdb::Transaction &disk_transaction, const Vertex &vertex) const;
+
+  [[nodiscard]] bool StageClearDeletedVertex(rocksdb::Transaction &disk_transaction, std::string_view gid) const;
+
+  [[nodiscard]] bool StageDeleteRemovedLabels(rocksdb::Transaction &disk_transaction,
+                                              EntriesForDeletion const &entries_for_deletion) const;
+
+  [[nodiscard]] static bool CommitTransaction(rocksdb::Transaction *disk_transaction, uint64_t commit_timestamp);
 
   [[nodiscard]] bool SyncVertexToLabelIndexStorage(const Vertex &vertex, uint64_t commit_timestamp) const;
 
@@ -69,7 +87,7 @@ class DiskLabelIndex : public storage::LabelIndex {
                                                             EntriesForDeletion const &entries_for_deletion);
 
   /// Returns false if there was no index to drop
-  bool DropIndex(LabelId label, ActiveIndicesUpdater const &updater);
+  bool DropIndex(LabelId label, ActiveIndicesUpdater const &updater, uint64_t commit_timestamp = 0);
 
   RocksDBStorage *GetRocksDBStorage() const;
 

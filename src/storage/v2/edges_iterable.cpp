@@ -44,6 +44,9 @@ EdgesIterable::EdgesIterable(EdgesIterable &&other) noexcept : type_(other.type_
 }
 
 EdgesIterable &EdgesIterable::operator=(EdgesIterable &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
   Destroy();
   type_ = other.type_;
   switch (other.type_) {
@@ -135,8 +138,10 @@ EdgesIterable::Iterator::Iterator(const EdgesIterable::Iterator &other) : type_(
   }
 }
 
-// NOLINTNEXTLINE(cert-oop54-cpp)
 EdgesIterable::Iterator &EdgesIterable::Iterator::operator=(const EdgesIterable::Iterator &other) {
+  if (this == &other) {
+    return *this;
+  }
   Destroy();
   type_ = other.type_;
   switch (other.type_) {
@@ -177,6 +182,9 @@ EdgesIterable::Iterator::Iterator(EdgesIterable::Iterator &&other) noexcept : ty
 }
 
 EdgesIterable::Iterator &EdgesIterable::Iterator::operator=(EdgesIterable::Iterator &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
   Destroy();
   type_ = other.type_;
   switch (other.type_) {

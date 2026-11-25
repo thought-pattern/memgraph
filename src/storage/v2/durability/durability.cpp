@@ -645,7 +645,8 @@ void RecoverDerivedState(utils::SkipListDb<Vertex> *vertices, [[maybe_unused]] u
 std::optional<ParallelizedSchemaCreationInfo> GetParallelExecInfo(const RecoveryInfo &recovery_info,
                                                                   const Config &config,
                                                                   memory::ArenaPool *db_arena_pool) {
-  return (config.durability.allow_parallel_schema_creation && recovery_info.vertex_batches.size() > 1)
+  return (config.durability.allow_parallel_schema_creation && config.durability.recovery_thread_count > 0 &&
+          recovery_info.vertex_batches.size() > 1)
              ? std::make_optional(
                    ParallelizedSchemaCreationInfo{.vertex_recovery_info = recovery_info.vertex_batches,
                                                   .thread_count = config.durability.recovery_thread_count,

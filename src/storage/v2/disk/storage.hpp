@@ -18,6 +18,7 @@
 #include "storage/v2/disk/durable_metadata.hpp"
 #include "storage/v2/disk/edge_import_mode_cache.hpp"
 #include "storage/v2/disk/rocksdb_storage.hpp"
+#include "storage/v2/disk/unique_constraints.hpp"
 #include "storage/v2/edge_import_mode.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indices/label_property_index.hpp"
@@ -543,23 +544,36 @@ class DiskStorage final : public Storage {
   std::unique_ptr<Accessor> ReadOnlyAccess(std::optional<IsolationLevel> override_isolation_level,
                                            std::optional<std::chrono::milliseconds> timeout) override;
 
+  struct AuxiliaryTransactions {
+    std::unique_ptr<rocksdb::Transaction> unique_tx;
+    std::unique_ptr<rocksdb::Transaction> label_tx;
+    std::unique_ptr<rocksdb::Transaction> label_prop_tx;
+  };
+
   /// Flushing methods
-  [[nodiscard]] std::expected<void, StorageManipulationError> FlushIndexCache(Transaction *transaction);
+  [[nodiscard]] std::expected<void, StorageManipulationError> FlushIndexCache(
+      Transaction *transaction, DiskUniqueConstraints::SeenUniqueValues &unique_storage,
+      const std::unordered_set<Gid> &superseded_gids, AuxiliaryTransactions &aux_txs);
 
   [[nodiscard]] std::expected<void, StorageManipulationError> FlushVertices(
-      Transaction *transaction, const auto &vertex_acc, std::vector<std::vector<PropertyValue>> &unique_storage);
+      Transaction *transaction, const auto &vertex_acc, DiskUniqueConstraints::SeenUniqueValues &unique_storage,
+      const std::unordered_set<Gid> &superseded_gids, AuxiliaryTransactions &aux_txs);
 
   [[nodiscard]] std::expected<void, StorageManipulationError> CheckVertexConstraintsBeforeCommit(
-      const Vertex &vertex, std::vector<std::vector<PropertyValue>> &unique_storage) const;
+      const Vertex &vertex, DiskUniqueConstraints::SeenUniqueValues &unique_storage,
+      const std::unordered_set<Gid> &superseded_gids) const;
 
-  [[nodiscard]] std::expected<void, StorageManipulationError> FlushDeletedVertices(Transaction *transaction);
+  [[nodiscard]] std::expected<void, StorageManipulationError> FlushDeletedVertices(Transaction *transaction,
+                                                                                   AuxiliaryTransactions &aux_txs);
   [[nodiscard]] std::expected<void, StorageManipulationError> FlushDeletedEdges(Transaction *transaction);
   [[nodiscard]] std::expected<void, StorageManipulationError> FlushModifiedEdges(Transaction *transaction,
                                                                                  const auto &edges_acc);
-  [[nodiscard]] std::expected<void, StorageManipulationError> ClearDanglingVertices(Transaction *transaction);
+  [[nodiscard]] std::expected<void, StorageManipulationError> ClearDanglingVertices(Transaction *transaction,
+                                                                                    AuxiliaryTransactions &aux_txs);
 
   /// Writing methods
   bool WriteVertexToVertexColumnFamily(Transaction *transaction, const Vertex &vertex);
+  bool DeleteOldVertexEntryFromDisk(Transaction *transaction, std::string_view old_vertex_key);
   bool WriteEdgeToEdgeColumnFamily(Transaction *transaction, std::string_view serialized_edge_key,
                                    std::string_view serialized_edge_value);
   bool WriteEdgeToConnectivityIndex(Transaction *transaction, std::string_view vertex_gid, std::string_view edge_gid,
@@ -654,19 +668,22 @@ class DiskStorage final : public Storage {
 
  private:
   void LoadPersistingMetadataInfo();
+  void ReconcileRecoveredStateFromGraph();
 
   uint64_t GetDiskSpaceUsage() const;
 
   [[nodiscard]] std::expected<void, ConstraintViolation> CheckExistingVerticesBeforeCreatingExistenceConstraint(
-      LabelId label, PropertyId property) const;
+      LabelId label, PropertyId property, CheckCancelFunction const &cancel_check = neverCancel) const;
 
   [[nodiscard]] std::expected<std::vector<std::pair<std::string, std::string>>, ConstraintViolation>
-  CheckExistingVerticesBeforeCreatingUniqueConstraint(LabelId label, const std::set<PropertyId> &properties) const;
+  CheckExistingVerticesBeforeCreatingUniqueConstraint(LabelId label, const std::set<PropertyId> &properties,
+                                                      CheckCancelFunction const &cancel_check = neverCancel) const;
 
-  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelIndex(LabelId label);
+  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelIndex(
+      LabelId label, CheckCancelFunction const &cancel_check = neverCancel);
 
-  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelPropertyIndex(LabelId label,
-                                                                                          PropertyId property);
+  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelPropertyIndex(
+      LabelId label, PropertyId property, CheckCancelFunction const &cancel_check = neverCancel);
 
   StorageInfo GetBaseInfo() override;
   StorageInfo GetInfo() override;

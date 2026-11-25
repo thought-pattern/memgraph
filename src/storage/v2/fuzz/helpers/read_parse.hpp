@@ -30,7 +30,7 @@ bool ReadPrimitive(const uint8_t *&data, size_t &size, T &out) {
   return true;
 }
 
-bool ReadString(const uint8_t *&data, size_t &size, std::string &out) {
+inline bool ReadString(const uint8_t *&data, size_t &size, std::string &out) {
   uint8_t len = 0;
   if (!ReadPrimitive(data, size, len)) return false;
   len = std::min<uint8_t>(len, 40);  // don't make strings too big
@@ -42,7 +42,8 @@ bool ReadString(const uint8_t *&data, size_t &size, std::string &out) {
   return true;
 }
 
-auto ParsePropertyValue(const uint8_t *&data, size_t &size) -> std::optional<memgraph::storage::PropertyValue> {
+inline auto ParsePropertyValue(const uint8_t *&data, size_t &size)
+    -> std::optional<memgraph::storage::PropertyValue> {
   using namespace memgraph::storage;
   using namespace memgraph::utils;
   uint8_t type;
@@ -87,13 +88,13 @@ auto ParsePropertyValue(const uint8_t *&data, size_t &size) -> std::optional<mem
       count = std::min<uint8_t>(count, 10);  // don't make lists too big
       PropertyValue::map_t map;
       for (uint8_t i = 0; i < count; ++i) {
-        std::string key;
-        if (!ReadString(data, size, key)) return std::nullopt;
+        PropertyId key;
+        if (!ReadPrimitive(data, size, key)) return std::nullopt;
 
         auto val = ParsePropertyValue(data, size);
         if (!val) return std::nullopt;
 
-        map.emplace(std::move(key), std::move(*val));
+        map.emplace(key, std::move(*val));
       }
       return PropertyValue(std::move(map));
     }
@@ -156,8 +157,12 @@ auto ParsePropertyValue(const uint8_t *&data, size_t &size) -> std::optional<mem
       if (!ReadString(data, size, tz)) return std::nullopt;
 
       auto time = memgraph::utils::AsSysTime(micros);
-      auto timezone = Timezone{std::chrono::current_zone()};
-      return PropertyValue(ZonedTemporalData(ZonedTemporalType::ZonedDateTime, time, timezone));
+      try {
+        auto timezone = Timezone{tz};
+        return PropertyValue(ZonedTemporalData(ZonedTemporalType::ZonedDateTime, time, timezone));
+      } catch (...) {
+        return std::nullopt;
+      }
     }
     case 11:  // NULL
     default:
@@ -165,14 +170,14 @@ auto ParsePropertyValue(const uint8_t *&data, size_t &size) -> std::optional<mem
   }
 }
 
-auto ParsePropertyId(const uint8_t *&data, size_t &size) -> std::optional<memgraph::storage::PropertyId> {
+inline auto ParsePropertyId(const uint8_t *&data, size_t &size) -> std::optional<memgraph::storage::PropertyId> {
   using namespace memgraph::storage;
   PropertyId id;
   if (!ReadPrimitive(data, size, id)) return std::nullopt;
   return id;
 }
 
-auto ParsePropertyMap(const uint8_t *data, size_t size)
+inline auto ParsePropertyMap(const uint8_t *&data, size_t &size)
     -> std::optional<std::map<memgraph::storage::PropertyId, memgraph::storage::PropertyValue>> {
   using namespace memgraph::storage;
   std::map<PropertyId, PropertyValue> props;
@@ -182,10 +187,10 @@ auto ParsePropertyMap(const uint8_t *data, size_t size)
 
   for (uint8_t i = 0; i < count; ++i) {
     auto id = ParsePropertyId(data, size);
-    if (!id) break;
+    if (!id) return std::nullopt;
 
     auto value = ParsePropertyValue(data, size);
-    if (!value) break;
+    if (!value) return std::nullopt;
     props[*id] = *std::move(value);
   }
 

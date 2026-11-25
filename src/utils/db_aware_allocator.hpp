@@ -136,7 +136,8 @@ struct DbAwareAllocator {
   DbAwareAllocator() noexcept = default;
 
   template <typename U>
-  explicit DbAwareAllocator(DbAwareAllocator<U> const & /*unused*/) noexcept {}
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  DbAwareAllocator(DbAwareAllocator<U> const & /*unused*/) noexcept {}
 
   [[nodiscard]] T *allocate(std::size_t n) {
     const unsigned idx = tls_db_arena_state.arena;

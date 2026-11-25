@@ -120,9 +120,27 @@ auto TypeConstraints::GetActiveConstraints() const -> std::shared_ptr<ActiveCons
   if (container->constraints_.empty()) {
     return {};
   }
+  boost::unordered_flat_map<LabelId, PropertyTypeConstraints, std::hash<LabelId>> l2p;
+  l2p.reserve(container->constraints_.size());
+  for (const auto &[label_prop, constraint] : container->constraints_) {
+    l2p[label_prop.first].emplace(label_prop.second, constraint->type);
+  }
   for (auto const &vertex : vertices) {
-    if (auto validation_result = ValidateVertex(vertex, container); !validation_result.has_value()) {
-      return validation_result;
+    if (vertex.deleted()) {
+      if (on_progress) on_progress();
+      continue;
+    }
+    auto validator = TypeConstraintsValidator{};
+    for (auto label : vertex.labels) {
+      auto it = l2p.find(label);
+      if (it == l2p.cend()) continue;
+      validator.add(label, it->second);
+    }
+    if (!validator.empty()) {
+      if (auto violation = vertex.properties.PropertiesMatchTypes(validator); violation.has_value()) {
+        auto const &[prop_id, label, kind] = *violation;
+        return std::unexpected{ConstraintViolation{ConstraintViolation::Type::TYPE, label, kind, std::set{prop_id}}};
+      }
     }
     if (on_progress) on_progress();
   }
@@ -200,12 +218,13 @@ void TypeConstraints::PublishConstraint(LabelId label, PropertyId property, Type
 
   // Update l2p_constraints_ (still needs copy-on-write for the secondary index)
   container_.WithLock([&](ContainerPtr &container) {
+    constraint->fallback_on_abort.reset();
     auto new_container = std::make_shared<Container>(*container);
 
     // maintain l2p_constraints_ (used for fast lookup during validation)
     auto l2p_it = new_container->l2p_constraints_.find(label);
     if (l2p_it != new_container->l2p_constraints_.end()) {
-      l2p_it->second.emplace(property, type);
+      l2p_it->second.insert_or_assign(property, type);
     } else {
       new_container->l2p_constraints_.emplace(label, PropertyTypeConstraints{{property, type}});
     }
@@ -241,9 +260,49 @@ TypeConstraints::IndividualConstraintPtr TypeConstraints::DropConstraint(LabelId
 
 void TypeConstraints::RestoreConstraint(LabelId label, PropertyId property, IndividualConstraintPtr evicted) {
   if (!evicted) return;
-  // Concurrent CREATE under READ_ONLY may own the slot; discarding evicted is benign
-  // since the winning CREATE validated all existing rows.
-  (void)InstallConstraint_(label, property, std::move(evicted), /*restore_l2p=*/true);
+  container_.WithLock([&](ContainerPtr &container) {
+    auto it = container->constraints_.find({label, property});
+    if (it != container->constraints_.end()) {
+      if (!it->second->status.IsReady()) {
+        it->second->fallback_on_abort = std::move(evicted);
+      }
+      return;
+    }
+    auto new_container = std::make_shared<Container>(*container);
+    auto const type = evicted->type;
+    new_container->constraints_.try_emplace({label, property}, std::move(evicted));
+    if (auto l2p_it = new_container->l2p_constraints_.find(label); l2p_it != new_container->l2p_constraints_.end()) {
+      l2p_it->second.insert_or_assign(property, type);
+    } else {
+      new_container->l2p_constraints_.emplace(label, PropertyTypeConstraints{{property, type}});
+    }
+    container = std::move(new_container);
+  });
+}
+
+void TypeConstraints::AbortUnpublishedConstraint(LabelId label, PropertyId property, TypeConstraintKind type) {
+  container_.WithLock([&](ContainerPtr &container) {
+    auto it = container->constraints_.find({label, property});
+    if (it == container->constraints_.end() || it->second->type != type || it->second->status.IsReady()) return;
+    auto fallback = std::move(it->second->fallback_on_abort);
+    auto new_container = std::make_shared<Container>(*container);
+    if (fallback) {
+      auto const fallback_type = fallback->type;
+      (*new_container).constraints_[{label, property}] = std::move(fallback);
+      if (auto l2p_it = new_container->l2p_constraints_.find(label); l2p_it != new_container->l2p_constraints_.end()) {
+        l2p_it->second.insert_or_assign(property, fallback_type);
+      } else {
+        new_container->l2p_constraints_.emplace(label, PropertyTypeConstraints{{property, fallback_type}});
+      }
+    } else {
+      new_container->constraints_.erase({label, property});
+      if (auto l2p_it = new_container->l2p_constraints_.find(label); l2p_it != new_container->l2p_constraints_.end()) {
+        l2p_it->second.erase(property);
+        if (l2p_it->second.empty()) new_container->l2p_constraints_.erase(l2p_it);
+      }
+    }
+    container = std::move(new_container);
+  });
 }
 
 void TypeConstraints::DropGraphClearConstraints() {

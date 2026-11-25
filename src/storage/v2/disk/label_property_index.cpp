@@ -9,12 +9,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-/// TODO: clear dependencies
-
 #include "storage/v2/disk/label_property_index.hpp"
+#include <charconv>
 #include <range/v3/all.hpp>
 #include "storage/v2/disk/delta_utils.hpp"
 #include "storage/v2/indices/active_indices_updater.hpp"
+#include "storage/v2/transaction.hpp"
+#include "utils/exceptions.hpp"
 #include "utils/file.hpp"
 #include "utils/logging.hpp"
 #include "utils/rocksdb_serialization.hpp"
@@ -42,10 +43,12 @@ bool IsVertexIndexedByLabelProperty(const Vertex &vertex, LabelId label, Propert
 }
 
 bool CommitWithTimestamp(rocksdb::Transaction *disk_transaction, uint64_t commit_ts) {
-  disk_transaction->SetCommitTimestamp(commit_ts);
+  if (!disk_transaction->SetCommitTimestamp(commit_ts).ok()) {
+    return false;
+  }
   const auto status = disk_transaction->Commit();
   if (!status.ok()) {
-    spdlog::error("rocksdb: {}", status.getState());
+    spdlog::error("rocksdb: {}", status.ToString());
   }
   return status.ok();
 }
@@ -56,23 +59,30 @@ DiskLabelPropertyIndex::DiskLabelPropertyIndex(const Config &config) {
   utils::EnsureDirOrDie(config.disk.label_property_index_directory);
   kvstore_ = std::make_unique<RocksDBStorage>();
   kvstore_->options_.create_if_missing = true;
-  kvstore_->options_.comparator = new ComparatorWithU64TsImpl();
+  kvstore_->InstallComparator(std::make_unique<ComparatorWithU64TsImpl>());
   logging::AssertRocksDBStatus(rocksdb::TransactionDB::Open(
       kvstore_->options_, rocksdb::TransactionDBOptions(), config.disk.label_property_index_directory, &kvstore_->db_));
 }
 
 bool DiskLabelPropertyIndex::CreateIndex(LabelId label, PropertyId property,
-                                         const std::vector<std::pair<std::string, std::string>> &vertices) {
-  if (!index_.emplace(label, property).second) {
+                                         const std::vector<std::pair<std::string, std::string>> &vertices,
+                                         uint64_t commit_timestamp) {
+  if (index_.contains({label, property})) {
     return false;
   }
 
   auto disk_transaction = CreateRocksDBTransaction();
   for (const auto &[key, value] : vertices) {
-    disk_transaction->Put(key, value);
+    if (!disk_transaction->Put(key, value).ok()) {
+      return false;
+    }
   }
 
-  return CommitWithTimestamp(disk_transaction.get(), 0);
+  if (!CommitWithTimestamp(disk_transaction.get(), commit_timestamp)) {
+    return false;
+  }
+  index_.emplace(label, property);
+  return true;
 }
 
 std::unique_ptr<rocksdb::Transaction> DiskLabelPropertyIndex::CreateRocksDBTransaction() const {
@@ -86,69 +96,110 @@ std::unique_ptr<rocksdb::Transaction> DiskLabelPropertyIndex::CreateAllReadingRo
   return tx;
 }
 
-bool DiskLabelPropertyIndex::SyncVertexToLabelPropertyIndexStorage(const Vertex &vertex,
-                                                                   uint64_t commit_timestamp) const {
-  auto disk_transaction = CreateRocksDBTransaction();
+bool DiskLabelPropertyIndex::CommitTransaction(rocksdb::Transaction *disk_transaction, uint64_t commit_timestamp) {
+  return CommitWithTimestamp(disk_transaction, commit_timestamp);
+}
 
-  if (auto maybe_old_disk_key = disk::GetOldDiskKeyOrNull(vertex.delta()); maybe_old_disk_key.has_value()) {
-    if (!disk_transaction->Delete(maybe_old_disk_key.value()).ok()) {
-      return false;
-    }
-  }
+bool DiskLabelPropertyIndex::StageSyncVertex(rocksdb::Transaction &disk_transaction, const Vertex &vertex) const {
   for (const auto &[index_label, index_property] : index_) {
+    const auto key = utils::SerializeVertexAsKeyForLabelPropertyIndex(index_label, index_property, vertex.gid);
     if (IsVertexIndexedByLabelProperty(vertex, index_label, index_property)) {
       if (!disk_transaction
-               ->Put(utils::SerializeVertexAsKeyForLabelPropertyIndex(index_label, index_property, vertex.gid),
-                     utils::SerializeVertexAsValueForLabelPropertyIndex(index_label, vertex.labels, vertex.properties))
+               .Put(key,
+                    utils::SerializeVertexAsValueForLabelPropertyIndex(index_label, vertex.labels, vertex.properties))
                .ok()) {
         return false;
       }
+    } else {
+      if (!disk_transaction.Delete(key).ok()) {
+        return false;
+      }
     }
+  }
+  return true;
+}
+
+bool DiskLabelPropertyIndex::StageClearDeletedVertex(rocksdb::Transaction &disk_transaction,
+                                                     std::string_view gid) const {
+  rocksdb::ReadOptions ro;
+  std::string strTs = utils::StringTimestamp(std::numeric_limits<uint64_t>::max());
+  rocksdb::Slice ts(strTs);
+  ro.timestamp = &ts;
+  auto it = std::unique_ptr<rocksdb::Iterator>(disk_transaction.GetIterator(ro));
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    if (std::string key = it->key().ToString(); gid == utils::ExtractGidFromLabelPropertyIndexStorage(key)) {
+      if (!disk_transaction.Delete(key).ok()) {
+        return false;
+      }
+    }
+  }
+  return it->status().ok();
+}
+
+bool DiskLabelPropertyIndex::StageDeleteRemovedLabels(rocksdb::Transaction &disk_transaction,
+                                                      EntriesForDeletion const &entries_for_deletion) const {
+  if (entries_for_deletion.empty()) {
+    return true;
+  }
+  return ClearTransactionEntriesWithRemovedIndexingLabel(disk_transaction, entries_for_deletion);
+}
+
+bool DiskLabelPropertyIndex::SyncVertexToLabelPropertyIndexStorage(const Vertex &vertex,
+                                                                   uint64_t commit_timestamp) const {
+  auto disk_transaction = CreateRocksDBTransaction();
+  if (!StageSyncVertex(*disk_transaction, vertex)) {
+    return false;
   }
   return CommitWithTimestamp(disk_transaction.get(), commit_timestamp);
 }
 
 bool DiskLabelPropertyIndex::ClearDeletedVertex(std::string_view gid, uint64_t transaction_commit_timestamp) const {
   auto disk_transaction = CreateAllReadingRocksDBTransaction();
-
-  rocksdb::ReadOptions ro;
-  std::string strTs = utils::StringTimestamp(std::numeric_limits<uint64_t>::max());
-  rocksdb::Slice ts(strTs);
-  ro.timestamp = &ts;
-  auto it = std::unique_ptr<rocksdb::Iterator>(disk_transaction->GetIterator(ro));
-  for (it->SeekToFirst(); it->Valid(); it->Next()) {
-    if (std::string key = it->key().ToString(); gid == utils::ExtractGidFromLabelPropertyIndexStorage(key)) {
-      if (!disk_transaction->Delete(key).ok()) {
-        return false;
-      }
-    }
+  if (!StageClearDeletedVertex(*disk_transaction, gid)) {
+    return false;
   }
   return CommitWithTimestamp(disk_transaction.get(), transaction_commit_timestamp);
 }
 
-bool DiskLabelPropertyIndex::DeleteVerticesWithRemovedIndexingLabel(uint64_t transaction_start_timestamp,
+bool DiskLabelPropertyIndex::DeleteVerticesWithRemovedIndexingLabel(uint64_t /*transaction_start_timestamp*/,
                                                                     uint64_t transaction_commit_timestamp,
                                                                     EntriesForDeletion const &entries_for_deletion) {
   if (entries_for_deletion.empty()) {
     return true;
   }
   auto disk_transaction = CreateAllReadingRocksDBTransaction();
-
-  rocksdb::ReadOptions ro;
-  std::string strTs = utils::StringTimestamp(std::numeric_limits<uint64_t>::max());
-  rocksdb::Slice ts(strTs);
-  ro.timestamp = &ts;
-  bool deletion_success = ClearTransactionEntriesWithRemovedIndexingLabel(*disk_transaction, entries_for_deletion);
-  if (deletion_success) {
-    return CommitWithTimestamp(disk_transaction.get(), transaction_commit_timestamp);
+  if (!StageDeleteRemovedLabels(*disk_transaction, entries_for_deletion)) {
+    return false;
   }
-  return false;
+  return CommitWithTimestamp(disk_transaction.get(), transaction_commit_timestamp);
+}
+
+DiskLabelPropertyIndex::EntriesForDeletion DiskLabelPropertyIndex::ActiveIndices::ExtractEntriesForTransaction(
+    uint64_t start_timestamp) {
+  std::lock_guard<std::mutex> const lock{deletion_mutex_};
+  auto it = entries_for_deletion_.find(start_timestamp);
+  if (it == entries_for_deletion_.end()) {
+    return {};
+  }
+  auto extracted = std::move(it->second);
+  entries_for_deletion_.erase(it);
+  return extracted;
+}
+
+void DiskLabelPropertyIndex::ActiveIndices::ClearEntriesForTransaction(uint64_t start_timestamp) {
+  std::lock_guard<std::mutex> const lock{deletion_mutex_};
+  entries_for_deletion_.erase(start_timestamp);
 }
 
 void DiskLabelPropertyIndex::ActiveIndices::UpdateOnAddLabel(LabelId added_label, Vertex *vertex_after_update,
                                                              const Transaction &tx) {
-  auto vertex_label_index_it = entries_for_deletion_.find(vertex_after_update->gid);
-  if (vertex_label_index_it == entries_for_deletion_.end()) {
+  std::lock_guard<std::mutex> const lock{deletion_mutex_};
+  auto tx_it = entries_for_deletion_.find(tx.start_timestamp);
+  if (tx_it == entries_for_deletion_.end()) {
+    return;
+  }
+  auto vertex_label_index_it = tx_it->second.find(vertex_after_update->gid);
+  if (vertex_label_index_it == tx_it->second.end()) {
     return;
   }
   std::erase_if(vertex_label_index_it->second,
@@ -157,33 +208,57 @@ void DiskLabelPropertyIndex::ActiveIndices::UpdateOnAddLabel(LabelId added_label
 
 void DiskLabelPropertyIndex::ActiveIndices::UpdateOnRemoveLabel(LabelId removed_label, Vertex *vertex_after_update,
                                                                 const Transaction &tx) {
+  std::lock_guard<std::mutex> const lock{deletion_mutex_};
   for (const auto &entry : index_) {
     if (entry.label != removed_label) {
       continue;
     }
-    auto [it_vertex_map_store, emplaced] = entries_for_deletion_.emplace(
-        std::piecewise_construct, std::forward_as_tuple(vertex_after_update->gid), std::forward_as_tuple());
-    it_vertex_map_store->second.emplace_back(entry);
+    entries_for_deletion_[tx.start_timestamp][vertex_after_update->gid].emplace_back(entry);
   }
 }
 
 LabelPropertyIndex::DropResult DiskLabelPropertyIndex::DropIndex(LabelId label,
                                                                  std::vector<PropertyPath> const &properties,
                                                                  ActiveIndicesUpdater const &updater,
-                                                                 std::optional<IndexOrder> order) {
-  // Disk only has ASC indices; a DESC-only selective drop is a miss.
+                                                                 std::optional<IndexOrder> order,
+                                                                 uint64_t commit_timestamp) {
+  // Disk only has ASC single top-level property indices; a DESC-only or composite/nested drop is a miss.
   if (order.has_value() && *order != IndexOrder::ASC) return {};
-  if (!index_.contains({label, properties[0][0]})) return {};
-  index_.erase({label, properties[0][0]});
+  if (properties.size() != 1 || properties[0].size() != 1) return {};
+  const PropertyId property = properties[0][0];
+  if (!index_.contains({label, property})) return {};
+
+  auto disk_transaction = CreateAllReadingRocksDBTransaction();
+  rocksdb::ReadOptions ro;
+  std::string strTs = utils::StringTimestamp(std::numeric_limits<uint64_t>::max());
+  rocksdb::Slice ts(strTs);
+  ro.timestamp = &ts;
+  auto it = std::unique_ptr<rocksdb::Iterator>(disk_transaction->GetIterator(ro));
+  const std::string prefix = utils::SerializeLabelPropertyIndexPrefix(label, property);
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    std::string key = it->key().ToString();
+    if (key.starts_with(prefix)) {
+      if (!disk_transaction->Delete(key).ok()) {
+        return {};
+      }
+    }
+  }
+  if (!it->status().ok() || !CommitWithTimestamp(disk_transaction.get(), commit_timestamp)) {
+    return {};
+  }
+
+  index_.erase({label, property});
   updater(GetActiveIndices());
   return {.dropped_asc = true};
 }
 
 bool DiskLabelPropertyIndex::ActiveIndices::IndexExists(LabelId label, std::span<PropertyPath const> properties) const {
+  if (properties.size() != 1 || properties[0].size() != 1) return false;
   return index_.contains(LabelProperty{label, properties[0][0]});
 }
 
 bool DiskLabelPropertyIndex::ActiveIndices::IndexReady(LabelId label, std::span<PropertyPath const> properties) const {
+  if (properties.size() != 1 || properties[0].size() != 1) return false;
   return index_.contains(LabelProperty{label, properties[0][0]});
 }
 
@@ -218,9 +293,32 @@ auto DiskLabelPropertyIndex::ActiveIndices::ApproximateVertexCount(LabelId /*lab
 }
 
 void DiskLabelPropertyIndex::LoadIndexInfo(const std::vector<std::string> &keys) {
+  auto const parse_strict_u32 = [](std::string_view raw, std::string_view record) -> uint32_t {
+    if (raw.empty()) {
+      throw utils::BasicException(
+          "Corrupted disk label-property index metadata record '{}': expected '<label_id>,<property_id>'.", record);
+    }
+    uint32_t parsed{0U};
+    const char *const begin = raw.data();
+    const char *const end = begin + raw.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc{} || ptr != end) {
+      throw utils::BasicException(
+          "Corrupted disk label-property index metadata record '{}': invalid numeric identifier '{}'.", record, raw);
+    }
+    return parsed;
+  };
+
   for (const auto &label_property : keys) {
+    if (label_property.empty()) continue;
     std::vector<std::string> label_property_split = utils::Split(label_property, ",");
-    index_.emplace(LabelId::FromString(label_property_split[0]), PropertyId::FromString(label_property_split[1]));
+    if (label_property_split.size() != 2) {
+      throw utils::BasicException(
+          "Corrupted disk label-property index metadata record '{}': expected '<label_id>,<property_id>'.",
+          label_property);
+    }
+    index_.emplace(LabelId::FromUint(parse_strict_u32(label_property_split[0], label_property)),
+                   PropertyId::FromUint(parse_strict_u32(label_property_split[1], label_property)));
   }
 }
 
@@ -240,15 +338,16 @@ auto DiskLabelPropertyIndex::ActiveIndices::RelevantLabelPropertiesIndicesInfo(
   for (auto &&[l_pos, label] : ranges::views::enumerate(labels)) {
     for (auto [p_pos, property] : ranges::views::enumerate(properties)) {
       if (IndexReady(label, std::array{property})) {
-        // NOLINTNEXTLINE(google-runtime-int)
-        res.emplace_back(l_pos, std::vector{static_cast<long>(p_pos)}, label, std::vector{property});
+        res.emplace_back(l_pos, std::vector<int64_t>{static_cast<int64_t>(p_pos)}, label, std::vector{property});
       }
     }
   }
   return res;
 }
 
-void DiskLabelPropertyIndex::ActiveIndices::AbortEntries(AbortableInfo const &info, uint64_t start_timestamp) {}
+void DiskLabelPropertyIndex::ActiveIndices::AbortEntries(AbortableInfo const & /*info*/, uint64_t start_timestamp) {
+  ClearEntriesForTransaction(start_timestamp);
+}
 
 LabelPropertyIndex::AbortProcessor DiskLabelPropertyIndex::ActiveIndices::GetAbortProcessor() const {
   return AbortProcessor();

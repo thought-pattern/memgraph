@@ -39,21 +39,28 @@ struct EnumStore {
       -> std::expected<EnumTypeId, EnumStorageError> {
     namespace rv = ranges::views;
 
-    auto new_pos = etype_strs_.size();
-    auto new_id = EnumTypeId{new_pos};
-
-    auto [it_type, inserted] = etype_lookup_.try_emplace(type_str, new_id);
-    if (!inserted) [[unlikely]] {
+    if (etype_lookup_.contains(type_str)) [[unlikely]] {
       return std::unexpected(EnumStorageError::EnumExists);
     }
 
     auto values_lookup = decltype(evalue_lookups_)::value_type{};
+    values_lookup.reserve(enum_value_strs.size());
     for (auto const &[pos, value] : rv::enumerate(enum_value_strs)) {
       auto [it_values, inserted] = values_lookup.try_emplace(value, EnumValueId{pos});
       if (!inserted) [[unlikely]] {
-        etype_lookup_.erase(it_type);
         return std::unexpected(EnumStorageError::InvalidValue);
       }
+    }
+
+    auto const new_pos = etype_strs_.size();
+    auto const new_id = EnumTypeId{new_pos};
+    evalue_lookups_.reserve(new_pos + 1);
+    etype_strs_.reserve(new_pos + 1);
+    evalue_strs_.reserve(new_pos + 1);
+
+    auto [it_type, inserted] = etype_lookup_.try_emplace(type_str, new_id);
+    if (!inserted) [[unlikely]] {
+      return std::unexpected(EnumStorageError::EnumExists);
     }
     try {
       evalue_lookups_.emplace_back(std::move(values_lookup));
@@ -81,8 +88,6 @@ struct EnumStore {
 
   auto UpdateValue(EnumTypeId e_type, std::string_view old_value, std::string_view new_value)
       -> std::expected<Enum, EnumStorageError> {
-    namespace rv = ranges::views;
-
     auto e_value = ToEnumValue(e_type, old_value);
     if (!e_value) return std::unexpected(e_value.error());
 
@@ -93,9 +98,11 @@ struct EnumStore {
 
     if (lookup.contains(new_value)) return std::unexpected{EnumStorageError::InvalidValue};
 
-    lookup.try_emplace(new_value, *e_value);
-    strings[e_value->value_of()] = new_value;
-    lookup.erase(old_value);
+    std::string updated_display{new_value};
+    auto [it_new, inserted] = lookup.try_emplace(new_value, *e_value);
+    if (!inserted) return std::unexpected{EnumStorageError::InvalidValue};
+    strings[e_value->value_of()].swap(updated_display);
+    lookup.erase(updated_display);
     MG_ASSERT(strings.size() == lookup.size());
     return Enum{e_type, *e_value};
   }

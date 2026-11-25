@@ -155,7 +155,7 @@ class InMemoryLabelPropertyIndex : public storage::LabelPropertyIndex {
       for (auto const &[label, by_label] : indices) {
         for (auto const &[propertyPaths, entry] : by_label) {
           auto const ed = EntryDetailT{&propertyPaths, &entry};
-          utils::small_vector<PropertyId, 4> seen_roots;
+          utils::small_vector<PropertyId> seen_roots;
           for (auto const &prop : propertyPaths) {
             if (!std::ranges::contains(seen_roots, prop[0])) {
               seen_roots.push_back(prop[0]);

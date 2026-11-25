@@ -306,7 +306,7 @@ inline void PopulateIndexOnMultipleThreads(TVerticesAccessor &vertices, TSkipLis
             }
             const auto &batch = vertex_batches[batch_index];
             auto it = vertices.find(batch.first);
-            for (auto j{0U}; j < batch.second; ++j, ++it) {
+            for (uint64_t j = 0; j < batch.second; ++j, ++it) {
               func(*it, acc);
             }
           }

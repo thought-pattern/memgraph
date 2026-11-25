@@ -42,6 +42,8 @@ struct GcProgress {
   // Epoch us / ms; start_time_us == 0 means "not started".
   std::atomic<int64_t> start_time_us{0};
   std::atomic<int64_t> start_steady_ms{0};
+  std::atomic<uint64_t> active_run_id{0};
+  std::atomic<uint64_t> next_run_id{0};
 
   void Start(bool is_periodic, bool is_exclusive);
   void SetPhase(GcPhase p);
