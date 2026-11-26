@@ -160,8 +160,9 @@ struct symbol_build_traits<symbol::Symbol> {
     if (it == state.symbol_store.end()) [[unlikely]] {
       ThrowPlannerBug("symbol not found in store");
     }
-    // Diagnostics-only loss: rebuilt Symbol carries no user_declared_/type_.
-    auto const &symbol = state.symbol_table.CreateSymbol(it->second, false /*TODO*/);
+    auto const &info = it->second;
+    auto const &symbol =
+        state.symbol_table.CreateSymbol(info.name, info.user_declared, info.type, info.token_position);
     return state.symbol_cache.emplace(sym_pos, symbol).first->second;
   }
 };
@@ -321,6 +322,21 @@ struct symbol_build_traits<symbol::Subquery> {
     // them directly.
     return std::static_pointer_cast<LogicalOperator>(
         std::make_shared<query::plan::Apply>(outer_input, inner_root, query::plan::OnEmptyBranch::kDropRow));
+  }
+};
+
+template <>
+struct symbol_build_traits<symbol::Distinct> {
+  using result_type = LogicalOperatorPtr;
+
+  struct slots {
+    using input = ChildSlot<child::distinct::input, LogicalOperatorPtr>;
+  };
+
+  static auto build(BuildState &state, ENodeRef /*node*/, Children children) -> result_type {
+    auto const &input = children.get<slots::input>();
+    return std::static_pointer_cast<LogicalOperator>(
+        std::make_shared<query::plan::Distinct>(input, input->OutputSymbols(state.symbol_table)));
   }
 };
 

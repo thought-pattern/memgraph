@@ -185,8 +185,8 @@ class AuthQuery : public memgraph::query::Query {
     object->roles_ = roles_;
     object->user_or_role_ = user_or_role_;
     object->role_databases_ = role_databases_;
-    object->old_password_ = old_password_;
-    object->new_password_ = new_password_;
+    object->old_password_ = old_password_ ? old_password_->Clone(storage) : nullptr;
+    object->new_password_ = new_password_ ? new_password_->Clone(storage) : nullptr;
     object->if_not_exists_ = if_not_exists_;
     object->password_ = password_ ? password_->Clone(storage) : nullptr;
     object->database_ = database_;

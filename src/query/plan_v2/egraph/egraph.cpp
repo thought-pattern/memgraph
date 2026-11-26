@@ -25,7 +25,7 @@ using EGraph = planner::core::EGraph<symbol, analysis>;
 
 egraph::egraph() : pimpl_(std::make_unique<impl>()) {}
 
-egraph::egraph(egraph &&other) noexcept : pimpl_(std::exchange(other.pimpl_, std::make_unique<impl>())) {}
+egraph::egraph(egraph &&other) noexcept = default;
 
 egraph &egraph::operator=(egraph &&other) noexcept {
   std::swap(pimpl_, other.pimpl_);
@@ -41,8 +41,9 @@ egraph::~egraph() = default;  // required because pimpl
 
 auto egraph::MakeOnce() -> eclass { return from_core(pimpl_->graph.Make<Once>().eclass_id); }
 
-auto egraph::MakeSymbol(int32_t position, std::string_view name) -> eclass {
-  return from_core(pimpl_->graph.Make<Symbol>(position, name).eclass_id);
+auto egraph::MakeSymbol(int32_t position, std::string_view name, bool user_declared, query::Symbol::Type type,
+                        int32_t token_position) -> eclass {
+  return from_core(pimpl_->graph.Make<Symbol>(position, name, user_declared, type, token_position).eclass_id);
 }
 
 auto egraph::MakeLiteral(storage::ExternalPropertyValue const &value) -> eclass {
@@ -88,6 +89,10 @@ auto egraph::MakeSubquery(eclass outer_input, eclass inner_root, std::span<eclas
   children.push_back(to_core(inner_root));
   for (auto e : exposed_syms) children.push_back(to_core(e));
   return from_core(pimpl_->graph.Make<Subquery>(std::move(children)).eclass_id);
+}
+
+auto egraph::MakeDistinct(eclass input) -> eclass {
+  return from_core(pimpl_->graph.Make<Distinct>(to_core(input)).eclass_id);
 }
 
 auto egraph::RefreshAnalysis() -> std::size_t {

@@ -35,11 +35,20 @@ class VirtualNode final {
       : gid_(NextSyntheticGid()), impl_(std::make_unique<Impl>(std::move(labels), std::move(properties), alloc)) {}
 
   VirtualNode(const VirtualNode &other, allocator_type alloc)
-      : gid_(other.gid_), impl_(std::make_unique<Impl>(other.impl_->labels, other.impl_->properties, alloc)) {}
+      : gid_(other.gid_),
+        impl_(std::make_unique<Impl>(other.impl_->labels,
+                                     other.impl_->properties,
+                                     other.impl_->in_degree,
+                                     other.impl_->out_degree,
+                                     alloc)) {}
 
   VirtualNode(VirtualNode &&other, allocator_type alloc)
       : gid_(other.gid_),
-        impl_(std::make_unique<Impl>(std::move(other.impl_->labels), std::move(other.impl_->properties), alloc)) {}
+        impl_(std::make_unique<Impl>(std::move(other.impl_->labels),
+                                     std::move(other.impl_->properties),
+                                     other.impl_->in_degree,
+                                     other.impl_->out_degree,
+                                     alloc)) {}
 
   VirtualNode(const VirtualNode &other) : VirtualNode(other, other.impl_->labels.get_allocator()) {}
 
@@ -74,18 +83,35 @@ class VirtualNode final {
 
   [[nodiscard]] auto Properties() const noexcept -> const property_map & { return impl_->properties; }
 
+  [[nodiscard]] auto InDegree() const noexcept -> size_t { return impl_->in_degree; }
+
+  [[nodiscard]] auto OutDegree() const noexcept -> size_t { return impl_->out_degree; }
+
   bool operator==(const VirtualNode &other) const noexcept { return gid_ == other.gid_; }
 
  private:
+  friend class VirtualGraph;
+
   struct Impl {
     label_list labels;
     property_map properties;
+    mutable size_t in_degree{0};
+    mutable size_t out_degree{0};
 
     Impl(const label_list &lbls, const property_map &props, allocator_type alloc)
         : labels(lbls, alloc), properties(props, alloc) {}
 
+    Impl(const label_list &lbls, const property_map &props, size_t in_deg, size_t out_deg, allocator_type alloc)
+        : labels(lbls, alloc), properties(props, alloc), in_degree(in_deg), out_degree(out_deg) {}
+
     Impl(label_list &&lbls, property_map &&props, allocator_type alloc)
         : labels(std::move(lbls), alloc), properties(std::move(props), alloc) {}
+
+    Impl(label_list &&lbls, property_map &&props, size_t in_deg, size_t out_deg, allocator_type alloc)
+        : labels(std::move(lbls), alloc),
+          properties(std::move(props), alloc),
+          in_degree(in_deg),
+          out_degree(out_deg) {}
   };
 
   storage::Gid gid_;

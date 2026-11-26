@@ -27,6 +27,8 @@
 #include "utils/concepts.hpp"
 
 namespace memgraph::query {
+class FineGrainedAuthChecker;
+
 namespace detail {
 template <typename T>
 concept ObjectAccessor = utils::SameAsAnyOf<T, VertexAccessor, EdgeAccessor>;
@@ -68,6 +70,10 @@ struct DeletedObject {
 
 struct ObjectCommonMethods {
   static auto PropertyToName(DbAccessor *dba, storage::PropertyId key) -> TypedValue;
+  static auto MaskPropertyValue(const VertexAccessor &vertex, storage::PropertyId key, const TypedValue &value,
+                                const FineGrainedAuthChecker *auth_checker) -> TypedValue;
+  static auto MaskPropertyValue(const EdgeAccessor &edge, storage::PropertyId key, const TypedValue &value,
+                                const FineGrainedAuthChecker *auth_checker) -> TypedValue;
 };
 
 template <ObjectAccessor TAccessor>
@@ -76,11 +82,12 @@ struct SetObjectProperty : ObjectCommonMethods {
                              TypedValue new_value)
       : object{object}, key{key}, old_value{std::move(old_value)}, new_value{std::move(new_value)} {}
 
-  std::map<std::string, TypedValue> ToMap(DbAccessor *dba) const {
+  std::map<std::string, TypedValue> ToMap(DbAccessor *dba,
+                                          const FineGrainedAuthChecker *auth_checker = nullptr) const {
     return {{ObjectString<TAccessor>(), TypedValue{object}},
             {"key", PropertyToName(dba, key)},
-            {"old", old_value},
-            {"new", new_value}};
+            {"old", MaskPropertyValue(object, key, old_value, auth_checker)},
+            {"new", MaskPropertyValue(object, key, new_value, auth_checker)}};
   }
 
   bool IsValid() const { return object.IsVisible(storage::View::OLD); }
@@ -96,8 +103,11 @@ struct RemovedObjectProperty : ObjectCommonMethods {
   explicit RemovedObjectProperty(const TAccessor &object, storage::PropertyId key, TypedValue old_value)
       : object{object}, key{key}, old_value{std::move(old_value)} {}
 
-  std::map<std::string, TypedValue> ToMap(DbAccessor *dba) const {
-    return {{ObjectString<TAccessor>(), TypedValue{object}}, {"key", PropertyToName(dba, key)}, {"old", old_value}};
+  std::map<std::string, TypedValue> ToMap(DbAccessor *dba,
+                                          const FineGrainedAuthChecker *auth_checker = nullptr) const {
+    return {{ObjectString<TAccessor>(), TypedValue{object}},
+            {"key", PropertyToName(dba, key)},
+            {"old", MaskPropertyValue(object, key, old_value, auth_checker)}};
   }
 
   bool IsValid() const { return object.IsVisible(storage::View::OLD); }
@@ -200,7 +210,8 @@ class TriggerContext {
   void AdaptForAccessor(DbAccessor *accessor);
 
   // Get TypedValue for the identifier defined with tag
-  TypedValue GetTypedValue(TriggerIdentifierTag tag, DbAccessor *dba) const;
+  TypedValue GetTypedValue(TriggerIdentifierTag tag, DbAccessor *dba,
+                           const FineGrainedAuthChecker *auth_checker = nullptr) const;
   bool ShouldEventTrigger(TriggerEventType) const;
 
  private:

@@ -22,7 +22,7 @@ namespace memgraph::storage {
 
 template <template <class...> class TContainer>
 nlohmann::json PropertyInfo<TContainer>::ToJson(const EnumStore &enum_store, std::string_view key,
-                                                uint32_t max_count) const {
+                                                int64_t max_count) const {
   nlohmann::json::object_t property_info;
   property_info.emplace("key", key);
   const auto num = n.load();
@@ -102,7 +102,8 @@ nlohmann::json TrackingInfo<TContainer>::ToJson(NameIdMapper &name_id_mapper, co
   const auto &[prop_itr, _] = tracking_info.emplace("properties", nlohmann::json::array_t{});
   for (const auto &[p, info] : properties) {
     if (!property_predicate(p)) continue;
-    prop_itr->second.emplace_back(info.ToJson(enum_store, name_id_mapper.IdToName(p.AsUint()), std::max(n.load(), 1)));
+    prop_itr->second.emplace_back(
+        info.ToJson(enum_store, name_id_mapper.IdToName(p.AsUint()), std::max<int64_t>(n.load(), 1)));
   }
   return tracking_info;
 }

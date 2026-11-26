@@ -167,21 +167,63 @@ struct symbol_resolve_traits<symbol::Subquery> {
 };
 
 template <>
+struct symbol_resolve_traits<symbol::Distinct> {
+  static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
+                               VariableSet const & /*chosen_introduces*/, SymbolContext const & /*syms*/,
+                               planner::core::extract::ChildSink<ResolverKey> auto visit) {
+    visit(ResolverKey{enode.children()[child::distinct::input], parent_key.in_scope, parent_key.must_introduce});
+  }
+};
+
+template <>
 struct symbol_resolve_traits<symbol::Output> {
-  // own_syms = {each NamedOutput child's sym}. Pipe gets:
-  //   in_scope       = parent.in_scope
-  //   must_introduce = chosen.introduces − own_syms
-  // NamedOutput children get:
-  //   in_scope       = parent.in_scope ∪ (chosen.introduces − own_syms)
-  //   must_introduce = ∅
   static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
                                VariableSet const &chosen_introduces, SymbolContext const &syms,
+                               planner::core::extract::FrontierMap<CostFrontier> const &frontier_map,
                                planner::core::extract::ChildSink<ResolverKey> auto visit) {
     using namespace child::output;
     auto const &children = enode.children();
     DMG_ASSERT(!children.empty(), "Output enode must have at least a pipe child");
     auto const own_syms = ExtractOutputOwnSyms(enode, syms.egraph, syms.variable_index);
-    auto const pipe_must_introduce = chosen_introduces.difference(own_syms);
+
+    auto pipe_must_introduce = chosen_introduces.difference(own_syms);
+    if (auto const pipe_fr_it = frontier_map.find(children[pipe]);
+        pipe_fr_it != frontier_map.end() && pipe_fr_it->second.has_value()) {
+      Alternative const *best_pipe_alt = nullptr;
+      double best_total_cost = 0.0;
+      for (Alternative const &pipe_alt : pipe_fr_it->second->alts()) {
+        if (!pipe_alt.required.is_subset_of(parent_key.in_scope)) continue;
+        if (!chosen_introduces.is_subset_of(pipe_alt.introduces.set_union(own_syms))) continue;
+        auto const cand_scope = parent_key.in_scope.set_union(pipe_alt.introduces);
+        double no_cost_sum = 0.0;
+        bool all_no_valid = true;
+        for (auto const no_eclass : children.subspan(first_named)) {
+          auto const no_fr_it = frontier_map.find(no_eclass);
+          if (no_fr_it == frontier_map.end() || !no_fr_it->second.has_value()) {
+            all_no_valid = false;
+            break;
+          }
+          auto const *best_no = planner::core::extract::PickBest(
+              no_fr_it->second->alts(),
+              [&cand_scope](Alternative const &a) { return a.required.is_subset_of(cand_scope); });
+          if (!best_no) {
+            all_no_valid = false;
+            break;
+          }
+          no_cost_sum += best_no->cost;
+        }
+        if (!all_no_valid) continue;
+        double const total_cost = pipe_alt.cost + (pipe_alt.cardinality * no_cost_sum);
+        if (!best_pipe_alt || total_cost < best_total_cost) {
+          best_pipe_alt = &pipe_alt;
+          best_total_cost = total_cost;
+        }
+      }
+      if (best_pipe_alt) {
+        pipe_must_introduce = best_pipe_alt->introduces;
+      }
+    }
+
     auto const named_out_in_scope = parent_key.in_scope.set_union(pipe_must_introduce);
     visit(ResolverKey{children[pipe], parent_key.in_scope, pipe_must_introduce});
     for (auto named_out : children.subspan(first_named)) {
@@ -214,9 +256,14 @@ EGRAPH_UNARY_OPS(MG_UNIFORM_FROM_OP)
 
 void ResolveChildren(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
                      VariableSet const &chosen_introduces, SymbolContext const &syms,
+                     planner::core::extract::FrontierMap<CostFrontier> const &frontier_map,
                      planner::core::extract::ChildSink<ResolverKey> auto visit) {
   DispatchBySymbol(enode.symbol(), [&]<symbol S>() {
-    symbol_resolve_traits<S>::resolve_children(enode, parent_key, chosen_introduces, syms, visit);
+    if constexpr (S == symbol::Output) {
+      symbol_resolve_traits<S>::resolve_children(enode, parent_key, chosen_introduces, syms, frontier_map, visit);
+    } else {
+      symbol_resolve_traits<S>::resolve_children(enode, parent_key, chosen_introduces, syms, visit);
+    }
   });
 }
 
@@ -244,7 +291,7 @@ auto ResolvePlanNode(SymbolContext const &syms, planner::core::extract::Frontier
   }
   auto const &chosen = *best;
   auto const &enode = syms.egraph.get_enode(chosen.enode_id);
-  ResolveChildren(enode, key, chosen.introduces, syms, record_child);
+  ResolveChildren(enode, key, chosen.introduces, syms, frontier_map, record_child);
   return chosen.enode_id;
 }
 

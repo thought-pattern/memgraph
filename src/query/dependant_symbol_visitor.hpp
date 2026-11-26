@@ -234,6 +234,10 @@ class DependantSymbolVisitor : public ExpressionVisitor<void> {
   void Visit(NamedExpression &named_expr) override { named_expr.expression_->Accept(*this); }
 
   void Visit(MapProjectionLiteral &map_proj) override {
+    map_proj.map_variable_->Accept(*this);
+    if (map_proj.all_properties_lookup_ != nullptr) {
+      map_proj.all_properties_lookup_->Accept(*this);
+    }
     std::ranges::for_each(map_proj.elements_, [this](const auto &pair) { pair.second->Accept(*this); });
   }
 

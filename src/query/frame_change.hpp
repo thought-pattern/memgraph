@@ -228,7 +228,10 @@ class FrameChangeCollector {
   }
 
   void AddInvalidator(utils::FrameChangeId const &key, Symbol::Position_t symbol_pos) {
-    invalidators_[symbol_pos].emplace_back(key);
+    auto &list = invalidators_[symbol_pos];
+    if (!std::ranges::contains(list, key)) {
+      list.emplace_back(key);
+    }
   }
 
   // Merge data from another FrameChangeCollector into this one
@@ -258,12 +261,14 @@ class FrameChangeCollector {
       }
     }
 
-    // Merge invalidators_: combine invalidator lists
+    // Merge invalidators_: combine invalidator lists without duplicating registrations
     for (auto &[symbol_pos, invalidator_list] : other.invalidators_) {
       auto &main_list = invalidators_[symbol_pos];
-      main_list.insert(main_list.end(),
-                       std::make_move_iterator(invalidator_list.begin()),
-                       std::make_move_iterator(invalidator_list.end()));
+      for (auto &inv : invalidator_list) {
+        if (!std::ranges::contains(main_list, inv)) {
+          main_list.push_back(std::move(inv));
+        }
+      }
     }
   }
 

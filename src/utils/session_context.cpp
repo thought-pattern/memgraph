@@ -13,6 +13,8 @@
 
 #include <iterator>
 
+#include "utils/logging.hpp"
+
 namespace memgraph::logging {
 
 namespace {
@@ -47,9 +49,11 @@ void AppendQuoted(fmt::memory_buffer &out, std::string_view value) {
 
 void EmitSlowQueryLog(std::string_view user, std::string_view db, std::string_view query, int64_t duration_ms,
                       std::optional<std::string_view> plan) {
+  auto const masked_query = MaskSensitiveInformation(query);
+  const std::string_view safe_query = masked_query ? std::string_view{*masked_query} : query;
   fmt::memory_buffer buf;
   fmt::format_to(std::back_inserter(buf), "[slow-query] duration_ms={} user={} db={} query=", duration_ms, user, db);
-  AppendQuoted(buf, query);
+  AppendQuoted(buf, safe_query);
   if (plan.has_value()) {
     fmt::format_to(std::back_inserter(buf), "\nPLAN:\n");
     // Indent each non-empty plan line by two spaces.
@@ -71,11 +75,13 @@ void EmitSlowQueryLog(std::string_view user, std::string_view db, std::string_vi
 }
 
 void EmitFailedQueryLog(std::string_view user, std::string_view db, std::string_view query, std::string_view error) {
+  auto const masked_query = MaskSensitiveInformation(query);
+  const std::string_view safe_query = masked_query ? std::string_view{*masked_query} : query;
   fmt::memory_buffer buf;
   fmt::format_to(std::back_inserter(buf), "[failed-query] user={} db={} error=", user, db);
   AppendQuoted(buf, error);
   fmt::format_to(std::back_inserter(buf), " query=");
-  AppendQuoted(buf, query);
+  AppendQuoted(buf, safe_query);
   spdlog::error(std::string_view{buf.data(), buf.size()});
 }
 

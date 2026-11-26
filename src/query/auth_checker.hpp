@@ -104,6 +104,11 @@ class FineGrainedAuthChecker {
                                                    memgraph::storage::PropertyId property,
                                                    AuthQuery::PropertyPermissionType type) const = 0;
 
+  [[nodiscard]] virtual bool HasGlobalEdgePropertyPermission(memgraph::storage::PropertyId /*property*/,
+                                                             AuthQuery::PropertyPermissionType /*type*/) const {
+    return HasUnrestrictedAccessToEdgeTypeProperties();
+  }
+
   virtual void UpdateDbAccessor(DbAccessor const * /*dba*/) {}
 
   // Used to make the auth checker thread safe

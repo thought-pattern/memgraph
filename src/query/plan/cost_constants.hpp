@@ -25,6 +25,7 @@ inline constexpr double kScanAllByPointWithinbbox{1.1};
 inline constexpr double kScanAllByEdgeType{1.1};
 inline constexpr double kScanAllByEdgeTypeProperty{1.1};
 inline constexpr double kScanAllByEdgeProperty{1.1};
+inline constexpr double kScanAllByEdgeId{1.0};
 inline constexpr double kScanAllByVertexProperty{1.1};
 inline constexpr double kExpand{2.0};
 inline constexpr double kExpandVariable{3.0};
@@ -34,6 +35,7 @@ inline constexpr double kEdgeUniquenessFilter{1.5};
 inline constexpr double kUnwind{1.3};
 inline constexpr double kForeach{1.0};
 inline constexpr double kUnion{1.0};
+inline constexpr double kHashJoin{1.0};
 inline constexpr double kSubquery{1.0};
 // Share of every WHEN branch's cost added to the costliest, so plans that differ only in a cheaper branch do not tie.
 inline constexpr double kConditionalTieBreak{0.001};

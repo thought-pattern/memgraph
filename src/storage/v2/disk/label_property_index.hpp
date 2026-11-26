@@ -48,6 +48,8 @@ class DiskLabelPropertyIndex : public storage::LabelPropertyIndex {
 
     bool IndexReady(LabelId label, std::span<PropertyPath const> properties) const override;
 
+    bool IndexReady(LabelId label, std::span<PropertyPath const> properties, IndexOrder order) const override;
+
     auto RelevantLabelPropertiesIndicesInfo(std::span<LabelId const> labels,
                                             std::span<PropertyPath const> properties) const
         -> std::vector<LabelPropertiesIndicesInfo> override;

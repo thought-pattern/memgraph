@@ -36,12 +36,20 @@ void CallableAliasMapper::LoadMapping(const std::filesystem::path &path) {
     const bool has_json_extension = (path.extension() == ".json");
     if (is_regular_file && has_json_extension) {
       std::ifstream mapping_file(path);
+      std::map<std::string, std::string, std::less<>> parsed_mapping;
       try {
         json mapping_data = json::parse(mapping_file);
-        mapping_ = mapping_data.get<std::map<std::string, std::string, std::less<>>>();
+        parsed_mapping = mapping_data.get<std::map<std::string, std::string, std::less<>>>();
       } catch (...) {
         MG_ASSERT(false, "Parsing callable mapping was unsuccesful. Make sure it is in correct json format.");
       }
+      for (const auto &[alias_name, target_name] : parsed_mapping) {
+        const auto dot_pos = target_name.find_last_of('.');
+        MG_ASSERT(!alias_name.empty() && dot_pos != std::string::npos && dot_pos > 0 &&
+                      dot_pos + 1 < target_name.size(),
+                  "Callable alias destination must be a qualified '<module>.<callable>' name.");
+      }
+      mapping_ = std::move(parsed_mapping);
     } else {
       MG_ASSERT(false, "Path to callable mappings is not a regular file or does not have .json extension.");
     }

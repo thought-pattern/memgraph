@@ -93,8 +93,8 @@ std::vector<Expansion> NormalizePatterns(const SymbolTable &symbol_table, const 
               collector.symbols_.erase(symbol_table.at(*edge->filter_lambda_.accumulated_weight));
             }
           }
-          // A no-op while the weight expression is not visited above; keep it next to that visit.
           if (edge->weight_lambda_.expression) {
+            edge->weight_lambda_.expression->Accept(collector);
             collector.symbols_.erase(symbol_table.at(*edge->weight_lambda_.inner_edge));
             collector.symbols_.erase(symbol_table.at(*edge->weight_lambda_.inner_node));
           }
@@ -768,6 +768,7 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
         filter.property_filter = PropertyFilter(
             symbol_table, symbol_table.at(*ident), nested_properties, Bound(expr2, bound_type), std::nullopt);
         all_filters_.emplace_back(filter);
+        is_prop_filter = true;
       }
     } else if (get_property_lookup(expr1, prop_lookup, ident)) {
       // n.prop > value
@@ -787,6 +788,7 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
                                                 std::nullopt,
                                                 Bound(expr1, bound_type));
         all_filters_.emplace_back(filter);
+        is_prop_filter = true;
       }
     } else if (get_property_lookup(expr2, prop_lookup, ident)) {
       // value > n.prop
@@ -907,7 +909,10 @@ void Filters::AnalyzeAndStoreFilter(Expression *expr, const SymbolTable &symbol_
   };
   // We are only interested to see the insides of And, because Or prevents
   // indexing since any labels and properties found there may be optional.
-  DMG_ASSERT(!utils::IsSubtype(*expr, AndOperator::kType), "Expected AndOperators have been split.");
+  // A chained comparison with an impure middle operand stays an unsplit AndOperator so its middle operand is
+  // evaluated once per row.
+  DMG_ASSERT(!utils::Downcast<AndOperator>(expr) || utils::Downcast<AndOperator>(expr)->chained_comparison_count_ >= 2U,
+             "Expected unchained AndOperators have been split.");
 
   if (auto *edgetype_test = utils::Downcast<EdgeTypesTest>(expr)) {
     if (auto *identifier = utils::Downcast<Identifier>(edgetype_test->expression_)) {
@@ -1481,6 +1486,52 @@ QueryParts CollectQueryParts(SymbolTable &symbol_table, AstStorage &storage, Cyp
   return CollectQueryParts(symbol_table, storage, query, is_subquery, query->pre_query_directives_.commit_frequency_);
 }
 
+namespace {
+
+class ImpureExpressionFinder : public HierarchicalTreeVisitor {
+ public:
+  using HierarchicalTreeVisitor::PostVisit;
+  using HierarchicalTreeVisitor::PreVisit;
+  using HierarchicalTreeVisitor::Visit;
+
+  bool PreVisit(Function &func) override {
+    if (!IsFunctionPure(func.function_name_)) {
+      impure = true;
+      return false;
+    }
+    return true;
+  }
+
+  bool PreVisit(SubqueryExpression & /*subquery*/) override {
+    impure = true;
+    return false;
+  }
+
+  bool Visit(Identifier & /*ident*/) override { return true; }
+  bool Visit(PrimitiveLiteral & /*lit*/) override { return true; }
+  bool Visit(ParameterLookup & /*param*/) override { return true; }
+  bool Visit(EnumValueAccess & /*access*/) override { return true; }
+
+  bool impure{false};
+};
+
+bool ChainedComparisonHasImpureMiddleOperand(const AndOperator &root) {
+  if (root.chained_comparison_count_ < 2U) return false;
+  const Expression *curr = &root;
+  for (uint32_t idx = root.chained_comparison_count_ - 1U; idx > 0U; --idx) {
+    const auto *and_node = utils::Downcast<const AndOperator>(curr);
+    const auto *rhs_cmp = and_node ? utils::Downcast<const BinaryOperator>(and_node->expression2_) : nullptr;
+    if (!and_node || !rhs_cmp) return false;
+    ImpureExpressionFinder finder;
+    rhs_cmp->expression1_->Accept(finder);
+    if (finder.impure) return true;
+    curr = and_node->expression1_;
+  }
+  return false;
+}
+
+}  // namespace
+
 // TODO: Think about converting all filtering expression into CNF to improve
 // the granularity of filters which can be stand alone.
 std::vector<Expression *> SplitExpression(Expression *expression, SplitExpressionMode mode) {
@@ -1493,9 +1544,11 @@ std::vector<Expression *> SplitExpression(Expression *expression, SplitExpressio
 
     if (mode == SplitExpressionMode::AND) {
       if (auto *and_op = utils::Downcast<AndOperator>(current_expression)) {
-        pending_expressions.push(and_op->expression1_);
-        pending_expressions.push(and_op->expression2_);
-        continue;
+        if (!ChainedComparisonHasImpureMiddleOperand(*and_op)) {
+          pending_expressions.push(and_op->expression1_);
+          pending_expressions.push(and_op->expression2_);
+          continue;
+        }
       }
     } else if (mode == SplitExpressionMode::OR) {
       if (auto *or_op = utils::Downcast<OrOperator>(current_expression)) {
@@ -1513,6 +1566,7 @@ std::vector<Expression *> SplitExpression(Expression *expression, SplitExpressio
 
 Expression *SplitLabelsTests(Expression *expression, AstStorage &storage) {
   if (auto *conjunction = utils::Downcast<AndOperator>(expression)) {
+    if (conjunction->chained_comparison_count_ >= 2U) return expression;
     auto *lhs = SplitLabelsTests(conjunction->expression1_, storage);
     auto *rhs = SplitLabelsTests(conjunction->expression2_, storage);
     if (lhs == conjunction->expression1_ && rhs == conjunction->expression2_) return expression;

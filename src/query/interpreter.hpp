@@ -870,14 +870,13 @@ std::map<std::string, TypedValue> Interpreter::Pull(TStream *result_stream, std:
   bool emit_slow_query = false;
   int64_t slow_query_duration_ms = 0;
   try {
-    // Wrap the (statically polymorphic) stream type into a common type which
-    // the handler knows.
-    AnyStream stream{result_stream, query_execution->resource()};
-    const auto maybe_res = query_execution->prepared_query->query_handler(&stream, bounded_n);
-    // Stream is using execution memory of the query_execution which
-    // can be deleted after its execution so the stream should be cleared
-    // first.
-    stream.~AnyStream();
+    // Stream is using execution memory of the query_execution which can be deleted after its execution, so scope the
+    // stream wrapper to destroy naturally before post-execution cleanup runs.
+    std::optional<QueryHandlerResult> maybe_res;
+    {
+      AnyStream stream{result_stream, query_execution->resource()};
+      maybe_res = query_execution->prepared_query->query_handler(&stream, bounded_n);
+    }
 
     // If the query finished executing, we have received a value which tells
     // us what to do after.

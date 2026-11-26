@@ -51,6 +51,8 @@ struct UsedIndexChecker : public virtual HierarchicalLogicalOperatorVisitor {
   bool PreVisit(ScanAllByEdgeProperty &) override;
   bool PreVisit(ScanAllByEdgeId &) override;
   bool PreVisit(ScanAllByVertexProperty &) override;
+  bool PreVisit(ScanAllByPointDistance &) override;
+  bool PreVisit(ScanAllByPointWithinbbox &) override;
 
   bool PreVisit(Expand &) override;
   bool PreVisit(ExpandVariable &) override;
@@ -59,6 +61,7 @@ struct UsedIndexChecker : public virtual HierarchicalLogicalOperatorVisitor {
 
   bool PreVisit(Filter &) override;
   bool PreVisit(EdgeUniquenessFilter &) override;
+  bool PreVisit(EvaluatePatternFilter &) override;
 
   bool PreVisit(Merge &) override;
   bool PreVisit(Optional &) override;
@@ -76,7 +79,11 @@ struct UsedIndexChecker : public virtual HierarchicalLogicalOperatorVisitor {
   bool PreVisit(Union &) override;
 
   bool PreVisit(Unwind &) override;
+  bool PreVisit(CardinalityScale &) override;
   bool PreVisit(CallProcedure &) override;
+  bool PreVisit(LoadCsv &) override;
+  bool PreVisit(LoadParquet &) override;
+  bool PreVisit(LoadJsonl &) override;
   bool PreVisit(Foreach &) override;
 
   bool PreVisit(Apply &) override;
@@ -86,6 +93,22 @@ struct UsedIndexChecker : public virtual HierarchicalLogicalOperatorVisitor {
   bool PreVisit(Conditional &) override;
   bool PreVisit(PeriodicSubquery &) override;
   bool PreVisit(PeriodicCommit &) override;
+  bool PreVisit(SetNestedProperty &) override;
+  bool PreVisit(RemoveNestedProperty &) override;
+
+  bool PreVisit(AggregateParallel &) override;
+  bool PreVisit(OrderByParallel &) override;
+  bool PreVisit(ParallelMerge &) override;
+  bool PreVisit(ScanParallel &) override;
+  bool PreVisit(ScanParallelByLabel &) override;
+  bool PreVisit(ScanParallelByLabelProperties &) override;
+  bool PreVisit(ScanParallelByEdge &) override;
+  bool PreVisit(ScanParallelByEdgeType &) override;
+  bool PreVisit(ScanParallelByEdgeTypeProperty &) override;
+  bool PreVisit(ScanParallelByEdgeProperty &) override;
+  bool PreVisit(ScanParallelByVertexProperty &) override;
+  bool PreVisit(ScanChunk &) override;
+  bool PreVisit(ScanChunkByEdge &) override;
 
   bool Visit(Once &) override;
 

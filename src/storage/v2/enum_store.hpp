@@ -134,6 +134,38 @@ struct EnumStore {
     return Enum{e_type, e_value};
   }
 
+  void RollbackRegisterEnum(EnumTypeId e_type) noexcept {
+    if (e_type.value_of() + 1 == etype_strs_.size()) {
+      etype_lookup_.erase(etype_strs_.back());
+      etype_strs_.pop_back();
+      evalue_strs_.pop_back();
+      evalue_lookups_.pop_back();
+    }
+  }
+
+  void RollbackAddValue(Enum added) noexcept {
+    auto const tid = added.type_id().value_of();
+    auto const vid = added.value_id().value_of();
+    if (tid < evalue_strs_.size() && vid + 1 == evalue_strs_[tid].size()) {
+      evalue_lookups_[tid].erase(evalue_strs_[tid].back());
+      evalue_strs_[tid].pop_back();
+    }
+  }
+
+  void RollbackUpdateValue(Enum updated, std::string restored_old_value) noexcept {
+    auto const tid = updated.type_id().value_of();
+    auto const vid = updated.value_id().value_of();
+    if (tid < evalue_strs_.size() && vid < evalue_strs_[tid].size()) {
+      auto &lookup = evalue_lookups_[tid];
+      auto &strings = evalue_strs_[tid];
+      auto [_, inserted] = lookup.try_emplace(restored_old_value, updated.value_id());
+      if (inserted) {
+        strings[vid].swap(restored_old_value);
+        lookup.erase(restored_old_value);
+      }
+    }
+  }
+
   // used by recovery in the event of failure
   void clear() {
     etype_strs_.clear();

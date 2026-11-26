@@ -140,11 +140,8 @@ struct IndexHints {
       if (label_id != label) continue;
 
       auto property_ids = properties_prefix | ranges::views::transform(property_path_converter(db)) | ranges::to_vector;
-      // Check if paths are the same
-      for (const auto &path : property_paths) {
-        if (std::ranges::contains(property_ids, path)) {
-          return true;
-        }
+      if (std::ranges::equal(property_ids, property_paths)) {
+        return true;
       }
     }
     return false;
@@ -363,8 +360,8 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
       // conservative: an element-independent value is still ordered, but at
       // worst we keep an unnecessary sort. The IN-list lowering is already
       // covered by has_in_filter.
-      bool const fed_by_unwind = target->input() && target->input()->GetTypeInfo() == Unwind::kType;
-      if (!fed_by_unwind) {
+      bool const single_pass_input = OrderByEliminator<TDbAccessor>::ProducesAtMostOneRow(target->input().get());
+      if (single_pass_input) {
         if (auto *s = dynamic_cast<ScanAllByLabelProperties const *>(target)) {
           provided = s;
         } else if (auto *s = dynamic_cast<ScanAllByVertexProperty const *>(target)) {
@@ -1264,7 +1261,7 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
     auto compare_indices = [](std::optional<LabelPropertyIndex> &found,
                               std::optional<storage::LabelPropertyIndexStats> &new_stats,
                               int vertex_count) {
-      if (!new_stats) {
+      if (!new_stats || !found || !found->index_stats) {
         return 0;
       }
 
@@ -1437,7 +1434,7 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
           auto storage_properties = label_prop.info_.properties_;
           auto vertex_count = db_->VerticesCount(label_id, storage_properties);
           bool has_hint = index_hints_.HasLabelPropertiesIndex(db_, label_id, storage_properties);
-          if (vertex_count < best_vertex_count || (has_hint && !best_has_hint)) {
+          if ((has_hint && !best_has_hint) || (has_hint == best_has_hint && vertex_count < best_vertex_count)) {
             if (!best_has_hint && has_hint) {
               current_group.num_of_index_hints++;
             }
@@ -1563,6 +1560,10 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
     const auto &type_info = op->GetTypeInfo();
     if (type_info == ScanAllById::kType) {
       return 1.0;
+    }
+    if (type_info == ScanAllByEdgeId::kType) {
+      auto *scan_op = dynamic_cast<ScanAllByEdgeId *>(op);
+      return scan_op && scan_op->common_.direction == EdgeAtom::Direction::BOTH ? 2.0 : 1.0;
     }
     if (type_info == ScanAllByLabel::kType) {
       auto *scan_op = dynamic_cast<ScanAllByLabel *>(op);
@@ -1713,7 +1714,8 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
                                  ? total
                                  : static_cast<int64_t>(total * CardParam::kFilter);
       auto const has_hint = index_hints_.HasVertexPropertyIndex(db_, property);
-      if (!best || (has_hint && !best->has_hint) || estimated < best->estimated_count) {
+      if (!best || (has_hint && !best->has_hint) ||
+          (has_hint == best->has_hint && estimated < best->estimated_count)) {
         best = Candidate{filter, property, estimated, has_hint};
       }
     }
@@ -2057,7 +2059,10 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
             filtered_property_ids;  // Used to check if all indices uses the same filter
         metadata.all_property_filters_same =
             true;  // Used to check if all indices uses the same filter -> if yes we can remove the filter
+        const auto incoming_symbols = input ? input->ModifiedSymbols(*symbol_table_) : std::vector<Symbol>{};
+        auto const original_input = input;
         for (const auto &index : best_group.indices) {
+          input = original_input;
           if (std::holds_alternative<LabelIx>(index)) {
             metadata.all_property_filters_same = false;
             metadata.labels_to_erase.push_back(std::get<LabelIx>(index));
@@ -2097,7 +2102,8 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
           }
         }
         metadata.is_or_label_filter = true;
-        return ScanByIndexResult{BalancedDisjunctionUnion(std::move(scans), node_symbol), std::move(metadata)};
+        return ScanByIndexResult{BalancedDisjunctionUnion(std::move(scans), node_symbol, incoming_symbols),
+                                 std::move(metadata)};
       }
     }
     if (vertex_prop_result) return std::move(*vertex_prop_result);

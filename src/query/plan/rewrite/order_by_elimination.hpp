@@ -76,6 +76,26 @@ class OrderByEliminator {
 
   // ---------- hooks called by the rewriter ---------------------------------
 
+  /// True when `op` yields at most one row, so an indexed scan directly above
+  /// it runs at most once and emits its rows in index order without restarting.
+  static bool ProducesAtMostOneRow(const LogicalOperator *op) {
+    while (op) {
+      const auto &ti = op->GetTypeInfo();
+      if (ti == Once::kType || ti == EmptyResult::kType) return true;
+      if (ti == Filter::kType || ti == Produce::kType || ti == CacheProperties::kType ||
+          ti == ConstructNamedPath::kType || ti == EdgeUniquenessFilter::kType || ti == RollUpApply::kType ||
+          ti == EvaluatePatternFilter::kType || ti == Accumulate::kType || ti == Distinct::kType ||
+          ti == Skip::kType || ti == SetProperty::kType || ti == SetProperties::kType || ti == SetLabels::kType ||
+          ti == RemoveProperty::kType || ti == RemoveLabels::kType || ti == SetNestedProperty::kType ||
+          ti == RemoveNestedProperty::kType || ti == Foreach::kType) {
+        op = op->input().get();
+        continue;
+      }
+      return false;
+    }
+    return false;
+  }
+
   /// Record a new ORDER BY operator.  Under parallel execution we push a
   /// bare (not well_formed) sentinel so that TryEliminate can still pop it,
   /// but we skip the analysis work since elimination is impossible.
@@ -328,32 +348,23 @@ class OrderByEliminator {
   /// Can the provided scans satisfy all ORDER BY entries without an explicit sort?
   [[nodiscard]] static bool CanEliminate(const OrderByInfo &ctx) {
     if (!ctx.well_formed || !ctx.order_preserving_path || ctx.has_pending_entries()) return false;
-    if (ctx.provided_scans.empty()) return false;
+    if (ctx.provided_scans.empty() || ctx.entries.empty()) return false;
 
-    size_t scan_idx = 0;
-    size_t entry_idx = 0;
+    // Only the outermost scan can establish a global sort order, and only when its
+    // own input yields at most one row. A subsequent scan restarts for each outer
+    // row, so tied outer keys interleave inner keys out of order.
+    const auto &first_scan = ctx.provided_scans.front();
+    const bool single_pass =
+        std::visit([](const auto *s) { return ProducesAtMostOneRow(s->input().get()); }, first_scan);
+    if (!single_pass) return false;
+    if (!ScanOrderMatches(first_scan, ctx.ordering)) return false;
 
-    // entries must form contiguous groups by source_position, matching provided scans in order
-    while (entry_idx < ctx.entries.size() && scan_idx < ctx.provided_scans.size()) {
-      if (!ScanOrderMatches(ctx.provided_scans[scan_idx], ctx.ordering)) return false;
-
-      const auto sym_pos =
-          std::visit([](const auto *s) { return s->output_symbol_.position(); }, ctx.provided_scans[scan_idx]);
-
-      if (ctx.entries[entry_idx].source_position != sym_pos) return false;
-
-      const size_t group_start = entry_idx;
-      while (entry_idx < ctx.entries.size() && ctx.entries[entry_idx].source_position == sym_pos) {
-        ++entry_idx;
-      }
-      const size_t group_size = entry_idx - group_start;
-
-      if (!MatchGroupAgainstScan(ctx.provided_scans[scan_idx], ctx.entries, group_start, group_size)) return false;
-
-      ++scan_idx;
+    const auto sym_pos = std::visit([](const auto *s) { return s->output_symbol_.position(); }, first_scan);
+    if (!std::ranges::all_of(ctx.entries, [sym_pos](const auto &e) { return e.source_position == sym_pos; })) {
+      return false;
     }
 
-    return entry_idx == ctx.entries.size();
+    return MatchGroupAgainstScan(first_scan, ctx.entries, 0, ctx.entries.size());
   }
 };
 

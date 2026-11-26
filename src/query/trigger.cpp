@@ -183,9 +183,11 @@ Trigger::Trigger(std::string name, const std::string &query, const UserParameter
   if (!utils::Downcast<CypherQuery>(parsed_statements_.query)) {
     throw utils::BasicException("A trigger statement must be a Cypher query.");
   }
-  // We check immediately if the query is valid by trying to create a plan.
+  // Validate that the query can be planned immediately for both DEFINER and INVOKER triggers.
   if (privilege_context_ == TriggerPrivilegeContext::DEFINER) {
     GetPlan(db_accessor, db_name, creator_);
+  } else {
+    GetPlan(db_accessor, db_name, nullptr);
   }
 }
 
@@ -236,9 +238,7 @@ Trigger::PlanResult Trigger::GetPlan(DbAccessor *db_accessor, std::string_view d
     }
     // Clone under plan_lock_ so concurrent executions cannot race on creator_'s mutable auth cache.
     effective_principal = creator_->clone();
-  } else {
-    // no users
-    DMG_ASSERT(triggering_user, "Triggering user is null");
+  } else if (triggering_user) {
     if (!triggering_user->IsAuthorized(parsed_statements_.required_privileges, db_name, &query::up_to_date_policy)) {
       throw utils::BasicException(
           fmt::format("The user who invoked the trigger '{}' is not authorized to execute the query!", name_));
@@ -255,6 +255,10 @@ void Trigger::Execute(DbAccessor *dba, dbms::DatabaseAccess db_acc, utils::Memor
                       [[maybe_unused]] const AuthChecker *auth_checker) const {
   if (!context.ShouldEventTrigger(event_type_)) {
     return;
+  }
+
+  if (privilege_context_ == TriggerPrivilegeContext::INVOKER) {
+    DMG_ASSERT(triggering_user, "Triggering user is null");
   }
 
   spdlog::debug("Executing trigger '{}'", name_);
@@ -311,7 +315,7 @@ void Trigger::Execute(DbAccessor *dba, dbms::DatabaseAccess db_acc, utils::Memor
       continue;
     }
 
-    frame_writer.Write(plan.symbol_table().at(identifier), context.GetTypedValue(tag, dba));
+    frame_writer.Write(plan.symbol_table().at(identifier), context.GetTypedValue(tag, dba, ctx.auth_checker));
   }
 
   while (cursor->Pull(frame, ctx));
@@ -373,112 +377,141 @@ void TriggerStore::RestoreTrigger(AstCache *query_cache, DbAccessor *db_accessor
   const auto invalid_state_message = get_failed_message("Invalid state of the trigger data.");
 
   spdlog::debug("Loading trigger '{}'", trigger_name);
-  auto json_trigger_data = nlohmann::json::parse(trigger_data);
-
-  if (!json_trigger_data["version"].is_number_unsigned()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  const auto version = json_trigger_data["version"].get<uint64_t>();
-  if (version != kVersion && version != kDefinerOnlyVersion) {
-    spdlog::warn(get_failed_message(fmt::format(
-        "Invalid version of the trigger data. Expected {} or {}, got {}.", kVersion, kDefinerOnlyVersion, version)));
-    return;
-  }
-
-  const bool migration_occurred = MigrateTriggerData(json_trigger_data, version);
-  if (migration_occurred) {
-    // update stored data with migrated version
-    storage_.Put(trigger_name, json_trigger_data.dump());
-  }
-
-  if (!json_trigger_data["statement"].is_string()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  auto statement = json_trigger_data["statement"].get<std::string>();
-
-  if (!json_trigger_data["phase"].is_number_integer()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  const auto phase = json_trigger_data["phase"].get<TriggerPhase>();
-
-  if (!json_trigger_data["event_type"].is_number_integer()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  const auto event_type = json_trigger_data["event_type"].get<TriggerEventType>();
-
-  if (!json_trigger_data["user_parameters"].is_object()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  const auto user_parameters = serialization::DeserializeExternalPropertyValueMap(json_trigger_data["user_parameters"],
-                                                                                  db_accessor->GetStorageAccessor());
-
-  const auto owner_json = json_trigger_data["owner"];
-  std::optional<std::string> owner{};
-  if (owner_json.is_string()) {
-    owner.emplace(owner_json.get<std::string>());
-  } else if (!owner_json.is_null()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-
-  const auto owner_roles_json = json_trigger_data["owner_roles"];
-  std::vector<std::string> roles{};
-  if (owner_roles_json.is_array()) {
-    roles = owner_roles_json.get<std::vector<std::string>>();
-  } else if (!owner_roles_json.is_null()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-
-  std::shared_ptr<query::QueryUserOrRole> user = nullptr;
   try {
-    user = auth_checker->GenQueryUser(owner, roles);
-  } catch (const utils::BasicException &e) {
-    spdlog::warn(
-        fmt::format("Failed to load trigger '{}' because its owner is not an existing Memgraph user.", trigger_name));
+    auto json_trigger_data = nlohmann::json::parse(trigger_data);
+    if (!json_trigger_data.is_object()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+
+    if (!json_trigger_data.contains("version") || !json_trigger_data["version"].is_number_unsigned()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto version = json_trigger_data["version"].get<uint64_t>();
+    if (version != kVersion && version != kDefinerOnlyVersion) {
+      spdlog::warn(get_failed_message(fmt::format(
+          "Invalid version of the trigger data. Expected {} or {}, got {}.", kVersion, kDefinerOnlyVersion, version)));
+      return;
+    }
+
+    const bool migration_occurred = MigrateTriggerData(json_trigger_data, version);
+    if (migration_occurred) {
+      // update stored data with migrated version
+      storage_.Put(trigger_name, json_trigger_data.dump());
+    }
+
+    if (!json_trigger_data.contains("statement") || !json_trigger_data["statement"].is_string()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    auto statement = json_trigger_data["statement"].get<std::string>();
+
+    if (!json_trigger_data.contains("phase") || !json_trigger_data["phase"].is_number_integer()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto phase_raw = json_trigger_data["phase"].get<int64_t>();
+    if (phase_raw < 0 || phase_raw > static_cast<int64_t>(TriggerPhase::AFTER_COMMIT)) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto phase = static_cast<TriggerPhase>(phase_raw);
+
+    if (!json_trigger_data.contains("event_type") || !json_trigger_data["event_type"].is_number_integer()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto event_raw = json_trigger_data["event_type"].get<int64_t>();
+    if (event_raw < 0 || event_raw > static_cast<int64_t>(TriggerEventType::UPDATE)) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto event_type = static_cast<TriggerEventType>(event_raw);
+
+    if (!json_trigger_data.contains("user_parameters") || !json_trigger_data["user_parameters"].is_object()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto user_parameters = serialization::DeserializeExternalPropertyValueMap(
+        json_trigger_data["user_parameters"], db_accessor->GetStorageAccessor());
+
+    std::optional<std::string> owner{};
+    if (json_trigger_data.contains("owner")) {
+      const auto &owner_json = json_trigger_data["owner"];
+      if (owner_json.is_string()) {
+        owner.emplace(owner_json.get<std::string>());
+      } else if (!owner_json.is_null()) {
+        spdlog::warn(invalid_state_message);
+        return;
+      }
+    }
+
+    std::vector<std::string> roles{};
+    if (json_trigger_data.contains("owner_roles")) {
+      const auto &owner_roles_json = json_trigger_data["owner_roles"];
+      if (owner_roles_json.is_array()) {
+        for (const auto &role_elem : owner_roles_json) {
+          if (!role_elem.is_string()) {
+            spdlog::warn(invalid_state_message);
+            return;
+          }
+          roles.push_back(role_elem.get<std::string>());
+        }
+      } else if (!owner_roles_json.is_null()) {
+        spdlog::warn(invalid_state_message);
+        return;
+      }
+    }
+
+    std::shared_ptr<query::QueryUserOrRole> user = nullptr;
+    try {
+      user = auth_checker->GenQueryUser(owner, roles);
+    } catch (const utils::BasicException &) {
+      spdlog::warn(
+          fmt::format("Failed to load trigger '{}' because its owner is not an existing Memgraph user.", trigger_name));
+      return;
+    }
+
+    if (!json_trigger_data.contains("privilege_context") || !json_trigger_data["privilege_context"].is_string()) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto privilege_context_opt =
+        TriggerPrivilegeContextFromString(json_trigger_data["privilege_context"].get<std::string>());
+    if (!privilege_context_opt) {
+      spdlog::warn(invalid_state_message);
+      return;
+    }
+    const auto privilege_context = *privilege_context_opt;
+
+    std::optional<Trigger> trigger;
+    try {
+      trigger.emplace(std::string{trigger_name},
+                      statement,
+                      user_parameters,
+                      event_type,
+                      query_cache,
+                      db_accessor,
+                      query_config,
+                      user,
+                      std::string{db_name},
+                      privilege_context,
+                      server_parameters);
+    } catch (const utils::BasicException &e) {
+      spdlog::warn("Failed to create trigger '{}' because: {}", trigger_name, e.what());
+      return;
+    }
+
+    auto triggers_acc =
+        phase == TriggerPhase::BEFORE_COMMIT ? before_commit_triggers_.access() : after_commit_triggers_.access();
+    triggers_acc.insert(std::move(*trigger));
+
+    spdlog::debug("Trigger loaded successfully!");
+  } catch (const std::exception &e) {
+    spdlog::warn(get_failed_message(e.what()));
     return;
   }
-
-  const auto privilege_context_json = json_trigger_data["privilege_context"];
-  if (!privilege_context_json.is_string()) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  const auto privilege_context_opt = TriggerPrivilegeContextFromString(privilege_context_json.get<std::string>());
-  if (!privilege_context_opt) {
-    spdlog::warn(invalid_state_message);
-    return;
-  }
-  const auto privilege_context = *privilege_context_opt;
-
-  std::optional<Trigger> trigger;
-  try {
-    trigger.emplace(std::string{trigger_name},
-                    statement,
-                    user_parameters,
-                    event_type,
-                    query_cache,
-                    db_accessor,
-                    query_config,
-                    user,
-                    std::string{db_name},
-                    privilege_context,
-                    server_parameters);
-  } catch (const utils::BasicException &e) {
-    spdlog::warn("Failed to create trigger '{}' because: {}", trigger_name, e.what());
-    return;
-  }
-
-  auto triggers_acc =
-      phase == TriggerPhase::BEFORE_COMMIT ? before_commit_triggers_.access() : after_commit_triggers_.access();
-  triggers_acc.insert(std::move(*trigger));
-
-  spdlog::debug("Trigger loaded successfully!");
 }
 
 void TriggerStore::RestoreTriggers(AstCache *query_cache, DbAccessor *db_accessor,
@@ -560,8 +593,9 @@ void TriggerStore::AddTrigger(std::string name, const std::string &query, const 
     data["owner"] = nullptr;
     data["owner_roles"] = nullptr;
   }
-  storage_.Put(trigger->Name(), data.dump());
-  store_guard.unlock();
+  if (!storage_.Put(trigger->Name(), data.dump())) {
+    throw QueryRuntimeException("Couldn't persist trigger '{}'!", trigger->Name());
+  }
 
   auto triggers_acc =
       phase == TriggerPhase::BEFORE_COMMIT ? before_commit_triggers_.access() : after_commit_triggers_.access();
@@ -586,20 +620,30 @@ void TriggerStore::DropTrigger(const std::string &name) {
     throw utils::BasicException("Couldn't load trigger data!");
   }
 
-  if (!data["phase"].is_number_integer()) {
+  if (!data.contains("phase") || !data["phase"].is_number_integer()) {
     throw utils::BasicException("Invalid type loaded inside the trigger data!");
   }
+  const auto phase_raw = data["phase"].get<int64_t>();
+  if (phase_raw < 0 || phase_raw > static_cast<int64_t>(TriggerPhase::AFTER_COMMIT)) {
+    throw utils::BasicException("Invalid trigger phase loaded inside the trigger data!");
+  }
 
-  auto triggers_acc =
-      data["phase"] == TriggerPhase::BEFORE_COMMIT ? before_commit_triggers_.access() : after_commit_triggers_.access();
+  if (!storage_.Delete(name)) {
+    throw QueryRuntimeException("Couldn't delete trigger '{}' from persistent store!", name);
+  }
+
+  auto triggers_acc = static_cast<TriggerPhase>(phase_raw) == TriggerPhase::BEFORE_COMMIT
+                          ? before_commit_triggers_.access()
+                          : after_commit_triggers_.access();
   triggers_acc.remove(name);
-  storage_.Delete(name);
 }
 
 void TriggerStore::DropAll() {
   std::unique_lock store_guard{store_lock_};
 
-  storage_.DeletePrefix("");
+  if (!storage_.DeletePrefix("")) {
+    throw QueryRuntimeException("Couldn't delete triggers from persistent store!");
+  }
   before_commit_triggers_.clear();
   after_commit_triggers_.clear();
 }

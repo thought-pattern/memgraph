@@ -56,8 +56,13 @@ namespace memgraph::query::plan {
 /// `scans` must be non-empty. With a single scan the result is that scan
 /// unchanged (no `Union`, no `Distinct`).
 inline std::unique_ptr<LogicalOperator> BalancedDisjunctionUnion(std::vector<std::unique_ptr<LogicalOperator>> scans,
-                                                                 const Symbol &node_symbol) {
+                                                                 const Symbol &node_symbol,
+                                                                 const std::vector<Symbol> &incoming_symbols = {}) {
   MG_ASSERT(!scans.empty(), "BalancedDisjunctionUnion requires at least one scan");
+  std::vector<Symbol> branch_symbols = incoming_symbols;
+  if (std::ranges::find(branch_symbols, node_symbol) == branch_symbols.end()) {
+    branch_symbols.push_back(node_symbol);
+  }
   // More than one branch means a vertex can match several of them, so the
   // combined output needs deduplicating exactly once at the top.
   const bool needs_distinct = scans.size() > 1;
@@ -67,11 +72,8 @@ inline std::unique_ptr<LogicalOperator> BalancedDisjunctionUnion(std::vector<std
     combined.reserve((scans.size() + 1) / 2);
     for (std::size_t i = 0; i < scans.size(); i += 2) {
       if (i + 1 < scans.size()) {
-        combined.push_back(std::make_unique<Union>(std::move(scans[i]),
-                                                   std::move(scans[i + 1]),
-                                                   std::vector<Symbol>{node_symbol},
-                                                   std::vector<Symbol>{node_symbol},
-                                                   std::vector<Symbol>{node_symbol}));
+        combined.push_back(std::make_unique<Union>(
+            std::move(scans[i]), std::move(scans[i + 1]), branch_symbols, branch_symbols, branch_symbols));
       } else {
         combined.push_back(std::move(scans[i]));
       }
@@ -80,7 +82,7 @@ inline std::unique_ptr<LogicalOperator> BalancedDisjunctionUnion(std::vector<std
   }
   auto root = std::move(scans.front());
   if (needs_distinct) {
-    root = std::make_unique<Distinct>(std::move(root), std::vector<Symbol>{node_symbol});
+    root = std::make_unique<Distinct>(std::move(root), branch_symbols);
   }
   return root;
 }

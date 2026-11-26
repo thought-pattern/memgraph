@@ -968,7 +968,12 @@ bool InMemoryLabelPropertyIndex::ActiveIndices::IndexExists(LabelId label,
 
 bool InMemoryLabelPropertyIndex::ActiveIndices::IndexReady(LabelId label,
                                                            std::span<PropertyPath const> properties) const {
-  auto check = [&](auto &indices_map) {
+  return IndexReady(label, properties, IndexOrder::ASC) || IndexReady(label, properties, IndexOrder::DESC);
+}
+
+bool InMemoryLabelPropertyIndex::ActiveIndices::IndexReady(LabelId label, std::span<PropertyPath const> properties,
+                                                           IndexOrder order) const {
+  auto check = [&](auto const &indices_map) {
     auto it = indices_map.find(label);
     if (it != indices_map.end()) {
       auto it2 = it->second.find(properties);
@@ -978,7 +983,7 @@ bool InMemoryLabelPropertyIndex::ActiveIndices::IndexReady(LabelId label,
     }
     return false;
   };
-  return check(index_container_->asc_indices_) || check(index_container_->desc_indices_);
+  return order == IndexOrder::DESC ? check(index_container_->desc_indices_) : check(index_container_->asc_indices_);
 }
 
 auto InMemoryLabelPropertyIndex::ActiveIndices::RelevantLabelPropertiesIndicesInfo(

@@ -243,6 +243,7 @@ class DbmsHandler {
         metrics::Metrics().RebindDefaultDatabaseUUID(config.uuid);
       }
       NotifyUuidRetired_(old_salient.uuid, kDefaultDB);
+      db->streams()->BindStorageUuid(config.uuid);
       spdlog::debug("Updated default db's UUID");
 
       return db;

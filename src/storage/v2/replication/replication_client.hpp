@@ -232,6 +232,8 @@ class ReplicationStorageClient {
    */
   void ForceRecoverReplica(Storage *main_storage, DatabaseProtector const &protector) const;
 
+  bool ForceResetPending() const noexcept { return force_reset_pending_.load(std::memory_order_acquire); }
+
   auto GetNumCommittedTxns() const -> uint64_t;
 
  private:
@@ -299,6 +301,8 @@ class ReplicationStorageClient {
   // re-queues every MAYBE_BEHIND replica on each tick, so without this the single maintenance thread
   // accumulates duplicate checks faster than it can drain them across many databases.
   mutable std::atomic<bool> check_queued_{false};
+  // Sticky across failed recovery attempts after ForceRecoverReplica until a recovery step wipes and reloads the replica.
+  mutable std::atomic<bool> force_reset_pending_{false};
   const utils::UUID main_uuid_;
 };
 

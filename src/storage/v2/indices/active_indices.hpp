@@ -16,9 +16,11 @@
 #include "storage/v2/indices/edge_type_property_index.hpp"
 #include "storage/v2/indices/label_index.hpp"
 #include "storage/v2/indices/label_property_index.hpp"
+#include "storage/v2/indices/point_index.hpp"
 #include "storage/v2/indices/vertex_property_index.hpp"
 
 #include <memory>
+#include <tuple>
 #include <vector>
 
 #include "utils/logging.hpp"
@@ -35,11 +37,12 @@ struct VectorEdgeIndexActiveIndices;
 
 struct IndicesCollection {
   std::vector<storage::LabelId> label_;
-  std::vector<std::pair<storage::LabelId, std::vector<storage::PropertyPath>>> label_properties_;
+  std::vector<std::tuple<storage::LabelId, std::vector<storage::PropertyPath>, storage::IndexOrder>> label_properties_;
   std::vector<storage::EdgeTypeId> edge_type_;
   std::vector<std::pair<storage::EdgeTypeId, storage::PropertyId>> edge_type_properties_;
   std::vector<storage::PropertyId> edge_property_;
   std::vector<storage::PropertyId> vertex_property_;
+  std::vector<std::pair<storage::LabelId, storage::PropertyId>> point_;
 };
 
 struct ActiveIndices {
@@ -87,9 +90,9 @@ struct ActiveIndices {
       if (!label_->IndexReady(label)) return false;
     }
 
-    // label + properties
-    for (auto const &[label, properties] : required_indices.label_properties_) {
-      if (!label_properties_->IndexReady(label, properties)) return false;
+    // label + properties + order
+    for (auto const &[label, properties, order] : required_indices.label_properties_) {
+      if (!label_properties_->IndexReady(label, properties, order)) return false;
     }
 
     // edge type
@@ -110,6 +113,11 @@ struct ActiveIndices {
     // vertex property
     for (auto const property : required_indices.vertex_property_) {
       if (!vertex_property_->IndexReady(property)) return false;
+    }
+
+    // point
+    for (auto const &[label, property] : required_indices.point_) {
+      if (!point_->PointIndexExists(label, property)) return false;
     }
 
     return true;

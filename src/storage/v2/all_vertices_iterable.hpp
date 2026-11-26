@@ -35,8 +35,8 @@ class AllVerticesIterable final {
  public:
   class Iterator final {
     AllVerticesIterable *self_;
-    utils::SkipListDb<Vertex>::Iterator it_;
     std::optional<VertexAccessor> vertex_;
+    utils::SkipListDb<Vertex>::Iterator it_;
 
    public:
     Iterator(AllVerticesIterable *self, utils::SkipListDb<Vertex>::Iterator it);

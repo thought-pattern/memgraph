@@ -69,6 +69,25 @@ class UserProfileQuery : public memgraph::query::Query {
           return quantity.value == other.quantity.value;
       }
     }
+
+    LimitValueResult Clone(AstStorage *storage) const {
+      LimitValueResult cloned;
+      cloned.type = type;
+      switch (type) {
+        case Type::UNLIMITED:
+          break;
+        case Type::MEMORY_LIMIT:
+          cloned.mem_limit.type = Type::MEMORY_LIMIT;
+          cloned.mem_limit.expr = mem_limit.expr ? mem_limit.expr->Clone(storage) : nullptr;
+          cloned.mem_limit.scale = mem_limit.scale;
+          break;
+        case Type::QUANTITY:
+          cloned.quantity.type = Type::QUANTITY;
+          cloned.quantity.expr = quantity.expr ? quantity.expr->Clone(storage) : nullptr;
+          break;
+      }
+      return cloned;
+    }
   };
 
   using limit_t = std::pair<std::string, LimitValueResult>;
@@ -96,7 +115,10 @@ class UserProfileQuery : public memgraph::query::Query {
     auto *object = storage->Create<UserProfileQuery>();
     object->action_ = action_;
     object->profile_name_ = profile_name_;
-    object->limits_ = limits_;
+    object->limits_.reserve(limits_.size());
+    for (const auto &[name, val] : limits_) {
+      object->limits_.emplace_back(name, val.Clone(storage));
+    }
     object->user_or_role_ = user_or_role_;
     object->show_user_ = show_user_;
     return object;

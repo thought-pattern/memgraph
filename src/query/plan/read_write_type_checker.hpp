@@ -65,6 +65,8 @@ struct ReadWriteTypeChecker : public virtual HierarchicalLogicalOperatorVisitor 
   bool PreVisit(ScanAllByEdgeProperty &) override;
   bool PreVisit(ScanAllByEdgeId &) override;
   bool PreVisit(ScanAllByVertexProperty &) override;
+  bool PreVisit(ScanAllByPointDistance &) override;
+  bool PreVisit(ScanAllByPointWithinbbox &) override;
 
   bool PreVisit(Expand &) override;
   bool PreVisit(ExpandVariable &) override;

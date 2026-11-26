@@ -33,9 +33,15 @@ auto AdvanceToVisibleVertex(utils::SkipListDb<Vertex>::Iterator it, utils::SkipL
 }  // namespace
 
 AllVerticesIterable::Iterator::Iterator(AllVerticesIterable *self, utils::SkipListDb<Vertex>::Iterator it)
-    : self_(self),
-      it_(AdvanceToVisibleVertex(it, self->vertices_accessor_.end(), &vertex_, self->storage_, self->transaction_,
-                                 self->view_, self->max_gid_)) {}
+    : self_(self), it_(it), vertex_(std::nullopt) {
+  it_ = AdvanceToVisibleVertex(it_,
+                               self_->vertices_accessor_.end(),
+                               &vertex_,
+                               self_->storage_,
+                               self_->transaction_,
+                               self_->view_,
+                               self_->max_gid_);
+}
 
 VertexAccessor const &AllVerticesIterable::Iterator::operator*() const { return *vertex_; }
 

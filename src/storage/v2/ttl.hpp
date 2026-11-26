@@ -120,6 +120,9 @@ struct TtlInfo {
    */
   static std::chrono::system_clock::time_point ParseStartTime(std::string_view sv);
 
+  static std::chrono::system_clock::time_point ParseStartTime(std::string_view sv,
+                                                              std::chrono::system_clock::time_point reference_now);
+
   /**
    * @brief Convert a time point to a string representation
    *
@@ -162,6 +165,16 @@ class TTL final {
    * @param period The TTL period (how often to run), defaults to 1 day if not provided
    * @param start_time Optional start time for the TTL job
    */
+  struct StateSnapshot {
+    TtlInfo info{};
+    bool enabled{false};
+    bool owns_label_property_index{false};
+    bool owns_edge_property_index{false};
+    bool wanted{false};
+  };
+
+  static std::chrono::microseconds ValidateInterval(std::optional<std::chrono::microseconds> period);
+
   void SetInterval(std::optional<std::chrono::microseconds> period = std::nullopt,
                    std::optional<std::chrono::system_clock::time_point> start_time = std::nullopt);
 
@@ -185,18 +198,20 @@ class TTL final {
    */
   void Shutdown() { ttl_.Stop(); }
 
+  std::jthread StopWorkerAsync() { return ttl_.StopAsync(); }
+
   /**
    * @brief Check if TTL is enabled
    *
    * @return true if enabled, false otherwise
    */
-  bool Enabled() const { return enabled_; }
+  bool Enabled() const { return enabled_.load(std::memory_order_acquire); }
 
   /**
    * @brief Enable the TTL feature.
    *
    */
-  void Enable() { enabled_ = true; }
+  void Enable() { enabled_.store(true, std::memory_order_release); }
 
   /**
    * @brief Returns whether TTL is running. @note: Paused TTL still counts as running.
@@ -206,17 +221,45 @@ class TTL final {
 
   bool Paused() const { return ttl_.IsPaused(); }
 
+  StateSnapshot CaptureState() const {
+    return {.info = info_,
+            .enabled = enabled_.load(std::memory_order_acquire),
+            .owns_label_property_index = owns_label_property_index_,
+            .owns_edge_property_index = owns_edge_property_index_,
+            .wanted = wanted_.load(std::memory_order_acquire)};
+  }
+
+  void StageMetadata(TtlInfo info, bool enabled, bool owns_label_property_index, bool owns_edge_property_index) {
+    info_ = std::move(info);
+    enabled_.store(enabled, std::memory_order_release);
+    owns_label_property_index_ = owns_label_property_index;
+    owns_edge_property_index_ = owns_edge_property_index;
+  }
+
+  void RestoreState(StateSnapshot const &snapshot) noexcept {
+    info_ = snapshot.info;
+    enabled_.store(snapshot.enabled, std::memory_order_release);
+    owns_label_property_index_ = snapshot.owns_label_property_index;
+    owns_edge_property_index_ = snapshot.owns_edge_property_index;
+    wanted_.store(snapshot.wanted, std::memory_order_release);
+  }
+
+  std::jthread DisableAsync() {
+    enabled_.store(false, std::memory_order_release);
+    wanted_.store(false, std::memory_order_release);
+    owns_label_property_index_ = false;
+    owns_edge_property_index_ = false;
+    info_ = {};
+    return ttl_.StopAsync();
+  }
+
   /**
    * @brief Disable the TTL feature.
    *
    */
   void Disable() {
-    enabled_ = false;
-    wanted_ = false;
-    owns_label_property_index_ = false;
-    owns_edge_property_index_ = false;
-    info_ = {};
-    ttl_.Stop();
+    auto worker = DisableAsync();
+    if (worker.joinable()) worker.join();
   }
 
   bool OwnsLabelPropertyIndex() const noexcept { return owns_label_property_index_; }
@@ -275,9 +318,9 @@ class TTL final {
   void SetUserCheck(std::function<bool()> check_fn) { user_check_.Update(std::move(check_fn)); }
 
  private:
-  utils::Scheduler ttl_;             //!< background thread
-  TtlInfo info_{};                   //!< configuration
-  bool enabled_{false};              //!< feature enabler
+  utils::Scheduler ttl_;                   //!< background thread
+  TtlInfo info_{};                         //!< configuration
+  std::atomic<bool> enabled_{false};       //!< feature enabler
   bool owns_label_property_index_{false};
   bool owns_edge_property_index_{false};
   std::atomic<bool> wanted_{false};  //!< asked to run rather than stopped

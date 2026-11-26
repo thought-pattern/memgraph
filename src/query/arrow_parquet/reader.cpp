@@ -25,10 +25,12 @@ module;
 
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 
 #include "arrow/api.h"
 #include "arrow/filesystem/s3fs.h"
@@ -100,7 +102,12 @@ auto BuildHeader(std::shared_ptr<arrow::Schema> const &schema, memgraph::utils::
     -> memgraph::query::Header {
   memgraph::query::Header header(resource);
   header.reserve(schema->num_fields());
+  std::unordered_set<std::string_view> seen_names;
+  seen_names.reserve(schema->num_fields());
   for (auto const &field : schema->fields()) {
+    if (!seen_names.insert(field->name()).second) {
+      throw memgraph::query::QueryRuntimeException("Duplicate column name '{}' in PARQUET file.", field->name());
+    }
     // temporary needs to be created
     // NOLINTNEXTLINE
     header.push_back(TypedValue::TString{field->name(), resource});
@@ -286,8 +293,13 @@ std::function<TypedValue(int64_t)> CreateColumnConverter(const std::shared_ptr<a
     case arrow::Type::UINT64: {
       auto int_array = std::static_pointer_cast<arrow::UInt64Array>(column);
       return [int_array, resource](int64_t const i) -> TypedValue {
-        return int_array->IsNull(i) ? TypedValue(resource)
-                                    : TypedValue(static_cast<int64_t>(int_array->Value(i)), resource);
+        if (int_array->IsNull(i)) return TypedValue(resource);
+        auto const val = int_array->Value(i);
+        if (val > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+          throw std::overflow_error(
+              fmt::format("unsigned integer value {} exceeds maximum signed 64-bit integer", val));
+        }
+        return TypedValue(static_cast<int64_t>(val), resource);
       };
     }
     case arrow::Type::HALF_FLOAT: {
@@ -430,8 +442,7 @@ std::function<TypedValue(int64_t)> CreateColumnConverter(const std::shared_ptr<a
       auto fixed_binary = std::static_pointer_cast<arrow::FixedSizeBinaryArray>(column);
       return [fixed_binary, resource](int64_t const i) -> TypedValue {
         if (fixed_binary->IsNull(i)) return TypedValue(resource);
-        const uint8_t *data = fixed_binary->GetValue(i);
-        return TypedValue(data, resource);
+        return TypedValue(fixed_binary->GetView(i), resource);
       };
     }
     case arrow::Type::LIST: {
@@ -457,9 +468,38 @@ std::function<TypedValue(int64_t)> CreateColumnConverter(const std::shared_ptr<a
       auto map_array = std::static_pointer_cast<arrow::MapArray>(column);
       auto keys_array = map_array->keys();
       auto values_array = map_array->items();
-      auto key_strings = std::static_pointer_cast<arrow::StringArray>(keys_array);
+      std::function<std::string_view(int64_t)> key_getter;
+      switch (keys_array->type()->id()) {
+        case arrow::Type::STRING: {
+          auto key_strings = std::static_pointer_cast<arrow::StringArray>(keys_array);
+          key_getter = [key_strings](int64_t const k) -> std::string_view {
+            if (key_strings->IsNull(k)) throw std::invalid_argument("PARQUET map keys cannot be null");
+            return key_strings->GetView(k);
+          };
+          break;
+        }
+        case arrow::Type::LARGE_STRING: {
+          auto key_strings = std::static_pointer_cast<arrow::LargeStringArray>(keys_array);
+          key_getter = [key_strings](int64_t const k) -> std::string_view {
+            if (key_strings->IsNull(k)) throw std::invalid_argument("PARQUET map keys cannot be null");
+            return key_strings->GetView(k);
+          };
+          break;
+        }
+        case arrow::Type::STRING_VIEW: {
+          auto key_strings = std::static_pointer_cast<arrow::StringViewArray>(keys_array);
+          key_getter = [key_strings](int64_t const k) -> std::string_view {
+            if (key_strings->IsNull(k)) throw std::invalid_argument("PARQUET map keys cannot be null");
+            return key_strings->GetView(k);
+          };
+          break;
+        }
+        default:
+          throw std::invalid_argument(fmt::format("Unsupported PARQUET map key type '{}'; map keys must be strings",
+                                                  keys_array->type()->ToString()));
+      }
 
-      return [map_array, key_strings, values_array, resource](int64_t const i) -> TypedValue {
+      return [map_array, key_getter = std::move(key_getter), values_array, resource](int64_t const i) -> TypedValue {
         if (map_array->IsNull(i)) return TypedValue(resource);
 
         auto const val_converter = CreateColumnConverter(values_array, resource);
@@ -470,7 +510,7 @@ std::function<TypedValue(int64_t)> CreateColumnConverter(const std::shared_ptr<a
         TypedValue::TMap map_values(resource);
 
         for (int64_t k = offset_start; k < offset_end; k++) {
-          auto key = key_strings->GetString(k);
+          auto const key = key_getter(k);
           map_values.emplace(TypedValue::TString{key, resource}, val_converter(k));
         }
 
@@ -511,7 +551,10 @@ class BatchIterator {
   // The user knows when to request the next batch
   std::vector<std::shared_ptr<arrow::Array>> Next() const {
     auto const res = rbr_->Next();
-    if (!res.ok() || !(*res)) {
+    if (!res.ok()) {
+      throw std::runtime_error(GetErrorMessage(res.status()));
+    }
+    if (!(*res)) {
       return {};
     }
     auto const &batch = *res;

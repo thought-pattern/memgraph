@@ -56,6 +56,8 @@ struct CostEstimation {
 
   // expected number of rows
   double cardinality;
+
+  bool use_index_hints{false};
 };
 
 struct PlanCost {
@@ -180,6 +182,12 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
   bool PostVisit(ScanAllByEdgeProperty &op) override {
     cardinality_ *= EstimateEdgePropertyCardinality(op.property_, op.expression_range_);
     IncrementCost(CostParam::kScanAllByEdgeProperty);
+    return true;
+  }
+
+  bool PostVisit(ScanAllByEdgeId &op) override {
+    cardinality_ *= (op.common_.direction == EdgeAtom::Direction::BOTH ? 2.0 : 1.0);
+    IncrementCost(CostParam::kScanAllByEdgeId);
     return true;
   }
 
@@ -361,10 +369,8 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
   }
 
   bool PostVisit(Foreach &foreach) override {
-    // Foreach cost depends both on the number elements in the list that get unwound
-    // as well as the total clauses that get called for each unwounded element.
-    // First estimate cardinality and then increment the cost.
-
+    // ForeachCursor yields one output row per input row even when the list is empty;
+    // the list length scales only the work performed per input row.
     double foreach_elements{0};
     if (auto *literal = utils::Downcast<query::ListLiteral>(foreach.expression_)) {
       foreach_elements = literal->elements_.size();
@@ -372,8 +378,7 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
       foreach_elements = MiscParam::kForeachNoLiteral;
     }
 
-    cardinality_ *= foreach_elements;
-    IncrementCost(CostParam::kForeach);
+    IncrementCost(CostParam::kForeach * foreach_elements);
     return true;
   }
 
@@ -384,6 +389,7 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
     // the number of hits in the previous operator should be the joined number of results of both parts of the union
     cost_ = left_estimation.cost + right_estimation.cost;
     cardinality_ = left_estimation.cardinality + right_estimation.cardinality;
+    use_index_hints_ = use_index_hints_ || left_estimation.use_index_hints || right_estimation.use_index_hints;
 
     return false;
   }
@@ -418,6 +424,7 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
       auto &last_scope = scopes_.back();
       CostEstimation pattern_estimation = EstimateCostOnBranch(&pattern_filter, last_scope);
       total_branch_cost += pattern_estimation.cost;
+      use_index_hints_ = use_index_hints_ || pattern_estimation.use_index_hints;
     }
     IncrementCost(std::max(total_branch_cost, CostParam::kFilter));
     cardinality_ *= CardParam::kFilter;
@@ -431,6 +438,7 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
     // Estimate cost on the subquery branch independently, use a copy
     auto &last_scope = scopes_.back();
     CostEstimation subquery_estimation = EstimateCostOnBranch(&op.subquery_, last_scope);
+    use_index_hints_ = use_index_hints_ || subquery_estimation.use_index_hints;
     double subquery_cost = !utils::ApproxEqualDecimal(subquery_estimation.cost, 0.0) ? subquery_estimation.cost : 1;
     IncrementCost(subquery_cost);
 
@@ -453,11 +461,14 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
       if (branch.predicate) {
         double fold_cost = 0.0;
         for (auto const &fold : branch.pattern_filters) {
-          fold_cost += EstimateCostOnBranch(&fold, scopes_.back()).cost;
+          auto const fold_est = EstimateCostOnBranch(&fold, scopes_.back());
+          fold_cost += fold_est.cost;
+          use_index_hints_ = use_index_hints_ || fold_est.use_index_hints;
         }
         predicate_cost += std::max(fold_cost, CostParam::kFilter);
       }
       auto const body = EstimateCostOnBranch(&branch.plan, scopes_.back());
+      use_index_hints_ = use_index_hints_ || body.use_index_hints;
       auto const branch_cost = predicate_cost + body.cost;
       worst_cost = std::max(worst_cost, branch_cost);
       total_cost += branch_cost;
@@ -474,10 +485,9 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
 
     // add cost from the right branch and multiply cardinalities
     CostEstimation right_cost_estimation = EstimateCostOnBranch(&op.right_op_);
+    use_index_hints_ = use_index_hints_ || right_cost_estimation.use_index_hints;
     cost_ += right_cost_estimation.cost;
-    double right_cardinality =
-        !utils::ApproxEqualDecimal(right_cost_estimation.cardinality, 0.0) ? right_cost_estimation.cardinality : 1;
-    cardinality_ *= right_cardinality;
+    cardinality_ *= right_cost_estimation.cardinality;
 
     return false;
   }
@@ -488,6 +498,7 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
 
     // add cost from the right branch and multiply cardinalities
     CostEstimation right_cost_estimation = EstimateCostOnBranch(&op.sub_branch_);
+    use_index_hints_ = use_index_hints_ || right_cost_estimation.use_index_hints;
     IncrementCost(right_cost_estimation.cost);
 
     double right_cardinality =
@@ -498,17 +509,38 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
   }
 
   bool PreVisit(HashJoin &op) override {
-    // Get the cost of the main branch
+    // HashJoinCursor builds the hash table once from left_op_ and scans right_op_ once.
     op.left_op_->Accept(*this);
 
-    // add cost from the right branch and multiply cardinalities
     CostEstimation right_cost_estimation = EstimateCostOnBranch(&op.right_op_);
-    IncrementCost(right_cost_estimation.cost);
+    use_index_hints_ = use_index_hints_ || right_cost_estimation.use_index_hints;
+    cost_ += right_cost_estimation.cost;
+    const auto join_work =
+        std::max(CostParam::kMinimumCost, CostParam::kHashJoin * (cardinality_ + right_cost_estimation.cardinality));
+    cost_ += join_work / num_threads_;
+    cardinality_ *= right_cost_estimation.cardinality * CardParam::kFilter;
 
-    double right_cardinality =
-        !utils::ApproxEqualDecimal(right_cost_estimation.cardinality, 0.0) ? right_cost_estimation.cardinality : 1;
-    cardinality_ *= right_cardinality;
+    return false;
+  }
 
+  bool PreVisit(RollUpApply &op) override {
+    op.input_->Accept(*this);
+    auto &last_scope = scopes_.back();
+    CostEstimation branch_estimation = EstimateCostOnBranch(&op.list_collection_branch_, last_scope);
+    use_index_hints_ = use_index_hints_ || branch_estimation.use_index_hints;
+    double branch_cost = !utils::ApproxEqualDecimal(branch_estimation.cost, 0.0) ? branch_estimation.cost : 1.0;
+    IncrementCost(branch_cost);
+    return false;
+  }
+
+  bool PreVisit(Optional &op) override {
+    op.input_->Accept(*this);
+    auto &last_scope = scopes_.back();
+    CostEstimation opt_estimation = EstimateCostOnBranch(&op.optional_, last_scope);
+    use_index_hints_ = use_index_hints_ || opt_estimation.use_index_hints;
+    double opt_cost = !utils::ApproxEqualDecimal(opt_estimation.cost, 0.0) ? opt_estimation.cost : CostParam::kMinimumCost;
+    IncrementCost(opt_cost);
+    cardinality_ *= std::max(1.0, opt_estimation.cardinality);
     return false;
   }
 
@@ -557,13 +589,17 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
   CostEstimation EstimateCostOnBranch(std::shared_ptr<LogicalOperator> *branch) {
     CostEstimator<TDbAccessor> cost_estimator(db_accessor_, table_, parameters, index_hints_);
     (*branch)->Accept(cost_estimator);
-    return CostEstimation{.cost = cost_estimator.cost(), .cardinality = cost_estimator.cardinality()};
+    return CostEstimation{.cost = cost_estimator.cost(),
+                          .cardinality = cost_estimator.cardinality(),
+                          .use_index_hints = cost_estimator.use_index_hints()};
   }
 
   CostEstimation EstimateCostOnBranch(std::shared_ptr<LogicalOperator> const *branch, Scope scope) {
     CostEstimator<TDbAccessor> cost_estimator(db_accessor_, table_, parameters, scope, index_hints_);
     (*branch)->Accept(cost_estimator);
-    return CostEstimation{.cost = cost_estimator.cost(), .cardinality = cost_estimator.cardinality()};
+    return CostEstimation{.cost = cost_estimator.cost(),
+                          .cardinality = cost_estimator.cardinality(),
+                          .use_index_hints = cost_estimator.use_index_hints()};
   }
 
   // converts an optional ScanAll range bound into a property value
@@ -603,11 +639,11 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
     auto lower = BoundToPropertyValue(lower_bound);
     auto upper = BoundToPropertyValue(upper_bound);
 
-    int64_t factor = 1;
+    double factor = 1.0;
     if (upper || lower) {
-      factor = db_accessor_->EdgesCount(edge_type, property, lower, upper);
+      factor = static_cast<double>(db_accessor_->EdgesCount(edge_type, property, lower, upper));
     } else {
-      factor = db_accessor_->EdgesCount(edge_type, property);
+      factor = static_cast<double>(db_accessor_->EdgesCount(edge_type, property));
     }
 
     if ((upper_bound && !upper) || (lower_bound && !lower)) {
@@ -625,11 +661,11 @@ class CostEstimator : public HierarchicalLogicalOperatorVisitor {
     auto lower = BoundToPropertyValue(lower_bound);
     auto upper = BoundToPropertyValue(upper_bound);
 
-    int64_t factor = 1;
+    double factor = 1.0;
     if (upper || lower) {
-      factor = db_accessor_->EdgesCount(property, lower, upper);
+      factor = static_cast<double>(db_accessor_->EdgesCount(property, lower, upper));
     } else {
-      factor = db_accessor_->EdgesCount(property);
+      factor = static_cast<double>(db_accessor_->EdgesCount(property));
     }
 
     if ((upper_bound && !upper) || (lower_bound && !lower)) {

@@ -143,7 +143,9 @@ class PrivilegeExtractor : public QueryVisitor<void>, public HierarchicalTreeVis
 
   void Visit(SessionQuery & /*session_query*/) override {}
 
-  void Visit(EdgeImportModeQuery & /*edge_import_mode_query*/) override {}
+  void Visit(EdgeImportModeQuery & /*edge_import_mode_query*/) override {
+    AddPrivilege(AuthQuery::Privilege::STORAGE_MODE);
+  }
 
   void Visit(DropAllIndexesQuery & /*drop_all_indexes_query*/) override { AddPrivilege(AuthQuery::Privilege::INDEX); }
 
@@ -151,7 +153,13 @@ class PrivilegeExtractor : public QueryVisitor<void>, public HierarchicalTreeVis
     AddPrivilege(AuthQuery::Privilege::CONSTRAINT);
   }
 
-  void Visit(DropGraphQuery & /*drop_graph_query*/) override {}
+  void Visit(DropGraphQuery & /*drop_graph_query*/) override {
+    AddPrivilege(AuthQuery::Privilege::DELETE);
+    AddPrivilege(AuthQuery::Privilege::TRIGGER);
+    AddPrivilege(AuthQuery::Privilege::STREAM);
+    AddPrivilege(AuthQuery::Privilege::CONFIG);
+    AddPrivilege(AuthQuery::Privilege::STORAGE_MODE);
+  }
 
   void Visit(VersionQuery & /*version_query*/) override { AddPrivilege(AuthQuery::Privilege::STATS); }
 

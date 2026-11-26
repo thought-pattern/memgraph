@@ -791,10 +791,24 @@ int main(int argc, char **argv) {
 
 #endif
 
+  int extracted_bolt_port = FLAGS_bolt_port;
+  if (auto const *maybe_env_bolt_port = std::getenv(kMgBoltPort); maybe_env_bolt_port != nullptr) {
+    auto const parsed_bolt_port = ParseBoltPortOverride(maybe_env_bolt_port);
+    if (!parsed_bolt_port.has_value()) {
+      spdlog::error(
+          "Invalid {} environment variable '{}': expected an integer port in [0, 65535]. Shutting down Memgraph.",
+          kMgBoltPort,
+          maybe_env_bolt_port);
+      return EXIT_FAILURE;
+    }
+    extracted_bolt_port = static_cast<int>(*parsed_bolt_port);
+  }
+
   // Default interpreter configuration
   memgraph::query::InterpreterConfig const interp_config{
       .query = {.allow_load_csv = FLAGS_allow_load_csv},
       .replication_replica_check_frequency = std::chrono::seconds(FLAGS_replication_replica_check_frequency_sec),
+      .bolt_port = extracted_bolt_port,
       .default_kafka_bootstrap_servers = FLAGS_kafka_bootstrap_servers,
       .default_pulsar_service_url = FLAGS_pulsar_service_url,
       .stream_transaction_conflict_retries = FLAGS_stream_transaction_conflict_retries,
@@ -927,19 +941,6 @@ int main(int argc, char **argv) {
 #endif
 
   auto system = memgraph::system::System{db_config.durability.storage_directory, FLAGS_data_recovery_on_startup};
-
-  int extracted_bolt_port = FLAGS_bolt_port;
-  if (auto const *maybe_env_bolt_port = std::getenv(kMgBoltPort); maybe_env_bolt_port != nullptr) {
-    auto const parsed_bolt_port = ParseBoltPortOverride(maybe_env_bolt_port);
-    if (!parsed_bolt_port.has_value()) {
-      spdlog::error(
-          "Invalid {} environment variable '{}': expected an integer port in [0, 65535]. Shutting down Memgraph.",
-          kMgBoltPort,
-          maybe_env_bolt_port);
-      return EXIT_FAILURE;
-    }
-    extracted_bolt_port = static_cast<int>(*parsed_bolt_port);
-  }
 
 // singleton coordinator state
 #ifdef MG_ENTERPRISE

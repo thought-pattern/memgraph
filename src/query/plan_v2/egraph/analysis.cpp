@@ -41,6 +41,7 @@ void MergeField(std::optional<T> &lhs, std::optional<T> const &rhs, Eq eq) {
 void ExpressionAnalysis::merge(ExpressionAnalysis const &other) {
   MergeField(known_constant_value, other.known_constant_value, ConstantIdentityEq{});
   MergeField(known_length, other.known_length, std::equal_to<>{});
+  has_impure = has_impure || other.has_impure;
 }
 
 void analysis::merge(analysis const &other) {

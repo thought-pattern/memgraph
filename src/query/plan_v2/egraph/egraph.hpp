@@ -17,6 +17,7 @@
 #include <span>
 #include <string_view>
 
+#include "query/frontend/semantic/symbol.hpp"
 #include "query/plan_v2/egraph/builtin_functions.hpp"
 #include "query/plan_v2/egraph/op_ast_lists.hpp"
 #include "storage/v2/property_value.hpp"
@@ -38,7 +39,8 @@ struct egraph {
 
   // Public API for creating egraph nodes
   auto MakeOnce() -> eclass;
-  auto MakeSymbol(int32_t position, std::string_view name) -> eclass;
+  auto MakeSymbol(int32_t position, std::string_view name, bool user_declared = false,
+                  query::Symbol::Type type = query::Symbol::Type::ANY, int32_t token_position = -1) -> eclass;
   auto MakeLiteral(storage::ExternalPropertyValue const &value) -> eclass;
   auto MakeParameterLookup(int32_t position) -> eclass;
   auto MakeBind(eclass input, eclass sym, eclass expr) -> eclass;
@@ -65,6 +67,8 @@ struct egraph {
   auto MakeSubquery(eclass outer_input, eclass inner_root, std::initializer_list<eclass> exposed_syms) -> eclass {
     return MakeSubquery(outer_input, inner_root, std::span<eclass const>{exposed_syms});
   }
+
+  auto MakeDistinct(eclass input) -> eclass;
 
   /// Derive the analysis facts an e-class's own e-nodes establish from their
   /// children, and answer how many facts that widened. A builtin's result length

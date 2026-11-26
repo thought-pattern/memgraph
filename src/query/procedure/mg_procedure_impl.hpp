@@ -93,6 +93,8 @@ struct mgp_value {
   /// Construct by copying memgraph::storage::PropertyValue using memgraph::utils::MemoryResource.
   /// @throw std::bad_alloc
   mgp_value(const memgraph::storage::PropertyValue &, memgraph::storage::NameIdMapper *, allocator_type);
+  mgp_value(const memgraph::storage::PropertyValue &, memgraph::storage::NameIdMapper *, memgraph::query::DbAccessor *,
+            allocator_type);
 
   /// Copy construction without memgraph::utils::MemoryResource is not allowed.
   mgp_value(const mgp_value &) = delete;
@@ -106,7 +108,7 @@ struct mgp_value {
   mgp_value(mgp_value &&, allocator_type);
 
   /// Move construct, memgraph::utils::MemoryResource is inherited.
-  mgp_value(mgp_value &&other) noexcept : mgp_value(other, other.alloc) {}
+  mgp_value(mgp_value &&other) noexcept : mgp_value(std::move(other), other.alloc) {}
 
   /// Copy-assignment is not allowed to preserve immutability.
   mgp_value &operator=(const mgp_value &) = delete;
@@ -258,7 +260,7 @@ struct mgp_local_date_time {
   mgp_local_date_time(const memgraph::utils::LocalDateTime &local_date_time, allocator_type alloc) noexcept
       : alloc(alloc), local_date_time(local_date_time) {}
 
-  mgp_local_date_time(const std::string_view string, allocator_type alloc) noexcept
+  mgp_local_date_time(const std::string_view string, allocator_type alloc)
       : alloc(alloc), local_date_time(CreateLocalDateTimeFromString(string)) {}
 
   mgp_local_date_time(const mgp_local_date_time_parameters *parameters, allocator_type alloc)
@@ -311,7 +313,7 @@ struct mgp_zoned_date_time {
   mgp_zoned_date_time(const memgraph::utils::ZonedDateTime &zoned_date_time, allocator_type alloc) noexcept
       : alloc(alloc), zoned_date_time(zoned_date_time) {}
 
-  mgp_zoned_date_time(const std::string_view string, allocator_type alloc) noexcept
+  mgp_zoned_date_time(const std::string_view string, allocator_type alloc)
       : alloc(alloc), zoned_date_time(CreateZonedDateTimeFromString(string)) {}
 
   mgp_zoned_date_time(const mgp_zoned_date_time_parameters *parameters, allocator_type alloc)
@@ -369,7 +371,7 @@ struct mgp_duration {
   mgp_duration(const std::string_view string, allocator_type alloc)
       : alloc(alloc), duration(memgraph::utils::ParseDurationParameters(string)) {}
 
-  mgp_duration(const mgp_duration_parameters *parameters, allocator_type alloc) noexcept
+  mgp_duration(const mgp_duration_parameters *parameters, allocator_type alloc)
       : alloc(alloc), duration(MapDurationParameters(parameters)) {}
 
   mgp_duration(const memgraph::utils::Duration &duration, allocator_type alloc) noexcept
@@ -847,6 +849,12 @@ struct mgp_graph {
   // `ctx` field is out of place here.
   memgraph::query::ExecutionContext *ctx;
   memgraph::storage::StorageMode storage_mode;
+  const memgraph::query::FineGrainedAuthChecker *auth_checker{nullptr};
+
+  [[nodiscard]] const memgraph::query::FineGrainedAuthChecker *AuthChecker() const noexcept {
+    if (auth_checker != nullptr) return auth_checker;
+    return ctx != nullptr ? ctx->auth_checker : nullptr;
+  }
 
   /// Null for the graph handed to a procedure that declared it needs none.
   [[nodiscard]] memgraph::query::DbAccessor *TryGetImpl() const {
@@ -882,25 +890,27 @@ struct mgp_graph {
   /// reports a logic error rather than reading through nothing.
   static mgp_graph GraphlessGraph(memgraph::storage::View view, memgraph::query::ExecutionContext &ctx,
                                   memgraph::storage::StorageMode storage_mode) {
-    return mgp_graph{static_cast<memgraph::query::DbAccessor *>(nullptr), view, &ctx, storage_mode};
+    return mgp_graph{static_cast<memgraph::query::DbAccessor *>(nullptr), view, &ctx, storage_mode, ctx.auth_checker};
   }
 
   static mgp_graph WritableGraph(memgraph::query::DbAccessor &acc, memgraph::storage::View view,
                                  memgraph::query::ExecutionContext &ctx) {
-    return mgp_graph{&acc, view, &ctx, acc.GetStorageMode()};
+    return mgp_graph{&acc, view, &ctx, acc.GetStorageMode(), ctx.auth_checker};
   }
 
-  static mgp_graph NonWritableGraph(memgraph::query::DbAccessor &acc, memgraph::storage::View view) {
-    return mgp_graph{&acc, view, nullptr, acc.GetStorageMode()};
+  static mgp_graph NonWritableGraph(memgraph::query::DbAccessor &acc, memgraph::storage::View view,
+                                    const memgraph::query::FineGrainedAuthChecker *auth_checker = nullptr) {
+    return mgp_graph{&acc, view, nullptr, acc.GetStorageMode(), auth_checker};
   }
 
   static mgp_graph WritableGraph(memgraph::query::SubgraphDbAccessor &acc, memgraph::storage::View view,
                                  memgraph::query::ExecutionContext &ctx) {
-    return mgp_graph{&acc, view, &ctx, acc.GetStorageMode()};
+    return mgp_graph{&acc, view, &ctx, acc.GetStorageMode(), ctx.auth_checker};
   }
 
-  static mgp_graph NonWritableGraph(memgraph::query::SubgraphDbAccessor &acc, memgraph::storage::View view) {
-    return mgp_graph{&acc, view, nullptr, acc.GetStorageMode()};
+  static mgp_graph NonWritableGraph(memgraph::query::SubgraphDbAccessor &acc, memgraph::storage::View view,
+                                    const memgraph::query::FineGrainedAuthChecker *auth_checker = nullptr) {
+    return mgp_graph{&acc, view, nullptr, acc.GetStorageMode(), auth_checker};
   }
 };
 
@@ -915,6 +925,7 @@ struct mgp_result_record {
   memgraph::utils::pmr::vector<memgraph::query::TypedValue> values;
   bool ignore_deleted_values = false;
   bool has_deleted_values = false;
+  memgraph::query::DbAccessor *db_accessor = nullptr;
 };
 
 struct mgp_result {
@@ -925,6 +936,7 @@ struct mgp_result {
   memgraph::utils::pmr::vector<mgp_result_record> rows;
   std::optional<memgraph::utils::pmr::string> error_msg;
   bool is_transactional = true;
+  memgraph::query::DbAccessor *db_accessor = nullptr;
 };
 
 struct mgp_func_result {
@@ -934,12 +946,14 @@ struct mgp_func_result {
   std::optional<memgraph::query::TypedValue> value;
   /// Return Magic function result with potential error
   std::optional<memgraph::utils::pmr::string> error_msg;
+  memgraph::query::DbAccessor *db_accessor = nullptr;
 };
 
 // Prevents user to use ExecutionContext in writable callables
 struct mgp_func_context {
   memgraph::query::DbAccessor *impl;
   memgraph::storage::View view;
+  const memgraph::query::FineGrainedAuthChecker *auth_checker = nullptr;
 };
 
 struct mgp_properties_iterator {
@@ -997,8 +1011,10 @@ struct mgp_properties_iterator {
           },
           graph->CheckedImpl());
 
-      current.emplace(value,
-                      mgp_value(current_it->second, graph->getImpl()->GetStorageAccessor()->GetNameIdMapper(), alloc));
+      current.emplace(
+          std::move(value),
+          mgp_value(
+              current_it->second, graph->getImpl()->GetStorageAccessor()->GetNameIdMapper(), graph->TryGetImpl(), alloc));
       property.name = current->first.c_str();
       property.value = &current->second;
     }
@@ -1356,7 +1372,8 @@ struct mgp_messages {
 
 bool ContainsDeleted(const mgp_value *val);
 
-memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::Allocator<mgp_value> alloc);
+memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::Allocator<mgp_value> alloc,
+                                         memgraph::query::DbAccessor *db_accessor = nullptr);
 
 struct mgp_execution_headers {
   using allocator_type = memgraph::utils::Allocator<mgp_execution_headers>;

@@ -13,6 +13,8 @@
 /// Functions and types for loading Query Modules written in Python.
 #pragma once
 
+#include <filesystem>
+
 #include "py/py.hpp"
 
 struct mgp_graph;
@@ -70,6 +72,9 @@ PyObject *MakePyGraph(mgp_graph *, mgp_memory *);
 ///
 /// Return nullptr and set appropriate Python exception on failure.
 py::Object ImportPyModule(const char *, mgp_module *);
+
+/// Import a Python module directly from the exact filesystem path in the context of mgp_module.
+py::Object ImportPyModuleFromPath(const std::filesystem::path &, mgp_module *);
 
 /// Reload already loaded Python module in the context of mgp_module.
 ///

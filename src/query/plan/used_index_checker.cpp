@@ -36,7 +36,17 @@ bool UsedIndexChecker::PreVisit(ScanAllByLabel &op) {
 }
 
 bool UsedIndexChecker::PreVisit(ScanAllByLabelProperties &op) {
-  required_indices_.label_properties_.emplace_back(op.label_, op.properties_);
+  required_indices_.label_properties_.emplace_back(op.label_, op.properties_, op.index_order_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanAllByPointDistance &op) {
+  required_indices_.point_.emplace_back(op.label_, op.property_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanAllByPointWithinbbox &op) {
+  required_indices_.point_.emplace_back(op.label_, op.property_);
   return true;
 }
 
@@ -72,6 +82,7 @@ PRE_VISIT(ConstructNamedPath)
 
 PRE_VISIT(Filter)
 PRE_VISIT(EdgeUniquenessFilter)
+PRE_VISIT(EvaluatePatternFilter)
 
 PRE_VISIT(Merge)
 PRE_VISIT(Optional)
@@ -94,10 +105,16 @@ PRE_VISIT(Limit)
 PRE_VISIT(OrderBy)
 PRE_VISIT(Distinct)
 PRE_VISIT(PeriodicCommit)
+PRE_VISIT(SetNestedProperty)
+PRE_VISIT(RemoveNestedProperty)
 
 PRE_VISIT(Union)
 
 PRE_VISIT(Unwind)
+PRE_VISIT(CardinalityScale)
+PRE_VISIT(LoadCsv)
+PRE_VISIT(LoadParquet)
+PRE_VISIT(LoadJsonl)
 
 bool UsedIndexChecker::PreVisit(CallProcedure & /*unused*/) { return true; }
 
@@ -113,6 +130,44 @@ PRE_VISIT(PeriodicSubquery)
 
 PRE_VISIT(RollUpApply)
 PRE_VISIT(Conditional)
+
+PRE_VISIT(AggregateParallel)
+PRE_VISIT(OrderByParallel)
+PRE_VISIT(ParallelMerge)
+PRE_VISIT(ScanParallel)
+PRE_VISIT(ScanParallelByEdge)
+PRE_VISIT(ScanChunk)
+PRE_VISIT(ScanChunkByEdge)
+
+bool UsedIndexChecker::PreVisit(ScanParallelByLabel &op) {
+  required_indices_.label_.emplace_back(op.label_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanParallelByLabelProperties &op) {
+  required_indices_.label_properties_.emplace_back(op.label_, op.properties_, op.index_order_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanParallelByEdgeType &op) {
+  required_indices_.edge_type_.emplace_back(op.edge_type_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanParallelByEdgeTypeProperty &op) {
+  required_indices_.edge_type_properties_.emplace_back(op.edge_type_, op.property_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanParallelByEdgeProperty &op) {
+  required_indices_.edge_property_.emplace_back(op.property_);
+  return true;
+}
+
+bool UsedIndexChecker::PreVisit(ScanParallelByVertexProperty &op) {
+  required_indices_.vertex_property_.emplace_back(op.property_);
+  return true;
+}
 
 #undef PRE_VISIT
 

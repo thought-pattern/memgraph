@@ -9,7 +9,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-#include "replication/replication_client.hpp"
+#include "storage/v2/replication/replication_client.hpp"
 
 #include "flags/coord_flag_env_handler.hpp"
 #include "flags/replication.hpp"
@@ -236,6 +236,26 @@ void ReplicationStorageClient::UpdateReplicaState(Storage *main_storage, Databas
     return;
   }
 
+  if (force_reset_pending_.load(std::memory_order_acquire)) {
+    replica_state_.WithLock([&](auto &state) {
+      spdlog::debug("Replica {} for db {} still requires a forced full reset; scheduling reset recovery.",
+                    client_.name_,
+                    main_db_name);
+      state = ReplicaState::RECOVERY;
+      client_.maintenance_pool_.AddTask(
+          [main_storage, gk = protector.clone(), arena_pool = main_storage->DbArenaPool(), this] {
+            try {
+              const memory::DbArenaScope db_arena_scope{arena_pool};
+              this->RecoverReplica(/*replica_last_commit_ts*/ 0, main_storage, *gk, RecoveryKind::RESET_ALWAYS);
+            } catch (...) {
+              spdlog::error("Recovery of replica {} failed.", client_.name_);
+              this->SetMaybeBehind();
+            }
+          });
+    });
+    return;
+  }
+
   // No branching point. The replica's history is consistent with main's, so its reported progress can't exceed
   // main's; record it now.
   // This needs to be done under the engine lock, otherwise this function could bump replica's num committed txns before
@@ -379,6 +399,7 @@ void ReplicationStorageClient::TryCheckReplicaStateAsync(Storage *main_storage, 
 }
 
 void ReplicationStorageClient::ForceRecoverReplica(Storage *main_storage, DatabaseProtector const &protector) const {
+  force_reset_pending_.store(true, std::memory_order_release);
   if (protector.sealed()) {
     SetMaybeBehind();
     return;
@@ -531,11 +552,17 @@ auto ReplicationStorageClient::StartTransactionReplication(Storage *storage, Dat
                                                                           main_uuid_,
                                                                           storage_uuid,
                                                                           durability_commit_timestamp)};
-    return stream.SendAndWait().success;
+    if (!stream.SendAndWait().success) {
+      SetMaybeBehind();
+      return false;
+    }
+    return true;
   } catch (const rpc::RpcFailedException &) {
     // Frequent heartbeat should trigger the recovery. Until then, commits on MAIN won't be allowed
+    SetMaybeBehind();
     return false;
   } catch (...) {
+    SetMaybeBehind();
     return false;
   }
 }
@@ -843,6 +870,7 @@ void ReplicationStorageClient::RecoverReplica(uint64_t replica_last_commit_ts, S
                 }
 
                 if (auto const &response = *maybe_response; response.current_commit_timestamp_.has_value()) {
+                  force_reset_pending_.store(false, std::memory_order_release);
                   replica_last_commit_ts = *(response.current_commit_timestamp_);
                   auto update_func = [new_num_txns_committed = response.num_txns_committed_](
                                          CommitTsInfo const &commit_ts_info) -> CommitTsInfo {
@@ -902,6 +930,9 @@ void ReplicationStorageClient::RecoverReplica(uint64_t replica_last_commit_ts, S
                 }
 
                 if (auto const &response = *maybe_response; response.current_commit_timestamp_.has_value()) {
+                  if (do_reset) {
+                    force_reset_pending_.store(false, std::memory_order_release);
+                  }
                   replica_last_commit_ts = *(response.current_commit_timestamp_);
                   auto update_func =
                       [operand = response.num_txns_committed_](CommitTsInfo const &commit_ts_info) -> CommitTsInfo {
@@ -940,6 +971,9 @@ void ReplicationStorageClient::RecoverReplica(uint64_t replica_last_commit_ts, S
                 if (current_wal_file == nullptr ||
                     current_wal_file->SequenceNumber() != current_wal.current_wal_seq_num) {
                   spdlog::debug("Cannot recover using current wal file {} for db {}.", client_.name_, main_db_name);
+                  if (do_reset) {
+                    recovery_failed = true;
+                  }
                   return;
                 }
                 // The WAL is copied under engine_lock_ and shipped from the copy. Holding its flush lock through
@@ -972,6 +1006,9 @@ void ReplicationStorageClient::RecoverReplica(uint64_t replica_last_commit_ts, S
                 }
 
                 if (auto const &response = *maybe_response; response.current_commit_timestamp_.has_value()) {
+                  if (do_reset) {
+                    force_reset_pending_.store(false, std::memory_order_release);
+                  }
                   replica_last_commit_ts = *(response.current_commit_timestamp_);
                   auto update_func =
                       [operand = response.num_txns_committed_](CommitTsInfo const &commit_ts_info) -> CommitTsInfo {
@@ -1046,7 +1083,7 @@ void ReplicationStorageClient::RecoverReplica(uint64_t replica_last_commit_ts, S
   atomic_struct_update<CommitTsInfo>(commit_ts_info_, std::move(update_func));
 
   // ldt can be larger on replica due to a snapshot
-  if (last_durable_timestamp <= replica_last_commit_ts) {
+  if (!force_reset_pending_.load(std::memory_order_acquire) && last_durable_timestamp <= replica_last_commit_ts) {
     replica_state_.WithLock([name = client_.name_, &main_db_name](auto &val) {
       val = ReplicaState::READY;
       spdlog::info("Replica {} set to READY after recovery for db {}.", name, main_db_name);

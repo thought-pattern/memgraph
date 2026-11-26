@@ -77,9 +77,32 @@ auto FormatReplicationError(ReplicationError const &error) -> std::string {
     }
   }
 
-  auto total_replicas = error.failures.size();
-  msg +=
-      total_replicas == 1 ? " Replica will be recovered automatically." : " Replicas will be recovered automatically.";
+  size_t diverged_count = 0;
+  for (auto const &failure : error.failures) {
+    if (failure.reason == ReplicaFailureReason::DIVERGED) {
+      ++diverged_count;
+    }
+  }
+  auto const total_replicas = error.failures.size();
+  auto const recoverable_count = total_replicas - diverged_count;
+  if (diverged_count == 0) {
+    msg += total_replicas == 1 ? " Replica will be recovered automatically."
+                               : " Replicas will be recovered automatically.";
+  } else if (recoverable_count == 0) {
+    msg += diverged_count == 1
+               ? " Diverged replica cannot be recovered automatically; resolve data conflicts and restart replication "
+                 "on a clean instance."
+               : " Diverged replicas cannot be recovered automatically; resolve data conflicts and restart replication "
+                 "on clean instances.";
+  } else {
+    msg += diverged_count == 1
+               ? " Diverged replica cannot be recovered automatically; resolve data conflicts and restart replication "
+                 "on a clean instance."
+               : " Diverged replicas cannot be recovered automatically; resolve data conflicts and restart replication "
+                 "on clean instances.";
+    msg += recoverable_count == 1 ? " Other failed replica will be recovered automatically."
+                                  : " Other failed replicas will be recovered automatically.";
+  }
   msg += error.transaction_committed ? " Transaction is still committed on the main instance and other alive replicas."
                                      : " Transaction was aborted on all instances.";
 

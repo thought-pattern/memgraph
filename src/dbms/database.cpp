@@ -207,6 +207,7 @@ Database::Database(storage::Config config)
   // Recovery adopts the uuid of the snapshot or WAL it recovered from, which need not be the one the
   // registration was made under.
   metrics_.Rebind(storage_->uuid());
+  streams_->BindStorageUuid(storage_->uuid());
 }
 
 DatabaseInfo Database::GetInfo() const {
@@ -345,6 +346,7 @@ void Database::SwitchToOnDisk() {
                                                               preserved_factory,
                                                               db_arena_.get(),
                                                               &db_embedding_memory_tracker_);
+  streams_->BindStorageUuid(storage_->uuid());
 
   if (!label_index_names.empty() || !label_prop_index_names.empty() || !existence_constraint_names.empty() ||
       !unique_constraint_names.empty()) {
@@ -383,7 +385,7 @@ void Database::SwitchToOnDisk() {
             "Failed to preserve uniqueness constraint on :{} while switching to on-disk storage mode.", lbl_name);
       }
     }
-    if (!disk_acc->PrepareForCommitPhase({}).has_value()) {
+    if (!disk_acc->PrepareForCommitPhase(storage::CommitArgs::make_main(nullptr)).has_value()) {
       throw utils::BasicException("Failed to persist schema metadata while switching to on-disk storage mode.");
     }
     disk_acc->FinalizeTransaction();

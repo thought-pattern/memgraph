@@ -102,10 +102,10 @@ struct EdgeKey {
  */
 template <template <class...> class TContainer = utils::ConcurrentUnorderedMap>
 struct PropertyInfo {
-  std::atomic_int n{0};                                     //!< Number of objects with this property
-  TContainer<ExtendedPropertyType, std::atomic_int> types;  //!< Numer of property instances with a specific type
+  std::atomic<int64_t> n{0};                                     //!< Number of objects with this property
+  TContainer<ExtendedPropertyType, std::atomic<int64_t>> types;  //!< Number of property instances with a specific type
 
-  nlohmann::json ToJson(const EnumStore &enum_store, std::string_view key, uint32_t max_count) const;
+  nlohmann::json ToJson(const EnumStore &enum_store, std::string_view key, int64_t max_count) const;
 };
 
 /**
@@ -113,7 +113,7 @@ struct PropertyInfo {
  */
 template <template <class...> class TContainer = utils::ConcurrentUnorderedMap>
 struct TrackingInfo {
-  std::atomic_int n{0};                                         //!< Number of tracked objects
+  std::atomic<int64_t> n{0};                                    //!< Number of tracked objects
   TContainer<PropertyId, PropertyInfo<TContainer>> properties;  //!< Property statistics defined by the tracked object
 
   nlohmann::json ToJson(NameIdMapper &name_id_mapper, const EnumStore &enum_store) const;

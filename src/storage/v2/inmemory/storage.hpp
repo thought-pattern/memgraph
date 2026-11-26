@@ -735,80 +735,122 @@ class InMemoryStorage final : public Storage {
     void StartTtl(TTLReplicationArgs repl_args = {}) override {
       DMG_ASSERT(type() == UNIQUE, "TTL operations require unique access to the storage!");
       if (!storage_->ttl_.Config()) throw ttl::TtlException("TTL not configured!");
-      // Only MAIN should be running the TTL worker, it does write operations which only MAIN should be doing
-      if (repl_args.is_main) {
-        storage_->ttl_.Resume();
-      } else {
-        storage_->ttl_.SetWanted(true);
-      }
+      auto *ttl_ptr = &storage_->ttl_;
+      bool const prev_wanted = ttl_ptr->Wanted();
+      ttl_ptr->SetWanted(true);
+      utils::OnScopeExit rollback{[ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); });
+      transaction_.commit_callbacks_.Add([ttl_ptr, is_main = repl_args.is_main](uint64_t /*commit_ts*/) {
+        if (is_main) {
+          ttl_ptr->Resume();
+        } else {
+          ttl_ptr->SetWanted(true);
+        }
+      });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::ENABLE, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
     void StopTtl() override {
       DMG_ASSERT(type() == UNIQUE, "TTL operations require unique access to the storage!");
-      storage_->ttl_.Pause();
+      auto *ttl_ptr = &storage_->ttl_;
+      bool const prev_wanted = ttl_ptr->Wanted();
+      ttl_ptr->SetWanted(false);
+      utils::OnScopeExit rollback{[ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); });
+      transaction_.commit_callbacks_.Add([ttl_ptr](uint64_t /*commit_ts*/) { ttl_ptr->Pause(); });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::STOP, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
     void ConfigureTtl(const storage::ttl::TtlInfo &ttl_info, TTLReplicationArgs repl_args = {}) override {
       DMG_ASSERT(type() == UNIQUE, "TTL operations require unique access to the storage!");
+      auto const validated_period = storage::ttl::TTL::ValidateInterval(ttl_info.period);
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
       auto const ttl_path = std::vector<storage::PropertyPath>{{ttl_property}};
 
       auto &ttl = storage_->ttl_;
+      auto const prev_state = ttl.CaptureState();
+      bool const effective_edge_ttl = ttl_info.should_run_edge_ttl &&
+                                      GetPinnedStorageMode() != StorageMode::ON_DISK_TRANSACTIONAL &&
+                                      storage_->config_.salient.items.properties_on_edges;
 
-      // If TTL is not enabled, create required indices and enable TTL
+      bool owns_lp = prev_state.owns_label_property_index;
+      bool owns_ep = prev_state.owns_edge_property_index;
+      bool enqueue_lp = false;
+      bool enqueue_ep = false;
+
       if (!ttl.Enabled()) {
         if (repl_args.is_main) {
           bool const label_index_existed =
               storage_->indices_.label_property_index_->GetActiveIndices()->IndexExists(ttl_label, ttl_path);
           bool const edge_index_existed =
-              !ttl_info.should_run_edge_ttl ||
+              !effective_edge_ttl ||
               storage_->indices_.edge_property_index_->GetActiveIndices()->IndexExists(ttl_property);
           if (GetPinnedStorageMode() == StorageMode::IN_MEMORY_TRANSACTIONAL) {
-            auto *mem_storage = static_cast<InMemoryStorage *>(storage_);
-            if (!label_index_existed) {
-              mem_storage->async_indexer_.Enqueue(ttl_label, ttl_path);
-            }
-            if (ttl_info.should_run_edge_ttl && !edge_index_existed) {
-              mem_storage->async_indexer_.Enqueue(ttl_property);
-            }
+            enqueue_lp = !label_index_existed;
+            enqueue_ep = effective_edge_ttl && !edge_index_existed;
           } else {
             if (!label_index_existed) {
               (void)CreateIndex(ttl_label, ttl_path);
             }
-            if (ttl_info.should_run_edge_ttl && !edge_index_existed) {
+            if (effective_edge_ttl && !edge_index_existed) {
               (void)CreateGlobalEdgeIndex(ttl_property);
             }
           }
-          ttl.SetOwnsLabelPropertyIndex(!label_index_existed);
-          ttl.SetOwnsEdgePropertyIndex(ttl_info.should_run_edge_ttl && !edge_index_existed);
+          owns_lp = !label_index_existed;
+          owns_ep = effective_edge_ttl && !edge_index_existed;
         }
-        ttl.Enable();
-      } else if (repl_args.is_main && ttl_info.should_run_edge_ttl && !ttl.Config().should_run_edge_ttl) {
+      } else if (repl_args.is_main && effective_edge_ttl && !ttl.Config().should_run_edge_ttl) {
         bool const edge_index_existed =
             storage_->indices_.edge_property_index_->GetActiveIndices()->IndexExists(ttl_property);
         if (!edge_index_existed) {
           if (GetPinnedStorageMode() == StorageMode::IN_MEMORY_TRANSACTIONAL) {
-            static_cast<InMemoryStorage *>(storage_)->async_indexer_.Enqueue(ttl_property);
+            enqueue_ep = true;
           } else {
             (void)CreateGlobalEdgeIndex(ttl_property);
           }
-          ttl.SetOwnsEdgePropertyIndex(true);
+          owns_ep = true;
         }
       }
 
-      // Configure TTL
-      if (!ttl.Running()) ttl.Configure(ttl_info.should_run_edge_ttl);
-      ttl.SetInterval(ttl_info.period, ttl_info.start_time);
+      ttl.StageMetadata(
+          storage::ttl::TtlInfo{validated_period, ttl_info.start_time, effective_edge_ttl}, true, owns_lp, owns_ep);
+      auto *ttl_ptr = &ttl;
+      utils::OnScopeExit rollback{[ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); });
+      auto *mem_storage = static_cast<InMemoryStorage *>(storage_);
+      auto const start_time = ttl_info.start_time;
+      transaction_.commit_callbacks_.Add([ttl_ptr,
+                                          mem_storage,
+                                          enqueue_lp,
+                                          enqueue_ep,
+                                          ttl_label,
+                                          ttl_path,
+                                          ttl_property,
+                                          effective_edge_ttl,
+                                          validated_period,
+                                          start_time](uint64_t /*commit_ts*/) {
+        if (enqueue_lp) {
+          mem_storage->async_indexer_.Enqueue(ttl_label, ttl_path);
+        }
+        if (enqueue_ep) {
+          mem_storage->async_indexer_.Enqueue(ttl_property);
+        }
+        if (!ttl_ptr->Running()) {
+          ttl_ptr->Configure(effective_edge_ttl);
+        }
+        ttl_ptr->SetInterval(validated_period, start_time);
+      });
       transaction_.md_deltas.emplace_back(MetadataDelta::ttl_operation,
                                           durability::TtlOperationType::CONFIGURE,
-                                          ttl_info.period,
+                                          validated_period,
                                           ttl_info.start_time,
-                                          ttl_info.should_run_edge_ttl);
+                                          effective_edge_ttl);
+      rollback.Disable();
     }
 
     void DisableTtl(TTLReplicationArgs repl_args = {}) override {
@@ -816,6 +858,7 @@ class InMemoryStorage final : public Storage {
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
       auto &ttl = storage_->ttl_;
+      auto const prev_state = ttl.CaptureState();
       if (repl_args.is_main) {
         // Only drop indexes that TTL created when enabled, leaving pre-existing indexes intact.
         if (ttl.OwnsLabelPropertyIndex()) {
@@ -826,10 +869,16 @@ class InMemoryStorage final : public Storage {
         }
       }
 
-      ttl.Disable();
-
+      ttl.StageMetadata({}, false, false, false);
+      ttl.SetWanted(false);
+      auto *ttl_ptr = &ttl;
+      utils::OnScopeExit rollback{[ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); });
+      transaction_.commit_callbacks_.Add(
+          [this, ttl_ptr](uint64_t /*commit_ts*/) { this->DeferThreadJoinAfterUnlock(ttl_ptr->DisableAsync()); });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::DISABLE, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
     storage::ttl::TtlInfo GetTtlConfig() const override { return storage_->ttl_.Config(); }

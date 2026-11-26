@@ -79,12 +79,12 @@ void *MgpAlignedAllocImpl(memgraph::utils::MemoryResource &memory, const size_t 
   // Since we request the initial memory to be aligned to `alloc_align`, we can
   // just allocate an additional multiple of `alloc_align` of bytes such that
   // the header fits. `data` will then be aligned after this multiple of bytes.
-  static_assert(std::is_same_v<size_t, uint64_t>);
+  static_assert(sizeof(size_t) == sizeof(uint64_t));
   const auto maybe_bytes_for_header = memgraph::utils::RoundUint64ToMultiple(header_size, alloc_align);
-  if (!maybe_bytes_for_header) return nullptr;
+  if (!maybe_bytes_for_header) throw std::bad_alloc{};
   const size_t bytes_for_header = *maybe_bytes_for_header;
+  if (size_in_bytes > std::numeric_limits<size_t>::max() - bytes_for_header) throw std::bad_alloc{};
   const size_t alloc_size = bytes_for_header + size_in_bytes;
-  if (alloc_size < size_in_bytes) return nullptr;
 
   void *ptr = memory.allocate(alloc_size, alloc_align);
   char *data = reinterpret_cast<char *>(ptr) + bytes_for_header;
@@ -448,6 +448,9 @@ bool ContainsDeleted(const mgp_value *val) {
     case MGP_VALUE_TYPE_LOCAL_DATE_TIME:
     case MGP_VALUE_TYPE_ZONED_DATE_TIME:
     case MGP_VALUE_TYPE_DURATION:
+    case MGP_VALUE_TYPE_POINT_2D:
+    case MGP_VALUE_TYPE_POINT_3D:
+    case MGP_VALUE_TYPE_ENUM:
       return false;
     // Reference types
     case MGP_VALUE_TYPE_LIST:
@@ -466,7 +469,8 @@ bool ContainsDeleted(const mgp_value *val) {
   return false;
 }
 
-memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::Allocator<mgp_value> alloc) {
+memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::Allocator<mgp_value> alloc,
+                                         memgraph::query::DbAccessor *db_accessor) {
   switch (val.type) {
     case MGP_VALUE_TYPE_NULL:
       return memgraph::query::TypedValue(alloc);
@@ -483,7 +487,7 @@ memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::
       memgraph::query::TypedValue::TVector tv_list(alloc);
       tv_list.reserve(list->elems.size());
       for (const auto &elem : list->elems) {
-        tv_list.emplace_back(ToTypedValue(elem, alloc));
+        tv_list.emplace_back(ToTypedValue(elem, alloc, db_accessor));
       }
       return memgraph::query::TypedValue(std::move(tv_list));
     }
@@ -491,9 +495,9 @@ memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::
       const auto *map = val.map_v;
       memgraph::query::TypedValue::TMap tv_map(alloc);
       std::visit(
-          [&tv_map, alloc](const auto &items) {
+          [&tv_map, alloc, db_accessor](const auto &items) {
             for (const auto &item : items) {
-              tv_map.emplace(item.first, ToTypedValue(item.second, alloc));
+              tv_map.emplace(item.first, ToTypedValue(item.second, alloc, db_accessor));
             }
           },
           map->items);
@@ -535,10 +539,18 @@ memgraph::query::TypedValue ToTypedValue(const mgp_value &val, memgraph::utils::
       return memgraph::query::TypedValue(val.point_2d_v->point, alloc);
     case MGP_VALUE_TYPE_POINT_3D:
       return memgraph::query::TypedValue(val.point_3d_v->point, alloc);
-    case MGP_VALUE_TYPE_ENUM:
-      throw memgraph::utils::BasicException(
-          "Enum values cannot be returned from procedures. "
-          "Returning enum results requires EnumStore context which is not available in this path.");
+    case MGP_VALUE_TYPE_ENUM: {
+      if (!db_accessor) {
+        throw ValueConversionException{
+            "Enum values cannot be converted without database EnumStore context."};
+      }
+      auto enum_res = db_accessor->GetEnumValue(val.enum_v->type_name, val.enum_v->value_name);
+      if (!enum_res.has_value()) {
+        throw ValueConversionException{
+            fmt::format("Unknown enum value '{}::{}'.", val.enum_v->type_name, val.enum_v->value_name)};
+      }
+      return memgraph::query::TypedValue(*enum_res, alloc);
+    }
   }
 }
 
@@ -783,6 +795,10 @@ mgp_value::mgp_value(const memgraph::query::TypedValue &tv, mgp_graph *graph, al
 
 mgp_value::mgp_value(const memgraph::storage::PropertyValue &pv, memgraph::storage::NameIdMapper *name_id_mapper,
                      allocator_type alloc)
+    : mgp_value(pv, name_id_mapper, nullptr, alloc) {}
+
+mgp_value::mgp_value(const memgraph::storage::PropertyValue &pv, memgraph::storage::NameIdMapper *name_id_mapper,
+                     memgraph::query::DbAccessor *db_accessor, allocator_type alloc)
     : alloc(alloc) {
   switch (pv.type()) {
     case memgraph::storage::PropertyValue::Type::Null:
@@ -813,7 +829,7 @@ mgp_value::mgp_value(const memgraph::storage::PropertyValue &pv, memgraph::stora
       memgraph::utils::pmr::vector<mgp_value> elems(alloc);
       elems.reserve(pv.ValueList().size());
       for (const auto &elem : pv.ValueList()) {
-        elems.emplace_back(elem, name_id_mapper);
+        elems.emplace_back(elem, name_id_mapper, db_accessor);
       }
       memgraph::utils::Allocator<mgp_list> allocator(alloc);
       list_v = allocator.new_object<mgp_list>(std::move(elems));
@@ -865,7 +881,7 @@ mgp_value::mgp_value(const memgraph::storage::PropertyValue &pv, memgraph::stora
       mgp_map::map_type items(alloc);
       for (const auto &item : pv.ValueMap()) {
         auto key_as_name = name_id_mapper->IdToName(item.first.AsUint());
-        auto value = mgp_value(item.second, name_id_mapper, alloc);
+        auto value = mgp_value(item.second, name_id_mapper, db_accessor, alloc);
         items.emplace(std::move(key_as_name), std::move(value));
       }
       memgraph::utils::Allocator<mgp_map> allocator(alloc);
@@ -911,12 +927,17 @@ mgp_value::mgp_value(const memgraph::storage::PropertyValue &pv, memgraph::stora
       break;
     }
     case memgraph::storage::PropertyValue::Type::Enum: {
-      // Enum names require DbAccessor/EnumStore to resolve from numeric IDs.
-      // The PropertyValue path doesn't carry that context, so we create a
-      // stub with empty names — sufficient for type-level inspection (e.g. schema module).
-      // Full name resolution happens in the TypedValue path which has graph context.
       type = MGP_VALUE_TYPE_ENUM;
-      enum_v = NewRawMgpObject<mgp_enum>(alloc.resource(), std::string_view{}, std::string_view{});
+      if (db_accessor != nullptr) {
+        auto name_result = db_accessor->EnumToName(pv.ValueEnum());
+        if (!name_result.has_value()) {
+          throw ValueConversionException{"Failed to resolve enum property value to name."};
+        }
+        auto [type_name, value_name] = SplitEnumName(name_result.value());
+        enum_v = NewRawMgpObject<mgp_enum>(alloc.resource(), type_name, value_name);
+      } else {
+        enum_v = NewRawMgpObject<mgp_enum>(alloc.resource(), std::string_view{}, std::string_view{});
+      }
       break;
     }
     case memgraph::storage::PropertyValue::Type::Point2d: {
@@ -1089,7 +1110,14 @@ mgp_value::mgp_value(mgp_value &&other, allocator_type alloc) : type(other.type)
       double_v = other.double_v;
       break;
     case MGP_VALUE_TYPE_STRING:
-      new (&string_v) memgraph::utils::pmr::string(std::move(other.string_v), alloc);
+      if (other.alloc == alloc) {
+        new (&string_v) memgraph::utils::pmr::string(std::move(other.string_v));
+        using TString = memgraph::utils::pmr::string;
+        other.string_v.~TString();
+        other.type = MGP_VALUE_TYPE_NULL;
+      } else {
+        new (&string_v) memgraph::utils::pmr::string(std::move(other.string_v), alloc);
+      }
       break;
     case MGP_VALUE_TYPE_LIST:
       static_assert(std::is_pointer_v<decltype(list_v)>, "Expected to move list_v by copying pointers.");
@@ -1547,17 +1575,29 @@ mgp_error mgp_map_insert_move(mgp_map *map, const char *key, mgp_value *value) {
   });
 }
 
+namespace {
+template <typename MapItems, typename ValueArg>
+void MgpMapUpdateEntry(MapItems &items, std::string_view key_sv, ValueArg &&val) {
+  auto existing_it = items.find(key_sv);
+  if (existing_it == items.end()) {
+    items.emplace(key_sv, std::forward<ValueArg>(val));
+    return;
+  }
+  MapItems staging(items.get_allocator());
+  staging.emplace(key_sv, std::forward<ValueArg>(val));
+  auto staged_node = staging.extract(staging.begin());
+  items.erase(existing_it);
+  items.insert(std::move(staged_node));
+}
+}  // namespace
+
 mgp_error mgp_map_update(mgp_map *map, const char *key, mgp_value *value) {
   return WrapExceptions([&] {
-    std::visit(
-        [key, value](auto &items) {
-          auto emplace_result = items.emplace(key, *value);
-          if (!emplace_result.second) {
-            items.erase(emplace_result.first);
-            items.emplace(key, *value);
-          }
-        },
-        map->items);
+    if (key == nullptr) {
+      throw std::invalid_argument("Cannot update a map entry with a null key pointer.");
+    }
+    const std::string_view key_sv{key};
+    std::visit([key_sv, value](auto &items) { MgpMapUpdateEntry(items, key_sv, *value); }, map->items);
   });
 }
 
@@ -1567,29 +1607,17 @@ mgp_error mgp_map_update_with_size(mgp_map *map, const char *key, size_t key_siz
       throw std::invalid_argument("Cannot update a map entry with a null key pointer and non-zero size.");
     }
     const std::string_view key_sv{key_size == 0 ? "" : key, key_size};
-    std::visit(
-        [key_sv, value](auto &items) {
-          auto emplace_result = items.emplace(key_sv, *value);
-          if (!emplace_result.second) {
-            items.erase(emplace_result.first);
-            items.emplace(key_sv, *value);
-          }
-        },
-        map->items);
+    std::visit([key_sv, value](auto &items) { MgpMapUpdateEntry(items, key_sv, *value); }, map->items);
   });
 }
 
 mgp_error mgp_map_update_move(mgp_map *map, const char *key, mgp_value *value) {
   return WrapExceptions([&] {
-    std::visit(
-        [key, value](auto &items) {
-          auto emplace_result = items.emplace(key, std::move(*value));
-          if (!emplace_result.second) {
-            items.erase(emplace_result.first);
-            items.emplace(key, *value);
-          }
-        },
-        map->items);
+    if (key == nullptr) {
+      throw std::invalid_argument("Cannot update a map entry with a null key pointer.");
+    }
+    const std::string_view key_sv{key};
+    std::visit([key_sv, value](auto &items) { MgpMapUpdateEntry(items, key_sv, std::move(*value)); }, map->items);
   });
 }
 
@@ -1786,11 +1814,21 @@ mgp_error mgp_path_expand(mgp_path *path, mgp_edge *edge) {
     }
     // Try appending edge and dst_vertex to path, preserving the original mgp_path
     // instance if anything fails.
+    mgp_vertex next_vertex(*dst_vertex, path->vertices.get_allocator());
+    mgp_edge next_edge(*edge, path->edges.get_allocator());
+    path->edges.reserve(path->edges.size() + 1);
+    path->vertices.reserve(path->vertices.size() + 1);
+
     memgraph::utils::OnScopeExit scope_guard(
         [path] { MG_ASSERT(Call<size_t>(mgp_path_size, path) == path->vertices.size() - 1); });
 
-    path->edges.push_back(*edge);
-    path->vertices.push_back(*dst_vertex);
+    path->edges.push_back(std::move(next_edge));
+    try {
+      path->vertices.push_back(std::move(next_vertex));
+    } catch (...) {
+      path->edges.pop_back();
+      throw;
+    }
   });
 }
 
@@ -1832,7 +1870,7 @@ mgp_error mgp_path_edge_at(mgp_path *path, size_t i, mgp_edge **result) {
       [path, i] {
         const auto path_size = Call<size_t>(mgp_path_size, path);
         MG_ASSERT(path_size == path->vertices.size() - 1);
-        if (i > path_size) {
+        if (i >= path_size) {
           throw std::out_of_range("Edge cannot be retrieved, because index exceeds path's size!");
         }
         return &path->edges[i];
@@ -2262,7 +2300,7 @@ mgp_error mgp_point_2d_make(double x, double y, uint16_t srid, mgp_memory *memor
   return WrapExceptions(
       [x, y, srid, memory] {
         auto crs_opt = memgraph::storage::SridToCrs(memgraph::storage::Srid{srid});
-        if (!crs_opt) {
+        if (!crs_opt || !memgraph::storage::valid2d(*crs_opt)) {
           throw std::invalid_argument{"Invalid SRID for Point2d"};
         }
         return NewRawMgpObject<mgp_point_2d>(memory, memgraph::storage::Point2d{*crs_opt, x, y});
@@ -2291,7 +2329,7 @@ mgp_error mgp_point_3d_make(double x, double y, double z, uint16_t srid, mgp_mem
   return WrapExceptions(
       [x, y, z, srid, memory] {
         auto crs_opt = memgraph::storage::SridToCrs(memgraph::storage::Srid{srid});
-        if (!crs_opt) {
+        if (!crs_opt || !memgraph::storage::valid3d(*crs_opt)) {
           throw std::invalid_argument{"Invalid SRID for Point3d"};
         }
         return NewRawMgpObject<mgp_point_3d>(memory, memgraph::storage::Point3d{*crs_opt, x, y, z});
@@ -2360,7 +2398,8 @@ mgp_error mgp_result_new_record(mgp_result *res, mgp_result_record **result) {
                               .values =
                                   memgraph::utils::pmr::vector<memgraph::query::TypedValue>{
                                       res->signature.size(), memgraph::query::TypedValue(allocator), allocator},
-                              .ignore_deleted_values = !res->is_transactional});
+                              .ignore_deleted_values = !res->is_transactional,
+                              .db_accessor = res->db_accessor});
         return &res->rows.back();
       },
       result);
@@ -2390,7 +2429,7 @@ mgp_error mgp_result_record_insert(mgp_result_record *record, const char *field_
           fmt::format("The type of value doesn't satisfy the type '{}'!", field_type->GetPresentableName())};
     }
 
-    record->values[field_id] = ToTypedValue(*val, allocator);
+    record->values[field_id] = ToTypedValue(*val, allocator, record->db_accessor);
   });
 }
 
@@ -2403,7 +2442,7 @@ mgp_error mgp_func_result_set_error_msg(mgp_func_result *res, const char *msg, m
 }
 
 mgp_error mgp_func_result_set_value(mgp_func_result *res, mgp_value *value, mgp_memory *memory) {
-  return WrapExceptions([=] { res->value = ToTypedValue(*value, memory->impl); });
+  return WrapExceptions([=] { res->value = ToTypedValue(*value, memory->impl, res->db_accessor); });
 }
 
 /// Graph Constructs
@@ -2447,8 +2486,11 @@ mgp_error mgp_properties_iterator_next(mgp_properties_iterator *it, mgp_property
               return memgraph::utils::pmr::string(impl->PropertyToName(it->current_it->first), it->GetMemoryResource());
             },
             it->graph->CheckedImpl());
-        it->current.emplace(propToName,
-                            mgp_value(it->current_it->second, GetNameIdMapper(it->graph), it->GetMemoryResource()));
+        it->current.emplace(std::move(propToName),
+                            mgp_value(it->current_it->second,
+                                      GetNameIdMapper(it->graph),
+                                      it->graph->TryGetImpl(),
+                                      it->GetMemoryResource()));
         it->property.name = it->current->first.c_str();
         it->property.value = &it->current->second;
         clean_up.Disable();
@@ -2470,6 +2512,28 @@ mgp_error mgp_vertex_get_in_degree(struct mgp_vertex *v, size_t *result) {
           auto *vg = std::get<memgraph::query::VirtualGraphDbAccessor *>(v->graph->CheckedImpl())->getGraph();
           return vg->InEdges(v->GetVirtualNode().Gid()).size();
         }
+#ifdef MG_ENTERPRISE
+        if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+          if (const auto *auth_checker = v->graph->AuthChecker();
+              auth_checker != nullptr &&
+              (!auth_checker->HasUnrestrictedAccessToEdges() || !auth_checker->HasUnrestrictedAccessToVertices())) {
+            auto maybe_edges = v->VisitReal([v](const auto &impl) { return impl.InEdges(v->graph->view); });
+            if (!maybe_edges) ThrowOnReadError(maybe_edges.error(), "get the degree of", ObjectKind::Vertex);
+            size_t count = 0;
+            const auto view = v->graph->view;
+            const auto self_acc = v->getImpl();
+            for (auto it = maybe_edges->edges.begin(); it != maybe_edges->edges.end(); ++it) {
+              const auto edge_acc = *it;
+              if (!auth_checker->Has(edge_acc, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) continue;
+              const auto &other_vertex = (self_acc == edge_acc.From()) ? edge_acc.To() : edge_acc.From();
+              if (auth_checker->Has(other_vertex, view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) {
+                ++count;
+              }
+            }
+            return count;
+          }
+        }
+#endif
         auto maybe_in_degree = v->VisitReal([v](const auto &impl) { return impl.InDegree(v->graph->view); });
         if (!maybe_in_degree) ThrowOnReadError(maybe_in_degree.error(), "get the degree of", ObjectKind::Vertex);
         return *maybe_in_degree;
@@ -2484,6 +2548,28 @@ mgp_error mgp_vertex_get_out_degree(struct mgp_vertex *v, size_t *result) {
           auto *vg = std::get<memgraph::query::VirtualGraphDbAccessor *>(v->graph->CheckedImpl())->getGraph();
           return vg->OutEdges(v->GetVirtualNode().Gid()).size();
         }
+#ifdef MG_ENTERPRISE
+        if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+          if (const auto *auth_checker = v->graph->AuthChecker();
+              auth_checker != nullptr &&
+              (!auth_checker->HasUnrestrictedAccessToEdges() || !auth_checker->HasUnrestrictedAccessToVertices())) {
+            auto maybe_edges = v->VisitReal([v](const auto &impl) { return impl.OutEdges(v->graph->view); });
+            if (!maybe_edges) ThrowOnReadError(maybe_edges.error(), "get the degree of", ObjectKind::Vertex);
+            size_t count = 0;
+            const auto view = v->graph->view;
+            const auto self_acc = v->getImpl();
+            for (auto it = maybe_edges->edges.begin(); it != maybe_edges->edges.end(); ++it) {
+              const auto edge_acc = *it;
+              if (!auth_checker->Has(edge_acc, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) continue;
+              const auto &other_vertex = (self_acc == edge_acc.From()) ? edge_acc.To() : edge_acc.From();
+              if (auth_checker->Has(other_vertex, view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) {
+                ++count;
+              }
+            }
+            return count;
+          }
+        }
+#endif
         auto maybe_out_degree = v->VisitReal([v](const auto &impl) { return impl.OutDegree(v->graph->view); });
         if (!maybe_out_degree) ThrowOnReadError(maybe_out_degree.error(), "get the degree of", ObjectKind::Vertex);
         return *maybe_out_degree;
@@ -2497,28 +2583,31 @@ mgp_error mgp_vertex_underlying_graph_is_mutable(mgp_vertex *v, int *result) {
 
 namespace {
 memgraph::storage::PropertyValue ToPropertyValue(const mgp_value &value,
-                                                 memgraph::storage::NameIdMapper *name_id_mapper);
+                                                 memgraph::storage::NameIdMapper *name_id_mapper,
+                                                 memgraph::query::DbAccessor *db_accessor = nullptr);
 
 memgraph::storage::PropertyValue ToPropertyValue(const mgp_list &list,
-                                                 memgraph::storage::NameIdMapper *name_id_mapper) {
+                                                 memgraph::storage::NameIdMapper *name_id_mapper,
+                                                 memgraph::query::DbAccessor *db_accessor = nullptr) {
   memgraph::storage::PropertyValue result{std::vector<memgraph::storage::PropertyValue>{}};
   auto &result_list = result.ValueList();
   for (const auto &value : list.elems) {
-    result_list.push_back(ToPropertyValue(value, name_id_mapper));
+    result_list.push_back(ToPropertyValue(value, name_id_mapper, db_accessor));
   }
   return result;
 }
 
-memgraph::storage::PropertyValue ToPropertyValue(const mgp_map &map, memgraph::storage::NameIdMapper *name_id_mapper) {
+memgraph::storage::PropertyValue ToPropertyValue(const mgp_map &map, memgraph::storage::NameIdMapper *name_id_mapper,
+                                                 memgraph::query::DbAccessor *db_accessor = nullptr) {
   auto result_map = memgraph::storage::PropertyValue::map_t{};
   const size_t size = std::visit([](const auto &items) { return items.size(); }, map.items);
   do_reserve(result_map, size);
 
   std::visit(
-      [&result_map, name_id_mapper](const auto &items) {
+      [&result_map, name_id_mapper, db_accessor](const auto &items) {
         for (const auto &[key, value] : items) {
           auto property_id = memgraph::storage::PropertyId::FromUint(name_id_mapper->NameToId(key));
-          result_map.insert_or_assign(property_id, ToPropertyValue(value, name_id_mapper));
+          result_map.insert_or_assign(property_id, ToPropertyValue(value, name_id_mapper, db_accessor));
         }
       },
       map.items);
@@ -2527,7 +2616,8 @@ memgraph::storage::PropertyValue ToPropertyValue(const mgp_map &map, memgraph::s
 }
 
 memgraph::storage::PropertyValue ToPropertyValue(const mgp_value &value,
-                                                 memgraph::storage::NameIdMapper *name_id_mapper) {
+                                                 memgraph::storage::NameIdMapper *name_id_mapper,
+                                                 memgraph::query::DbAccessor *db_accessor) {
   switch (value.type) {
     case MGP_VALUE_TYPE_NULL:
       return memgraph::storage::PropertyValue{};
@@ -2540,9 +2630,9 @@ memgraph::storage::PropertyValue ToPropertyValue(const mgp_value &value,
     case MGP_VALUE_TYPE_STRING:
       return memgraph::storage::PropertyValue{std::string{value.string_v}};
     case MGP_VALUE_TYPE_LIST:
-      return ToPropertyValue(*value.list_v, name_id_mapper);
+      return ToPropertyValue(*value.list_v, name_id_mapper, db_accessor);
     case MGP_VALUE_TYPE_MAP:
-      return ToPropertyValue(*value.map_v, name_id_mapper);
+      return ToPropertyValue(*value.map_v, name_id_mapper, db_accessor);
     case MGP_VALUE_TYPE_DATE:
       return memgraph::storage::PropertyValue{memgraph::storage::TemporalData{
           memgraph::storage::TemporalType::Date, value.date_v->date.MicrosecondsSinceEpoch()}};
@@ -2572,8 +2662,17 @@ memgraph::storage::PropertyValue ToPropertyValue(const mgp_value &value,
       return memgraph::storage::PropertyValue{value.point_2d_v->point};
     case MGP_VALUE_TYPE_POINT_3D:
       return memgraph::storage::PropertyValue{value.point_3d_v->point};
-    case MGP_VALUE_TYPE_ENUM:
-      throw ValueConversionException{"Cannot convert Enum mgp_value back to PropertyValue without EnumStore context!"};
+    case MGP_VALUE_TYPE_ENUM: {
+      if (!db_accessor) {
+        throw ValueConversionException{"Cannot convert Enum mgp_value back to PropertyValue without EnumStore context!"};
+      }
+      auto enum_res = db_accessor->GetEnumValue(value.enum_v->type_name, value.enum_v->value_name);
+      if (!enum_res.has_value()) {
+        throw ValueConversionException{
+            fmt::format("Unknown enum value '{}::{}'.", value.enum_v->type_name, value.enum_v->value_name)};
+      }
+      return memgraph::storage::PropertyValue{*enum_res};
+    }
   }
 }
 
@@ -2668,21 +2767,32 @@ mgp_error mgp_vertex_set_property(struct mgp_vertex *v, const char *property_nam
     auto *ctx = v->graph->ctx;
 
 #ifdef MG_ENTERPRISE
-    if (memgraph::license::global_license_checker.IsEnterpriseValidFast() && ctx && ctx->auth_checker &&
-        !ctx->auth_checker->Has(
-            v->getImpl(), v->graph->view, memgraph::query::AuthQuery::FineGrainedPrivilege::SET_PROPERTY)) {
-      throw AuthorizationException{
-          "Setting vertex property failed: missing SET PROPERTY or UPDATE permission on vertex labels."};
+    if (memgraph::license::global_license_checker.IsEnterpriseValidFast() && ctx && ctx->auth_checker) {
+      if (!ctx->auth_checker->Has(
+              v->getImpl(), v->graph->view, memgraph::query::AuthQuery::FineGrainedPrivilege::SET_PROPERTY)) {
+        throw AuthorizationException{
+            "Setting vertex property failed: missing SET PROPERTY or UPDATE permission on vertex labels."};
+      }
+      if (ctx->auth_checker->HasPropertyRestrictions()) {
+        const auto maybe_labels = v->getImpl().Labels(v->graph->view);
+        if (!maybe_labels) ThrowOnReadError(maybe_labels.error(), "set a property of", ObjectKind::Vertex);
+        if (!ctx->auth_checker->HasPropertyPermission(
+                *maybe_labels, prop_key, memgraph::query::AuthQuery::PropertyPermissionType::WRITE)) {
+          throw AuthorizationException{"Setting vertex property failed: missing WRITE permission on vertex property."};
+        }
+      }
     }
 #endif
     if (!MgpVertexIsMutable(*v)) {
       throw ImmutableObjectException{"Cannot set a property on an immutable vertex!"};
     }
 
-    const auto result =
-        v->VisitReal([prop_key, property_value, name_id_mapper = GetNameIdMapper(v->graph)](auto &impl) {
-          return impl.SetProperty(prop_key, ToPropertyValue(*property_value, name_id_mapper));
-        });
+    const auto result = v->VisitReal([prop_key,
+                                      property_value,
+                                      name_id_mapper = GetNameIdMapper(v->graph),
+                                      db_acc = v->graph->TryGetImpl()](auto &impl) {
+      return impl.SetProperty(prop_key, ToPropertyValue(*property_value, name_id_mapper, db_acc));
+    });
 
     if (!result) {
       switch (result.error()) {
@@ -2710,7 +2820,7 @@ mgp_error mgp_vertex_set_property(struct mgp_vertex *v, const char *property_nam
       trigger_ctx_collector->RegisterRemovedObjectProperty(v->getImpl(), prop_key, old_value);
       return;
     }
-    const auto new_value = ToTypedValue(*property_value, property_value->alloc);
+    const auto new_value = ToTypedValue(*property_value, property_value->alloc, v->graph->TryGetImpl());
     trigger_ctx_collector->RegisterSetObjectProperty(v->getImpl(), prop_key, old_value, new_value);
   });
 }
@@ -2739,13 +2849,29 @@ mgp_error mgp_vertex_set_properties(struct mgp_vertex *v, struct mgp_map *proper
         [&props, v](const auto &items) {
           for (const auto &item : items) {
             props.insert(std::visit(
-                [&item, name_id_mapper = GetNameIdMapper(v->graph)](auto *impl) {
-                  return std::make_pair(impl->NameToProperty(item.first), ToPropertyValue(item.second, name_id_mapper));
+                [&item, name_id_mapper = GetNameIdMapper(v->graph), db_acc = v->graph->TryGetImpl()](auto *impl) {
+                  return std::make_pair(impl->NameToProperty(item.first),
+                                        ToPropertyValue(item.second, name_id_mapper, db_acc));
                 },
                 v->graph->CheckedImpl()));
           }
         },
         properties->items);
+
+#ifdef MG_ENTERPRISE
+    if (memgraph::license::global_license_checker.IsEnterpriseValidFast() && ctx && ctx->auth_checker &&
+        ctx->auth_checker->HasPropertyRestrictions()) {
+      const auto maybe_labels = v->getImpl().Labels(v->graph->view);
+      if (!maybe_labels) ThrowOnReadError(maybe_labels.error(), "set the properties of", ObjectKind::Vertex);
+      for (const auto &[prop_key, _] : props) {
+        if (!ctx->auth_checker->HasPropertyPermission(
+                *maybe_labels, prop_key, memgraph::query::AuthQuery::PropertyPermissionType::WRITE)) {
+          throw AuthorizationException{
+              "Setting vertex properties failed: missing WRITE permission on vertex property."};
+        }
+      }
+    }
+#endif
 
     const auto result = v->getImpl().UpdateProperties(props);
 
@@ -2829,7 +2955,7 @@ mgp_error mgp_vertex_add_label(struct mgp_vertex *v, mgp_label label) {
       }
     }
 
-    if (ctx) {
+    if (*result && ctx) {
       ctx->execution_stats[memgraph::query::ExecutionStats::Key::CREATED_LABELS] += 1;
 
       if (ctx->trigger_context_collector) {
@@ -2881,7 +3007,7 @@ mgp_error mgp_vertex_remove_label(struct mgp_vertex *v, mgp_label label) {  // N
       }
     }
 
-    if (ctx) {
+    if (*result && ctx) {
       ctx->execution_stats[memgraph::query::ExecutionStats::Key::DELETED_LABELS] += 1;
 
       if (ctx->trigger_context_collector) {
@@ -2982,11 +3108,18 @@ mgp_error mgp_vertex_get_property(mgp_vertex *v, const char *name, mgp_memory *m
 
         if (v->IsVirtual()) {
           auto prop = v->GetVirtualNode().GetProperty(key);
-          return NewRawMgpObject<mgp_value>(memory, std::move(prop), GetNameIdMapper(v->graph));
+          return NewRawMgpObject<mgp_value>(memory, std::move(prop), GetNameIdMapper(v->graph), v->graph->TryGetImpl());
         }
         auto maybe_prop = v->VisitReal([v, key](const auto &impl) { return impl.GetProperty(v->graph->view, key); });
         if (!maybe_prop) ThrowOnReadError(maybe_prop.error(), "get a property of", ObjectKind::Vertex);
-        return NewRawMgpObject<mgp_value>(memory, std::move(*maybe_prop), GetNameIdMapper(v->graph));
+#ifdef MG_ENTERPRISE
+        if (memgraph::license::global_license_checker.IsEnterpriseValidFast() &&
+            !memgraph::query::PropertyReadAllowed(v->graph->AuthChecker(), v->getImpl(), v->graph->view, key)) {
+          return NewRawMgpObject<mgp_value>(memory);
+        }
+#endif
+        return NewRawMgpObject<mgp_value>(
+            memory, std::move(*maybe_prop), GetNameIdMapper(v->graph), v->graph->TryGetImpl());
       },
       result);
 }
@@ -3003,6 +3136,18 @@ mgp_error mgp_vertex_iter_properties(mgp_vertex *v, mgp_memory *memory, mgp_prop
         }
         auto maybe_props = v->VisitReal([v](const auto &impl) { return impl.Properties(v->graph->view); });
         if (!maybe_props) ThrowOnReadError(maybe_props.error(), "get the properties of", ObjectKind::Vertex);
+#ifdef MG_ENTERPRISE
+        if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+          if (const auto *auth_checker = v->graph->AuthChecker();
+              auth_checker != nullptr && auth_checker->HasPropertyRestrictions()) {
+            const auto maybe_labels = v->getImpl().Labels(v->graph->view);
+            if (!maybe_labels) ThrowOnReadError(maybe_labels.error(), "get the properties of", ObjectKind::Vertex);
+            std::erase_if(*maybe_props, [&](const auto &kv) {
+              return !memgraph::query::PropertyReadAllowed(auth_checker, *maybe_labels, kv.first);
+            });
+          }
+        }
+#endif
         return NewRawMgpObject<mgp_properties_iterator>(memory, v->graph, std::move(*maybe_props));
       },
       result);
@@ -3013,9 +3158,8 @@ void mgp_edges_iterator_destroy(mgp_edges_iterator *it) { DeleteRawMgpObject(it)
 #ifdef MG_ENTERPRISE
 namespace {
 void NextPermittedEdge(mgp_edges_iterator::RealCursor &c, const mgp_vertex &source_vertex) {
-  const auto *ctx = source_vertex.graph->ctx;
-  if (!ctx || !ctx->auth_checker) return;
-  const auto *auth_checker = ctx->auth_checker;
+  const auto *auth_checker = source_vertex.graph->AuthChecker();
+  if (!auth_checker) return;
   const auto view = source_vertex.graph->view;
   while (c.it != c.edges.end()) {
     auto edgeAcc = *c.it;
@@ -3245,11 +3389,19 @@ mgp_error mgp_edge_get_property(mgp_edge *e, const char *name, mgp_memory *memor
                   auto view = e->from.graph->view;
                   auto maybe_prop = ea.GetProperty(view, key);
                   if (!maybe_prop) ThrowOnReadError(maybe_prop.error(), "get a property of", ObjectKind::Edge);
-                  return NewRawMgpObject<mgp_value>(memory, std::move(*maybe_prop), GetNameIdMapper(e->from.graph));
+#ifdef MG_ENTERPRISE
+                  if (memgraph::license::global_license_checker.IsEnterpriseValidFast() &&
+                      !memgraph::query::PropertyReadAllowed(e->from.graph->AuthChecker(), ea, key)) {
+                    return NewRawMgpObject<mgp_value>(memory);
+                  }
+#endif
+                  return NewRawMgpObject<mgp_value>(
+                      memory, std::move(*maybe_prop), GetNameIdMapper(e->from.graph), e->from.graph->TryGetImpl());
                 },
                 [&](const memgraph::query::VirtualEdge &ve) {
                   auto prop = ve.GetProperty(key);
-                  return NewRawMgpObject<mgp_value>(memory, std::move(prop), GetNameIdMapper(e->from.graph));
+                  return NewRawMgpObject<mgp_value>(
+                      memory, std::move(prop), GetNameIdMapper(e->from.graph), e->from.graph->TryGetImpl());
                 }},
             e->impl);
       },
@@ -3267,17 +3419,24 @@ mgp_error mgp_edge_set_property(struct mgp_edge *e, const char *property_name, m
     auto *ctx = e->from.graph->ctx;
 
 #ifdef MG_ENTERPRISE
-    if (memgraph::license::global_license_checker.IsEnterpriseValidFast() && ctx && ctx->auth_checker &&
-        !ctx->auth_checker->Has(ea, memgraph::query::AuthQuery::FineGrainedPrivilege::SET_PROPERTY)) {
-      throw AuthorizationException{
-          "Setting edge property failed: missing SET PROPERTY or UPDATE permission on edge type."};
+    if (memgraph::license::global_license_checker.IsEnterpriseValidFast() && ctx && ctx->auth_checker) {
+      if (!ctx->auth_checker->Has(ea, memgraph::query::AuthQuery::FineGrainedPrivilege::SET_PROPERTY)) {
+        throw AuthorizationException{
+            "Setting edge property failed: missing SET PROPERTY or UPDATE permission on edge type."};
+      }
+      if (ctx->auth_checker->HasPropertyRestrictions() &&
+          !ctx->auth_checker->HasPropertyPermission(
+              ea.EdgeType(), prop_key, memgraph::query::AuthQuery::PropertyPermissionType::WRITE)) {
+        throw AuthorizationException{"Setting edge property failed: missing WRITE permission on edge property."};
+      }
     }
 #endif
 
     if (!MgpEdgeIsMutable(*e)) {
       throw ImmutableObjectException{"Cannot set a property on an immutable edge!"};
     }
-    const auto result = ea.SetProperty(prop_key, ToPropertyValue(*property_value, GetNameIdMapper(e->from.graph)));
+    const auto result = ea.SetProperty(
+        prop_key, ToPropertyValue(*property_value, GetNameIdMapper(e->from.graph), e->from.graph->TryGetImpl()));
 
     if (!result) {
       switch (result.error()) {
@@ -3305,7 +3464,7 @@ mgp_error mgp_edge_set_property(struct mgp_edge *e, const char *property_name, m
       e->from.graph->ctx->trigger_context_collector->RegisterRemovedObjectProperty(ea, prop_key, old_value);
       return;
     }
-    const auto new_value = ToTypedValue(*property_value, property_value->alloc);
+    const auto new_value = ToTypedValue(*property_value, property_value->alloc, e->from.graph->TryGetImpl());
     e->from.graph->ctx->trigger_context_collector->RegisterSetObjectProperty(ea, prop_key, old_value, new_value);
   });
 }
@@ -3336,13 +3495,26 @@ mgp_error mgp_edge_set_properties(struct mgp_edge *e, struct mgp_map *properties
           for (const auto &item : items) {
             props.insert(std::visit(
                 [&item, &e](auto *impl) {
-                  return std::make_pair(impl->NameToProperty(item.first),
-                                        ToPropertyValue(item.second, GetNameIdMapper(e->from.graph)));
+                  return std::make_pair(
+                      impl->NameToProperty(item.first),
+                      ToPropertyValue(item.second, GetNameIdMapper(e->from.graph), e->from.graph->TryGetImpl()));
                 },
                 e->from.graph->CheckedImpl()));
           }
         },
         properties->items);
+
+#ifdef MG_ENTERPRISE
+    if (memgraph::license::global_license_checker.IsEnterpriseValidFast() && ctx && ctx->auth_checker &&
+        ctx->auth_checker->HasPropertyRestrictions()) {
+      for (const auto &[prop_key, _] : props) {
+        if (!ctx->auth_checker->HasPropertyPermission(
+                ea.EdgeType(), prop_key, memgraph::query::AuthQuery::PropertyPermissionType::WRITE)) {
+          throw AuthorizationException{"Setting edge properties failed: missing WRITE permission on edge property."};
+        }
+      }
+    }
+#endif
 
     const auto result = ea.UpdateProperties(props);
     if (!result) {
@@ -3396,6 +3568,16 @@ mgp_error mgp_edge_iter_properties(mgp_edge *e, mgp_memory *memory, mgp_properti
                                 auto maybe_props = ea.Properties(view);
                                 if (!maybe_props)
                                   ThrowOnReadError(maybe_props.error(), "get the properties of", ObjectKind::Edge);
+#ifdef MG_ENTERPRISE
+                                if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+                                  if (const auto *auth_checker = e->from.graph->AuthChecker();
+                                      auth_checker != nullptr && auth_checker->HasPropertyRestrictions()) {
+                                    std::erase_if(*maybe_props, [&](const auto &kv) {
+                                      return !memgraph::query::PropertyReadAllowed(auth_checker, ea, kv.first);
+                                    });
+                                  }
+                                }
+#endif
                                 return NewRawMgpObject<mgp_properties_iterator>(
                                     memory, e->from.graph, std::move(*maybe_props));
                               },
@@ -3416,11 +3598,31 @@ mgp_error mgp_graph_get_vertex_by_id(mgp_graph *graph, mgp_vertex_id id, mgp_mem
                 [graph, gid, memory](memgraph::query::DbAccessor *impl) -> mgp_vertex * {
                   const auto maybe_vertex = impl->FindVertex(gid, graph->view);
                   if (!maybe_vertex) return nullptr;
+#ifdef MG_ENTERPRISE
+                  if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+                    if (const auto *auth_checker = graph->AuthChecker();
+                        auth_checker != nullptr &&
+                        !auth_checker->Has(
+                            *maybe_vertex, graph->view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) {
+                      return nullptr;
+                    }
+                  }
+#endif
                   return NewRawMgpObject<mgp_vertex>(memory, *maybe_vertex, graph);
                 },
                 [graph, gid, memory](memgraph::query::SubgraphDbAccessor *impl) -> mgp_vertex * {
                   const auto maybe_vertex = impl->FindVertex(gid, graph->view);
                   if (!maybe_vertex) return nullptr;
+#ifdef MG_ENTERPRISE
+                  if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+                    if (const auto *auth_checker = graph->AuthChecker();
+                        auth_checker != nullptr &&
+                        !auth_checker->Has(
+                            *maybe_vertex, graph->view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) {
+                      return nullptr;
+                    }
+                  }
+#endif
                   return NewRawMgpObject<mgp_vertex>(
                       memory, memgraph::query::SubgraphVertexAccessor(*maybe_vertex, impl->getGraph()), graph);
                 },
@@ -3673,13 +3875,50 @@ mgp_error mgp_list_all_label_property_indices(mgp_graph *graph, mgp_memory *memo
     }
 
     for (const auto &[label, property_paths, order] : index_res) {
-      if (property_paths.size() != 1) {  // TODO: Support composite indices
+      if (property_paths.empty()) {
         continue;
       }
+      const auto label_id_str =
+          std::visit([label](const auto *impl) { return impl->LabelToName(label); }, graph->CheckedImpl());
+      mgp_list *entry_list = nullptr;
+      if (const auto err_entry = mgp_list_make_empty(property_paths.size() + 1, memory, &entry_list);
+          err_entry != mgp_error::MGP_ERROR_NO_ERROR) {
+        throw std::logic_error("Listing all label+property indices failed due to failure of creating an inner list");
+      }
+      MgpUniquePtr<mgp_list> owned_entry{entry_list, mgp_list_destroy};
 
-      if (const auto err =
-              create_and_append_label_property_to_mgp_list(graph, memory, result, std::pair{label, property_paths[0]});
-          err != mgp_error::MGP_ERROR_NO_ERROR) {
+      MgpUniquePtr<mgp_value> label_val{nullptr, mgp_value_destroy};
+      if (CreateMgpObject(label_val, mgp_value_make_string, label_id_str.c_str(), memory) !=
+              mgp_error::MGP_ERROR_NO_ERROR ||
+          mgp_list_append_extend(owned_entry.get(), label_val.get()) != mgp_error::MGP_ERROR_NO_ERROR) {
+        throw std::logic_error("Listing all label+property indices failed due to failure of appending label value");
+      }
+
+      for (const auto &property_path : property_paths) {
+        const auto property_path_str = std::visit(
+            [&property_path](const auto *impl) {
+              return property_path | ranges::views::transform([impl](const auto &property_id) {
+                       return impl->PropertyToName(property_id);
+                     }) |
+                     ranges::views::join('.') | ranges::to<std::string>();
+            },
+            graph->CheckedImpl());
+        MgpUniquePtr<mgp_value> prop_val{nullptr, mgp_value_destroy};
+        if (CreateMgpObject(prop_val, mgp_value_make_string, property_path_str.c_str(), memory) !=
+                mgp_error::MGP_ERROR_NO_ERROR ||
+            mgp_list_append_extend(owned_entry.get(), prop_val.get()) != mgp_error::MGP_ERROR_NO_ERROR) {
+          throw std::logic_error(
+              "Listing all label+property indices failed due to failure of appending property value");
+        }
+      }
+
+      MgpUniquePtr<mgp_value> entry_val{nullptr, mgp_value_destroy};
+      if (CreateMgpObject(entry_val, mgp_value_make_list, owned_entry.get()) != mgp_error::MGP_ERROR_NO_ERROR) {
+        throw std::logic_error(
+            "Listing all label+property indices failed due to failure of creating label+property list value");
+      }
+      static_cast<void>(owned_entry.release());
+      if (mgp_list_append_extend(*result, entry_val.get()) != mgp_error::MGP_ERROR_NO_ERROR) {
         throw std::logic_error(
             "Listing all label+property indices failed due to failure of appending label+property value");
       }
@@ -3876,7 +4115,10 @@ mgp_error mgp_create_unique_constraint(mgp_graph *graph, const char *label, mgp_
                   throw ImmutableObjectException{"mgp_create_unique_constraint is not supported on a virtual graph"};
                 }},
             graph->CheckedImpl());
-        return unique_res.has_value() ? 1 : 0;
+        return (unique_res.has_value() &&
+                *unique_res == memgraph::storage::UniqueConstraints::CreationStatus::SUCCESS)
+                   ? 1
+                   : 0;
       },
       result);
 }
@@ -4371,9 +4613,9 @@ bool CandidatePropertiesReadable(const TAccessor &entity, memgraph::storage::Vie
 // entity lacks is skipped — it could not have produced the match.
 bool VertexSearchHitReadable(const memgraph::query::VertexAccessor &v, const mgp_graph &graph,
                              std::span<const memgraph::storage::PropertyId> searched) {
-  const auto *ctx = graph.ctx;
-  if (!ctx || !ctx->auth_checker) return true;
-  const auto *auth_checker = ctx->auth_checker;
+  if (!memgraph::license::global_license_checker.IsEnterpriseValidFast()) return true;
+  const auto *auth_checker = graph.AuthChecker();
+  if (!auth_checker) return true;
   if (!auth_checker->Has(v, graph.view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) return false;
   if (!auth_checker->HasPropertyRestrictions()) return true;
   return CandidatePropertiesReadable(v, graph.view, searched, [&](const memgraph::storage::PropertyId property) {
@@ -4385,9 +4627,9 @@ bool VertexSearchHitReadable(const memgraph::query::VertexAccessor &v, const mgp
 // returns raw matches with no known source, so a partial check would leak.
 bool EdgeSearchHitReadable(const memgraph::query::EdgeAccessor &e, const mgp_graph &graph,
                            std::span<const memgraph::storage::PropertyId> searched) {
-  const auto *ctx = graph.ctx;
-  if (!ctx || !ctx->auth_checker) return true;
-  const auto *auth_checker = ctx->auth_checker;
+  if (!memgraph::license::global_license_checker.IsEnterpriseValidFast()) return true;
+  const auto *auth_checker = graph.AuthChecker();
+  if (!auth_checker) return true;
   if (!auth_checker->Has(e, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) return false;
   const auto view = graph.view;
   if (!auth_checker->Has(e.From(), view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) return false;
@@ -4415,10 +4657,21 @@ std::vector<memgraph::storage::PropertyId> TextEdgeIndexSearchedProperties(const
   return it == indices.text_edge_indices.end() ? std::vector<memgraph::storage::PropertyId>{} : it->properties;
 }
 
-std::vector<memgraph::storage::PropertyId> QueriedTextProperties(const mgp_graph &graph, std::string_view query) {
+std::optional<std::vector<memgraph::storage::PropertyId>> QueriedTextProperties(
+    const mgp_graph &graph, std::string_view query,
+    std::span<const memgraph::storage::PropertyId> indexed_properties) {
+  const auto fields = memgraph::query::procedure::TryExtractCompleteTextQueryFields(query);
+  if (!fields) return std::nullopt;
   std::vector<memgraph::storage::PropertyId> properties;
-  for (const auto field : memgraph::query::procedure::ReferencedTextQueryFields(query))
-    if (const auto property = graph.getImpl()->NameToPropertyIfExists(field)) properties.push_back(*property);
+  properties.reserve(fields->size());
+  for (const auto field : *fields) {
+    const auto property = graph.getImpl()->NameToPropertyIfExists(field);
+    if (!property) return std::nullopt;
+    if (!indexed_properties.empty() && !r::contains(indexed_properties, *property)) {
+      return std::nullopt;
+    }
+    properties.push_back(*property);
+  }
   return properties;
 }
 
@@ -4441,15 +4694,12 @@ std::optional<memgraph::storage::PropertyId> VectorEdgeIndexSearchedProperty(con
   return it->property;
 }
 
-// Aggregation runs inside Tantivy with no per-row hook, so RBAC can't be applied to the result — it
-// must be gated up front. Property dimension: require affirmative READ on every indexed property (an
-// all-string-properties index can't be certified, and a caller with property RBAC but no grant on the
-// indexed property would otherwise count values it can't read). Multi-label over-counting (a node the
-// caller can't fully read still contributes) stays a documented best-effort limitation.
+// Aggregation runs inside Tantivy with no per-row hook, so RBAC must be verified up front across labels,
+// endpoints, and indexed properties.
 void PrecheckVertexTextAggregateAccess(const mgp_graph &graph, std::string_view index_name) {
-  const auto *ctx = graph.ctx;
-  if (!ctx || !ctx->auth_checker) return;
-  const auto *auth_checker = ctx->auth_checker;
+  if (!memgraph::license::global_license_checker.IsEnterpriseValidFast()) return;
+  const auto *auth_checker = graph.AuthChecker();
+  if (!auth_checker) return;
   const auto indices = graph.getImpl()->ListAllIndices();
   const auto it = r::find_if(indices.text_indices, [&](const memgraph::storage::TextIndexSpec &spec) {
     return spec.index_name == index_name;
@@ -4460,6 +4710,11 @@ void PrecheckVertexTextAggregateAccess(const mgp_graph &graph, std::string_view 
   if (!auth_checker->Has(label_span, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) {
     throw AuthorizationException{
         "text_search.aggregate is unavailable for this index: caller lacks READ on its bound label."};
+  }
+  if (!auth_checker->HasUnrestrictedAccessToVertices()) {
+    throw AuthorizationException{
+        "text_search.aggregate is unavailable: vertex label restrictions are active and multi-label vertices cannot "
+        "be filtered inside index aggregation. Use text_search.search and aggregate the filtered results in Cypher."};
   }
   if (auth_checker->HasUnrestrictedAccessToVertexProperties()) return;
   const bool all_readable =
@@ -4476,9 +4731,9 @@ void PrecheckVertexTextAggregateAccess(const mgp_graph &graph, std::string_view 
 }
 
 void PrecheckEdgeTextAggregateAccess(const mgp_graph &graph, std::string_view index_name) {
-  const auto *ctx = graph.ctx;
-  if (!ctx || !ctx->auth_checker) return;
-  const auto *auth_checker = ctx->auth_checker;
+  if (!memgraph::license::global_license_checker.IsEnterpriseValidFast()) return;
+  const auto *auth_checker = graph.AuthChecker();
+  if (!auth_checker) return;
   const auto indices = graph.getImpl()->ListAllIndices();
   const auto it = r::find_if(indices.text_edge_indices, [&](const memgraph::storage::TextEdgeIndexSpec &spec) {
     return spec.index_name == index_name;
@@ -4488,6 +4743,12 @@ void PrecheckEdgeTextAggregateAccess(const mgp_graph &graph, std::string_view in
   if (!auth_checker->Has(it->edge_type, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) {
     throw AuthorizationException{
         "text_search.aggregate_edges is unavailable for this index: caller lacks READ on its edge type."};
+  }
+  if (!auth_checker->HasUnrestrictedAccessToVertices()) {
+    throw AuthorizationException{
+        "text_search.aggregate_edges is unavailable: vertex label restrictions are active and edge endpoints cannot "
+        "be filtered inside index aggregation. Use text_search.search_edges and aggregate the filtered results in "
+        "Cypher."};
   }
   if (auth_checker->HasUnrestrictedAccessToEdgeTypeProperties()) return;
   const bool all_readable =
@@ -4512,13 +4773,14 @@ void WrapVectorSearchResults(mgp_graph *graph, mgp_memory *memory, mgp_map **res
     throw std::logic_error("Retrieving vector search results failed during creation of a mgp_map");
   }
 
-  mgp_value *error_value = nullptr;
   if (error_msg) {
-    if (const auto err = mgp_value_make_string(error_msg->data(), memory, &error_value);
-        err != mgp_error::MGP_ERROR_NO_ERROR) {
+    MgpUniquePtr<mgp_value> error_value{nullptr, mgp_value_destroy};
+    if (CreateMgpObject(error_value, mgp_value_make_string, error_msg->data(), memory) !=
+        mgp_error::MGP_ERROR_NO_ERROR) {
       throw std::logic_error("Retrieving vector search results failed during creation of a string mgp_value");
     }
-    if (const auto err = mgp_map_insert(*result, kErrorMsgKey, error_value); err != mgp_error::MGP_ERROR_NO_ERROR) {
+    if (const auto err = mgp_map_insert(*result, kErrorMsgKey, error_value.get());
+        err != mgp_error::MGP_ERROR_NO_ERROR) {
       throw std::logic_error("Retrieving vector search error failed during insertion into mgp_map");
     }
     return;
@@ -4603,7 +4865,6 @@ void WrapVectorSearchResults(mgp_graph *graph, mgp_memory *memory, mgp_map **res
     throw std::logic_error("Retrieving vector search results failed during insertion into mgp_map");
   }
 
-  mgp_value_destroy(error_value);
   mgp_value_destroy(search_results_value);
 }
 
@@ -4616,7 +4877,16 @@ void WrapVectorSearchResults(
                               mgp_graph *graph,
                               mgp_value **out) {
     auto query_vertex_acc = memgraph::query::VertexAccessor(storage_vertex_acc);
-    return mgp_value_make_vertex(NewRawMgpObject<mgp_vertex>(memory, query_vertex_acc, graph), out);
+    auto *mgp_v = std::visit(
+        memgraph::utils::Overloaded{
+            [&](memgraph::query::DbAccessor *) { return NewRawMgpObject<mgp_vertex>(memory, query_vertex_acc, graph); },
+            [&](memgraph::query::SubgraphDbAccessor *sub_impl) {
+              return NewRawMgpObject<mgp_vertex>(
+                  memory, memgraph::query::SubgraphVertexAccessor(query_vertex_acc, sub_impl->getGraph()), graph);
+            },
+            VirtualGraphUnreachable<mgp_vertex *>("WrapVectorSearchResults")},
+        graph->CheckedImpl());
+    return mgp_value_make_vertex(mgp_v, out);
   };
   WrapVectorSearchResults(graph, memory, result, found_vertices.size(), make_vertex_value, found_vertices, error_msg);
 }
@@ -4630,7 +4900,20 @@ void WrapVectorSearchOnEdgesResults(
                             mgp_graph *graph,
                             mgp_value **out) {
     auto query_edge_acc = memgraph::query::EdgeAccessor(storage_edge_acc);
-    return mgp_value_make_edge(NewRawMgpObject<mgp_edge>(memory, query_edge_acc, graph), out);
+    auto *mgp_e = std::visit(
+        memgraph::utils::Overloaded{
+            [&](memgraph::query::DbAccessor *) { return NewRawMgpObject<mgp_edge>(memory, query_edge_acc, graph); },
+            [&](memgraph::query::SubgraphDbAccessor *sub_impl) {
+              return NewRawMgpObject<mgp_edge>(
+                  memory,
+                  query_edge_acc,
+                  memgraph::query::SubgraphVertexAccessor(query_edge_acc.From(), sub_impl->getGraph()),
+                  memgraph::query::SubgraphVertexAccessor(query_edge_acc.To(), sub_impl->getGraph()),
+                  graph);
+            },
+            VirtualGraphUnreachable<mgp_edge *>("WrapVectorSearchOnEdgesResults")},
+        graph->CheckedImpl());
+    return mgp_value_make_edge(mgp_e, out);
   };
   WrapVectorSearchResults(graph, memory, result, found_edges.size(), make_edge_value, found_edges, error_msg);
 }
@@ -4746,13 +5029,14 @@ void WrapVectorIndexInfoResult(mgp_memory *memory, mgp_map **result,
     throw std::logic_error("Retrieving vector search results failed during creation of a mgp_map");
   }
 
-  mgp_value *error_value = nullptr;
   if (error_msg) {
-    if (const auto err = mgp_value_make_string(error_msg->data(), memory, &error_value);
-        err != mgp_error::MGP_ERROR_NO_ERROR) {
+    MgpUniquePtr<mgp_value> error_value{nullptr, mgp_value_destroy};
+    if (CreateMgpObject(error_value, mgp_value_make_string, error_msg->data(), memory) !=
+        mgp_error::MGP_ERROR_NO_ERROR) {
       throw std::logic_error("Retrieving vector search results failed during creation of a string mgp_value");
     }
-    if (const auto err = mgp_map_insert(*result, kErrorMsgKey, error_value); err != mgp_error::MGP_ERROR_NO_ERROR) {
+    if (const auto err = mgp_map_insert(*result, kErrorMsgKey, error_value.get());
+        err != mgp_error::MGP_ERROR_NO_ERROR) {
       throw std::logic_error("Retrieving vector search error failed during insertion into mgp_map");
     }
     return;
@@ -4791,7 +5075,6 @@ void WrapVectorIndexInfoResult(mgp_memory *memory, mgp_map **result,
     throw std::logic_error("Retrieving vector search results failed during insertion into mgp_map");
   }
 
-  mgp_value_destroy(error_value);
   mgp_value_destroy(search_results_value);
 }
 
@@ -4889,26 +5172,26 @@ void WrapTextIndexAggregation(mgp_memory *memory, mgp_map **result, const std::s
     throw std::logic_error("Retrieving text search results failed during creation of a mgp_map");
   }
 
-  mgp_value *aggregation_result_or_error_value = nullptr;
-  if (const auto err = mgp_value_make_string(
-          error_msg.value_or(aggregation_result).data(), memory, &aggregation_result_or_error_value);
-      err != mgp_error::MGP_ERROR_NO_ERROR) {
+  MgpUniquePtr<mgp_value> aggregation_result_or_error_value{nullptr, mgp_value_destroy};
+  if (CreateMgpObject(aggregation_result_or_error_value,
+                      mgp_value_make_string,
+                      error_msg.value_or(aggregation_result).data(),
+                      memory) != mgp_error::MGP_ERROR_NO_ERROR) {
     throw std::logic_error("Retrieving text search results failed during creation of a string mgp_value");
   }
 
   if (error_msg) {
-    if (const auto err = mgp_map_insert(*result, kErrorMsgKey, aggregation_result_or_error_value);
+    if (const auto err = mgp_map_insert(*result, kErrorMsgKey, aggregation_result_or_error_value.get());
         err != mgp_error::MGP_ERROR_NO_ERROR) {
       throw std::logic_error("Retrieving text index aggregation error failed during insertion into mgp_map");
     }
     return;
   }
 
-  if (const auto err = mgp_map_insert(*result, kAggregationResultsKey, aggregation_result_or_error_value);
+  if (const auto err = mgp_map_insert(*result, kAggregationResultsKey, aggregation_result_or_error_value.get());
       err != mgp_error::MGP_ERROR_NO_ERROR) {
     throw std::logic_error("Retrieving text index aggregation results failed during insertion into mgp_map");
   }
-  mgp_value_destroy(aggregation_result_or_error_value);
 }
 
 void WrapTextEdgeSearchResults(mgp_graph *graph, mgp_memory *memory, mgp_map **result,
@@ -4999,6 +5282,35 @@ void WrapTextEdgeSearchResults(mgp_graph *graph, mgp_memory *memory, mgp_map **r
   mgp_value_destroy(search_results_value);
 }
 
+namespace {
+std::optional<memgraph::query::VertexAccessor> ResolveVisibleVertexInGraph(const mgp_graph &graph,
+                                                                           memgraph::storage::Gid gid) {
+  return std::visit(
+      memgraph::utils::Overloaded{
+          [&](memgraph::query::DbAccessor *impl) { return impl->FindVertex(gid, graph.view); },
+          [&](memgraph::query::SubgraphDbAccessor *impl) { return impl->FindVertex(gid, graph.view); },
+          [](memgraph::query::VirtualGraphDbAccessor *) -> std::optional<memgraph::query::VertexAccessor> {
+            throw ImmutableObjectException{"Search is not supported on a virtual graph"};
+          }},
+      graph.CheckedImpl());
+}
+
+std::optional<memgraph::query::EdgeAccessor> ResolveVisibleEdgeInGraph(const mgp_graph &graph,
+                                                                       memgraph::storage::Gid edge_gid,
+                                                                       memgraph::storage::Gid from_vertex_gid) {
+  return std::visit(
+      memgraph::utils::Overloaded{
+          [&](memgraph::query::DbAccessor *impl) { return impl->FindEdge(edge_gid, from_vertex_gid, graph.view); },
+          [&](memgraph::query::SubgraphDbAccessor *impl) {
+            return impl->FindEdge(edge_gid, from_vertex_gid, graph.view);
+          },
+          [](memgraph::query::VirtualGraphDbAccessor *) -> std::optional<memgraph::query::EdgeAccessor> {
+            throw ImmutableObjectException{"Search is not supported on a virtual graph"};
+          }},
+      graph.CheckedImpl());
+}
+}  // namespace
+
 mgp_error mgp_graph_search_text_index(mgp_graph *graph, const char *index_name, const char *search_query,
                                       text_search_mode search_mode, std::size_t limit, uint8_t fuzzy_distance,
                                       int fuzzy_prefix, int fuzzy_transpositions, mgp_memory *memory,
@@ -5015,19 +5327,44 @@ mgp_error mgp_graph_search_text_index(mgp_graph *graph, const char *index_name, 
                          fuzzy_transpositions]() {
     std::vector<memgraph::storage::TextSearchResult> text_search_results;
     std::optional<std::string> error_msg = std::nullopt;
-    const memgraph::storage::TextSearchConfig config{.limit = limit,
-                                                     .fuzzy_distance = fuzzy_distance,
-                                                     .fuzzy_prefix = fuzzy_prefix != 0,
-                                                     .fuzzy_transpositions = fuzzy_transpositions != 0};
     std::vector<memgraph::storage::PropertyId> searched;
     try {
+      if (std::holds_alternative<memgraph::query::VirtualGraphDbAccessor *>(graph->CheckedImpl())) {
+        throw ImmutableObjectException{"mgp_graph_search_text_index is not supported on a virtual graph"};
+      }
 #ifdef MG_ENTERPRISE
       searched = TextIndexSearchedProperties(*graph, index_name);
       if (search_mode == text_search_mode::SPECIFIED_PROPERTIES) {
-        if (auto queried = QueriedTextProperties(*graph, search_query); !queried.empty()) searched = std::move(queried);
+        if (auto queried = QueriedTextProperties(*graph, search_query, searched)) searched = std::move(*queried);
       }
 #endif
-      text_search_results = graph->getImpl()->TextIndexSearch(index_name, search_query, search_mode, config);
+      const size_t max_candidates =
+          static_cast<size_t>(std::max<int64_t>(0, graph->getImpl()->VerticesCount())) + 16U;
+      size_t fetch_limit = limit;
+      while (true) {
+        const memgraph::storage::TextSearchConfig config{.limit = fetch_limit,
+                                                         .fuzzy_distance = fuzzy_distance,
+                                                         .fuzzy_prefix = fuzzy_prefix != 0,
+                                                         .fuzzy_transpositions = fuzzy_transpositions != 0};
+        auto raw_results = graph->getImpl()->TextIndexSearch(index_name, search_query, search_mode, config);
+        const size_t raw_count = raw_results.size();
+        std::erase_if(raw_results, [&](const memgraph::storage::TextSearchResult &hit) {
+          const auto maybe_v = ResolveVisibleVertexInGraph(*graph, hit.vertex_gid);
+          if (!maybe_v) return true;
+#ifdef MG_ENTERPRISE
+          if (!VertexSearchHitReadable(*maybe_v, *graph, searched)) return true;
+#endif
+          return false;
+        });
+        if (limit == 0 || raw_results.size() >= limit || raw_count < fetch_limit || fetch_limit >= max_candidates) {
+          if (limit > 0 && raw_results.size() > limit) {
+            raw_results.resize(limit);
+          }
+          text_search_results = std::move(raw_results);
+          break;
+        }
+        fetch_limit = std::min(max_candidates, fetch_limit * 2U);
+      }
     } catch (const AuthorizationException &e) {
       error_msg = e.what();
     } catch (memgraph::storage::InvalidOperationException &e) {
@@ -5092,19 +5429,44 @@ mgp_error mgp_graph_search_text_edge_index(struct mgp_graph *graph, const char *
                          fuzzy_transpositions]() {
     std::vector<memgraph::storage::TextEdgeSearchResult> text_edge_search_results;
     std::optional<std::string> error_msg = std::nullopt;
-    const memgraph::storage::TextSearchConfig config{.limit = limit,
-                                                     .fuzzy_distance = fuzzy_distance,
-                                                     .fuzzy_prefix = fuzzy_prefix != 0,
-                                                     .fuzzy_transpositions = fuzzy_transpositions != 0};
     std::vector<memgraph::storage::PropertyId> searched;
     try {
+      if (std::holds_alternative<memgraph::query::VirtualGraphDbAccessor *>(graph->CheckedImpl())) {
+        throw ImmutableObjectException{"mgp_graph_search_text_edge_index is not supported on a virtual graph"};
+      }
 #ifdef MG_ENTERPRISE
       searched = TextEdgeIndexSearchedProperties(*graph, index_name);
       if (search_mode == text_search_mode::SPECIFIED_PROPERTIES) {
-        if (auto queried = QueriedTextProperties(*graph, search_query); !queried.empty()) searched = std::move(queried);
+        if (auto queried = QueriedTextProperties(*graph, search_query, searched)) searched = std::move(*queried);
       }
 #endif
-      text_edge_search_results = graph->getImpl()->SearchEdgeTextIndex(index_name, search_query, search_mode, config);
+      const size_t max_candidates =
+          static_cast<size_t>(std::max<int64_t>(0, graph->getImpl()->EdgesCount())) + 16U;
+      size_t fetch_limit = limit;
+      while (true) {
+        const memgraph::storage::TextSearchConfig config{.limit = fetch_limit,
+                                                         .fuzzy_distance = fuzzy_distance,
+                                                         .fuzzy_prefix = fuzzy_prefix != 0,
+                                                         .fuzzy_transpositions = fuzzy_transpositions != 0};
+        auto raw_results = graph->getImpl()->SearchEdgeTextIndex(index_name, search_query, search_mode, config);
+        const size_t raw_count = raw_results.size();
+        std::erase_if(raw_results, [&](const memgraph::storage::TextEdgeSearchResult &hit) {
+          const auto maybe_e = ResolveVisibleEdgeInGraph(*graph, hit.edge_gid, hit.from_vertex_gid);
+          if (!maybe_e) return true;
+#ifdef MG_ENTERPRISE
+          if (!EdgeSearchHitReadable(*maybe_e, *graph, searched)) return true;
+#endif
+          return false;
+        });
+        if (limit == 0 || raw_results.size() >= limit || raw_count < fetch_limit || fetch_limit >= max_candidates) {
+          if (limit > 0 && raw_results.size() > limit) {
+            raw_results.erase(raw_results.begin() + static_cast<std::ptrdiff_t>(limit), raw_results.end());
+          }
+          text_edge_search_results = std::move(raw_results);
+          break;
+        }
+        fetch_limit = std::min(max_candidates, fetch_limit * 2U);
+      }
     } catch (const AuthorizationException &e) {
       error_msg = e.what();
     } catch (memgraph::storage::InvalidOperationException &e) {
@@ -5120,6 +5482,9 @@ mgp_error mgp_graph_search_vector_index(mgp_graph *graph, const char *index_name
     std::vector<std::tuple<memgraph::storage::VertexAccessor, double, double>> found_vertices;
     std::optional<std::string> error_msg = std::nullopt;
     try {
+      if (std::holds_alternative<memgraph::query::VirtualGraphDbAccessor *>(graph->CheckedImpl())) {
+        throw ImmutableObjectException{"mgp_graph_search_vector_index is not supported on a virtual graph"};
+      }
       if (result_size < 0) {
         throw memgraph::storage::VectorSearchException("Result set size must be non-negative.");
       }
@@ -5146,18 +5511,37 @@ mgp_error mgp_graph_search_vector_index(mgp_graph *graph, const char *index_name
         throw std::logic_error(
             "Unrecognized argument type when performing vector search, expected values are Double or Int!");
       }
-      found_vertices =
-          graph->getImpl()->VectorIndexSearchOnNodes(index_name, static_cast<uint64_t>(result_size), search_query_vector);
 #ifdef MG_ENTERPRISE
-      if (graph->ctx && graph->ctx->auth_checker) {
-        const auto searched_property = VectorIndexSearchedProperty(*graph, index_name);
-        const auto searched = searched_property ? std::span<const memgraph::storage::PropertyId>{&*searched_property, 1}
-                                                : std::span<const memgraph::storage::PropertyId>{};
-        std::erase_if(found_vertices, [&](const auto &hit) {
-          return !VertexSearchHitReadable(memgraph::query::VertexAccessor(std::get<0>(hit)), *graph, searched);
-        });
-      }
+      const auto searched_property = VectorIndexSearchedProperty(*graph, index_name);
+      const auto searched = searched_property ? std::span<const memgraph::storage::PropertyId>{&*searched_property, 1}
+                                              : std::span<const memgraph::storage::PropertyId>{};
 #endif
+      const auto requested = static_cast<size_t>(result_size);
+      const size_t max_candidates =
+          static_cast<size_t>(std::max<int64_t>(0, graph->getImpl()->VerticesCount())) + 16U;
+      size_t fetch_limit = requested;
+      while (true) {
+        auto raw_vertices = graph->getImpl()->VectorIndexSearchOnNodes(
+            index_name, static_cast<uint64_t>(fetch_limit), search_query_vector);
+        const size_t raw_count = raw_vertices.size();
+        std::erase_if(raw_vertices, [&](const auto &hit) {
+          const auto maybe_v = ResolveVisibleVertexInGraph(*graph, std::get<0>(hit).Gid());
+          if (!maybe_v) return true;
+#ifdef MG_ENTERPRISE
+          if (!VertexSearchHitReadable(*maybe_v, *graph, searched)) return true;
+#endif
+          return false;
+        });
+        if (requested == 0 || raw_vertices.size() >= requested || raw_count < fetch_limit ||
+            fetch_limit >= max_candidates) {
+          if (raw_vertices.size() > requested) {
+            raw_vertices.erase(raw_vertices.begin() + static_cast<std::ptrdiff_t>(requested), raw_vertices.end());
+          }
+          found_vertices = std::move(raw_vertices);
+          break;
+        }
+        fetch_limit = std::min(max_candidates, fetch_limit * 2U);
+      }
     } catch (const AuthorizationException &e) {
       error_msg = e.what();
     } catch (memgraph::storage::InvalidOperationException &e) {
@@ -5173,6 +5557,9 @@ mgp_error mgp_graph_search_vector_index_on_edges(mgp_graph *graph, const char *i
     std::vector<std::tuple<memgraph::storage::EdgeAccessor, double, double>> found_edges;
     std::optional<std::string> error_msg = std::nullopt;
     try {
+      if (std::holds_alternative<memgraph::query::VirtualGraphDbAccessor *>(graph->CheckedImpl())) {
+        throw ImmutableObjectException{"mgp_graph_search_vector_index_on_edges is not supported on a virtual graph"};
+      }
       if (result_size < 0) {
         throw memgraph::storage::VectorSearchException("Result set size must be non-negative.");
       }
@@ -5199,18 +5586,38 @@ mgp_error mgp_graph_search_vector_index_on_edges(mgp_graph *graph, const char *i
         throw std::logic_error(
             "Unrecognized argument type when performing vector search, expected values are Double or Int!");
       }
-      found_edges =
-          graph->getImpl()->VectorIndexSearchOnEdges(index_name, static_cast<uint64_t>(result_size), search_query_vector);
 #ifdef MG_ENTERPRISE
-      if (graph->ctx && graph->ctx->auth_checker) {
-        const auto searched_property = VectorEdgeIndexSearchedProperty(*graph, index_name);
-        const auto searched = searched_property ? std::span<const memgraph::storage::PropertyId>{&*searched_property, 1}
-                                                : std::span<const memgraph::storage::PropertyId>{};
-        std::erase_if(found_edges, [&](const auto &hit) {
-          return !EdgeSearchHitReadable(memgraph::query::EdgeAccessor(std::get<0>(hit)), *graph, searched);
-        });
-      }
+      const auto searched_property = VectorEdgeIndexSearchedProperty(*graph, index_name);
+      const auto searched = searched_property ? std::span<const memgraph::storage::PropertyId>{&*searched_property, 1}
+                                              : std::span<const memgraph::storage::PropertyId>{};
 #endif
+      const auto requested = static_cast<size_t>(result_size);
+      const size_t max_candidates =
+          static_cast<size_t>(std::max<int64_t>(0, graph->getImpl()->EdgesCount())) + 16U;
+      size_t fetch_limit = requested;
+      while (true) {
+        auto raw_edges = graph->getImpl()->VectorIndexSearchOnEdges(
+            index_name, static_cast<uint64_t>(fetch_limit), search_query_vector);
+        const size_t raw_count = raw_edges.size();
+        std::erase_if(raw_edges, [&](const auto &hit) {
+          const auto &raw_ea = std::get<0>(hit);
+          const auto maybe_e = ResolveVisibleEdgeInGraph(*graph, raw_ea.Gid(), raw_ea.FromVertex().Gid());
+          if (!maybe_e) return true;
+#ifdef MG_ENTERPRISE
+          if (!EdgeSearchHitReadable(*maybe_e, *graph, searched)) return true;
+#endif
+          return false;
+        });
+        if (requested == 0 || raw_edges.size() >= requested || raw_count < fetch_limit ||
+            fetch_limit >= max_candidates) {
+          if (raw_edges.size() > requested) {
+            raw_edges.erase(raw_edges.begin() + static_cast<std::ptrdiff_t>(requested), raw_edges.end());
+          }
+          found_edges = std::move(raw_edges);
+          break;
+        }
+        fetch_limit = std::min(max_candidates, fetch_limit * 2U);
+      }
     } catch (const AuthorizationException &e) {
       error_msg = e.what();
     } catch (memgraph::storage::InvalidOperationException &e) {
@@ -5238,10 +5645,10 @@ mgp_error mgp_graph_show_index_info(mgp_graph *graph, mgp_memory *memory, mgp_ma
 #ifdef MG_ENTERPRISE
 namespace {
 void NextPermitted(mgp_vertices_iterator::RealCursor &rc, const mgp_graph &graph) {
-  const auto *ctx = graph.ctx;
-  if (!ctx || !ctx->auth_checker) return;
+  const auto *auth_checker = graph.AuthChecker();
+  if (!auth_checker) return;
   while (rc.it != rc.vertices.end()) {
-    if (ctx->auth_checker->Has(*rc.it, graph.view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) break;
+    if (auth_checker->Has(*rc.it, graph.view, memgraph::query::AuthQuery::FineGrainedPrivilege::READ)) break;
     ++rc.it;
   }
 }
@@ -5295,7 +5702,9 @@ mgp_error mgp_graph_approximate_vertex_count(mgp_graph *graph, size_t *result) {
     *result =
         std::visit(memgraph::utils::Overloaded{
                        [](memgraph::query::DbAccessor *impl) { return impl->VerticesCount(); },
-                       [](memgraph::query::SubgraphDbAccessor *impl) { return impl->GetAccessor()->VerticesCount(); },
+                       [](memgraph::query::SubgraphDbAccessor *impl) -> int64_t {
+                         return static_cast<int64_t>(impl->getGraph()->vertices().size());
+                       },
                        [](memgraph::query::VirtualGraphDbAccessor *impl) -> int64_t {
                          return static_cast<int64_t>(impl->getGraph()->nodes().size());
                        }},
@@ -5308,7 +5717,9 @@ mgp_error mgp_graph_approximate_edge_count(mgp_graph *graph, size_t *result) {
     *result =
         std::visit(memgraph::utils::Overloaded{
                        [](memgraph::query::DbAccessor *impl) { return impl->EdgesCount(); },
-                       [](memgraph::query::SubgraphDbAccessor *impl) { return impl->GetAccessor()->EdgesCount(); },
+                       [](memgraph::query::SubgraphDbAccessor *impl) -> int64_t {
+                         return static_cast<int64_t>(impl->getGraph()->edges().size());
+                       },
                        [](memgraph::query::VirtualGraphDbAccessor *impl) -> int64_t {
                          return static_cast<int64_t>(impl->getGraph()->edges().size());
                        }},
@@ -5546,7 +5957,7 @@ template <typename T>
 concept IsCallable = memgraph::utils::SameAsAnyOf<T, mgp_proc, mgp_func>;
 
 template <IsCallable TCall>
-mgp_error MgpAddArg(TCall &callable, const std::string &name, mgp_type &type) {
+mgp_error MgpAddArg(TCall &callable, const char *raw_name, mgp_type &type) noexcept {
   return WrapExceptions([&]() mutable {
     static constexpr std::string_view type_name = std::invoke([]() constexpr {
       if constexpr (std::is_same_v<TCall, mgp_proc>) {
@@ -5556,21 +5967,23 @@ mgp_error MgpAddArg(TCall &callable, const std::string &name, mgp_type &type) {
       }
     });
 
-    if (!IsValidIdentifierName(name.c_str())) {
-      throw std::invalid_argument{fmt::format("Invalid argument name for {} '{}': {}", type_name, callable.name, name)};
+    if (!IsValidIdentifierName(raw_name)) {
+      throw std::invalid_argument{
+          fmt::format("Invalid argument name for {} '{}': {}", type_name, callable.name, raw_name ? raw_name : "<null>")};
     }
     if (!callable.opt_args.empty()) {
       throw std::logic_error{fmt::format("Cannot add required argument '{}' to {} '{}' after adding any optional one",
-                                         name,
+                                         raw_name,
                                          type_name,
                                          callable.name)};
     }
-    callable.args.emplace_back(name, type.impl.get());
+    auto *memory = callable.args.get_allocator().resource();
+    callable.args.emplace_back(memgraph::utils::pmr::string(raw_name, memory), type.impl.get());
   });
 }
 
 template <IsCallable TCall>
-mgp_error MgpAddOptArg(TCall &callable, const std::string name, mgp_type &type, mgp_value &default_value) {
+mgp_error MgpAddOptArg(TCall &callable, const char *raw_name, mgp_type &type, mgp_value &default_value) noexcept {
   return WrapExceptions([&]() mutable {
     static constexpr std::string_view type_name = std::invoke([]() constexpr {
       if constexpr (std::is_same_v<TCall, mgp_proc>) {
@@ -5580,8 +5993,9 @@ mgp_error MgpAddOptArg(TCall &callable, const std::string name, mgp_type &type, 
       }
     });
 
-    if (!IsValidIdentifierName(name.c_str())) {
-      throw std::invalid_argument{fmt::format("Invalid argument name for {} '{}': {}", type_name, callable.name, name)};
+    if (!IsValidIdentifierName(raw_name)) {
+      throw std::invalid_argument{
+          fmt::format("Invalid argument name for {} '{}': {}", type_name, callable.name, raw_name ? raw_name : "<null>")};
     }
     switch (MgpValueGetType(default_value)) {
       case MGP_VALUE_TYPE_VERTEX:
@@ -5589,7 +6003,7 @@ mgp_error MgpAddOptArg(TCall &callable, const std::string name, mgp_type &type, 
       case MGP_VALUE_TYPE_PATH:
         // default_value must not be a graph element.
         throw ValueConversionException{"Default value of argument '{}' of {} '{}' name must not be a graph element!",
-                                       name,
+                                       raw_name,
                                        type_name,
                                        callable.name};
       case MGP_VALUE_TYPE_NULL:
@@ -5612,32 +6026,32 @@ mgp_error MgpAddOptArg(TCall &callable, const std::string name, mgp_type &type, 
     // Default value must be of required `type`.
     if (!type.impl->SatisfiesType(default_value)) {
       throw std::logic_error{fmt::format("The default value of argument '{}' for {} '{}' doesn't satisfy type '{}'",
-                                         name,
+                                         raw_name,
                                          type_name,
                                          callable.name,
                                          type.impl->GetPresentableName())};
     }
     auto *memory = callable.opt_args.get_allocator().resource();
     callable.opt_args.emplace_back(
-        memgraph::utils::pmr::string(name, memory), type.impl.get(), ToTypedValue(default_value, memory));
+        memgraph::utils::pmr::string(raw_name, memory), type.impl.get(), ToTypedValue(default_value, memory));
   });
 }
 }  // namespace
 
 mgp_error mgp_proc_add_arg(mgp_proc *proc, const char *name, mgp_type *type) {
-  return MgpAddArg(*proc, std::string(name), *type);
+  return MgpAddArg(*proc, name, *type);
 }
 
 mgp_error mgp_proc_add_opt_arg(mgp_proc *proc, const char *name, mgp_type *type, mgp_value *default_value) {
-  return MgpAddOptArg(*proc, std::string(name), *type, *default_value);
+  return MgpAddOptArg(*proc, name, *type, *default_value);
 }
 
 mgp_error mgp_func_add_arg(mgp_func *func, const char *name, mgp_type *type) {
-  return MgpAddArg(*func, std::string(name), *type);
+  return MgpAddArg(*func, name, *type);
 }
 
 mgp_error mgp_func_add_opt_arg(mgp_func *func, const char *name, mgp_type *type, mgp_value *default_value) {
-  return MgpAddOptArg(*func, std::string(name), *type, *default_value);
+  return MgpAddOptArg(*func, name, *type, *default_value);
 }
 
 namespace {

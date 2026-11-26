@@ -129,8 +129,9 @@ std::optional<typename T::Response> TransferDurabilityFiles(const R &files, rpc:
   slk::Builder *builder = stream_result.GetBuilder();
   builder->FlushSegment(/*final_segment*/ false, /*force_flush*/ true);
 
-  // If writing files failed, fail the task by returning empty optional
+  // If writing files failed, close the half-written RPC socket before ~StreamHandler unlocks it
   if (replication::Encoder encoder(builder); !WriteFiles(files, root_data_dir, encoder, page_cache)) {
+    client.Shutdown();
     return std::nullopt;
   }
 

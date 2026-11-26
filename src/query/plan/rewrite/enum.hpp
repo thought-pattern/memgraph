@@ -23,6 +23,10 @@ class ExpressionEnumAccessRewriter : public ExpressionVisitor<void> {
  public:
   ExpressionEnumAccessRewriter(TDbAccessor *dba, AstStorage *storage) : dba_(dba), storage_(storage) {}
 
+  void Rewrite(Expression *&expr) {
+    if (expr) AcceptExpression(expr);
+  }
+
  private:
   void Visit(EnumValueAccess &enum_value_access) override {
     auto maybe_enum = dba_->GetEnumValue(enum_value_access.enum_name_, enum_value_access.enum_value_);
@@ -150,29 +154,53 @@ class ExpressionEnumAccessRewriter : public ExpressionVisitor<void> {
   }
 
   // Other
-  void Visit(ListSlicingOperator &op) override {}
+  void Visit(ListSlicingOperator &op) override {
+    if (op.list_) AcceptExpression(op.list_);
+    if (op.lower_bound_) AcceptExpression(op.lower_bound_);
+    if (op.upper_bound_) AcceptExpression(op.upper_bound_);
+  }
 
-  void Visit(IfOperator &op) override {}
+  void Visit(IfOperator &op) override {
+    if (op.condition_) AcceptExpression(op.condition_);
+    if (op.then_expression_) AcceptExpression(op.then_expression_);
+    if (op.else_expression_) AcceptExpression(op.else_expression_);
+  }
 
-  void Visit(ListLiteral &op) override {}
+  void Visit(ListLiteral &op) override {
+    for (auto *&element : op.elements_) {
+      if (element) AcceptExpression(element);
+    }
+  }
 
-  void Visit(MapLiteral &op) override {}
+  void Visit(MapLiteral &op) override {
+    for (auto &[key, val] : op.elements_) {
+      if (val) AcceptExpression(val);
+    }
+  }
 
-  void Visit(MapProjectionLiteral &op) override {}
+  void Visit(MapProjectionLiteral &op) override {
+    for (auto &[key, val] : op.elements_) {
+      if (val) AcceptExpression(val);
+    }
+  }
 
   void Visit(LabelsTest &op) override {}
 
   void Visit(EdgeTypesTest &op) override {}
 
   void Visit(Function &op) override {
-    for (auto *argument : op.arguments_) {
-      AcceptExpression(argument);
+    for (auto *&argument : op.arguments_) {
+      if (argument) AcceptExpression(argument);
     }
   }
 
   void Visit(Reduce &op) override { AcceptExpression(op.expression_); }
 
-  void Visit(Coalesce &op) override {}
+  void Visit(Coalesce &op) override {
+    for (auto *&expr : op.expressions_) {
+      if (expr) AcceptExpression(expr);
+    }
+  }
 
   void Visit(Extract &op) override { AcceptExpression(op.expression_); }
 
@@ -226,8 +254,9 @@ class EnumAccessRewriter final : public HierarchicalLogicalOperatorVisitor {
 
   bool PostVisit(Filter &op) override {
     auto expression_rewriter = ExpressionEnumAccessRewriter{db, ast_storage};
+    expression_rewriter.Rewrite(op.expression_);
     for (auto &filter : op.all_filters_) {
-      filter.expression->Accept(expression_rewriter);
+      expression_rewriter.Rewrite(filter.expression);
     }
     return true;
   }

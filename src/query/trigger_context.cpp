@@ -13,6 +13,7 @@
 
 #include <concepts>
 
+#include "query/auth_checker.hpp"
 #include "query/context.hpp"
 #include "query/cypher_query_interpreter.hpp"
 #include "query/db_accessor.hpp"
@@ -27,22 +28,37 @@
 namespace memgraph::query {
 namespace {
 template <typename T>
+concept WithAuthAwareToMap = requires(const T value, DbAccessor *dba, const FineGrainedAuthChecker *auth_checker) {
+  { value.ToMap(dba, auth_checker) } -> std::same_as<std::map<std::string, TypedValue>>;
+};
+
+template <typename T>
 concept WithToMap = requires(const T value, DbAccessor *dba) {
   { value.ToMap(dba) } -> std::same_as<std::map<std::string, TypedValue>>;
 };
 
+template <WithAuthAwareToMap T>
+TypedValue ToTypedValue(const T &value, DbAccessor *dba, const FineGrainedAuthChecker *auth_checker) {
+  return TypedValue{value.ToMap(dba, auth_checker)};
+}
+
 template <WithToMap T>
-TypedValue ToTypedValue(const T &value, DbAccessor *dba) {
+TypedValue ToTypedValue(const T &value, DbAccessor *dba,
+                        [[maybe_unused]] const FineGrainedAuthChecker *auth_checker)
+  requires(!WithAuthAwareToMap<T>)
+{
   return TypedValue{value.ToMap(dba)};
 }
 
 template <detail::ObjectAccessor TAccessor>
-TypedValue ToTypedValue(const detail::CreatedObject<TAccessor> &created_object, [[maybe_unused]] DbAccessor *dba) {
+TypedValue ToTypedValue(const detail::CreatedObject<TAccessor> &created_object, [[maybe_unused]] DbAccessor *dba,
+                        [[maybe_unused]] const FineGrainedAuthChecker *auth_checker) {
   return TypedValue{created_object.object};
 }
 
 template <detail::ObjectAccessor TAccessor>
-TypedValue ToTypedValue(const detail::DeletedObject<TAccessor> &deleted_object, [[maybe_unused]] DbAccessor *dba) {
+TypedValue ToTypedValue(const detail::DeletedObject<TAccessor> &deleted_object, [[maybe_unused]] DbAccessor *dba,
+                        [[maybe_unused]] const FineGrainedAuthChecker *auth_checker) {
   return TypedValue{deleted_object.object};
 }
 
@@ -52,15 +68,16 @@ concept WithIsValid = requires(const T value) {
 };
 
 template <typename T>
-concept ConvertableToTypedValue = requires(T value, DbAccessor *dba) {
-  { ToTypedValue(value, dba) } -> std::same_as<TypedValue>;
+concept ConvertableToTypedValue = requires(T value, DbAccessor *dba, const FineGrainedAuthChecker *auth_checker) {
+  { ToTypedValue(value, dba, auth_checker) } -> std::same_as<TypedValue>;
 } && WithIsValid<T>;
 
 template <typename T>
 concept LabelUpdateContext = utils::SameAsAnyOf<T, detail::SetVertexLabel, detail::RemovedVertexLabel>;
 
 template <LabelUpdateContext TContext>
-TypedValue ToTypedValue(const std::vector<TContext> &values, DbAccessor *dba) {
+TypedValue ToTypedValue(const std::vector<TContext> &values, DbAccessor *dba,
+                        [[maybe_unused]] const FineGrainedAuthChecker *auth_checker = nullptr) {
   std::unordered_map<storage::LabelId, std::vector<TypedValue>> vertices_by_labels;
 
   for (const auto &value : values) {
@@ -82,7 +99,8 @@ TypedValue ToTypedValue(const std::vector<TContext> &values, DbAccessor *dba) {
 }
 
 template <ConvertableToTypedValue T>
-TypedValue ToTypedValue(const std::vector<T> &values, DbAccessor *dba)
+TypedValue ToTypedValue(const std::vector<T> &values, DbAccessor *dba,
+                        const FineGrainedAuthChecker *auth_checker = nullptr)
   requires(!LabelUpdateContext<T>)
 {
   TypedValue result{std::vector<TypedValue>{}};
@@ -91,7 +109,7 @@ TypedValue ToTypedValue(const std::vector<T> &values, DbAccessor *dba)
 
   for (const auto &value : values) {
     if (value.IsValid()) {
-      typed_values.push_back(ToTypedValue(value, dba));
+      typed_values.push_back(ToTypedValue(value, dba, auth_checker));
     }
   }
 
@@ -127,7 +145,7 @@ template <typename T>
 concept ContextInfo = WithToMap<T> && WithIsValid<T>;
 
 template <ContextInfo... Args>
-TypedValue Concatenate(DbAccessor *dba, const std::vector<Args> &...args) {
+TypedValue Concatenate(DbAccessor *dba, const FineGrainedAuthChecker *auth_checker, const std::vector<Args> &...args) {
   const auto size = (args.size() + ...);
   TypedValue result{std::vector<TypedValue>{}};
   auto &concatenated = result.ValueList();
@@ -136,7 +154,12 @@ TypedValue Concatenate(DbAccessor *dba, const std::vector<Args> &...args) {
   const auto add_to_concatenated = [&]<ContextInfo T>(const std::vector<T> &values) {
     for (const auto &value : values) {
       if (value.IsValid()) {
-        auto map = value.ToMap(dba);
+        std::map<std::string, TypedValue> map;
+        if constexpr (WithAuthAwareToMap<T>) {
+          map = value.ToMap(dba, auth_checker);
+        } else {
+          map = value.ToMap(dba);
+        }
         map["event_type"] = TypeToString<T>();
         concatenated.emplace_back(std::move(map));
       }
@@ -148,14 +171,9 @@ TypedValue Concatenate(DbAccessor *dba, const std::vector<Args> &...args) {
   return result;
 }
 
-template <typename T>
-concept WithEmpty = requires(const T value) {
-  { value.empty() } -> std::same_as<bool>;
-};
-
-template <WithEmpty... TContainer>
+template <typename... TContainer>
 bool AnyContainsValue(const TContainer &...value_containers) {
-  return (!value_containers.empty() || ...);
+  return (std::ranges::any_of(value_containers, [](const auto &value) { return value.IsValid(); }) || ...);
 }
 
 template <detail::ObjectAccessor TAccessor>
@@ -231,6 +249,25 @@ std::map<std::string, TypedValue> RemovedVertexLabel::ToMap(DbAccessor *dba) con
 auto ObjectCommonMethods::PropertyToName(DbAccessor *dba, storage::PropertyId key) -> TypedValue {
   return TypedValue{dba->PropertyToName(key)};
 }
+
+auto ObjectCommonMethods::MaskPropertyValue(const VertexAccessor &vertex, storage::PropertyId key,
+                                            const TypedValue &value,
+                                            const FineGrainedAuthChecker *auth_checker) -> TypedValue {
+  if (!auth_checker || value.IsNull()) return value;
+  if (!PropertyReadAllowed(auth_checker, vertex, storage::View::OLD, key)) return TypedValue{};
+  if (vertex.IsVisible(storage::View::NEW) && !PropertyReadAllowed(auth_checker, vertex, storage::View::NEW, key)) {
+    return TypedValue{};
+  }
+  return value;
+}
+
+auto ObjectCommonMethods::MaskPropertyValue(const EdgeAccessor &edge, storage::PropertyId key,
+                                            const TypedValue &value,
+                                            const FineGrainedAuthChecker *auth_checker) -> TypedValue {
+  if (!auth_checker || value.IsNull()) return value;
+  if (!PropertyReadAllowed(auth_checker, edge, key)) return TypedValue{};
+  return value;
+}
 }  // namespace detail
 
 const char *TriggerEventTypeToString(const TriggerEventType event_type) {
@@ -301,101 +338,102 @@ void TriggerContext::AdaptForAccessor(DbAccessor *accessor) {
   adapt_context_with_vertex(&set_vertex_labels_);
   adapt_context_with_vertex(&removed_vertex_labels_);
 
-  {
-    // adapt created_edges
-    auto it = created_edges_.begin();
-    for (auto &created_edge : created_edges_) {
-      const auto maybe_from_vertex = accessor->FindVertex(created_edge.object.From().Gid(), storage::View::OLD);
-      if (!maybe_from_vertex) {
-        continue;
-      }
-      auto maybe_out_edges = maybe_from_vertex->OutEdges(storage::View::OLD);
-      MG_ASSERT(maybe_out_edges);
-      const auto edge_gid = created_edge.object.Gid();
-      for (const auto &edge : maybe_out_edges->edges) {
-        if (edge.Gid() == edge_gid) {
-          *it = detail::CreatedObject{edge};
-          ++it;
+  const auto adapt_edges_by_source = [accessor](auto *values, auto &&assign_edge) {
+    if (values->empty()) return;
+    std::unordered_map<storage::Gid, std::unordered_map<storage::Gid, EdgeAccessor>> resolved_by_source;
+    for (const auto &value : *values) {
+      const auto src_gid = value.object.From().Gid();
+      if (resolved_by_source.contains(src_gid)) continue;
+      auto &edge_map = resolved_by_source[src_gid];
+      if (const auto maybe_from_vertex = accessor->FindVertex(src_gid, storage::View::OLD); maybe_from_vertex) {
+        auto maybe_out_edges = maybe_from_vertex->OutEdges(storage::View::OLD);
+        MG_ASSERT(maybe_out_edges);
+        edge_map.reserve(maybe_out_edges->edges.size());
+        for (const auto &edge : maybe_out_edges->edges) {
+          edge_map.emplace(edge.Gid(), edge);
         }
       }
     }
-    created_edges_.erase(it, created_edges_.end());
-  }
+
+    auto out_it = values->begin();
+    for (auto &value : *values) {
+      const auto src_it = resolved_by_source.find(value.object.From().Gid());
+      if (src_it == resolved_by_source.end()) continue;
+      const auto edge_it = src_it->second.find(value.object.Gid());
+      if (edge_it == src_it->second.end()) continue;
+      assign_edge(*out_it, value, edge_it->second);
+      ++out_it;
+    }
+    values->erase(out_it, values->end());
+  };
+
+  adapt_edges_by_source(&created_edges_, [](auto &dst, auto & /*src*/, const EdgeAccessor &edge) {
+    dst = detail::CreatedObject{edge};
+  });
 
   // deleted_edges_ should keep the transaction context of the transaction which deleted it
   // because no other transaction can modify an object after it's deleted so it should be the
   // latest state of the object
 
-  const auto adapt_context_with_edge = [accessor](auto *values) {
-    auto it = values->begin();
-    for (const auto &value : *values) {
-      if (auto maybe_vertex = accessor->FindVertex(value.object.From().Gid(), storage::View::OLD); maybe_vertex) {
-        auto maybe_out_edges = maybe_vertex->OutEdges(storage::View::OLD);
-        MG_ASSERT(maybe_out_edges);
-        for (const auto &edge : maybe_out_edges->edges) {
-          if (edge.Gid() == value.object.Gid()) {
-            *it = std::move(value);
-            it->object = edge;
-            ++it;
-            break;
-          }
-        }
-      }
+  const auto assign_updated_edge = [](auto &dst, auto &src, const EdgeAccessor &edge) {
+    if (&dst != &src) {
+      dst = std::move(src);
     }
-    values->erase(it, values->end());
+    dst.object = edge;
   };
-
-  adapt_context_with_edge(&set_edge_properties_);
-  adapt_context_with_edge(&removed_edge_properties_);
+  adapt_edges_by_source(&set_edge_properties_, assign_updated_edge);
+  adapt_edges_by_source(&removed_edge_properties_, assign_updated_edge);
 }
 
-TypedValue TriggerContext::GetTypedValue(const TriggerIdentifierTag tag, DbAccessor *dba) const {
+TypedValue TriggerContext::GetTypedValue(const TriggerIdentifierTag tag, DbAccessor *dba,
+                                         const FineGrainedAuthChecker *auth_checker) const {
   switch (tag) {
     case TriggerIdentifierTag::CREATED_VERTICES:
-      return ToTypedValue(created_vertices_, dba);
+      return ToTypedValue(created_vertices_, dba, auth_checker);
 
     case TriggerIdentifierTag::CREATED_EDGES:
-      return ToTypedValue(created_edges_, dba);
+      return ToTypedValue(created_edges_, dba, auth_checker);
 
     case TriggerIdentifierTag::CREATED_OBJECTS:
-      return Concatenate(dba, created_vertices_, created_edges_);
+      return Concatenate(dba, auth_checker, created_vertices_, created_edges_);
 
     case TriggerIdentifierTag::DELETED_VERTICES:
-      return ToTypedValue(deleted_vertices_, dba);
+      return ToTypedValue(deleted_vertices_, dba, auth_checker);
 
     case TriggerIdentifierTag::DELETED_EDGES:
-      return ToTypedValue(deleted_edges_, dba);
+      return ToTypedValue(deleted_edges_, dba, auth_checker);
 
     case TriggerIdentifierTag::DELETED_OBJECTS:
-      return Concatenate(dba, deleted_vertices_, deleted_edges_);
+      return Concatenate(dba, auth_checker, deleted_vertices_, deleted_edges_);
 
     case TriggerIdentifierTag::SET_VERTEX_PROPERTIES:
-      return ToTypedValue(set_vertex_properties_, dba);
+      return ToTypedValue(set_vertex_properties_, dba, auth_checker);
 
     case TriggerIdentifierTag::SET_EDGE_PROPERTIES:
-      return ToTypedValue(set_edge_properties_, dba);
+      return ToTypedValue(set_edge_properties_, dba, auth_checker);
 
     case TriggerIdentifierTag::REMOVED_VERTEX_PROPERTIES:
-      return ToTypedValue(removed_vertex_properties_, dba);
+      return ToTypedValue(removed_vertex_properties_, dba, auth_checker);
 
     case TriggerIdentifierTag::REMOVED_EDGE_PROPERTIES:
-      return ToTypedValue(removed_edge_properties_, dba);
+      return ToTypedValue(removed_edge_properties_, dba, auth_checker);
 
     case TriggerIdentifierTag::SET_VERTEX_LABELS:
-      return ToTypedValue(set_vertex_labels_, dba);
+      return ToTypedValue(set_vertex_labels_, dba, auth_checker);
 
     case TriggerIdentifierTag::REMOVED_VERTEX_LABELS:
-      return ToTypedValue(removed_vertex_labels_, dba);
+      return ToTypedValue(removed_vertex_labels_, dba, auth_checker);
 
     case TriggerIdentifierTag::UPDATED_VERTICES:
       return Concatenate(
-          dba, set_vertex_properties_, removed_vertex_properties_, set_vertex_labels_, removed_vertex_labels_);
+          dba, auth_checker, set_vertex_properties_, removed_vertex_properties_, set_vertex_labels_, removed_vertex_labels_);
 
     case TriggerIdentifierTag::UPDATED_EDGES:
-      return Concatenate(dba, set_edge_properties_, removed_edge_properties_);
+      return Concatenate(dba, auth_checker, set_edge_properties_, removed_edge_properties_);
 
     case TriggerIdentifierTag::UPDATED_OBJECTS:
       return Concatenate(dba,
+                         auth_checker,
                          set_vertex_properties_,
                          set_edge_properties_,
                          removed_vertex_properties_,
@@ -606,8 +644,12 @@ void TriggerContextCollector::MergeFrom(TriggerContextCollector &&other) {
         // Object was created in main, skip property changes
         continue;
       }
-      // If exists in main, replace with other (latest change); otherwise add it
-      main_registry.property_changes[key] = std::move(change_info);
+      // Preserve the earliest old_value while taking the incoming latest new_value.
+      if (auto it = main_registry.property_changes.find(key); it != main_registry.property_changes.end()) {
+        it->second.new_value = std::move(change_info.new_value);
+      } else {
+        main_registry.property_changes.emplace(key, std::move(change_info));
+      }
     }
   };
 

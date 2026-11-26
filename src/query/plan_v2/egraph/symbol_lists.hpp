@@ -55,7 +55,9 @@
   /* CALL { ... } subquery: variadic [outer_input, inner_root, exposed_sym_1, ...]. */ \
   /* Acts as a scope barrier: inner's introduces are stripped at the boundary; */      \
   /* only the explicit exposed_sym children become visible to the outer scope. */      \
-  X(Subquery)
+  X(Subquery)                                                                          \
+  /* DISTINCT pipe operator: 1 child [input]. */                                       \
+  X(Distinct)
 
 #define EGRAPH_ALL_SYMBOLS(X) \
   EGRAPH_LEAF_SYMBOLS(X)      \
@@ -74,7 +76,8 @@
   X(Bind)                          \
   X(Output)                        \
   X(Unwind)                        \
-  X(Subquery)
+  X(Subquery)                      \
+  X(Distinct)
 
 // Symbol: e-class denotes a binding. Singleton by invariant.
 #define EGRAPH_SYMBOL_KIND_SYMBOLS(X) X(Symbol)
@@ -115,6 +118,7 @@
   X(NamedOutput)                          \
   X(Function)                             \
   X(Unwind)                               \
-  X(Subquery)
+  X(Subquery)                             \
+  X(Distinct)
 
 // NOLINTEND(cppcoreguidelines-macro-usage)

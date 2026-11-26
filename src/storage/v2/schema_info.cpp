@@ -57,7 +57,7 @@ inline auto PropertyTypes_ActionMethod(std::map<PropertyId, ExtendedPropertyType
         it->second = ExtendedPropertyType{*delta.property.value};
       }
     } else if (!delta.property.value->IsNull()) {
-      properties.emplace(delta.property.key, delta.property.value->type());
+      properties.emplace(delta.property.key, ExtendedPropertyType{*delta.property.value});
     }
   });
 }
@@ -475,11 +475,12 @@ nlohmann::json SchemaTracking<TContainer>::ToJson(
 
   // Cleanup result (we must leave unused stats in analytical)
   auto stats_cleanup = [&json](const std::string &main_key) {
-    erase_if(json[main_key].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
+    std::erase_if(json[main_key].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
     for (auto &val : json[main_key].get_ref<nlohmann::json::array_t &>()) {
-      erase_if(val["properties"].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
+      std::erase_if(val["properties"].get_ref<nlohmann::json::array_t &>(),
+                    [](auto &elem) { return elem["count"] <= 0; });
       for (auto &val : val["properties"].get_ref<nlohmann::json::array_t &>()) {
-        erase_if(val["types"].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
+        std::erase_if(val["types"].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
       }
     }
   };
@@ -582,10 +583,11 @@ void SchemaTracking<TContainer>::UpdateLabels(Vertex *vertex, const VertexKey &o
   };
 
   for (const auto &[edge_type, other_vertex, edge_ref] : vertex->in_edges) {
+    if (other_vertex == vertex) continue;
     update_edge(edge_type, edge_ref, other_vertex, vertex, {}, &old_labels);
   }
   for (const auto &[edge_type, other_vertex, edge_ref] : vertex->out_edges) {
-    update_edge(edge_type, edge_ref, vertex, other_vertex, &old_labels, {});
+    update_edge(edge_type, edge_ref, vertex, other_vertex, &old_labels, other_vertex == vertex ? &old_labels : nullptr);
   }
 }
 
@@ -823,9 +825,22 @@ void SchemaInfo::TransactionalEdgeModifyingAccessor::UpdateTransactionalEdges(
     auto edge_lock =
         properties_on_edges_ ? std::shared_lock{edge_ref.ptr->lock} : std::shared_lock<decltype(edge_ref.ptr->lock)>{};
 
-    auto other_labels = GetLabels(other_vertex, snapshot_bound_, commit_ts_, post_process_->vertex_cache);
     Properties edge_props{};
     if (properties_on_edges_) edge_props = GetProperties(edge_ref.ptr, snapshot_bound_, commit_ts_);
+
+    if (other_vertex == vertex) {
+      tracking_->UpdateEdgeStats(
+          edge_ref, edge_type, vertex->labels, vertex->labels, old_labels, old_labels, edge_props.types);
+      SchemaInfoEdge pp_item{edge_ref, edge_type, from_vertex, to_vertex};
+      if (edge_props.needs_pp) {
+        post_process_->edges.emplace(pp_item);
+      } else {
+        post_process_->edges.erase(pp_item);
+      }
+      return;
+    }
+
+    auto other_labels = GetLabels(other_vertex, snapshot_bound_, commit_ts_, post_process_->vertex_cache);
 
     tracking_->UpdateEdgeStats(edge_ref,
                                edge_type,
@@ -844,6 +859,7 @@ void SchemaInfo::TransactionalEdgeModifyingAccessor::UpdateTransactionalEdges(
   };
 
   for (const auto &edge : vertex->in_edges) {
+    if (std::get<1>(edge) == vertex) continue;
     process(edge, InEdge);
   }
 
@@ -863,11 +879,12 @@ void SchemaInfo::AnalyticalEdgeModifyingAccessor::UpdateAnalyticalEdges(Vertex *
                                (edge_dir == InEdge) ? other_vertex->labels : vertex->labels,
                                (edge_dir == InEdge) ? vertex->labels : other_vertex->labels,
                                (edge_dir == InEdge) ? other_vertex->labels : old_labels,
-                               (edge_dir == InEdge) ? old_labels : other_vertex->labels,
+                               (edge_dir == InEdge || other_vertex == vertex) ? old_labels : other_vertex->labels,
                                properties_on_edges_);
   };
 
   for (const auto &edge : vertex->in_edges) {
+    if (std::get<1>(edge) == vertex) continue;
     process(edge, InEdge);
   }
   for (const auto &edge : vertex->out_edges) {

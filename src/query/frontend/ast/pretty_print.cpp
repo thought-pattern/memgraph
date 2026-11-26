@@ -632,6 +632,9 @@ void ExpressionPrettyPrinter::Visit(MapProjectionLiteral &op) {
     map_projection_elements[kv.first.name] = kv.second;
   }
   PrintObject(out_, dba_, op.map_variable_);
+  if (op.all_properties_lookup_ != nullptr) {
+    PrintObject(out_, dba_, op.all_properties_lookup_);
+  }
   PrintObject(out_, dba_, map_projection_elements);
 }
 

@@ -42,19 +42,27 @@ int GetPart(auto &current) {
 namespace memgraph::storage::ttl {
 
 std::chrono::microseconds TtlInfo::ParsePeriod(std::string_view sv) {
+  if (sv.empty()) {
+    throw TtlException("Badly defined period. Use integers and 'd', 'h', 'm' and 's' to define it.");
+  }
   std::chrono::microseconds total{0};
   std::string_view remaining = sv;
 
   while (!remaining.empty()) {
     size_t pos = 0;
-    while (pos < remaining.size() && std::isdigit(remaining[pos])) {
+    while (pos < remaining.size() && std::isdigit(static_cast<unsigned char>(remaining[pos]))) {
       ++pos;
     }
     if (pos == 0) {
       throw TtlException("Badly defined period. Use integers and 'd', 'h', 'm' and 's' to define it.");
     }
 
-    const auto value = std::stoi(std::string(remaining.substr(0, pos)));
+    int64_t value = 0;
+    try {
+      value = std::stoll(std::string(remaining.substr(0, pos)));
+    } catch (const std::exception &) {
+      throw TtlException("Badly defined period. Use integers and 'd', 'h', 'm' and 's' to define it.");
+    }
     remaining = remaining.substr(pos);
 
     if (remaining.empty()) {
@@ -80,6 +88,10 @@ std::chrono::microseconds TtlInfo::ParsePeriod(std::string_view sv) {
       default:
         throw TtlException("Badly defined period. Use integers and 'd', 'h', 'm' and 's' to define it.");
     }
+  }
+
+  if (total <= std::chrono::microseconds{0}) {
+    throw TtlException("TTL period must be greater than zero.");
   }
 
   return total;
@@ -112,21 +124,25 @@ std::string TtlInfo::StringifyPeriod(std::chrono::microseconds us) {
   return result;
 }
 
-std::chrono::system_clock::time_point TtlInfo::ParseStartTime(std::string_view sv) {
+std::chrono::system_clock::time_point TtlInfo::ParseStartTime(std::string_view sv,
+                                                              std::chrono::system_clock::time_point reference_now) {
   try {
-    // Midnight might be a problem...
-    const auto now =
-        std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now())};
-    const utils::DateParameters date{.year = static_cast<int>(now.year()),
-                                     .month = static_cast<unsigned>(now.month()),
-                                     .day = static_cast<unsigned>(now.day())};
+    const auto now_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(reference_now.time_since_epoch()).count();
+    const auto local_today = utils::LocalDateTime{now_us}.date();
+    const utils::DateParameters date{.year = static_cast<int64_t>(local_today.year),
+                                     .month = static_cast<int64_t>(local_today.month),
+                                     .day = static_cast<int64_t>(local_today.day)};
     auto [time, _] = utils::ParseLocalTimeParameters(sv);
-    // LocalDateTime uses the user-defined timezone
     return std::chrono::system_clock::time_point{
         std::chrono::microseconds{utils::LocalDateTime(date, time).SysMicrosecondsSinceEpoch()}};
   } catch (const utils::temporal::InvalidArgumentException &e) {
     throw TtlException(e.what());
   }
+}
+
+std::chrono::system_clock::time_point TtlInfo::ParseStartTime(std::string_view sv) {
+  return ParseStartTime(sv, std::chrono::system_clock::now());
 }
 
 std::string TtlInfo::StringifyStartTime(std::chrono::system_clock::time_point st) {
@@ -141,17 +157,27 @@ std::string TtlInfo::StringifyStartTime(std::chrono::system_clock::time_point st
   return fmt::format("{:02d}:{:02d}:{:02d}", h, m, s);
 }
 
+std::chrono::microseconds TTL::ValidateInterval(std::optional<std::chrono::microseconds> period) {
+  auto actual_period = period.value_or(std::chrono::days(1));
+  if (actual_period <= std::chrono::microseconds{0}) {
+    throw TtlException("TTL period must be greater than zero.");
+  }
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(actual_period) <= std::chrono::milliseconds{0}) {
+    actual_period = std::chrono::milliseconds{1};
+  }
+  return actual_period;
+}
+
 void TTL::SetInterval(std::optional<std::chrono::microseconds> period,
                       std::optional<std::chrono::system_clock::time_point> start_time) {
-  if (!enabled_) {
+  if (!enabled_.load(std::memory_order_acquire)) {
     throw TtlException("TTL not enabled!");
   }
   if (!ttl_.IsRunning()) {
     throw TtlException("TTL not running!");
   }
 
-  // Use provided period or default to 1 day
-  auto actual_period = period.value_or(std::chrono::days(1));
+  auto actual_period = ValidateInterval(period);
 
   // Update the info_ with the new period and start_time
   info_.period = actual_period;
@@ -163,7 +189,7 @@ void TTL::SetInterval(std::optional<std::chrono::microseconds> period,
 }
 
 void TTL::Configure(bool should_run_edge_ttl) {
-  if (!enabled_) {
+  if (!enabled_.load(std::memory_order_acquire)) {
     throw TtlException("TTL not enabled!");
   }
   if (ttl_.IsRunning()) {
@@ -180,8 +206,11 @@ void TTL::Configure(bool should_run_edge_ttl) {
 
   auto ttl_job = [this]() {
     const memory::DbArenaScope db_arena_scope{storage_ptr_->DbArenaPool()};
-    // Skip the run when TTL may not delete, such as on a replica or without a valid license
-    if (!user_check_()) return;
+    auto const should_abort_run = [this]() {
+      return !enabled_.load(std::memory_order_acquire) || !wanted_.load(std::memory_order_acquire) || Paused() ||
+             !user_check_();
+    };
+    if (should_abort_run()) return;
 
     bool finished_vertex = false;
     bool finished_edge = !info_.should_run_edge_ttl;
@@ -195,14 +224,18 @@ void TTL::Configure(bool should_run_edge_ttl) {
     const auto ttl_property = storage_ptr_->NameToProperty("ttl");
 
     while (!finished_vertex || !finished_edge) {
+      if (should_abort_run()) return;
       try {
         constexpr size_t batch_size = 10'000;
         size_t n_deleted = 0;
         size_t n_edges_deleted = 0;
+        bool batch_finishes_vertex = false;
+        bool batch_finishes_edge = false;
 
         // Create a new transaction for this batch
         // This ensures each batch is isolated and can be retried independently
         auto batch_accessor = storage_ptr_->Access(storage::StorageAccessType::WRITE);
+        if (should_abort_run()) return;
 
         // Verify required indices exist and are ready for TTL operations
         // This ensures TTL can work efficiently using range-based filtering
@@ -214,17 +247,23 @@ void TTL::Configure(bool should_run_edge_ttl) {
         if (missing_lp_index) {
           spdlog::warn(
               "TTL requires label+property index on :TTL(ttl) but it doesn't exist. Will create it automatically.");
-          std::vector<PropertyPath> ttl_property_path = {storage_ptr_->NameToProperty("ttl")};
+          std::vector<PropertyPath> create_path = {ttl_property};
 
           if (storage_ptr_->GetStorageMode() == StorageMode::IN_MEMORY_TRANSACTIONAL) {
             auto *mem_storage = static_cast<storage::InMemoryStorage *>(storage_ptr_);
-            mem_storage->GetAsyncIndexer().Enqueue(ttl_label, std::move(ttl_property_path));
+            mem_storage->GetAsyncIndexer().Enqueue(ttl_label, std::move(create_path));
           } else {
             batch_accessor.reset();
-            batch_accessor = storage_ptr_->UniqueAccess();  // ATM no timeout/backoff
-            (void)batch_accessor->CreateIndex(ttl_label, std::move(ttl_property_path));
-            batch_accessor.reset();
+            auto ddl_accessor = storage_ptr_->UniqueAccess();
+            if (should_abort_run()) return;
+            auto ddl_protector = storage_ptr_->make_database_protector();
+            if (!ddl_protector) return;
+            if (ddl_accessor->CreateIndex(ttl_label, std::move(create_path)).has_value()) {
+              (void)ddl_accessor->PrepareForCommitPhase(CommitArgs::make_main(std::move(ddl_protector)));
+            }
+            ddl_accessor.reset();
             batch_accessor = storage_ptr_->Access(storage::StorageAccessType::WRITE);
+            if (should_abort_run()) return;
           }
         }
 
@@ -236,10 +275,16 @@ void TTL::Configure(bool should_run_edge_ttl) {
             mem_storage->GetAsyncIndexer().Enqueue(ttl_property);
           } else {
             batch_accessor.reset();
-            batch_accessor = storage_ptr_->UniqueAccess();  // ATM no timeout/backoff
-            (void)batch_accessor->CreateGlobalEdgeIndex(ttl_property);
-            batch_accessor.reset();
+            auto ddl_accessor = storage_ptr_->UniqueAccess();
+            if (should_abort_run()) return;
+            auto ddl_protector = storage_ptr_->make_database_protector();
+            if (!ddl_protector) return;
+            if (ddl_accessor->CreateGlobalEdgeIndex(ttl_property).has_value()) {
+              (void)ddl_accessor->PrepareForCommitPhase(CommitArgs::make_main(std::move(ddl_protector)));
+            }
+            ddl_accessor.reset();
             batch_accessor = storage_ptr_->Access(storage::StorageAccessType::WRITE);
+            if (should_abort_run()) return;
           }
         }
 
@@ -248,9 +293,6 @@ void TTL::Configure(bool should_run_edge_ttl) {
 
         // Process vertices with TTL label and ttl property using label+property index with range
         if (!finished_vertex && lp_index_ready) {
-          // Use label+property index with range to efficiently find vertices where ttl < now
-          // This is the most efficient approach as it uses the index to filter by property value
-          std::vector<PropertyPath> ttl_property_path = {ttl_property};
           std::vector<PropertyValueRange> ttl_property_ranges = {
               PropertyValueRange::Bounded(std::nullopt, utils::MakeBoundExclusive(PropertyValue(now_us.count())))};
           auto vertices = batch_accessor->Vertices(ttl_label, ttl_property_path, ttl_property_ranges, View::NEW);
@@ -263,24 +305,25 @@ void TTL::Configure(bool should_run_edge_ttl) {
           }
 
           if (!vertices_to_delete.empty()) {
-            // Need to convert to pointers to use the DetachDelete method
             std::vector<VertexAccessor *> vertices_to_delete_pointers;
             vertices_to_delete_pointers.reserve(vertices_to_delete.size());
             for (auto &vertex : vertices_to_delete) {
               vertices_to_delete_pointers.push_back(&vertex);
             }
             auto result = batch_accessor->DetachDelete(vertices_to_delete_pointers, {}, true);
-            if (result.has_value() && result->has_value()) {
+            if (!result.has_value()) {
+              batch_accessor->Abort();
+              std::this_thread::yield();
+              continue;
+            }
+            if (result->has_value()) {
               n_deleted += (*result)->first.size();
               n_edges_deleted += (*result)->second.size();
             }
           }
 
-          finished_vertex = vertices_to_delete.size() < batch_size;
+          batch_finishes_vertex = vertices_to_delete.size() < batch_size;
         } else if (!finished_edge && edge_index_ready) {
-          // Process edges with TTL property using range-based filtering
-          // Use edge property index with range to efficiently find edges where ttl < now
-          // This is much more efficient than using property index + checking each edge for the value
           auto edges = batch_accessor->Edges(
               ttl_property,
               PropertyValueRange::Bounded(std::nullopt, utils::MakeBoundExclusive(PropertyValue(now_us.count()))),
@@ -294,38 +337,56 @@ void TTL::Configure(bool should_run_edge_ttl) {
           }
 
           if (!edges_to_delete.empty()) {
-            // Need to convert to pointers to use the DetachDelete method
             std::vector<EdgeAccessor *> edges_to_delete_pointers;
             edges_to_delete_pointers.reserve(edges_to_delete.size());
             for (auto &edge : edges_to_delete) {
               edges_to_delete_pointers.push_back(&edge);
             }
             auto result = batch_accessor->DetachDelete({}, edges_to_delete_pointers, false);
-            if (result.has_value() && result->has_value()) {
+            if (!result.has_value()) {
+              batch_accessor->Abort();
+              std::this_thread::yield();
+              continue;
+            }
+            if (result->has_value()) {
               n_edges_deleted += (*result)->second.size();
             }
           }
 
-          finished_edge = edges_to_delete.size() < batch_size;
+          batch_finishes_edge = edges_to_delete.size() < batch_size;
         } else if (!lp_index_ready || (info_.should_run_edge_ttl && !edge_index_ready)) {
           spdlog::info("TTL indices not ready, skipping this run.");
+          return;
         } else {
           DMG_ASSERT(false, "Unsupported TTL state.");
         }
 
+        if (should_abort_run()) {
+          batch_accessor->Abort();
+          return;
+        }
+
         auto protector = storage_ptr_->make_database_protector();
         if (!protector) [[unlikely]] {
-          // database has been dropped, we should aim to stop this worker ASAP
+          batch_accessor->Abort();
           return;
         }
 
         // Commit the transaction for this batch using the database protector
         auto commit_result = batch_accessor->PrepareForCommitPhase(CommitArgs::make_main(std::move(protector)));
-        if (!commit_result) {
-          // Transaction failed, will retry in next iteration
-          // TODO: on sync replication error it should not continue since it commits
+        bool committed_on_main = commit_result.has_value();
+        if (!committed_on_main) {
+          if (auto const *repl_err = std::get_if<ReplicationError>(&commit_result.error());
+              repl_err != nullptr && repl_err->transaction_committed) {
+            committed_on_main = true;
+          }
+        }
+        if (!committed_on_main) {
           continue;
         }
+
+        if (batch_finishes_vertex) finished_vertex = true;
+        if (batch_finishes_edge) finished_edge = true;
         deleted_nodes_.Increment(static_cast<double>(n_deleted));
         deleted_edges_.Increment(static_cast<double>(n_edges_deleted));
 

@@ -457,67 +457,97 @@ class DiskStorage final : public Storage {
 
 #ifdef MG_ENTERPRISE
     // TTL management methods
-    void StartTtl(TTLReplicationArgs /*repl_args*/ = {}) override {
-      storage_->ttl_.Resume();
+    void StartTtl(TTLReplicationArgs repl_args = {}) override {
+      if (!storage_->ttl_.Config()) throw ttl::TtlException("TTL not configured!");
+      auto *ttl_ptr = &storage_->ttl_;
+      bool const prev_wanted = ttl_ptr->Wanted();
+      ttl_ptr->SetWanted(true);
+      utils::OnScopeExit rollback{[ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); });
+      transaction_.commit_callbacks_.Add([ttl_ptr, is_main = repl_args.is_main](uint64_t /*commit_ts*/) {
+        if (is_main) {
+          ttl_ptr->Resume();
+        } else {
+          ttl_ptr->SetWanted(true);
+        }
+      });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::ENABLE, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
-    void DisableTtl(TTLReplicationArgs /*repl_args*/ = {}) override {
+    void DisableTtl(TTLReplicationArgs repl_args = {}) override {
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
+      auto &ttl = storage_->ttl_;
+      auto const prev_state = ttl.CaptureState();
 
-      if (storage_->ttl_.OwnsLabelPropertyIndex()) {
-        auto index_result = DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-        if (!index_result) {
-          // Silently fail if vertex index already dropped
+      if (repl_args.is_main) {
+        if (ttl.OwnsLabelPropertyIndex()) {
+          (void)DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
+        }
+        if (ttl.Config().should_run_edge_ttl && ttl.OwnsEdgePropertyIndex()) {
+          (void)DropGlobalEdgeIndex(ttl_property);
         }
       }
 
-      // Check if edge TTL was enabled and drop edge index only when TTL created it
-      if (storage_->ttl_.Config().should_run_edge_ttl && storage_->ttl_.OwnsEdgePropertyIndex()) {
-        auto edge_index_result = DropGlobalEdgeIndex(ttl_property);
-        if (!edge_index_result) {
-          // Silently fail if edge index already dropped
-        }
-      }
-
-      storage_->ttl_.Disable();
+      ttl.StageMetadata({}, false, false, false);
+      ttl.SetWanted(false);
+      auto *ttl_ptr = &ttl;
+      utils::OnScopeExit rollback{[ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); });
+      transaction_.commit_callbacks_.Add(
+          [this, ttl_ptr](uint64_t /*commit_ts*/) { this->DeferThreadJoinAfterUnlock(ttl_ptr->DisableAsync()); });
 
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::DISABLE, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
     void StopTtl() override {
-      storage_->ttl_.Pause();
+      auto *ttl_ptr = &storage_->ttl_;
+      bool const prev_wanted = ttl_ptr->Wanted();
+      ttl_ptr->SetWanted(false);
+      utils::OnScopeExit rollback{[ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); });
+      transaction_.commit_callbacks_.Add([ttl_ptr](uint64_t /*commit_ts*/) { ttl_ptr->Pause(); });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::STOP, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
-    void ConfigureTtl(const storage::ttl::TtlInfo &ttl_info, TTLReplicationArgs /*repl_args*/ = {}) override {
+    void ConfigureTtl(const storage::ttl::TtlInfo &ttl_info, TTLReplicationArgs repl_args = {}) override {
+      auto const validated_period = storage::ttl::TTL::ValidateInterval(ttl_info.period);
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
       auto const ttl_path = std::vector<storage::PropertyPath>{{ttl_property}};
+      auto &ttl = storage_->ttl_;
+      auto const prev_state = ttl.CaptureState();
+      bool owns_lp = prev_state.owns_label_property_index;
 
-      // If TTL is not enabled, create required indices and enable TTL
-      if (!storage_->ttl_.Enabled()) {
+      if (!ttl.Enabled() && repl_args.is_main) {
         bool const label_index_existed =
             storage_->indices_.label_property_index_->GetActiveIndices()->IndexExists(ttl_label, ttl_path);
         if (!label_index_existed) {
           (void)CreateIndex(ttl_label, ttl_path);
         }
-        storage_->ttl_.SetOwnsLabelPropertyIndex(!label_index_existed);
-        storage_->ttl_.Enable();
+        owns_lp = !label_index_existed;
       }
 
-      // Configure TTL
-      if (!storage_->ttl_.Running()) storage_->ttl_.Configure(ttl_info.should_run_edge_ttl);
-      storage_->ttl_.SetInterval(ttl_info.period, ttl_info.start_time);
-      transaction_.md_deltas.emplace_back(MetadataDelta::ttl_operation,
-                                          durability::TtlOperationType::CONFIGURE,
-                                          ttl_info.period,
-                                          ttl_info.start_time,
-                                          ttl_info.should_run_edge_ttl);
+      ttl.StageMetadata(storage::ttl::TtlInfo{validated_period, ttl_info.start_time, false}, true, owns_lp, false);
+      auto *ttl_ptr = &ttl;
+      utils::OnScopeExit rollback{[ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); });
+      auto const start_time = ttl_info.start_time;
+      transaction_.commit_callbacks_.Add([ttl_ptr, validated_period, start_time](uint64_t /*commit_ts*/) {
+        if (!ttl_ptr->Running()) {
+          ttl_ptr->Configure(false);
+        }
+        ttl_ptr->SetInterval(validated_period, start_time);
+      });
+      transaction_.md_deltas.emplace_back(
+          MetadataDelta::ttl_operation, durability::TtlOperationType::CONFIGURE, validated_period, ttl_info.start_time, false);
+      rollback.Disable();
     }
 
     storage::ttl::TtlInfo GetTtlConfig() const override { return storage_->ttl_.Config(); }

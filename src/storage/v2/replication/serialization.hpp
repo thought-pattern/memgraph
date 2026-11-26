@@ -46,7 +46,7 @@ class Encoder final : public durability::BaseEncoder {
 
   void WriteFileBuffer(const uint8_t *buffer, size_t buffer_size);
 
-  void WriteFileData(utils::InputFile *file);
+  bool WriteFileData(utils::InputFile *file);
 
   /// Sends `path` to the replica, disposing of its pages afterwards as `page_cache` says. Pass
   /// `kKeep` for a file that is still being written to, or that something else is going to read.

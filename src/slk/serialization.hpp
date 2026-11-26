@@ -244,9 +244,15 @@ template <typename T>
 inline void Load(utils::small_vector<T> *obj, Reader *reader) {
   uint64_t size = 0;
   Load(&size, reader);
-  obj->resize(size);
+  constexpr size_t min_elem_bytes = std::is_arithmetic_v<T> ? sizeof(T) : 1UZ;
+  if (size > reader->RemainingPayloadBytes() / min_elem_bytes) {
+    throw SlkReaderException("Declared small_vector element count {} exceeds remaining SLK payload!", size);
+  }
+  obj->clear();
   for (uint64_t i = 0; i < size; ++i) {
-    Load(&(*obj)[i], reader);
+    T item{};
+    Load(&item, reader);
+    obj->push_back(std::move(item));
   }
 }
 

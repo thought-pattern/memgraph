@@ -1132,9 +1132,9 @@ auto CoordinatorInstance::SetCoordinatorSetting(std::string_view const setting_n
     if (setting_name == kMaxFailoverLagOnReplica) {
       delta_state.max_failover_replica_lag_ = utils::ParseStringToUint<uint64_t>(setting_value);
     } else if (setting_name == kEnabledReadsOnMain) {
-      delta_state.enabled_reads_on_main_ = utils::ToLowerCase(setting_value) == "true"sv;
+      delta_state.enabled_reads_on_main_ = parse_bool(setting_value);
     } else if (setting_name == kSyncFailoverOnly) {
-      delta_state.sync_failover_only_ = utils::ToLowerCase(setting_value) == "true"sv;
+      delta_state.sync_failover_only_ = parse_bool(setting_value);
     } else if (setting_name == kMaxReplicaReadLag) {
       delta_state.max_replica_read_lag_ = utils::ParseStringToUint<uint64_t>(setting_value);
     } else if (setting_name == kDeltasBatchProgressSize) {

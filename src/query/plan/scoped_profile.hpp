@@ -28,7 +28,7 @@ namespace memgraph::query::plan {
  */
 class ScopedProfile {
  public:
-  ScopedProfile(uint64_t key, const query::plan::NamedLogicalOperator &op, query::ExecutionContext *context) noexcept
+  ScopedProfile(uint64_t key, const query::plan::NamedLogicalOperator &op, query::ExecutionContext *context)
       : context_(context), root_{context_->stats_root} {
     DMG_ASSERT(context_->is_profile_query);
 
@@ -59,7 +59,7 @@ class ScopedProfile {
     start_time_ = utils::ReadTSC();
   }
 
-  ScopedProfile(uint64_t key, const char *name, query::ExecutionContext *context) noexcept
+  ScopedProfile(uint64_t key, const char *name, query::ExecutionContext *context)
       : context_(context), root_{context_->stats_root} {
     DMG_ASSERT(context_->is_profile_query);
 

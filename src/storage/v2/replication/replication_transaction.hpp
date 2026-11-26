@@ -78,7 +78,10 @@ class TransactionReplication {
                   return ShipOne(raw_client, *stream_ptr, durability_commit_timestamp, *db_acc);
                 } catch (...) {
                   spdlog::error("Failed to replicate transaction to replica {}.", raw_client->Name());
-                  stream_ptr->reset();
+                  if (*stream_ptr) {
+                    raw_client->AbortRpcClient();
+                    stream_ptr->reset();
+                  }
                   raw_client->SetMaybeBehind();
                   return std::unexpected{io::network::ClientCommunicationError::GENERIC_ERROR};
                 }

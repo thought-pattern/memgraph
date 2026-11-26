@@ -23,7 +23,7 @@ namespace memgraph::query::plan::v2 {
 /// without standing up a VariableIndex; tests treat the integers as abstract
 /// variable identifiers (the role the per-extraction VariableIndex fills in a
 /// real query).
-inline auto MakeSet(std::initializer_list<uint16_t> bits) -> VariableSet {
+inline auto MakeSet(std::initializer_list<uint32_t> bits) -> VariableSet {
   VariableSet s;
   for (auto b : bits) s.set(b);
   return s;

@@ -1651,16 +1651,25 @@ void AuthQueryHandler::CreateProfile(const std::string &profile_name,
   for (const auto &[limit_name, limit_value] : defined_limits) {
     const auto limit_type = name_to_limit(limit_name);
     is_limit_supported(limit_value.type, limit_type);  // throw on failure
+    bool inserted = false;
     switch (limit_value.type) {
       case query::UserProfileQuery::LimitValueResult::Type::UNLIMITED:
-        limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{});
+        inserted = limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{}).second;
         break;
       case query::UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT: {
-        limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale);
+        if (limit_value.mem_limit.scale == 0 ||
+            limit_value.mem_limit.value > std::numeric_limits<uint64_t>::max() / limit_value.mem_limit.scale) {
+          throw memgraph::query::QueryRuntimeException(
+              "Memory limit overflow for '{}' in profile '{}'.", limit_name, profile_name);
+        }
+        inserted = limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale).second;
       } break;
       case query::UserProfileQuery::LimitValueResult::Type::QUANTITY: {
-        limits.emplace(limit_type, limit_value.quantity.value);
+        inserted = limits.emplace(limit_type, limit_value.quantity.value).second;
       } break;
+    }
+    if (!inserted) {
+      throw memgraph::query::QueryRuntimeException("Duplicate limit '{}' in profile definition.", limit_name);
     }
   }
   try {
@@ -1680,16 +1689,25 @@ void AuthQueryHandler::UpdateProfile(const std::string &profile_name,
   for (const auto &[limit_name, limit_value] : updated_limits) {
     const auto limit_type = name_to_limit(limit_name);
     is_limit_supported(limit_value.type, limit_type);  // throw on failure
+    bool inserted = false;
     switch (limit_value.type) {
       case query::UserProfileQuery::LimitValueResult::Type::UNLIMITED:
-        limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{});
+        inserted = limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{}).second;
         break;
       case query::UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT: {
-        limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale);
+        if (limit_value.mem_limit.scale == 0 ||
+            limit_value.mem_limit.value > std::numeric_limits<uint64_t>::max() / limit_value.mem_limit.scale) {
+          throw memgraph::query::QueryRuntimeException(
+              "Memory limit overflow for '{}' in profile '{}'.", limit_name, profile_name);
+        }
+        inserted = limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale).second;
       } break;
       case query::UserProfileQuery::LimitValueResult::Type::QUANTITY: {
-        limits.emplace(limit_type, limit_value.quantity.value);
+        inserted = limits.emplace(limit_type, limit_value.quantity.value).second;
       } break;
+    }
+    if (!inserted) {
+      throw memgraph::query::QueryRuntimeException("Duplicate limit '{}' in profile update.", limit_name);
     }
   }
   try {

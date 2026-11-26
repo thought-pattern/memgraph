@@ -11,13 +11,18 @@
 
 #include "query/procedure/module.hpp"
 
+#include <atomic>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <sstream>
 #include <utility>
 
 extern "C" {
 #include <dlfcn.h>
+#include <fcntl.h>
 }
 
 #include <fmt/format.h>
@@ -182,7 +187,13 @@ std::string GetPathString(const std::optional<std::filesystem::path> &path) {
     return "builtin";
   }
 
-  return std::filesystem::canonical(*path).generic_string();
+  std::error_code ec;
+  const auto canonical_path = std::filesystem::canonical(*path, ec);
+  if (!ec) {
+    return canonical_path.generic_string();
+  }
+  const auto weak_path = std::filesystem::weakly_canonical(*path, ec);
+  return ec ? path->generic_string() : weak_path.generic_string();
 }
 }  // namespace
 
@@ -444,20 +455,26 @@ bool IsLoadableModuleExtension(const auto &extension) {
 }
 
 bool IsSubPath(const auto &base, const auto &destination) {
-  const auto relative = std::filesystem::relative(destination, base);
+  std::error_code ec;
+  const auto relative = std::filesystem::relative(destination, base, ec);
+  if (ec) {
+    return false;
+  }
   return !relative.empty() && *relative.begin() != "..";
 }
 
 std::optional<std::string> ReadFile(const auto &path) {
-  std::ifstream file(path);
+  std::ifstream file(path, std::ios::binary);
   if (!file.is_open()) {
     return std::nullopt;
   }
 
-  const auto size = std::filesystem::file_size(path);
-  std::string content(size, '\0');
-  file.read(content.data(), static_cast<std::streamsize>(size));
-  return std::move(content);
+  std::ostringstream buffer;
+  buffer << file.rdbuf();
+  if (file.bad() || (file.fail() && !file.eof())) {
+    return std::nullopt;
+  }
+  return std::move(buffer).str();
 }
 
 // Return the module directory that contains the `path`
@@ -469,7 +486,12 @@ std::expected<std::filesystem::path, const char *> ParentModuleDirectory(const M
   auto max_length = std::numeric_limits<uint64_t>::min();
   for (auto it = module_directories.begin(); it != module_directories.end(); ++it) {
     if (IsSubPath(*it, path)) {
-      const auto length = std::filesystem::canonical(*it).string().size();
+      std::error_code ec;
+      const auto canon = std::filesystem::canonical(*it, ec);
+      if (ec) {
+        continue;
+      }
+      const auto length = canon.string().size();
       if (length > max_length) {
         longest_parent_directory = it;
         max_length = length;
@@ -489,15 +511,29 @@ void RegisterMgGetModuleFiles(ModuleRegistry *module_registry, BuiltinModule *mo
   auto get_module_files_cb = [module_registry](
                                  mgp_list * /*args*/, mgp_graph * /*unused*/, mgp_result *result, mgp_memory *memory) {
     for (const auto &module_directory : module_registry->GetModulesDirectory()) {
-      for (const auto &dir_entry : std::filesystem::recursive_directory_iterator(module_directory)) {
-        if (dir_entry.is_regular_file() && IsLoadableModuleExtension(dir_entry.path().extension())) {
+      std::error_code ec;
+      auto it = std::filesystem::recursive_directory_iterator(module_directory, ec);
+      if (ec) {
+        spdlog::warn("Unable to read module directory {}: {}", module_directory.string(), ec.message());
+        continue;
+      }
+      for (; it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) {
+          spdlog::warn("Error while reading module directory {}: {}", module_directory.string(), ec.message());
+          break;
+        }
+        const auto &dir_entry = *it;
+        std::error_code entry_ec;
+        if (dir_entry.is_regular_file(entry_ec) && !entry_ec &&
+            IsLoadableModuleExtension(dir_entry.path().extension())) {
           mgp_result_record *record{nullptr};
           if (!TryOrSetError([&] { return mgp_result_new_record(result, &record); }, result)) {
             return;
           }
 
-          const auto path_string = GetPathString(dir_entry);
-          const auto is_editable = IsAllowedExtension(dir_entry.path().extension()) && IsFileEditable(dir_entry);
+          const auto path_string = GetPathString(dir_entry.path());
+          const auto is_editable =
+              IsAllowedExtension(dir_entry.path().extension()) && IsFileEditable(dir_entry.path());
 
           const auto path_value = GetStringValueOrSetError(path_string.c_str(), memory, result);
           if (!path_value) {
@@ -518,6 +554,11 @@ void RegisterMgGetModuleFiles(ModuleRegistry *module_registry, BuiltinModule *mo
           if (!InsertResultOrSetError(result, record, "is_editable", is_editable_value.get())) {
             return;
           }
+        } else if (entry_ec) {
+          spdlog::warn("Unable to inspect entry {} in module directory {}: {}",
+                       dir_entry.path().string(),
+                       module_directory.string(),
+                       entry_ec.message());
         }
       }
     }
@@ -542,35 +583,16 @@ void RegisterMgGetModuleFile(ModuleRegistry *module_registry, BuiltinModule *mod
     auto *arg = Call<mgp_value *>(mgp_list_at, args, 0);
     MG_ASSERT(CallBool(mgp_value_is_string, arg), "Should have been type checked already");
     const char *path_str{nullptr};
-    if (!TryOrSetError([&] { return mgp_value_get_string(arg, &path_str); }, result)) {
+    size_t path_len{0};
+    if (!TryOrSetError([&] { return mgp_value_get_string(arg, &path_str); }, result) ||
+        !TryOrSetError([&] { return mgp_value_get_string_size(arg, &path_len); }, result)) {
       return;
     }
 
-    const std::filesystem::path path{path_str};
-
-    if (!path.is_absolute()) {
-      static_cast<void>(mgp_result_set_error_msg(result, "The path should be an absolute path."));
-      return;
-    }
-
-    if (!IsAllowedExtension(path.extension())) {
-      static_cast<void>(mgp_result_set_error_msg(result, "The specified file isn't in the supported format."));
-      return;
-    }
-
-    if (!std::filesystem::exists(path)) {
-      static_cast<void>(mgp_result_set_error_msg(result, "The specified file doesn't exist."));
-      return;
-    }
-
-    if (auto maybe_error_msg = ParentModuleDirectory(*module_registry, path); !maybe_error_msg.has_value()) {
-      static_cast<void>(mgp_result_set_error_msg(result, maybe_error_msg.error()));
-      return;
-    }
-
-    const auto maybe_content = ReadFile(path);
+    const std::filesystem::path path{std::string_view{path_str, path_len}};
+    const auto maybe_content = module_registry->ReadModuleFileContent(path);
     if (!maybe_content) {
-      static_cast<void>(mgp_result_set_error_msg(result, "Couldn't read the content of the file."));
+      static_cast<void>(mgp_result_set_error_msg(result, maybe_content.error().c_str()));
       return;
     }
 
@@ -579,8 +601,13 @@ void RegisterMgGetModuleFile(ModuleRegistry *module_registry, BuiltinModule *mod
       return;
     }
 
-    const auto content_value = GetStringValueOrSetError(maybe_content->c_str(), memory, result);
-    if (!content_value) {
+    MgpUniquePtr<mgp_value> content_value{nullptr, mgp_value_destroy};
+    if (!TryOrSetError(
+            [&] {
+              return CreateMgpObject(
+                  content_value, mgp_value_make_string_with_size, maybe_content->data(), maybe_content->size(), memory);
+            },
+            result)) {
       return;
     }
 
@@ -600,13 +627,75 @@ void RegisterMgGetModuleFile(ModuleRegistry *module_registry, BuiltinModule *mod
 }
 
 namespace {
-std::expected<void, std::string> WriteToFile(const std::filesystem::path &file, const std::string_view content) {
-  std::ofstream output_file{file};
-  if (!output_file.is_open()) {
-    return std::unexpected(fmt::format("Failed to open the file at location {}", file));
+std::expected<void, std::string> WriteAllToFd(int fd, std::string_view content, const std::filesystem::path &file) {
+  size_t written = 0;
+  while (written < content.size()) {
+    const ssize_t n = ::write(fd, content.data() + written, content.size() - written);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return std::unexpected(
+          fmt::format("Failed to write the file at location {}: {}", file, std::strerror(errno)));
+    }
+    written += static_cast<size_t>(n);
   }
-  output_file.write(content.data(), static_cast<std::streamsize>(content.size()));
-  output_file.flush();
+  return {};
+}
+
+std::expected<void, std::string> CreateFileExclusive(const std::filesystem::path &file, std::string_view content) {
+  // NOLINTNEXTLINE(hicpp-signed-bitwise,cppcoreguidelines-pro-type-vararg)
+  const int fd = ::open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0) {
+    if (errno == EEXIST) {
+      return std::unexpected("File with the same name already exists!");
+    }
+    return std::unexpected(fmt::format("Failed to open the file at location {}: {}", file, std::strerror(errno)));
+  }
+  if (auto write_res = WriteAllToFd(fd, content, file); !write_res.has_value()) {
+    static_cast<void>(::close(fd));
+    std::error_code ec;
+    std::filesystem::remove(file, ec);
+    return std::unexpected(std::move(write_res.error()));
+  }
+  if (::close(fd) != 0) {
+    const int err = errno;
+    std::error_code ec;
+    std::filesystem::remove(file, ec);
+    return std::unexpected(fmt::format("Failed to close the file at location {}: {}", file, std::strerror(err)));
+  }
+  return {};
+}
+
+std::expected<void, std::string> WriteToFileAtomic(const std::filesystem::path &file, std::string_view content) {
+  static std::atomic<uint64_t> temp_counter{0};
+  const auto temp_name =
+      fmt::format(".{}.tmp.{}.{}", file.filename().string(), ::getpid(), temp_counter.fetch_add(1));
+  const auto temp_path = file.parent_path() / temp_name;
+
+  // NOLINTNEXTLINE(hicpp-signed-bitwise,cppcoreguidelines-pro-type-vararg)
+  const int fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0) {
+    return std::unexpected(
+        fmt::format("Failed to create staging file for {}: {}", file, std::strerror(errno)));
+  }
+  if (auto write_res = WriteAllToFd(fd, content, temp_path); !write_res.has_value()) {
+    static_cast<void>(::close(fd));
+    std::error_code ec;
+    std::filesystem::remove(temp_path, ec);
+    return std::unexpected(std::move(write_res.error()));
+  }
+  if (::close(fd) != 0) {
+    const int err = errno;
+    std::error_code ec;
+    std::filesystem::remove(temp_path, ec);
+    return std::unexpected(fmt::format("Failed to close staging file for {}: {}", file, std::strerror(err)));
+  }
+  std::error_code rename_ec;
+  std::filesystem::rename(temp_path, file, rename_ec);
+  if (rename_ec) {
+    std::error_code rm_ec;
+    std::filesystem::remove(temp_path, rm_ec);
+    return std::unexpected(fmt::format("Failed to replace {}: {}", file, rename_ec.message()));
+  }
   return {};
 }
 }  // namespace
@@ -618,40 +707,25 @@ void RegisterMgCreateModuleFile(ModuleRegistry *module_registry, BuiltinModule *
     auto *filename_arg = Call<mgp_value *>(mgp_list_at, args, 0);
     MG_ASSERT(CallBool(mgp_value_is_string, filename_arg), "Should have been type checked already");
     const char *filename_str{nullptr};
-    if (!TryOrSetError([&] { return mgp_value_get_string(filename_arg, &filename_str); }, result)) {
+    size_t filename_len{0};
+    if (!TryOrSetError([&] { return mgp_value_get_string(filename_arg, &filename_str); }, result) ||
+        !TryOrSetError([&] { return mgp_value_get_string_size(filename_arg, &filename_len); }, result)) {
       return;
     }
-
-    const auto file_path = module_registry->InternalModuleDir() / filename_str;
-
-    if (!IsSubPath(module_registry->InternalModuleDir(), file_path)) {
-      static_cast<void>(mgp_result_set_error_msg(
-          result,
-          "Invalid relative path defined. The module file cannot be define outside the internal modules directory."));
-      return;
-    }
-
-    if (!IsAllowedExtension(file_path.extension())) {
-      static_cast<void>(mgp_result_set_error_msg(result, "The specified file isn't in the supported format."));
-      return;
-    }
-
-    if (std::filesystem::exists(file_path)) {
-      static_cast<void>(mgp_result_set_error_msg(result, "File with the same name already exists!"));
-      return;
-    }
-
-    utils::EnsureDir(file_path.parent_path());
 
     auto *content_arg = Call<mgp_value *>(mgp_list_at, args, 1);
     MG_ASSERT(CallBool(mgp_value_is_string, content_arg), "Should have been type checked already");
     const char *content_str{nullptr};
-    if (!TryOrSetError([&] { return mgp_value_get_string(content_arg, &content_str); }, result)) {
+    size_t content_len{0};
+    if (!TryOrSetError([&] { return mgp_value_get_string(content_arg, &content_str); }, result) ||
+        !TryOrSetError([&] { return mgp_value_get_string_size(content_arg, &content_len); }, result)) {
       return;
     }
 
-    if (auto maybe_error = WriteToFile(file_path, {content_str, std::strlen(content_str)}); !maybe_error.has_value()) {
-      static_cast<void>(mgp_result_set_error_msg(result, maybe_error.error().c_str()));
+    const auto maybe_created = module_registry->CreateModuleFile(
+        std::string_view{filename_str, filename_len}, std::string_view{content_str, content_len});
+    if (!maybe_created.has_value()) {
+      static_cast<void>(mgp_result_set_error_msg(result, maybe_created.error().c_str()));
       return;
     }
 
@@ -660,7 +734,8 @@ void RegisterMgCreateModuleFile(ModuleRegistry *module_registry, BuiltinModule *
       return;
     }
 
-    const auto path_value = GetStringValueOrSetError(std::filesystem::canonical(file_path).c_str(), memory, result);
+    const auto path_str = GetPathString(*maybe_created);
+    const auto path_value = GetStringValueOrSetError(path_str.c_str(), memory, result);
     if (!path_value) {
       return;
     }
@@ -668,8 +743,6 @@ void RegisterMgCreateModuleFile(ModuleRegistry *module_registry, BuiltinModule *
     if (!InsertResultOrSetError(result, record, "path", path_value.get())) {
       return;
     }
-
-    module_registry->UnloadAndLoadModulesFromDirectories();
   };
   mgp_proc create_module_file("create_module_file",
                               std::move(create_module_file_cb),
@@ -691,45 +764,28 @@ void RegisterMgUpdateModuleFile(ModuleRegistry *module_registry, BuiltinModule *
         auto *path_arg = Call<mgp_value *>(mgp_list_at, args, 0);
         MG_ASSERT(CallBool(mgp_value_is_string, path_arg), "Should have been type checked already");
         const char *path_str{nullptr};
-        if (!TryOrSetError([&] { return mgp_value_get_string(path_arg, &path_str); }, result)) {
-          return;
-        }
-
-        const std::filesystem::path path{path_str};
-
-        if (!path.is_absolute()) {
-          static_cast<void>(mgp_result_set_error_msg(result, "The path should be an absolute path."));
-          return;
-        }
-
-        if (!IsAllowedExtension(path.extension())) {
-          static_cast<void>(mgp_result_set_error_msg(result, "The specified file isn't in the supported format."));
-          return;
-        }
-
-        if (!std::filesystem::exists(path)) {
-          static_cast<void>(mgp_result_set_error_msg(result, "The specified file doesn't exist."));
-          return;
-        }
-
-        if (auto maybe_error_msg = ParentModuleDirectory(*module_registry, path); !maybe_error_msg.has_value()) {
-          static_cast<void>(mgp_result_set_error_msg(result, maybe_error_msg.error()));
+        size_t path_len{0};
+        if (!TryOrSetError([&] { return mgp_value_get_string(path_arg, &path_str); }, result) ||
+            !TryOrSetError([&] { return mgp_value_get_string_size(path_arg, &path_len); }, result)) {
           return;
         }
 
         auto *content_arg = Call<mgp_value *>(mgp_list_at, args, 1);
         MG_ASSERT(CallBool(mgp_value_is_string, content_arg), "Should have been type checked already");
         const char *content_str{nullptr};
-        if (!TryOrSetError([&] { return mgp_value_get_string(content_arg, &content_str); }, result)) {
+        size_t content_len{0};
+        if (!TryOrSetError([&] { return mgp_value_get_string(content_arg, &content_str); }, result) ||
+            !TryOrSetError([&] { return mgp_value_get_string_size(content_arg, &content_len); }, result)) {
           return;
         }
 
-        if (auto maybe_error = WriteToFile(path, {content_str, std::strlen(content_str)}); !maybe_error.has_value()) {
+        const std::filesystem::path path{std::string_view{path_str, path_len}};
+        if (auto maybe_error =
+                module_registry->UpdateModuleFile(path, std::string_view{content_str, content_len});
+            !maybe_error.has_value()) {
           static_cast<void>(mgp_result_set_error_msg(result, maybe_error.error().c_str()));
           return;
         }
-
-        module_registry->UnloadAndLoadModulesFromDirectories();
       };
   mgp_proc update_module_file("update_module_file",
                               std::move(update_module_file_cb),
@@ -749,48 +805,17 @@ void RegisterMgDeleteModuleFile(ModuleRegistry *module_registry, BuiltinModule *
         auto *path_arg = Call<mgp_value *>(mgp_list_at, args, 0);
         MG_ASSERT(CallBool(mgp_value_is_string, path_arg), "Should have been type checked already");
         const char *path_str{nullptr};
-        if (!TryOrSetError([&] { return mgp_value_get_string(path_arg, &path_str); }, result)) {
+        size_t path_len{0};
+        if (!TryOrSetError([&] { return mgp_value_get_string(path_arg, &path_str); }, result) ||
+            !TryOrSetError([&] { return mgp_value_get_string_size(path_arg, &path_len); }, result)) {
           return;
         }
 
-        const std::filesystem::path path{path_str};
-
-        if (!path.is_absolute()) {
-          static_cast<void>(mgp_result_set_error_msg(result, "The path should be an absolute path."));
+        const std::filesystem::path path{std::string_view{path_str, path_len}};
+        if (auto maybe_error = module_registry->DeleteModuleFile(path); !maybe_error.has_value()) {
+          static_cast<void>(mgp_result_set_error_msg(result, maybe_error.error().c_str()));
           return;
         }
-
-        if (!IsAllowedExtension(path.extension())) {
-          static_cast<void>(mgp_result_set_error_msg(result, "The specified file isn't in the supported format."));
-          return;
-        }
-
-        if (!std::filesystem::exists(path)) {
-          static_cast<void>(mgp_result_set_error_msg(result, "The specified file doesn't exist."));
-          return;
-        }
-
-        const auto parent_module_directory = ParentModuleDirectory(*module_registry, path);
-        if (!parent_module_directory) {
-          static_cast<void>(mgp_result_set_error_msg(result, parent_module_directory.error()));
-          return;
-        }
-
-        std::error_code ec;
-        if (!std::filesystem::remove(path, ec)) {
-          static_cast<void>(
-              mgp_result_set_error_msg(result, fmt::format("Failed to delete the module: {}", ec.message()).c_str()));
-          return;
-        }
-
-        auto parent_path = path.parent_path();
-        while (!std::filesystem::is_symlink(parent_path) && std::filesystem::is_empty(parent_path) &&
-               !std::filesystem::equivalent(*parent_module_directory, parent_path)) {
-          std::filesystem::remove(parent_path);
-          parent_path = parent_path.parent_path();
-        }
-
-        module_registry->UnloadAndLoadModulesFromDirectories();
       };
   mgp_proc delete_module_file("delete_module_file",
                               std::move(delete_module_file_cb),
@@ -852,6 +877,8 @@ class SharedLibraryModule final : public Module {
  private:
   /// Path as requested for loading the module from a library.
   std::filesystem::path file_path_;
+  /// Private staged path opened by dlopen so hot-reloads never collide with a still-open handle at file_path_.
+  std::filesystem::path loaded_so_path_;
   /// System handle to shared library.
   void *handle_;
   /// Required initialization function called on module load.
@@ -876,12 +903,34 @@ bool SharedLibraryModule::Load(const std::filesystem::path &file_path) {
   MG_ASSERT(!handle_, "Attempting to load an already loaded module...");
   spdlog::info("Loading module {}...", file_path);
   file_path_ = file_path;
+  auto cleanup_staged_so = [this] {
+    if (!loaded_so_path_.empty()) {
+      std::error_code rm_ec;
+      std::filesystem::remove(loaded_so_path_, rm_ec);
+      loaded_so_path_.clear();
+    }
+  };
+  static std::atomic<uint64_t> next_so_stage_id{1};
+  std::error_code stage_ec;
+  const auto stage_dir = std::filesystem::temp_directory_path(stage_ec);
+  if (!stage_ec) {
+    const auto cand = stage_dir / fmt::format("mg_shared_mod_{}_{}{}",
+                                              static_cast<uint64_t>(::getpid()),
+                                              next_so_stage_id.fetch_add(1, std::memory_order_relaxed),
+                                              file_path.extension().string());
+    if (std::filesystem::copy_file(file_path, cand, std::filesystem::copy_options::overwrite_existing, stage_ec) &&
+        !stage_ec) {
+      loaded_so_path_ = cand;
+    }
+  }
+  const auto &dlopen_target = loaded_so_path_.empty() ? file_path : loaded_so_path_;
   dlerror();  // Clear any existing error.
   // NOLINTNEXTLINE(hicpp-signed-bitwise)
-  handle_ = dlopen(file_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  handle_ = dlopen(dlopen_target.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!handle_) {
     spdlog::error(
         utils::MessageWithLink("Unable to load module {}; {}.", file_path, dlerror(), "https://memgr.ph/modules"));
+    cleanup_staged_so();
     return false;
   }
   // Get required mgp_init_module
@@ -892,15 +941,17 @@ bool SharedLibraryModule::Load(const std::filesystem::path &file_path) {
         utils::MessageWithLink("Unable to load module {}; {}.", file_path, dl_errored, "https://memgr.ph/modules"));
     dlclose(handle_);
     handle_ = nullptr;
+    cleanup_staged_so();
     return false;
   }
   auto module_cb = [&](auto *module_def, auto *memory) {
     // Run mgp_init_module which must succeed.
     int init_res = init_fn_(module_def, memory);
-    auto with_error = [this](std::string_view error_msg) {
+    auto with_error = [this, &cleanup_staged_so](std::string_view error_msg) {
       spdlog::error(error_msg);
       dlclose(handle_);
       handle_ = nullptr;
+      cleanup_staged_so();
       return false;
     };
 
@@ -927,6 +978,7 @@ bool SharedLibraryModule::Load(const std::filesystem::path &file_path) {
     return true;
   };
   if (!WithModuleRegistration(&procedures_, &transformations_, &functions_, module_cb)) {
+    cleanup_staged_so();
     return false;
   }
   // Get optional mgp_shutdown_module
@@ -951,6 +1003,11 @@ bool SharedLibraryModule::Close() {
     spdlog::error(
         utils::MessageWithLink("Failed to close module {}; {}.", file_path_, dlerror(), "https://memgr.ph/modules"));
     return false;
+  }
+  if (!loaded_so_path_.empty()) {
+    std::error_code rm_ec;
+    std::filesystem::remove(loaded_so_path_, rm_ec);
+    loaded_so_path_.clear();
   }
   spdlog::info("Closed module {}", file_path_);
   handle_ = nullptr;
@@ -1031,7 +1088,10 @@ bool PythonModule::Load(const std::filesystem::path &file_path) {
   bool succ = true;
   std::string batched_void_proc_name;
   auto module_cb = [&](auto *module_def, auto * /*memory*/) {
-    auto result = ImportPyModule(file_path.stem().c_str(), module_def);
+    auto result = ImportPyModuleFromPath(file_path, module_def);
+    if (!result) {
+      return result;
+    }
     for (auto &trans : module_def->transformations) {
       succ = MgpTransAddFixedResult(&trans.second) == mgp_error::MGP_ERROR_NO_ERROR;
       if (!succ) {
@@ -1049,8 +1109,6 @@ bool PythonModule::Load(const std::filesystem::path &file_path) {
   };
   py_module_ = WithModuleRegistration(&procedures_, &transformations_, &functions_, module_cb);
   if (py_module_) {
-    spdlog::info("Loaded module {}", file_path);
-
     if (!succ) {
       if (!batched_void_proc_name.empty()) {
         spdlog::error(
@@ -1060,13 +1118,18 @@ bool PythonModule::Load(const std::filesystem::path &file_path) {
       } else {
         spdlog::error("Unable to add result to transformation");
       }
+      Close();
       return false;
     }
+    spdlog::info("Loaded module {}", file_path);
     return true;
   }
-  auto exc_info = py::FetchError().value();
-  spdlog::error(
-      utils::MessageWithLink("Unable to load module {}; {}.", file_path, exc_info, "https://memgr.ph/modules"));
+  auto exc_info = py::FetchError();
+  spdlog::error(utils::MessageWithLink(
+      "Unable to load module {}; {}.",
+      file_path,
+      exc_info ? py::FormatException(*exc_info) : std::string{"import failed"},
+      "https://memgr.ph/modules"));
   return false;
 }
 
@@ -1102,66 +1165,71 @@ bool PythonModule::Close() {
   }
 
   std::string stem = file_path_.stem().string();
+  PyObject *current_sys_mod = PyDict_GetItemString(sys_mod_ref, stem.c_str());
+  const bool replaced_in_place = (current_sys_mod != nullptr && current_sys_mod != py_module_.Ptr());
 
-  ProcessFileDependencies(file_path_, file_path_.stem().c_str(), func_code, sys_mod_ref);
+  if (!replaced_in_place) {
+    ProcessFileDependencies(file_path_, stem.c_str(), func_code, sys_mod_ref);
 
-  std::vector<std::filesystem::path> submodules;
+    std::vector<std::filesystem::path> submodules;
 
-  for (auto it = std::filesystem::recursive_directory_iterator(file_path_.parent_path());
-       it != std::filesystem::recursive_directory_iterator();
-       ++it) {
-    std::string dir_entry_stem = it->path().stem().string();
-    if (it->is_regular_file() || dir_entry_stem == "__pycache__") continue;
-    if (dir_entry_stem.contains(stem)) {
-      it.disable_recursion_pending();
-      submodules.emplace_back(it->path());
+    for (auto it = std::filesystem::recursive_directory_iterator(file_path_.parent_path());
+         it != std::filesystem::recursive_directory_iterator();
+         ++it) {
+      std::string dir_entry_stem = it->path().stem().string();
+      if (it->is_regular_file() || dir_entry_stem == "__pycache__") continue;
+      if (dir_entry_stem.contains(stem)) {
+        it.disable_recursion_pending();
+        submodules.emplace_back(it->path());
+      }
     }
-  }
 
-  for (const auto &submodule : submodules) {
-    if (!std::filesystem::exists(submodule)) {
-      continue;
-    }
-    std::error_code ec;
-    std::filesystem::remove_all(submodule / "__pycache__", ec);
-    if (ec) {
-      spdlog::warn("Failed to remove __pycache__ in {}: {}", submodule.string(), ec.message());
-    }
-    auto rec_it = std::filesystem::recursive_directory_iterator(submodule, ec);
-    if (ec) {
-      spdlog::warn("Failed to iterate submodule {}: {}", submodule.string(), ec.message());
-      continue;
-    }
-    for (; rec_it != std::filesystem::recursive_directory_iterator(); rec_it.increment(ec)) {
+    for (const auto &submodule : submodules) {
+      if (!std::filesystem::exists(submodule)) {
+        continue;
+      }
+      std::error_code ec;
+      std::filesystem::remove_all(submodule / "__pycache__", ec);
       if (ec) {
-        spdlog::warn("Failed to iterate in {}: {}", submodule.string(), ec.message());
-        break;
+        spdlog::warn("Failed to remove __pycache__ in {}: {}", submodule.string(), ec.message());
       }
-      auto const &rec_dir_entry = *rec_it;
-      std::string const rec_dir_entry_stem = rec_dir_entry.path().stem().string();
-      if (rec_dir_entry.is_directory() && rec_dir_entry_stem != "__pycache__") {
-        ec.clear();
-        std::filesystem::remove_all(rec_dir_entry.path() / "__pycache__", ec);
+      auto rec_it = std::filesystem::recursive_directory_iterator(submodule, ec);
+      if (ec) {
+        spdlog::warn("Failed to iterate submodule {}: {}", submodule.string(), ec.message());
+        continue;
+      }
+      for (; rec_it != std::filesystem::recursive_directory_iterator(); rec_it.increment(ec)) {
         if (ec) {
-          spdlog::warn("Failed to remove __pycache__ in {}: {}", rec_dir_entry.path().string(), ec.message());
+          spdlog::warn("Failed to iterate in {}: {}", submodule.string(), ec.message());
+          break;
         }
+        auto const &rec_dir_entry = *rec_it;
+        std::string const rec_dir_entry_stem = rec_dir_entry.path().stem().string();
+        if (rec_dir_entry.is_directory() && rec_dir_entry_stem != "__pycache__") {
+          ec.clear();
+          std::filesystem::remove_all(rec_dir_entry.path() / "__pycache__", ec);
+          if (ec) {
+            spdlog::warn("Failed to remove __pycache__ in {}: {}", rec_dir_entry.path().string(), ec.message());
+          }
+        }
+        std::string const rec_dir_entry_ext = rec_dir_entry.path().extension().string();
+        if (!rec_dir_entry.is_regular_file() || rec_dir_entry_ext != ".py") continue;
+        ProcessFileDependencies(rec_dir_entry.path().c_str(), stem.c_str(), func_code, sys_mod_ref);
       }
-      std::string const rec_dir_entry_ext = rec_dir_entry.path().extension().string();
-      if (!rec_dir_entry.is_regular_file() || rec_dir_entry_ext != ".py") continue;
-      ProcessFileDependencies(rec_dir_entry.path().c_str(), file_path_.stem().c_str(), func_code, sys_mod_ref);
     }
-  }
 
-  // first throw out of cache file
-  if (PyDict_DelItemString(sys_mod_ref, file_path_.stem().c_str()) != 0) {
-    spdlog::warn("Failed to remove the module {} from sys.modules", file_path_.stem().c_str());
-    PyErr_Clear();
-    py_module_ = py::Object(nullptr);
-    return false;
-  }
+    if (current_sys_mod == py_module_.Ptr()) {
+      if (PyDict_DelItemString(sys_mod_ref, stem.c_str()) != 0) {
+        spdlog::warn("Failed to remove the module {} from sys.modules", stem.c_str());
+        PyErr_Clear();
+        py_module_ = py::Object(nullptr);
+        return false;
+      }
+    }
 
-  // Remove the cached bytecode if it's present
-  std::filesystem::remove_all(file_path_.parent_path() / "__pycache__");
+    // Remove the cached bytecode if it's present
+    std::filesystem::remove_all(file_path_.parent_path() / "__pycache__");
+  }
   py_module_ = py::Object(nullptr);
   spdlog::info("Closed module {}", file_path_);
   return true;
@@ -1266,7 +1334,13 @@ void ProcessFileDependencies(std::filesystem::path file_path_, const char *modul
         }
 
         const std::string_view sys_mod_key_name_str(sys_mod_key_name);
-        if (sys_mod_key_name_str.starts_with(module_name_str) && sys_mod_key_name_str != module_path) {
+        const bool matches_dep = sys_mod_key_name_str == module_name_str ||
+                                 (sys_mod_key_name_str.starts_with(module_name_str) &&
+                                  sys_mod_key_name_str.size() > module_name_str.size() &&
+                                  sys_mod_key_name_str[module_name_str.size()] == '.');
+        const bool is_builtin_bridge = sys_mod_key_name_str == "mgp" || sys_mod_key_name_str == "_mgp" ||
+                                       sys_mod_key_name_str.starts_with("mgp.");
+        if (matches_dep && sys_mod_key_name_str != module_path && !is_builtin_bridge) {
           if (PyDict_DelItemString(sys_mod_ref, sys_mod_key_name) != 0) {
             spdlog::warn("Failed to remove stale sys.modules entry '{}' during module cleanup", sys_mod_key_name);
             PyErr_Clear();
@@ -1382,6 +1456,16 @@ bool ModuleRegistry::TryEraseAllModules() {
   return true;
 }
 
+bool ModuleRegistry::AreAnyCustomModulesInUse() const {
+  for (const auto &[mod_name, module] : modules_) {
+    if (mod_name == "mg") continue;
+    if (module.use_count() != 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ModuleRegistry::RegisterModule(const std::string_view name, std::unique_ptr<Module> module) {
   MG_ASSERT(!name.empty(), "Module name cannot be empty");
   MG_ASSERT(module, "Tried to register an invalid module");
@@ -1460,47 +1544,267 @@ bool ModuleRegistry::LoadOrReloadModuleFromName(const std::string_view name) {
   if (name.empty()) return false;
   auto guard = std::unique_lock{lock_};
 
-  if (!TryEraseModule(name))
+  if (ReservedBuiltInModuleNames().contains(name)) {
+    return false;
+  }
+
+  auto existing_it = modules_.find(name);
+  if (existing_it != modules_.end() && existing_it->second.use_count() != 1) {
     throw query::QueryException(
-        "Unable to unload module '{}', either it doesn't exist, or it is currently being used. In order to check "
+        "Unable to unload module '{}', it is currently being used. In order to check "
         "whether the module exists, please use CALL mg.procedures() YIELD * for custom query procedures, or CALL "
         "mg.functions() YIELD * for custom query functions.",
         name);
-
-  for (const auto &module_dir : modules_dirs_) {
-    if (LoadModuleIfFound(module_dir, name)) {
-      return true;
-    }
   }
-  return false;
+
+  std::optional<std::filesystem::path> candidate_path;
+  for (const auto &module_dir : modules_dirs_) {
+    if (!utils::DirExists(module_dir)) {
+      spdlog::error(
+          utils::MessageWithLink("Module directory {} doesn't exist.", module_dir, "https://memgr.ph/modules"));
+      continue;
+    }
+    std::error_code ec;
+    for (const auto &entry : std::filesystem::directory_iterator(module_dir, ec)) {
+      std::error_code file_ec;
+      if (entry.is_regular_file(file_ec) && !file_ec && entry.path().stem() == name &&
+          IsLoadableModuleExtension(entry.path().extension())) {
+        candidate_path = entry.path();
+        break;
+      }
+    }
+    if (candidate_path) break;
+  }
+
+  if (!candidate_path) {
+    return false;
+  }
+
+  auto new_module = LoadModuleFromFile(*candidate_path);
+  if (!new_module) {
+    return false;
+  }
+
+  if (existing_it != modules_.end()) {
+    existing_it->second = std::move(new_module);
+    ++generation_;
+    return true;
+  }
+  return RegisterModule(name, std::move(new_module));
 }
 
-void ModuleRegistry::LoadModulesFromDirectory(const std::filesystem::path &modules_dir) {
+std::vector<std::filesystem::path> ModuleRegistry::LoadModulesFromDirectory(const std::filesystem::path &modules_dir) {
+  std::vector<std::filesystem::path> failed_paths;
   // all modules except mg are deleted before this
-  if (modules_dir.empty()) return;
+  if (modules_dir.empty()) return failed_paths;
   if (!utils::DirExists(modules_dir)) {
     spdlog::error(
         utils::MessageWithLink("Module directory {} doesn't exist.", modules_dir, "https://memgr.ph/modules"));
-    return;
+    return failed_paths;
   }
-  for (const auto &entry : std::filesystem::directory_iterator(modules_dir)) {
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(modules_dir, ec)) {
     const auto &path = entry.path();
-    if (entry.is_regular_file()) {
+    std::error_code file_ec;
+    if (entry.is_regular_file(file_ec) && !file_ec) {
+      if (!IsLoadableModuleExtension(path.extension())) continue;
       std::string name = path.stem();
       if (name.empty()) continue;
       auto module = LoadModuleFromFile(path);
-      if (!module) continue;
-      RegisterModule(name, std::move(module));
+      if (!module) {
+        failed_paths.push_back(path);
+        continue;
+      }
+      if (!RegisterModule(name, std::move(module))) {
+        failed_paths.push_back(path);
+      }
     }
   }
+  return failed_paths;
 }
 
 void ModuleRegistry::UnloadAndLoadModulesFromDirectories() {
   auto guard = std::unique_lock{lock_};
   DoUnloadAllModules();
   for (const auto &module_dir : modules_dirs_) {
-    LoadModulesFromDirectory(module_dir);
+    static_cast<void>(LoadModulesFromDirectory(module_dir));
   }
+}
+
+std::expected<std::string, std::string> ModuleRegistry::ReadModuleFileContent(const std::filesystem::path &path) const {
+  auto guard = std::shared_lock{lock_};
+  if (!path.is_absolute()) {
+    return std::unexpected("The path should be an absolute path.");
+  }
+  if (!IsAllowedExtension(path.extension())) {
+    return std::unexpected("The specified file isn't in the supported format.");
+  }
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) || ec) {
+    return std::unexpected("The specified file doesn't exist.");
+  }
+  if (auto maybe_parent = ParentModuleDirectory(*this, path); !maybe_parent.has_value()) {
+    return std::unexpected(maybe_parent.error());
+  }
+  const auto maybe_content = ReadFile(path);
+  if (!maybe_content) {
+    return std::unexpected("Couldn't read the content of the file.");
+  }
+  return *maybe_content;
+}
+
+std::expected<std::filesystem::path, std::string> ModuleRegistry::CreateModuleFile(std::string_view filename,
+                                                                                   std::string_view content) {
+  auto guard = std::unique_lock{lock_};
+  const auto file_path = internal_module_dir_ / filename;
+  if (!IsSubPath(internal_module_dir_, file_path)) {
+    return std::unexpected(
+        "Invalid relative path defined. The module file cannot be define outside the internal modules directory.");
+  }
+  if (!IsAllowedExtension(file_path.extension())) {
+    return std::unexpected("The specified file isn't in the supported format.");
+  }
+  if (AreAnyCustomModulesInUse()) {
+    return std::unexpected("Unable to unload modules, they are currently being used.");
+  }
+
+  std::vector<std::filesystem::path> missing_dirs;
+  for (auto p = file_path.parent_path(); !p.empty() && p != internal_module_dir_; p = p.parent_path()) {
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec)) break;
+    missing_dirs.push_back(p);
+  }
+  utils::EnsureDir(file_path.parent_path());
+
+  if (auto write_res = CreateFileExclusive(file_path, content); !write_res.has_value()) {
+    for (const auto &d : missing_dirs) {
+      std::error_code ec;
+      std::filesystem::remove(d, ec);
+    }
+    return std::unexpected(std::move(write_res.error()));
+  }
+
+  std::error_code canon_ec;
+  auto canonical_created = std::filesystem::canonical(file_path, canon_ec);
+  if (canon_ec) {
+    canonical_created = file_path;
+  }
+
+  DoUnloadAllModules();
+  std::vector<std::filesystem::path> failed_paths;
+  for (const auto &module_dir : modules_dirs_) {
+    auto dir_failures = LoadModulesFromDirectory(module_dir);
+    failed_paths.insert(failed_paths.end(), dir_failures.begin(), dir_failures.end());
+  }
+
+  const bool created_failed = std::ranges::any_of(failed_paths, [&](const auto &failed) {
+    std::error_code eq_ec;
+    return std::filesystem::equivalent(failed, file_path, eq_ec) && !eq_ec;
+  });
+  if (created_failed || !failed_paths.empty()) {
+    std::error_code rm_ec;
+    std::filesystem::remove(file_path, rm_ec);
+    for (const auto &d : missing_dirs) {
+      std::error_code dir_ec;
+      std::filesystem::remove(d, dir_ec);
+    }
+    DoUnloadAllModules();
+    for (const auto &module_dir : modules_dirs_) {
+      static_cast<void>(LoadModulesFromDirectory(module_dir));
+    }
+    return std::unexpected(
+        fmt::format("Failed to load module after creating file {}.", canonical_created.generic_string()));
+  }
+
+  return canonical_created;
+}
+
+std::expected<void, std::string> ModuleRegistry::UpdateModuleFile(const std::filesystem::path &path,
+                                                                  std::string_view content) {
+  auto guard = std::unique_lock{lock_};
+  if (!path.is_absolute()) {
+    return std::unexpected("The path should be an absolute path.");
+  }
+  if (!IsAllowedExtension(path.extension())) {
+    return std::unexpected("The specified file isn't in the supported format.");
+  }
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) || ec) {
+    return std::unexpected("The specified file doesn't exist.");
+  }
+  if (auto maybe_parent = ParentModuleDirectory(*this, path); !maybe_parent.has_value()) {
+    return std::unexpected(maybe_parent.error());
+  }
+  if (AreAnyCustomModulesInUse()) {
+    return std::unexpected("Unable to unload modules, they are currently being used.");
+  }
+
+  const auto previous_content = ReadFile(path);
+  if (!previous_content) {
+    return std::unexpected("Couldn't read the content of the file.");
+  }
+
+  if (auto write_res = WriteToFileAtomic(path, content); !write_res.has_value()) {
+    return std::unexpected(std::move(write_res.error()));
+  }
+
+  DoUnloadAllModules();
+  std::vector<std::filesystem::path> failed_paths;
+  for (const auto &module_dir : modules_dirs_) {
+    auto dir_failures = LoadModulesFromDirectory(module_dir);
+    failed_paths.insert(failed_paths.end(), dir_failures.begin(), dir_failures.end());
+  }
+
+  if (!failed_paths.empty()) {
+    static_cast<void>(WriteToFileAtomic(path, *previous_content));
+    DoUnloadAllModules();
+    for (const auto &module_dir : modules_dirs_) {
+      static_cast<void>(LoadModulesFromDirectory(module_dir));
+    }
+    return std::unexpected(fmt::format("Failed to reload module after updating file {}.", path.generic_string()));
+  }
+  return {};
+}
+
+std::expected<void, std::string> ModuleRegistry::DeleteModuleFile(const std::filesystem::path &path) {
+  auto guard = std::unique_lock{lock_};
+  if (!path.is_absolute()) {
+    return std::unexpected("The path should be an absolute path.");
+  }
+  if (!IsAllowedExtension(path.extension())) {
+    return std::unexpected("The specified file isn't in the supported format.");
+  }
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) || ec) {
+    return std::unexpected("The specified file doesn't exist.");
+  }
+  const auto parent_module_directory = ParentModuleDirectory(*this, path);
+  if (!parent_module_directory) {
+    return std::unexpected(parent_module_directory.error());
+  }
+  if (AreAnyCustomModulesInUse()) {
+    return std::unexpected("Unable to unload modules, they are currently being used.");
+  }
+
+  if (!std::filesystem::remove(path, ec)) {
+    return std::unexpected(fmt::format("Failed to delete the module: {}", ec.message()));
+  }
+
+  auto parent_path = path.parent_path();
+  std::error_code cleanup_ec;
+  while (!std::filesystem::is_symlink(parent_path, cleanup_ec) && !cleanup_ec &&
+         std::filesystem::is_empty(parent_path, cleanup_ec) && !cleanup_ec &&
+         !std::filesystem::equivalent(*parent_module_directory, parent_path, cleanup_ec) && !cleanup_ec) {
+    std::filesystem::remove(parent_path, cleanup_ec);
+    if (cleanup_ec) break;
+    parent_path = parent_path.parent_path();
+  }
+
+  DoUnloadAllModules();
+  for (const auto &module_dir : modules_dirs_) {
+    static_cast<void>(LoadModulesFromDirectory(module_dir));
+  }
+  return {};
 }
 
 /// Takes a read lock.
@@ -1542,7 +1846,10 @@ namespace {
 auto FindModuleNameAndProp(std::string_view fully_qualified_name)
     -> std::optional<std::pair<std::string_view, std::string_view>> {
   auto last_dot_pos = fully_qualified_name.find_last_of('.');
-  if (last_dot_pos == std::string_view::npos) return std::nullopt;
+  if (last_dot_pos == std::string_view::npos || last_dot_pos == 0 ||
+      last_dot_pos + 1 >= fully_qualified_name.size()) {
+    return std::nullopt;
+  }
   auto module_name = fully_qualified_name.substr(0, last_dot_pos);
   auto name = fully_qualified_name.substr(last_dot_pos + 1);
   return std::pair{module_name, name};
@@ -1577,12 +1884,15 @@ auto MakePairIfPropFound(const ModuleRegistry &module_registry, std::string_view
     const auto maybe_valid_alias = gCallableAliasMapper.FindAlias(fully_qualified_name);
     if (maybe_valid_alias) {
       result = FindModuleNameAndProp(*maybe_valid_alias);
-      auto [module_name, module_prop_name] = *result;
-      module = module_registry.GetModuleNamed(module_name);
-      prop_name = std::string(module_prop_name);
+      if (!result) {
+        return std::nullopt;
+      }
+      auto [alias_module_name, alias_prop_name] = *result;
+      module = module_registry.GetModuleNamed(alias_module_name);
       if (!module) {
         return std::nullopt;
       }
+      prop_name = std::string(alias_prop_name);
     } else {
       return std::nullopt;
     }

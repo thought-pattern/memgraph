@@ -96,6 +96,8 @@ class Scheduler {
 
   void Stop();
 
+  std::jthread StopAsync();
+
   bool IsRunning();
 
   bool IsPaused() const { return is_paused_; }

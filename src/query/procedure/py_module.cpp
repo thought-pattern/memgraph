@@ -51,11 +51,14 @@ PyObject *g_dt_time = nullptr;       // NOLINT(cppcoreguidelines-avoid-non-const
 PyObject *g_dt_datetime = nullptr;   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 PyObject *g_dt_timedelta = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 PyObject *g_dt_timezone = nullptr;   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+PyObject *g_zoneinfo_cls = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 bool InitDateTimeRefs() {
   if (g_dt_date != nullptr) return true;
   const py::Object module(PyImport_ImportModule("datetime"));
   if (!module) return false;
+  const py::Object zi_module(PyImport_ImportModule("zoneinfo"));
+  if (!zi_module) return false;
   // Fetch into owned locals first. If any lookup fails, the py::Object
   // destructors release the ones that succeeded (no leak) and the globals stay
   // null — so the `g_dt_date` guard above keeps reflecting "not initialised" and
@@ -67,12 +70,14 @@ bool InitDateTimeRefs() {
   py::Object datetime(PyObject_GetAttrString(module.Ptr(), "datetime"));
   py::Object timedelta(PyObject_GetAttrString(module.Ptr(), "timedelta"));
   py::Object timezone(PyObject_GetAttrString(module.Ptr(), "timezone"));
-  if (!date || !time || !datetime || !timedelta || !timezone) return false;
+  py::Object zoneinfo_cls(PyObject_GetAttrString(zi_module.Ptr(), "ZoneInfo"));
+  if (!date || !time || !datetime || !timedelta || !timezone || !zoneinfo_cls) return false;
   g_dt_date = date.Steal();
   g_dt_time = time.Steal();
   g_dt_datetime = datetime.Steal();
   g_dt_timedelta = timedelta.Steal();
   g_dt_timezone = timezone.Steal();
+  g_zoneinfo_cls = zoneinfo_cls.Steal();
   return true;
 }
 
@@ -499,9 +504,10 @@ PyObject *MakePyVertexWithoutCopy(mgp_vertex &vertex, PyGraph *py_graph);
 PyObject *PyGraphGetVertexById(PyGraph *self, PyObject *args) {
   MG_ASSERT(PyGraphIsValidImpl(*self));
   MG_ASSERT(self->memory);
-  static_assert(std::is_same_v<int64_t, long>);
-  int64_t id = 0;
-  if (!PyArg_ParseTuple(args, "l", &id)) return nullptr;
+  static_assert(sizeof(long long) == sizeof(int64_t));
+  long long raw_id = 0;
+  if (!PyArg_ParseTuple(args, "L", &raw_id)) return nullptr;
+  const auto id = static_cast<int64_t>(raw_id);
   mgp_vertex *vertex{nullptr};
   if (RaiseExceptionFromErrorCode(mgp_graph_get_vertex_by_id(self->graph, mgp_vertex_id{id}, self->memory, &vertex))) {
     return nullptr;
@@ -939,7 +945,7 @@ PyObject *PyMessageGetTimestamp(PyMessage *self, PyObject *Py_UNUSED(ignored)) {
   if (RaiseExceptionFromErrorCode(mgp_message_timestamp(self->message, &timestamp))) {
     return nullptr;
   }
-  auto *py_int = PyLong_FromUnsignedLong(timestamp);
+  auto *py_int = PyLong_FromLongLong(timestamp);
   if (!py_int) {
     PyErr_SetString(PyExc_IndexError, "Unable to get timestamp.");
     return nullptr;
@@ -1030,8 +1036,11 @@ PyObject *PyMessagesGetMessageAt(PyMessages *self, PyObject *args) {
   MG_ASSERT(self->memory);
   int64_t id = 0;
   if (!PyArg_ParseTuple(args, "l", &id)) return nullptr;
-  if (id < 0 || id >= self->messages->messages.size()) return nullptr;
-  auto *message = &self->messages->messages[id];
+  if (id < 0 || static_cast<size_t>(id) >= self->messages->messages.size()) {
+    PyErr_SetString(PyExc_IndexError, "Unable to find the message with given index.");
+    return nullptr;
+  }
+  auto *message = &self->messages->messages[static_cast<size_t>(id)];
   // NOLINTNEXTLINE
   auto *py_message = MakeHeapInstance<PyMessage>(PyMessageType);
   if (!py_message) {
@@ -1042,10 +1051,6 @@ PyObject *PyMessagesGetMessageAt(PyMessages *self, PyObject *args) {
   Py_INCREF(self);
   py_message->messages = self;
   py_message->memory = self->memory;
-  if (!message) {
-    PyErr_SetString(PyExc_IndexError, "Unable to find the message with given index.");
-    return nullptr;
-  }
   // NOLINTNEXTLINE
   return reinterpret_cast<PyObject *>(py_message);
 }
@@ -1328,10 +1333,15 @@ std::optional<py::ExceptionInfo> ConsumePythonRecords(mgp_result *result, const 
   }
 
   py::Object py_iter(raw_iter);
-  const Py_ssize_t hint = PyObject_LengthHint(py_res.Ptr(), 0);
-  if (hint < 0) return py::FetchError();
-  if (hint > 0) {
-    result->rows.reserve(static_cast<size_t>(hint));
+  const Py_ssize_t exact_len = PyObject_Length(py_res.Ptr());
+  if (exact_len < 0) {
+    if (PyErr_ExceptionMatches(PyExc_TypeError) || PyErr_ExceptionMatches(PyExc_AttributeError)) {
+      PyErr_Clear();
+    } else {
+      return py::FetchError();
+    }
+  } else if (exact_len > 0) {
+    result->rows.reserve(static_cast<size_t>(exact_len));
   }
 
   while (PyObject *item = PyIter_Next(py_iter.Ptr())) {
@@ -1346,21 +1356,22 @@ std::optional<py::ExceptionInfo> ConsumePythonRecords(mgp_result *result, const 
 }
 
 std::function<void()> PyObjectCleanup(py::Object &py_object) {
-  return [py_object]() {
-    // After making sure all references from our side have been cleared,
-    // invalidate the `_mgp.Graph` object. If the user kept a reference to one
-    // of our `_mgp` instances then this will prevent them from using those
-    // objects (whose internal `mgp_*` pointers are now invalid and would cause
-    // a crash).
-    //
-    // During C++ stack unwinding (e.g., memory limit exceeded), skip cleanup entirely.
-    // The query is failing anyway, and calling Python C API during unwinding is risky
-    // (Python may have a pending exception that would cause CallMethod to fail).
-    if (std::uncaught_exceptions() > 0) {
+  return [py_object]() noexcept {
+    // Clear the underlying C++ context pointers directly so retained Python
+    // handles become invalid on both normal completion and C++ stack unwinding,
+    // without re-entering the Python C API or disturbing any active exception.
+    if (!py_object) return;
+    if (Py_TYPE(py_object.Ptr()) == PyGraphType) {
+      auto *py_graph = reinterpret_cast<PyGraph *>(py_object.Ptr());
+      py_graph->graph = nullptr;
+      py_graph->memory = nullptr;
       return;
     }
-    if (!py_object.CallMethod("invalidate")) {
-      LOG_FATAL(py::FetchError().value());
+    if (Py_TYPE(py_object.Ptr()) == PyMessagesType) {
+      auto *py_messages = reinterpret_cast<PyMessages *>(py_object.Ptr());
+      py_messages->messages = nullptr;
+      py_messages->memory = nullptr;
+      return;
     }
   };
 }
@@ -1536,6 +1547,9 @@ void CallPythonFunction(const py::Object &py_cb, mgp_list *args, mgp_graph *grap
     auto py_res = py_cb.Call(py_graph, py_args);
     if (!py_res) return std::unexpected{py::FetchError()};
     mgp_value *ret_val = PyObjectToMgpValueWithPythonExceptions(py_res.Ptr(), memory);
+    if (ret_val == nullptr) {
+      return std::unexpected(py::FetchError());
+    }
     if (!is_transactional && ContainsDeleted(ret_val)) {
       mgp_value_destroy(ret_val);
       mgp_value *null_val{nullptr};
@@ -1551,10 +1565,6 @@ void CallPythonFunction(const py::Object &py_cb, mgp_list *args, mgp_graph *grap
       }
 
       return null_val;
-    }
-
-    if (ret_val == nullptr) {
-      return std::unexpected(py::FetchError());
     }
     return ret_val;
   };
@@ -1575,10 +1585,16 @@ void CallPythonFunction(const py::Object &py_cb, mgp_list *args, mgp_graph *grap
     if (py_graph) {
       auto maybe_result = call(py_graph);
       if (maybe_result) {
-        static_cast<void>(mgp_func_result_set_value(result, maybe_result.value(), memory));
-        return;
+        MgpUniquePtr<mgp_value> owned_val{maybe_result.value(), mgp_value_destroy};
+        const auto set_err = mgp_func_result_set_value(result, owned_val.get(), memory);
+        if (set_err == mgp_error::MGP_ERROR_NO_ERROR) {
+          return;
+        }
+        RaiseExceptionFromErrorCode(set_err);
+        maybe_msg = error_to_msg(py::FetchError());
+      } else {
+        maybe_msg = error_to_msg(maybe_result.error());
       }
-      maybe_msg = error_to_msg(maybe_result.error());
     } else {
       maybe_msg = error_to_msg(py::FetchError());
     }
@@ -1734,7 +1750,7 @@ PyObject *PyQueryModuleAddFunction(PyQueryModule *self, PyObject *cb) {
   mgp_func func(
       name,
       [py_cb](mgp_list *args, mgp_func_context *func_ctx, mgp_func_result *result, mgp_memory *memory) {
-        auto graph = mgp_graph::NonWritableGraph(*(func_ctx->impl), func_ctx->view);
+        auto graph = mgp_graph::NonWritableGraph(*(func_ctx->impl), func_ctx->view, func_ctx->auth_checker);
         return CallPythonFunction(py_cb, args, &graph, result, memory);
       },
       memory);
@@ -2134,15 +2150,15 @@ PyObject *PyEdgeSetProperties(PyEdge *self, PyObject *args) {
   if (!PyArg_ParseTuple(args, "O", &props)) {
     return nullptr;
   }
+  // NOLINTNEXTLINE(hicpp-signed-bitwise)
+  if (!PyDict_Check(props)) {
+    PyErr_SetString(PyExc_TypeError, "Expected a dict");
+    return nullptr;
+  }
 
   MgpUniquePtr<mgp_map> properties_map{nullptr, mgp_map_destroy};
-  const auto map_err = CreateMgpObject(properties_map, mgp_map_make_empty, self->py_graph->memory);
-
-  if (map_err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
-    throw std::bad_alloc{};
-  }
-  if (map_err != mgp_error::MGP_ERROR_NO_ERROR) {
-    throw std::runtime_error{"Unexpected error during creating mgp_map"};
+  if (RaiseExceptionFromErrorCode(CreateMgpObject(properties_map, mgp_map_make_empty, self->py_graph->memory))) {
+    return nullptr;
   }
 
   PyObject *key{nullptr};
@@ -2151,24 +2167,25 @@ PyObject *PyEdgeSetProperties(PyEdge *self, PyObject *args) {
   while (PyDict_Next(props, &pos, &key, &value)) {
     // NOLINTNEXTLINE(hicpp-signed-bitwise)
     if (!PyUnicode_Check(key)) {
-      throw std::invalid_argument("Dictionary keys must be strings");
+      PyErr_SetString(PyExc_TypeError, "Dictionary keys must be strings");
+      return nullptr;
     }
 
-    const char *k = PyUnicode_AsUTF8(key);
-
+    Py_ssize_t key_size = 0;
+    const char *k = PyUnicode_AsUTF8AndSize(key, &key_size);
     if (!k) {
-      PyErr_Clear();
-      throw std::bad_alloc{};
+      return nullptr;
     }
 
     MgpUniquePtr<mgp_value> prop_value{PyObjectToMgpValueWithPythonExceptions(value, self->py_graph->memory),
                                        mgp_value_destroy};
+    if (!prop_value) {
+      return nullptr;
+    }
 
-    if (const auto err = mgp_map_insert(properties_map.get(), k, prop_value.get());
-        err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
-      throw std::bad_alloc{};
-    } else if (err != mgp_error::MGP_ERROR_NO_ERROR) {
-      throw std::runtime_error{"Unexpected error during inserting an item to mgp_map"};
+    if (RaiseExceptionFromErrorCode(mgp_map_insert_with_size(
+            properties_map.get(), k, static_cast<size_t>(key_size), prop_value.get()))) {
+      return nullptr;
     }
   }
 
@@ -2462,15 +2479,15 @@ PyObject *PyVertexSetProperties(PyVertex *self, PyObject *args) {
   if (!PyArg_ParseTuple(args, "O", &props)) {
     return nullptr;
   }
+  // NOLINTNEXTLINE(hicpp-signed-bitwise)
+  if (!PyDict_Check(props)) {
+    PyErr_SetString(PyExc_TypeError, "Expected a dict");
+    return nullptr;
+  }
 
   MgpUniquePtr<mgp_map> properties_map{nullptr, mgp_map_destroy};
-  const auto map_err = CreateMgpObject(properties_map, mgp_map_make_empty, self->py_graph->memory);
-
-  if (map_err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
-    throw std::bad_alloc{};
-  }
-  if (map_err != mgp_error::MGP_ERROR_NO_ERROR) {
-    throw std::runtime_error{"Unexpected error during creating mgp_map"};
+  if (RaiseExceptionFromErrorCode(CreateMgpObject(properties_map, mgp_map_make_empty, self->py_graph->memory))) {
+    return nullptr;
   }
 
   PyObject *key{nullptr};
@@ -2479,24 +2496,25 @@ PyObject *PyVertexSetProperties(PyVertex *self, PyObject *args) {
   while (PyDict_Next(props, &pos, &key, &value)) {
     // NOLINTNEXTLINE(hicpp-signed-bitwise)
     if (!PyUnicode_Check(key)) {
-      throw std::invalid_argument("Dictionary keys must be strings");
+      PyErr_SetString(PyExc_TypeError, "Dictionary keys must be strings");
+      return nullptr;
     }
 
-    const char *k = PyUnicode_AsUTF8(key);
-
+    Py_ssize_t key_size = 0;
+    const char *k = PyUnicode_AsUTF8AndSize(key, &key_size);
     if (!k) {
-      PyErr_Clear();
-      throw std::bad_alloc{};
+      return nullptr;
     }
 
     MgpUniquePtr<mgp_value> prop_value{PyObjectToMgpValueWithPythonExceptions(value, self->py_graph->memory),
                                        mgp_value_destroy};
+    if (!prop_value) {
+      return nullptr;
+    }
 
-    if (const auto err = mgp_map_insert(properties_map.get(), k, prop_value.get());
-        err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
-      throw std::bad_alloc{};
-    } else if (err != mgp_error::MGP_ERROR_NO_ERROR) {
-      throw std::runtime_error{"Unexpected error during inserting an item to mgp_map"};
+    if (RaiseExceptionFromErrorCode(mgp_map_insert_with_size(
+            properties_map.get(), k, static_cast<size_t>(key_size), prop_value.get()))) {
+      return nullptr;
     }
   }
 
@@ -3112,14 +3130,14 @@ auto WithMgpModule(mgp_module *module_def, const TFun &fun) {
             "Expected '_mgp._MODULE' to be None as we are just starting to "
             "import a new module. Is some other thread also importing Python "
             "modules?");
-  auto *py_query_module = MakePyQueryModule(module_def);
-
+  py::Object py_query_module(MakePyQueryModule(module_def));
   MG_ASSERT(py_query_module);
-  MG_ASSERT(py_mgp.SetAttr("_MODULE", py_query_module));
+  MG_ASSERT(py_mgp.SetAttr("_MODULE", py_query_module.Ptr()));
 
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
-  auto *py_logger = reinterpret_cast<PyObject *>(MakeHeapInstance<PyLogger>(PyLoggerType));
-  MG_ASSERT(py_mgp.SetAttr("_LOGGER", py_logger));
+  py::Object py_logger(reinterpret_cast<PyObject *>(MakeHeapInstance<PyLogger>(PyLoggerType)));
+  MG_ASSERT(py_logger);
+  MG_ASSERT(py_mgp.SetAttr("_LOGGER", py_logger.Ptr()));
 
   auto ret = fun();
   auto maybe_exc = py::FetchError();
@@ -3134,6 +3152,78 @@ auto WithMgpModule(mgp_module *module_def, const TFun &fun) {
 
 py::Object ImportPyModule(const char *name, mgp_module *module_def) {
   return WithMgpModule(module_def, [name]() { return py::Object(PyImport_ImportModule(name)); });
+}
+
+py::Object ImportPyModuleFromPath(const std::filesystem::path &file_path, mgp_module *module_def) {
+  return WithMgpModule(module_def, [&file_path]() -> py::Object {
+    const std::string stem = file_path.stem().string();
+    const std::string full_path = file_path.string();
+    if (py::Object importlib_mod{PyImport_ImportModule("importlib")}) {
+      py::Object inv{importlib_mod.CallMethod("invalidate_caches")};
+      if (!inv) PyErr_Clear();
+    } else {
+      PyErr_Clear();
+    }
+    py::Object importlib_util(PyImport_ImportModule("importlib.util"));
+    if (!importlib_util) return nullptr;
+
+    py::Object py_name(PyUnicode_FromStringAndSize(stem.data(), static_cast<Py_ssize_t>(stem.size())));
+    py::Object py_path(PyUnicode_FromStringAndSize(full_path.data(), static_cast<Py_ssize_t>(full_path.size())));
+    if (!py_name || !py_path) return nullptr;
+
+    if (py::Object pyc_path_obj{importlib_util.CallMethod("cache_from_source", py_path)}) {
+      if (PyUnicode_Check(pyc_path_obj.Ptr())) {
+        if (const char *pyc_cstr = PyUnicode_AsUTF8(pyc_path_obj.Ptr())) {
+          std::error_code remove_ec;
+          std::filesystem::remove(std::filesystem::path{pyc_cstr}, remove_ec);
+        } else {
+          PyErr_Clear();
+        }
+      }
+    } else {
+      PyErr_Clear();
+    }
+
+    py::Object spec(importlib_util.CallMethod("spec_from_file_location", py_name, py_path));
+    if (!spec || spec.Ptr() == Py_None) {
+      if (!PyErr_Occurred()) {
+        PyErr_Format(PyExc_ImportError, "Unable to create module spec for '%s'", full_path.c_str());
+      }
+      return nullptr;
+    }
+    py::Object loader(spec.GetAttr("loader"));
+    if (!loader || loader.Ptr() == Py_None) {
+      if (!PyErr_Occurred()) {
+        PyErr_Format(PyExc_ImportError, "Module spec for '%s' has no loader", full_path.c_str());
+      }
+      return nullptr;
+    }
+    py::Object mod(importlib_util.CallMethod("module_from_spec", spec));
+    if (!mod) return nullptr;
+
+    PyObject *sys_modules = PyImport_GetModuleDict();
+    if (!sys_modules) return nullptr;
+    py::Object prev_mod(py::Object::FromBorrow(PyDict_GetItemString(sys_modules, stem.c_str())));
+    if (PyDict_SetItem(sys_modules, py_name.Ptr(), mod.Ptr()) != 0) {
+      return nullptr;
+    }
+
+    py::Object exec_res(loader.CallMethod("exec_module", mod));
+    if (!exec_res) {
+      auto saved_exc = py::FetchError();
+      if (prev_mod) {
+        static_cast<void>(PyDict_SetItem(sys_modules, py_name.Ptr(), prev_mod.Ptr()));
+      } else {
+        static_cast<void>(PyDict_DelItem(sys_modules, py_name.Ptr()));
+      }
+      PyErr_Clear();
+      if (saved_exc) {
+        py::RestoreError(*saved_exc);
+      }
+      return nullptr;
+    }
+    return mod;
+  });
 }
 
 py::Object ReloadPyModule(PyObject *py_module, mgp_module *module_def) {
@@ -3166,7 +3256,8 @@ py::Object MgpValueToPyObjectImpl(const mgp_value &value, PyGraph *py_graph, PyO
     case MGP_VALUE_TYPE_DOUBLE:
       return py::Object(PyFloat_FromDouble(value.double_v));
     case MGP_VALUE_TYPE_STRING:
-      return py::Object(PyUnicode_FromString(value.string_v.c_str()));
+      return py::Object(
+          PyUnicode_FromStringAndSize(value.string_v.data(), static_cast<Py_ssize_t>(value.string_v.size())));
     case MGP_VALUE_TYPE_LIST:
       return MgpListToPyTupleImpl(value.list_v, py_graph, py_mgp);
     case MGP_VALUE_TYPE_MAP: {
@@ -3175,18 +3266,31 @@ py::Object MgpValueToPyObjectImpl(const mgp_value &value, PyGraph *py_graph, PyO
       if (!py_dict) {
         return nullptr;
       }
+      bool ok = true;
       std::visit(
-          [&py_dict, py_graph, py_mgp](const auto &items) {
+          [&py_dict, py_graph, py_mgp, &ok](const auto &items) {
             for (const auto &[key, val] : items) {
+              py::Object py_key(PyUnicode_FromStringAndSize(key.data(), static_cast<Py_ssize_t>(key.size())));
+              if (!py_key) {
+                ok = false;
+                return;
+              }
               auto py_val = MgpValueToPyObjectImpl(val, py_graph, py_mgp);
               if (!py_val) {
+                ok = false;
                 return;
               }
               // Unlike PyList_SET_ITEM, PyDict_SetItem does not steal the value.
-              if (PyDict_SetItemString(py_dict.Ptr(), key.c_str(), py_val.Ptr()) != 0) return;
+              if (PyDict_SetItem(py_dict.Ptr(), py_key.Ptr(), py_val.Ptr()) != 0) {
+                ok = false;
+                return;
+              }
             }
           },
           map->items);
+      if (!ok) {
+        return nullptr;
+      }
       return py_dict;
     }
     case MGP_VALUE_TYPE_VERTEX: {
@@ -3240,21 +3344,68 @@ py::Object MgpValueToPyObjectImpl(const mgp_value &value, PyGraph *py_graph, PyO
     }
     case MGP_VALUE_TYPE_DURATION: {
       const auto &duration = value.duration_v->duration;
+      constexpr int64_t kMicrosecondsPerDay = 86'400LL * 1'000'000LL;
+      const int64_t days = duration.microseconds / kMicrosecondsPerDay;
+      const int64_t rem_us = duration.microseconds % kMicrosecondsPerDay;
+      const int64_t secs = rem_us / kMicrosecondsInSecond;
+      const int64_t usecs = rem_us % kMicrosecondsInSecond;
       py::Object py_duration(PyObject_CallFunction(g_dt_timedelta,
-                                                   "iii",
-                                                   0,
-                                                   duration.microseconds / kMicrosecondsInSecond,
-                                                   duration.microseconds % kMicrosecondsInSecond));
+                                                   "LLL",
+                                                   static_cast<long long>(days),
+                                                   static_cast<long long>(secs),
+                                                   static_cast<long long>(usecs)));
       return py_duration;
     }
     case MGP_VALUE_TYPE_ZONED_DATE_TIME: {
-      auto const local_time = value.zoned_date_time_v->zoned_date_time.AsLocalTime();
-      auto const date = value.zoned_date_time_v->zoned_date_time.AsLocalDate();
-      auto const offset_seconds =
-          static_cast<int32_t>(value.zoned_date_time_v->zoned_date_time.OffsetSeconds().count());
+      const auto &zdt = value.zoned_date_time_v->zoned_date_time;
+      auto const local_time = zdt.AsLocalTime();
+      auto const date = zdt.AsLocalDate();
+      auto const offset_seconds = static_cast<int32_t>(zdt.OffsetSeconds().count());
+      const int us_total = (local_time.millisecond * kMicrosecondsInMillisecond) + local_time.microsecond;
 
-      // Python's `timedelta` cannot be constructed with -negative values,
-      // so convert a negative second offset to a positive one.
+      if (zdt.GetTimezone().InTzDatabase()) {
+        const auto tz_name = zdt.TimezoneName();
+        py::Object const tz(
+            PyObject_CallFunction(g_zoneinfo_cls, "s#", tz_name.data(), static_cast<Py_ssize_t>(tz_name.size())));
+        if (!tz) return nullptr;
+
+        py::Object py_zoned_date_time(PyObject_CallFunction(g_dt_datetime,
+                                                            "iiiiiiiO",
+                                                            date.year,
+                                                            date.month,
+                                                            date.day,
+                                                            local_time.hour,
+                                                            local_time.minute,
+                                                            local_time.second,
+                                                            us_total,
+                                                            tz.Ptr()));
+        if (!py_zoned_date_time) return nullptr;
+
+        py::Object fold0_offset(PyObject_CallMethod(tz.Ptr(), "utcoffset", "O", py_zoned_date_time.Ptr()));
+        if (fold0_offset && fold0_offset.Ptr() != Py_None) {
+          const int64_t f0_secs = static_cast<int64_t>(GetIntAttr(fold0_offset.Ptr(), "days")) * 86'400LL +
+                                  static_cast<int64_t>(GetIntAttr(fold0_offset.Ptr(), "seconds"));
+          if (!PyErr_Occurred() && f0_secs != static_cast<int64_t>(offset_seconds)) {
+            py::Object kwargs(PyDict_New());
+            py::Object py_one(PyLong_FromLong(1));
+            if (kwargs && py_one && PyDict_SetItemString(kwargs.Ptr(), "fold", py_one.Ptr()) == 0) {
+              py::Object replace_fn(py_zoned_date_time.GetAttr("replace"));
+              py::Object empty_args(PyTuple_New(0));
+              if (replace_fn && empty_args) {
+                py::Object folded(PyObject_Call(replace_fn.Ptr(), empty_args.Ptr(), kwargs.Ptr()));
+                if (folded) {
+                  return folded;
+                }
+              }
+            }
+            PyErr_Clear();
+          }
+        } else {
+          PyErr_Clear();
+        }
+        return py_zoned_date_time;
+      }
+
       int32_t days = offset_seconds / 86'400;
       int32_t seconds = offset_seconds % 86'400;
       if (seconds < 0) {
@@ -3267,17 +3418,16 @@ py::Object MgpValueToPyObjectImpl(const mgp_value &value, PyGraph *py_graph, PyO
       py::Object const tz(PyObject_CallFunction(g_dt_timezone, "O", offset_delta.Ptr()));
       if (!tz) return nullptr;
 
-      py::Object py_zoned_date_time(
-          PyObject_CallFunction(g_dt_datetime,
-                                "iiiiiiiO",
-                                date.year,
-                                date.month,
-                                date.day,
-                                local_time.hour,
-                                local_time.minute,
-                                local_time.second,
-                                (local_time.millisecond * kMicrosecondsInMillisecond) + local_time.microsecond,
-                                tz.Ptr()));
+      py::Object py_zoned_date_time(PyObject_CallFunction(g_dt_datetime,
+                                                          "iiiiiiiO",
+                                                          date.year,
+                                                          date.month,
+                                                          date.day,
+                                                          local_time.hour,
+                                                          local_time.minute,
+                                                          local_time.second,
+                                                          us_total,
+                                                          tz.Ptr()));
 
       return py_zoned_date_time;
     }
@@ -3395,9 +3545,13 @@ mgp_value *PyObjectToMgpValue(PyObject *o, mgp_memory *memory) {
   } else if (PyFloat_Check(o)) {
     last_error = mgp_value_make_double(PyFloat_AsDouble(o), memory, &mgp_v);
   } else if (PyUnicode_Check(o)) {  // NOLINT(hicpp-signed-bitwise)
-    const char *s = PyUnicode_AsUTF8(o);
-    if (!s) throw std::invalid_argument("Failed to decode Python string as UTF-8");
-    last_error = mgp_value_make_string(s, memory, &mgp_v);
+    Py_ssize_t str_len = 0;
+    const char *s = PyUnicode_AsUTF8AndSize(o, &str_len);
+    if (!s) {
+      PyErr_Clear();
+      throw std::invalid_argument("Failed to decode Python string as UTF-8");
+    }
+    last_error = mgp_value_make_string_with_size(s, static_cast<size_t>(str_len), memory, &mgp_v);
   } else if (PyList_Check(o)) {
     mgp_v = py_seq_to_list(o, PyList_Size(o), [](auto *list, const auto i) { return PyList_GetItem(list, i); });
   } else if (PyTuple_Check(o)) {
@@ -3421,7 +3575,8 @@ mgp_value *PyObjectToMgpValue(PyObject *o, mgp_memory *memory) {
         throw std::invalid_argument("Dictionary keys must be strings");
       }
 
-      const char *k = PyUnicode_AsUTF8(key);
+      Py_ssize_t key_len = 0;
+      const char *k = PyUnicode_AsUTF8AndSize(key, &key_len);
 
       if (!k) {
         PyErr_Clear();
@@ -3430,7 +3585,8 @@ mgp_value *PyObjectToMgpValue(PyObject *o, mgp_memory *memory) {
 
       MgpUniquePtr<mgp_value> v{PyObjectToMgpValue(value, memory), mgp_value_destroy};
 
-      if (const auto err = mgp_map_insert(map.get(), k, v.get()); err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
+      if (const auto err = mgp_map_insert_with_size(map.get(), k, static_cast<size_t>(key_len), v.get());
+          err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
         throw std::bad_alloc{};
       } else if (err != mgp_error::MGP_ERROR_NO_ERROR) {
         throw std::runtime_error{"Unexpected error during inserting an item to mgp_map"};
@@ -3562,30 +3718,88 @@ mgp_value *PyObjectToMgpValue(PyObject *o, mgp_memory *memory) {
                                                     .microsecond = dt_microsecond % 1000};
 
     if (const py::Object tzinfo(GetTzInfo(o)); tzinfo) {
-      py::Object const offset(PyObject_CallMethod(tzinfo.Ptr(), "utcoffset", "O", o));
-      if (!offset) {
-        throw std::runtime_error{"Cannot read timezone offset"};
+      py::Object tz_key_attr(PyObject_GetAttrString(tzinfo.Ptr(), "key"));
+      if (!tz_key_attr) {
+        PyErr_Clear();
+        tz_key_attr = py::Object(PyObject_GetAttrString(tzinfo.Ptr(), "zone"));
+        if (!tz_key_attr) {
+          PyErr_Clear();
+        }
       }
 
-      constexpr int SECONDS_PER_DAY = 86'400;
-      constexpr int SECONDS_PER_MINUTE = 60;
-      auto const offset_days = static_cast<int32_t>(GetIntAttr(offset.Ptr(), "days"));
-      auto const offset_seconds = static_cast<int32_t>(GetIntAttr(offset.Ptr(), "seconds"));
-
-      // Convert total offset to minutes
-      int32_t const total_offset_seconds = offset_days * SECONDS_PER_DAY + offset_seconds;
-      int32_t const offset_minutes = total_offset_seconds / SECONDS_PER_MINUTE;
-
-      mgp_zoned_date_time_parameters parameters{
-          &date_parameters, &local_time_parameters, {.offset_in_minutes = offset_minutes}, 0};
-
       MgpUniquePtr<mgp_zoned_date_time> zoned_date_time{nullptr, mgp_zoned_date_time_destroy};
+      if (tz_key_attr && tz_key_attr.Ptr() != Py_None && PyUnicode_Check(tz_key_attr.Ptr())) {
+        const char *tz_name = PyUnicode_AsUTF8(tz_key_attr.Ptr());
+        if (!tz_name) {
+          PyErr_Clear();
+          throw std::invalid_argument{"Failed to decode timezone name as UTF-8"};
+        }
+        mgp_zoned_date_time_parameters parameters{
+            &date_parameters, &local_time_parameters, {.timezone_name = tz_name}, 1};
+        if (const auto err =
+                CreateMgpObject(zoned_date_time, mgp_zoned_date_time_from_parameters, &parameters, memory);
+            err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
+          throw std::bad_alloc{};
+        } else if (err == mgp_error::MGP_ERROR_INVALID_ARGUMENT) {
+          throw std::invalid_argument{"Invalid timezone or zoned datetime parameters"};
+        } else if (err != mgp_error::MGP_ERROR_NO_ERROR) {
+          throw std::runtime_error{"Unexpected error while creating mgp_zoned_date_time"};
+        }
+        // Preserve fold=1 disambiguation during DST fall-back overlap when Python's utcoffset differs.
+        py::Object const py_offset(PyObject_CallMethod(tzinfo.Ptr(), "utcoffset", "O", o));
+        if (py_offset && py_offset.Ptr() != Py_None) {
+          const int64_t py_off_secs = static_cast<int64_t>(GetIntAttr(py_offset.Ptr(), "days")) * 86'400LL +
+                                      static_cast<int64_t>(GetIntAttr(py_offset.Ptr(), "seconds"));
+          if (!PyErr_Occurred() && zoned_date_time->zoned_date_time.OffsetSeconds().count() != py_off_secs) {
+            const int64_t delta_us =
+                (zoned_date_time->zoned_date_time.OffsetSeconds().count() - py_off_secs) * kMicrosecondsInSecond;
+            zoned_date_time->zoned_date_time = memgraph::utils::ZonedDateTime{
+                zoned_date_time->zoned_date_time.SysTimeSinceEpoch() + std::chrono::microseconds{delta_us},
+                zoned_date_time->zoned_date_time.GetTimezone()};
+          }
+        } else {
+          PyErr_Clear();
+        }
+      } else {
+        py::Object const offset(PyObject_CallMethod(tzinfo.Ptr(), "utcoffset", "O", o));
+        if (!offset || offset.Ptr() == Py_None) {
+          PyErr_Clear();
+          throw std::invalid_argument{"Cannot read timezone offset"};
+        }
 
-      if (const auto err = CreateMgpObject(zoned_date_time, mgp_zoned_date_time_from_parameters, &parameters, memory);
-          err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
-        throw std::bad_alloc{};
-      } else if (err != mgp_error::MGP_ERROR_NO_ERROR) {
-        throw std::runtime_error{"Unexpected error while creating mgp_zoned_date_time"};
+        constexpr int64_t kSecondsPerDay = 86'400LL;
+        constexpr int64_t kSecondsPerMinute = 60LL;
+        auto const offset_days = static_cast<int64_t>(GetIntAttr(offset.Ptr(), "days"));
+        auto const offset_seconds = static_cast<int64_t>(GetIntAttr(offset.Ptr(), "seconds"));
+        auto const offset_microseconds = static_cast<int64_t>(GetIntAttr(offset.Ptr(), "microseconds"));
+        if (PyErr_Occurred()) {
+          PyErr_Clear();
+          throw std::invalid_argument{"Cannot read timezone offset components"};
+        }
+
+        const int64_t total_offset_seconds = offset_days * kSecondsPerDay + offset_seconds;
+        if (offset_microseconds != 0 || (total_offset_seconds % kSecondsPerMinute) != 0) {
+          throw std::invalid_argument{"Timezone offset must be a whole number of minutes"};
+        }
+        const int64_t offset_minutes_64 = total_offset_seconds / kSecondsPerMinute;
+        if (offset_minutes_64 < std::numeric_limits<int32_t>::min() ||
+            offset_minutes_64 > std::numeric_limits<int32_t>::max()) {
+          throw std::invalid_argument{"Timezone offset is out of range"};
+        }
+        const auto offset_minutes = static_cast<int32_t>(offset_minutes_64);
+
+        mgp_zoned_date_time_parameters parameters{
+            &date_parameters, &local_time_parameters, {.offset_in_minutes = offset_minutes}, 0};
+
+        if (const auto err =
+                CreateMgpObject(zoned_date_time, mgp_zoned_date_time_from_parameters, &parameters, memory);
+            err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
+          throw std::bad_alloc{};
+        } else if (err == mgp_error::MGP_ERROR_INVALID_ARGUMENT) {
+          throw std::invalid_argument{"Invalid timezone offset"};
+        } else if (err != mgp_error::MGP_ERROR_NO_ERROR) {
+          throw std::runtime_error{"Unexpected error while creating mgp_zoned_date_time"};
+        }
       }
       if (const auto err = mgp_value_make_zoned_date_time(zoned_date_time.get(), &mgp_v);
           err == mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE) {
@@ -3616,11 +3830,26 @@ mgp_value *PyObjectToMgpValue(PyObject *o, mgp_memory *memory) {
   } else if (IsDeltaExact(o)) {
     static constexpr int64_t microseconds_in_days =
         static_cast<std::chrono::microseconds>(std::chrono::days{1}).count();
-    const auto days = GetIntAttr(o, "days");
-    auto microseconds = (std::abs(days) * microseconds_in_days) +
-                        (static_cast<int64_t>(GetIntAttr(o, "seconds")) * kMicrosecondsInSecond) +
-                        GetIntAttr(o, "microseconds");
-    microseconds *= days < 0 ? -1 : 1;
+    const py::Object py_days(PyObject_GetAttrString(o, "days"));
+    if (!py_days) {
+      PyErr_Clear();
+      throw std::invalid_argument{"Cannot read timedelta days"};
+    }
+    const long long days = PyLong_AsLongLong(py_days.Ptr());
+    const auto seconds = static_cast<int64_t>(GetIntAttr(o, "seconds"));
+    const auto sub_us = static_cast<int64_t>(GetIntAttr(o, "microseconds"));
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      throw std::overflow_error{"Python timedelta component is out of range"};
+    }
+    const __int128 total_us_128 = static_cast<__int128>(days) * static_cast<__int128>(microseconds_in_days) +
+                                  static_cast<__int128>(seconds) * static_cast<__int128>(kMicrosecondsInSecond) +
+                                  static_cast<__int128>(sub_us);
+    if (total_us_128 < static_cast<__int128>(std::numeric_limits<int64_t>::min()) ||
+        total_us_128 > static_cast<__int128>(std::numeric_limits<int64_t>::max())) {
+      throw std::overflow_error{"Python timedelta is out of range for Duration"};
+    }
+    const auto microseconds = static_cast<int64_t>(total_us_128);
 
     MgpUniquePtr<mgp_duration> duration{nullptr, mgp_duration_destroy};
 

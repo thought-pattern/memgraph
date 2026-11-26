@@ -53,7 +53,10 @@ struct InlineRule {
     return RewriteRule<typed_egraph>::Builder{"inline"}
         .pattern(std::move(bind_pattern), "Bind")
         .pattern(std::move(ident_pattern), "Identifier")
-        .apply([](RuleContext<typed_egraph> &ctx, Match const &match) { ctx.merge(match[kIdent], match[kExpr]); });
+        .apply([](RuleContext<typed_egraph> &ctx, Match const &match) {
+          if (ctx.analysis(match[kExpr]).has_impure()) return;
+          ctx.merge(match[kIdent], match[kExpr]);
+        });
   }
 };
 

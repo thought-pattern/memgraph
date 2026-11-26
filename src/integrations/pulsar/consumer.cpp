@@ -170,10 +170,20 @@ namespace {
 ConsumerThreadFactory DefaultThreadFactory() {
   return [](std::function<void()> task) { return std::thread(std::move(task)); };
 }
+
+ConsumerInfo ValidateConsumerInfo(ConsumerInfo info) {
+  if (info.batch_interval < kMinimumInterval) {
+    throw ConsumerFailedToInitializeException(info.consumer_name, "Batch interval has to be positive!");
+  }
+  if (info.batch_size < kMinimumSize) {
+    throw ConsumerFailedToInitializeException(info.consumer_name, "Batch size has to be positive!");
+  }
+  return info;
+}
 }  // namespace
 
 Consumer::Consumer(ConsumerInfo info, ConsumerFunction consumer_function, ConsumerThreadFactory thread_factory)
-    : info_{std::move(info)},
+    : info_{ValidateConsumerInfo(std::move(info))},
       client_{CreateClient(info_.service_url)},
       consumer_function_{std::move(consumer_function)},
       thread_factory_(thread_factory ? std::move(thread_factory) : DefaultThreadFactory()) {

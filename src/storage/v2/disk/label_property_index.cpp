@@ -262,6 +262,11 @@ bool DiskLabelPropertyIndex::ActiveIndices::IndexReady(LabelId label, std::span<
   return index_.contains(LabelProperty{label, properties[0][0]});
 }
 
+bool DiskLabelPropertyIndex::ActiveIndices::IndexReady(LabelId label, std::span<PropertyPath const> properties,
+                                                       IndexOrder order) const {
+  return order == IndexOrder::ASC && IndexReady(label, properties);
+}
+
 auto DiskLabelPropertyIndex::ActiveIndices::ListIndices(uint64_t /*start_timestamp*/) const
     -> std::vector<LabelPropertyIndexEntry> {
   auto const convert = [](auto &&index) -> LabelPropertyIndexEntry {

@@ -35,6 +35,7 @@
 #include "storage/v2/view.hpp"
 #include "utils/atomic_memory_block.hpp"
 #include "utils/logging.hpp"
+#include "utils/on_scope_exit.hpp"
 #include "utils/resource_lock.hpp"
 #include "utils/small_vector.hpp"
 #include "utils/variant_helpers.hpp"
@@ -150,6 +151,7 @@ Storage::Accessor::Accessor(Storage *storage, std::optional<IsolationLevel> over
 
 Storage::Accessor::Accessor(Accessor &&other) noexcept
     : storage_(other.storage_),
+      post_unlock_threads_(std::move(other.post_unlock_threads_)),
       guard_(std::move(other.guard_)),
       transaction_(std::move(other.transaction_)),
       commit_timestamp_(other.commit_timestamp_),
@@ -265,6 +267,10 @@ Result<std::optional<std::pair<VertexAccessor, std::vector<EdgeAccessor>>>> Stor
   auto &[vertices, edges] = *value;
 
   MG_ASSERT(vertices.size() <= 1, "The number of detach deleted vertices is not less or equal to 1!");
+
+  if (vertices.empty()) {
+    return std::optional<ReturnType>{};
+  }
 
   return std::make_optional<ReturnType>(vertices[0], std::move(edges));
 }
@@ -390,8 +396,7 @@ Result<std::optional<std::unordered_set<Vertex *>>> Storage::Accessor::PrepareDe
 }
 
 EdgeInfoForDeletion Storage::Accessor::PrepareDeletableEdges(const std::unordered_set<Vertex *> &vertices,
-                                                             const std::vector<EdgeAccessor *> &edges,
-                                                             bool detach) noexcept {
+                                                             const std::vector<EdgeAccessor *> &edges, bool detach) {
   std::unordered_set<Vertex *> partial_src_vertices;
   std::unordered_set<Vertex *> partial_dest_vertices;
   std::unordered_set<Gid> src_edge_ids;
@@ -511,6 +516,8 @@ Result<std::optional<std::vector<EdgeAccessor>>> Storage::Accessor::ClearEdgesOn
         if (this->storage_->config_.salient.items.properties_on_edges) {
           auto *edge_ptr = edge_ref.ptr;
           MarkEdgeAsDeleted(edge_ptr);
+        } else if constexpr (std::is_same_v<std::decay_t<decltype(deletion_delta)>, Delta::AddOutEdgeTag>) {
+          this->storage_->edge_count_.fetch_sub(1, std::memory_order_acq_rel);
         }
 
         auto const edge_gid = storage_->config_.salient.items.properties_on_edges ? edge_ref.ptr->gid : edge_ref.gid;
@@ -600,6 +607,8 @@ Result<std::optional<std::vector<EdgeAccessor>>> Storage::Accessor::DetachRemain
           // this can happen only if we marked edges for deletion with no nodes,
           // so the method detaching nodes will not do anything
           MarkEdgeAsDeleted(edge_ptr);
+        } else if constexpr (std::is_same_v<std::decay_t<decltype(deletion_delta)>, Delta::AddOutEdgeTag>) {
+          storage_->edge_count_.fetch_sub(1, std::memory_order_acq_rel);
         }
 
         CreateAndLinkDelta(&transaction_, vertex_ptr, deletion_delta, edge_type, opposing_vertex, edge_ref);
@@ -710,8 +719,16 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Cre
 
   // Defer publication to commit time so concurrent readers don't observe a
   // create that gets rolled back.
-  auto updater = storage_->indices_.MakeUpdater();
   auto &text_index = storage_->indices_.text_index_;
+  utils::OnScopeExit rollback_create{[&text_index, &name = text_index_info.index_name]() noexcept {
+    if (!text_index.IndexExists(name)) return;
+    try {
+      auto evicted = text_index.DropIndex(name);
+      if (evicted) evicted->deferred_drop = true;
+    } catch (...) {
+    }
+  }};
+  auto updater = storage_->indices_.MakeUpdater();
   auto &metric_handles = storage_->metric_handles_;
   transaction_.commit_callbacks_.Add([&text_index, updater, &metric_handles](uint64_t /*commit_ts*/) {
     text_index.PublishActiveIndices(updater);
@@ -726,6 +743,7 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Cre
     if (evicted) evicted->deferred_drop = true;
   });
   transaction_.md_deltas.emplace_back(MetadataDelta::text_index_create, text_index_info);
+  rollback_create.Disable();
   return {};
 }
 
@@ -749,8 +767,16 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Cre
   }
 
   // Defer publication to commit time. See CreateTextIndex above.
-  auto updater = storage_->indices_.MakeUpdater();
   auto &text_edge_index = storage_->indices_.text_edge_index_;
+  utils::OnScopeExit rollback_create{[&text_edge_index, &name = text_edge_index_info.index_name]() noexcept {
+    if (!text_edge_index.IndexExists(name)) return;
+    try {
+      auto evicted = text_edge_index.DropIndex(name);
+      if (evicted) evicted->deferred_drop = true;
+    } catch (...) {
+    }
+  }};
+  auto updater = storage_->indices_.MakeUpdater();
   auto &metric_handles = storage_->metric_handles_;
   transaction_.commit_callbacks_.Add([&text_edge_index, updater, &metric_handles](uint64_t /*commit_ts*/) {
     text_edge_index.PublishActiveIndices(updater);
@@ -763,6 +789,7 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Cre
     if (evicted) evicted->deferred_drop = true;
   });
   transaction_.md_deltas.emplace_back(MetadataDelta::text_edge_index_create, text_edge_index_info);
+  rollback_create.Disable();
   return {};
 }
 
@@ -775,9 +802,15 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Dro
   auto updater = storage_->indices_.MakeUpdater();
   auto &metric_handles = storage_->metric_handles_;
   if (storage_->indices_.text_index_.IndexExists(index_name)) {
-    auto evicted = storage_->indices_.text_index_.DropIndex(index_name);
     auto &text_index = storage_->indices_.text_index_;
+    auto evicted = text_index.DropIndex(index_name);
     auto shared_evicted = std::shared_ptr<TextIndexData>(std::move(evicted));
+    utils::OnScopeExit rollback_drop{[&text_index, &index_name, shared_evicted]() mutable noexcept {
+      try {
+        text_index.RestoreIndex(index_name, std::move(shared_evicted));
+      } catch (...) {
+      }
+    }};
     transaction_.commit_callbacks_.Add(
         [&text_index, updater, shared_evicted, &metric_handles](uint64_t /*commit_ts*/) mutable {
           shared_evicted->deferred_drop = true;
@@ -787,10 +820,18 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Dro
     transaction_.abort_callbacks_.Add([&text_index, index_name, shared_evicted]() mutable {
       text_index.RestoreIndex(index_name, std::move(shared_evicted));
     });
+    transaction_.md_deltas.emplace_back(MetadataDelta::text_index_drop, index_name);
+    rollback_drop.Disable();
   } else if (storage_->indices_.text_edge_index_.IndexExists(index_name)) {
-    auto evicted = storage_->indices_.text_edge_index_.DropIndex(index_name);
     auto &text_edge_index = storage_->indices_.text_edge_index_;
+    auto evicted = text_edge_index.DropIndex(index_name);
     auto shared_evicted = std::shared_ptr<TextEdgeIndexData>(std::move(evicted));
+    utils::OnScopeExit rollback_drop{[&text_edge_index, &index_name, shared_evicted]() mutable noexcept {
+      try {
+        text_edge_index.RestoreIndex(index_name, std::move(shared_evicted));
+      } catch (...) {
+      }
+    }};
     transaction_.commit_callbacks_.Add(
         [&text_edge_index, updater, shared_evicted, &metric_handles](uint64_t /*commit_ts*/) mutable {
           shared_evicted->deferred_drop = true;
@@ -800,10 +841,11 @@ std::expected<void, storage::StorageIndexDefinitionError> Storage::Accessor::Dro
     transaction_.abort_callbacks_.Add([&text_edge_index, index_name, shared_evicted]() mutable {
       text_edge_index.RestoreIndex(index_name, std::move(shared_evicted));
     });
+    transaction_.md_deltas.emplace_back(MetadataDelta::text_index_drop, index_name);
+    rollback_drop.Disable();
   } else {
     return std::unexpected{storage::StorageIndexDefinitionError{IndexDefinitionError{}}};
   }
-  transaction_.md_deltas.emplace_back(MetadataDelta::text_index_drop, index_name);
   return {};
 }
 
