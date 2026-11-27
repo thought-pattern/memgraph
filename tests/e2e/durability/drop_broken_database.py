@@ -13,10 +13,10 @@ import os
 import shutil
 import sys
 
+from common import connect, corrupt_snapshots, execute_and_fetch_all, get_data_path
 import interactive_mg_runner
 import mgclient
 import pytest
-from common import connect, corrupt_snapshots, execute_and_fetch_all, get_data_path
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

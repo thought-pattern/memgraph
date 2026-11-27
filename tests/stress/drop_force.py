@@ -46,11 +46,11 @@ Usage::
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from common import OutputData, connection_argument_parser

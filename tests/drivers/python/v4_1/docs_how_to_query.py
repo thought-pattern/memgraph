@@ -13,6 +13,7 @@
 # licenses/APL.txt.
 
 import sys
+
 from neo4j import GraphDatabase, basic_auth
 
 driver = GraphDatabase.driver('bolt://localhost:7687',

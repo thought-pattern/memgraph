@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import *
+import pytest
 
 get_number_of_vertices_query = "CALL read.number_of_visible_nodes() YIELD nr_of_nodes RETURN nr_of_nodes;"
 get_number_of_edges_query = "CALL read.number_of_visible_edges() YIELD nr_of_edges RETURN nr_of_edges;"

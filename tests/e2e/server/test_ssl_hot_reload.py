@@ -17,8 +17,8 @@ import subprocess
 import sys
 import threading
 
-import pytest
 from common import connect_ssl, execute_and_fetch_all
+import pytest
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CERT_FILE = os.path.join(SCRIPT_DIR, "tls_certs", "ssl_reload_test.crt")

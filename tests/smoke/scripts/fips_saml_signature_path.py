@@ -17,12 +17,12 @@ import sys
 AUTH_MODULE_DIR = "/usr/lib/memgraph/auth_module"
 sys.path.insert(0, AUTH_MODULE_DIR)
 
-import lxml.etree as ET
-import xmlsec
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+import lxml.etree as ET
+import xmlsec
 
 DSIG_NS = "{http://www.w3.org/2000/09/xmldsig#}Signature"
 

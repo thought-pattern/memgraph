@@ -18,13 +18,13 @@ Instances are managed via the standard interactive_mg_runner module.
 """
 
 import os
+from pathlib import Path
 import sys
 import time
-from pathlib import Path
 from typing import Generator, Optional
 
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 # Add standard e2e directory to sys.path
 E2E_ROOT = Path(__file__).resolve().parent.parent
@@ -32,7 +32,6 @@ if str(E2E_ROOT) not in sys.path:
     sys.path.insert(0, str(E2E_ROOT))
 
 import interactive_mg_runner
-
 from memgraph import connectable_port
 
 # Base port for Memgraph instances

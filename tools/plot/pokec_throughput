@@ -10,9 +10,10 @@ Example usage:
 '''
 
 
-import json
-import matplotlib.pyplot as plt
 from argparse import ArgumentParser
+import json
+
+import matplotlib.pyplot as plt
 
 COLORS = {
     'memgraph': '#ff7300',

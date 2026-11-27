@@ -1,11 +1,11 @@
 #!/usr/bin/python3
 
 import argparse
-import re
-import sys
 from datetime import datetime
 from pathlib import Path
+import re
 from string import Template
+import sys
 
 BSL_HEADER = Template(
     """// Copyright $year Memgraph Ltd.

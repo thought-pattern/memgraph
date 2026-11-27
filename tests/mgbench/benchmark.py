@@ -12,6 +12,7 @@
 # licenses/APL.txt.
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import multiprocessing
@@ -21,16 +22,15 @@ import platform
 import random
 import sys
 import time
-from copy import deepcopy
 from typing import Dict, List
 
+from benchmark_context import BenchmarkContext
+from benchmark_results import BenchmarkResults
+from constants import *
 import helpers
 import log
 import runners
 import setup
-from benchmark_context import BenchmarkContext
-from benchmark_results import BenchmarkResults
-from constants import *
 from workload_mode import BENCHMARK_MODE_MIXED, BENCHMARK_MODE_REALISTIC
 from workloads.base import Workload
 

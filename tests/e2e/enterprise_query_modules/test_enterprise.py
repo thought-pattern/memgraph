@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, cursor, execute_and_fetch_all
+import pytest
 
 
 def test_enterprise_true(cursor):

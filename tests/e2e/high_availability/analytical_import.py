@@ -12,13 +12,10 @@
 # Bulk import on an HA data instance: switch the single MAIN to IN_MEMORY_ANALYTICAL, import, switch
 # back (which writes the snapshot), then register the replicas again. See specs/ha-analytical-import.md.
 
+from functools import partial
 import os
 import sys
-from functools import partial
 
-import interactive_mg_runner
-import mgclient
-import pytest
 from common import (
     connect,
     count_files,
@@ -29,7 +26,10 @@ from common import (
     show_instances,
     show_replicas,
 )
+import interactive_mg_runner
 from mg_utils import mg_sleep_and_assert
+import mgclient
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

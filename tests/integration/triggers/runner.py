@@ -14,13 +14,13 @@
 import argparse
 import logging
 import os
+from pathlib import Path
 import shutil
 import sys
 import tempfile
-from pathlib import Path
 
-import mgclient
 from memgraph_server_context import memgraph_server
+import mgclient
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PROJECT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", ".."))

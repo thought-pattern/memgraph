@@ -13,9 +13,9 @@ import multiprocessing
 import sys
 import time
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 
 def tx1_lock_vertex(conn_params, locked_barrier, done_barrier):

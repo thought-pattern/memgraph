@@ -15,7 +15,6 @@ Generates a random graph with some configurable statistics.
 
 from random import randint, seed
 
-
 seed(0)
 
 def rint(upper_bound_exclusive):

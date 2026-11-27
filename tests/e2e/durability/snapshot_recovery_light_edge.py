@@ -17,9 +17,9 @@
 import os
 import sys
 
+from common import connect, execute_and_fetch_all, get_data_path, get_logs_path
 import interactive_mg_runner
 import pytest
-from common import connect, execute_and_fetch_all, get_data_path, get_logs_path
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

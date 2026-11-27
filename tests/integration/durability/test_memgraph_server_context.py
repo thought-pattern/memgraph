@@ -21,15 +21,15 @@ Run with: pytest tests/integration/durability/
 
 import logging
 import os
+from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
 
-import pytest
 from memgraph_server_context import memgraph_server, wait_for_server
+import pytest
 
 LOGGER = logging.getLogger(__name__)
 

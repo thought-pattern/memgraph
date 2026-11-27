@@ -9,12 +9,12 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 URI = "bolt://127.0.0.1:7687"
 NUM_WORKERS = 4

@@ -12,8 +12,8 @@
 import sys
 
 import common
-import pytest
 from mgclient import DatabaseError
+import pytest
 
 
 def test_show_databases_w_user():

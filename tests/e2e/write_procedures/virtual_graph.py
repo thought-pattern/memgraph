@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import execute_and_fetch_all
+import pytest
 
 
 class TestVirtualEdgesWithProcedures:

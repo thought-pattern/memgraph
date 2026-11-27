@@ -12,8 +12,8 @@ def skip_signature_validation(*args, **kwargs):
 # Monkey-patch the SAML library to skip signature validation (not needed for tests)
 onelogin.saml2.utils.OneLogin_Saml2_Utils.validate_sign = skip_signature_validation
 
-import saml
 from common import compose_path, load_test_data
+import saml
 
 
 @pytest.fixture(scope="function")

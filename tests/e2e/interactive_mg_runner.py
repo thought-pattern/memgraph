@@ -26,7 +26,9 @@
 # approaches have to be employed.
 # NOTE: The instance description / context should be compatible with tests/e2e/runner.py
 
+from argparse import ArgumentParser
 import concurrent.futures
+from inspect import signature
 import logging
 import os
 import re
@@ -34,12 +36,9 @@ import readline
 import secrets
 import sys
 import time
-from argparse import ArgumentParser
-from inspect import signature
-
-import yaml
 
 from memgraph import *
+import yaml
 
 log = logging.getLogger("memgraph.tests.e2e")
 

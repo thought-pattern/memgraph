@@ -4,11 +4,11 @@ Common utilities for EKS HA stress tests.
 Thin wrapper around ha_common — resolves instance hosts at runtime by querying
 kubectl for external LoadBalancer IPs. All EKS instances expose bolt on port 7687.
 """
+from functools import lru_cache
 import os
 import re
 import subprocess
 import sys
-from functools import lru_cache
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 

@@ -11,14 +11,14 @@
 
 # -*- coding: utf-8 -*-
 
+import parser
 import re
 
-import database
-import parser
-import yaml
 from behave import given, step, then, when
+import database
 from neo4j.graph import Node, Path, Relationship
 from neo4j.spatial import CartesianPoint, WGS84Point
+import yaml
 
 ALL_SIDE_EFFECT_KEYS = (
     "+nodes",

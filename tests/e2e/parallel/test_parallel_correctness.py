@@ -1,8 +1,8 @@
 import sys
 from typing import Any, Dict, List
 
-import pytest
 from common import pq, setup_large_db, setup_thread_count_db
+import pytest
 
 
 def make_hashable(value):

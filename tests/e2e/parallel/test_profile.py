@@ -33,9 +33,9 @@ import sys
 import time
 from typing import Optional
 
-import pytest
 from common import clear_database, pq, setup_thread_count_db
 from neo4j import GraphDatabase
+import pytest
 
 
 class TestParallelProfile:

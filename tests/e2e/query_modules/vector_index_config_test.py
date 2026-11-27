@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import execute_and_fetch_all
+import pytest
 
 
 def test_create_vector_index_with_config_function_default(connection):

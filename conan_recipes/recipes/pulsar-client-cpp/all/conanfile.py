@@ -1,9 +1,10 @@
-from conan import ConanFile
-from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
-from conan.tools.env import Environment
-from conan.tools.build import check_min_cppstd, check_max_cppstd
-from conan.tools.files import apply_conandata_patches, copy, export_conandata_patches, get, trim_conandata
 import os
+
+from conan import ConanFile
+from conan.tools.build import check_max_cppstd, check_min_cppstd
+from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
+from conan.tools.env import Environment
+from conan.tools.files import apply_conandata_patches, copy, export_conandata_patches, get, trim_conandata
 
 """
 Known to work with pulsar 3.7.1, 4.0.0 -> only 4.0.0 works with boost 1.88.0, otherwise boost 1.86

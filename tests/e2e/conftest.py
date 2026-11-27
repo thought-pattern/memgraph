@@ -19,8 +19,8 @@ to work correctly whether tests are run from:
 """
 
 import os
-import sys
 from pathlib import Path
+import sys
 
 import pytest
 

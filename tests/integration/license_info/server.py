@@ -12,8 +12,8 @@
 # licenses/APL.txt.
 
 import argparse
-import json
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+import json
 
 EXPECTED_LICENSE_INFO_FIELDS = {
     "run_id": str,

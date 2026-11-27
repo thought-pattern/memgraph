@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_label_index_hint(memgraph):

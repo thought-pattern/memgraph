@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 
 @pytest.fixture(scope="module")

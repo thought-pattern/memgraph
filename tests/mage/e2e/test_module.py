@@ -1,15 +1,12 @@
 import os
-import subprocess
 from pathlib import Path
+import subprocess
 from typing import Dict, List
 
+from gqlalchemy import Memgraph, Node, Path as path_gql, Relationship
+from mgclient import Node as node_mgclient, Relationship as relationship_mgclient
 import pytest
 import yaml
-from gqlalchemy import Memgraph, Node
-from gqlalchemy import Path as path_gql
-from gqlalchemy import Relationship
-from mgclient import Node as node_mgclient
-from mgclient import Relationship as relationship_mgclient
 
 
 @pytest.fixture

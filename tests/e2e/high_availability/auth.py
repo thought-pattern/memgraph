@@ -17,12 +17,12 @@ import subprocess
 import sys
 import time
 
-import interactive_mg_runner
-import mgclient
-import pytest
 from common import connect, execute_and_fetch_all, get_data_path, get_logs_path, show_instances
+import interactive_mg_runner
 from mg_utils import mg_sleep_and_assert
+import mgclient
 from neo4j import Auth, GraphDatabase
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

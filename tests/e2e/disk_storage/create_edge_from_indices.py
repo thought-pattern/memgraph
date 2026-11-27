@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
+import pytest
 
 
 def test_creating_edges_by_loading_vertices_from_index(connect):

@@ -7,13 +7,13 @@
 import base64
 import csv
 import datetime
+from decimal import Decimal
 import hashlib
 import io
 import json
 import os
 import re
 import threading
-from decimal import Decimal
 from typing import Any, Dict, List
 from urllib.parse import urljoin, urlparse
 
@@ -21,17 +21,13 @@ import boto3
 import duckdb as duckDB
 import mgp
 import mysql.connector as mysql_connector
+from neo4j import GraphDatabase
+from neo4j.spatial import Point as Neo4jPoint
+from neo4j.time import Date as Neo4jDate, DateTime as Neo4jDateTime, Duration as Neo4jDuration, Time as Neo4jTime
 import oracledb
 import psycopg2
 import pyarrow.flight as flight
 import pyodbc
-from neo4j import GraphDatabase
-from neo4j.spatial import Point as Neo4jPoint
-from neo4j.time import Date as Neo4jDate
-from neo4j.time import DateTime as Neo4jDateTime
-from neo4j.time import Duration as Neo4jDuration
-from neo4j.time import Time as Neo4jTime
-
 import requests
 
 

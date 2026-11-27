@@ -5,9 +5,9 @@ import os
 import ssl
 import sys
 
+from common import add_call_id_to_response, pop_call_id
 import ldap3
 import yaml
-from common import add_call_id_to_response, pop_call_id
 
 ALLOWED_ENCRYPTIONS = ("disabled", "ssl", "starttls")
 CONFIG_FILE = os.environ.get("MEMGRAPH_LDAP_CONFIG_FILE", "/etc/memgraph/auth/ldap.yaml")

@@ -12,8 +12,8 @@
 import sys
 import time
 
-import pytest
 from common import cursor, execute_and_fetch_all
+import pytest
 
 
 # Helper functions

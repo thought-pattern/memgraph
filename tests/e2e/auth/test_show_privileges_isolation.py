@@ -9,12 +9,12 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import sys
 from contextlib import contextmanager
+import sys
 
-import pytest
 from common import memgraph, provide_user
 from gqlalchemy import Memgraph
+import pytest
 
 
 @contextmanager

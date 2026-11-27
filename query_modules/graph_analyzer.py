@@ -1,7 +1,7 @@
-import sys
 from collections import OrderedDict
 from inspect import cleandoc
 from itertools import chain, repeat
+import sys
 from typing import List, Tuple
 
 import mgp

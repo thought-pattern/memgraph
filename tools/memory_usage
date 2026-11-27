@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import time
-import sys  
 import os
+import sys
+import time
 
 # hackish way to resuse existing start code
 sys.path.append(os.path.dirname(os.path.realpath(__file__)) + 
         "/../tests/macro_benchmark/")
-from databases import *
 from clients import *
+from databases import *
+
 
 def avg_no_label_node_size(memgraph, client, measure_points):
     node_size_sum = 0

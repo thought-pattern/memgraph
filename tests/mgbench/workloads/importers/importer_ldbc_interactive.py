@@ -11,12 +11,12 @@
 
 # --- DISCLAIMER: This is NOT an official implementation of an LDBC Benchmark.  ---
 import csv
-import subprocess
 from pathlib import Path
+import subprocess
 
-import helpers
 from benchmark_context import BenchmarkContext
 from constants import GraphVendors
+import helpers
 from runners import BaseClient, BaseRunner
 from workloads.importers.base import BaseImporter
 

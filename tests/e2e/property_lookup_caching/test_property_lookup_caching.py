@@ -16,8 +16,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
+import pytest
 
 
 @pytest.fixture(scope="function")

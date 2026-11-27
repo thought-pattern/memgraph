@@ -4,6 +4,7 @@ import json
 import os
 import sys
 
+
 def load_file(fname):
     with open(fname) as f:
         data = f.read()

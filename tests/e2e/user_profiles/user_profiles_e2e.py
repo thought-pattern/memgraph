@@ -14,8 +14,8 @@ import sys
 import threading
 import time
 
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 
 def test_basic_profile_operations():

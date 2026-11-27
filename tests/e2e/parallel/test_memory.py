@@ -31,10 +31,10 @@ import sys
 import time
 from typing import Optional
 
-import pytest
 from common import clear_database, pq
 from neo4j import GraphDatabase
 from neo4j.exceptions import *
+import pytest
 
 # Common exception types for memory limit errors
 MEMORY_ERRORS = (ClientError, DatabaseError, TransientError)

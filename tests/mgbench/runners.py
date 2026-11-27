@@ -9,9 +9,11 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from abc import ABC, abstractmethod
 import atexit
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -20,12 +22,10 @@ import sys
 import tempfile
 import threading
 import time
-from abc import ABC, abstractmethod
-from pathlib import Path
 
-import log
 from benchmark_context import BenchmarkContext
 from constants import PASSWORD, USERNAME, BenchmarkInstallationType, GraphVendors
+import log
 
 DOCKER_NETWORK_NAME = "mgbench_network"
 

@@ -1,9 +1,9 @@
-import sys
 from json import loads
+import sys
 from textwrap import dedent
 
-import pytest
 from graphql_server import *
+import pytest
 
 
 def extract_cursor_from_response(response):

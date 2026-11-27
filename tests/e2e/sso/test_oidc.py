@@ -1,7 +1,7 @@
 import sys
 
+from oidc import _load_role_mappings, process_tokens
 import pytest
-from oidc import process_tokens, _load_role_mappings
 
 
 @pytest.mark.parametrize("scheme", ["oidc-entra-id", "oidc-okta", "oidc-custom"])

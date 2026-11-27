@@ -6,12 +6,12 @@ A script for transfering all data from a Neo4j database
 into a Memgraph database.
 '''
 
-import logging
+from argparse import ArgumentParser
+from datetime import datetime
 import json
+import logging
 import os
 from time import time
-from datetime import datetime
-from argparse import ArgumentParser
 
 from neo4j.v1 import GraphDatabase, basic_auth
 

@@ -10,13 +10,13 @@
 # licenses/APL.txt.
 
 import os
-import sys
 from pathlib import Path
+import sys
 
-import pytest
 from common import memgraph
 from mgclient import DatabaseError
 from neo4j import GraphDatabase
+import pytest
 
 SIMPLE_NODES_CSV_FILE = "simple_nodes.csv"
 SIMPLE_EDGES_CSV_FILE = "simple_edges.csv"

@@ -17,9 +17,9 @@ different points of the cache fill: while the set grows and while an element is 
 
 import sys
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 BOLT_PORT = 7687
 LIMITS_KB = range(1, 65)

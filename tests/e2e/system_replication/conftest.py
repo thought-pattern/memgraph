@@ -9,8 +9,8 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import pytest
 from common import connect, execute_and_fetch_all
+import pytest
 
 
 @pytest.fixture(scope="function")

@@ -28,8 +28,8 @@ import pytest
 # reliably triggers a wire-level RESET after FAILURE; pymgclient exposes neither.
 neo4j = pytest.importorskip("neo4j", reason="neo4j driver required to trigger Bolt LOGOFF/RESET")
 
-import mgclient
 from common import connect, get_data_path, get_logs_path
+import mgclient
 from neo4j import GraphDatabase
 from neo4j.exceptions import ClientError
 

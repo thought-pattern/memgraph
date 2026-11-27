@@ -12,16 +12,16 @@
 # TTL is an enterprise feature: it deletes nothing while the licence is invalid, and resumes once it is valid again.
 # The instance is licensed through settings only, so a mismatched organization name makes it unlicensed.
 
+from functools import partial
 import os
 import sys
 import time
-from functools import partial
 from unittest.mock import patch
 
-import interactive_mg_runner
-import pytest
 from common import execute_and_fetch_all
+import interactive_mg_runner
 from mg_utils import mg_sleep_and_assert
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

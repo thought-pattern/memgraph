@@ -10,13 +10,11 @@
 # licenses/APL.txt.
 
 
+from functools import partial
 import os
 import sys
 import time
-from functools import partial
 
-import interactive_mg_runner
-import pytest
 from common import (
     connect,
     execute_and_fetch_all,
@@ -25,6 +23,7 @@ from common import (
     show_instances,
     wait_until_main_writeable,
 )
+import interactive_mg_runner
 from mg_utils import (
     mg_sleep_and_assert,
     mg_sleep_and_assert_collection,
@@ -33,6 +32,7 @@ from mg_utils import (
     mg_sleep_and_assert_until_role_change,
     wait_for_status_change,
 )
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

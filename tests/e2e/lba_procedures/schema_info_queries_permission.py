@@ -12,8 +12,8 @@
 import json
 import sys
 
-import pytest
 from common import *
+import pytest
 
 SHOW_SCHEMA_INFO_QUERY = "SHOW SCHEMA INFO;"
 

@@ -11,9 +11,9 @@
 
 from pathlib import Path
 
-import log
 from benchmark_context import BenchmarkContext
 from constants import *
+import log
 from runners import BaseClient, BaseRunner
 from workloads.importers.base import BaseImporter
 

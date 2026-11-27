@@ -15,15 +15,15 @@ import argparse
 import atexit
 import logging
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
 
-import mgclient
 from memgraph_server_context import memgraph_server
+import mgclient
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PROJECT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", ".."))

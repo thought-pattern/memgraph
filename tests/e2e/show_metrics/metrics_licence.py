@@ -14,9 +14,9 @@
 import os
 import sys
 import time
+from unittest.mock import patch
 import urllib.error
 import urllib.request
-from unittest.mock import patch
 
 import interactive_mg_runner
 import mgclient

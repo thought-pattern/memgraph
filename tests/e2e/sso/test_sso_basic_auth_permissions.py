@@ -1,10 +1,10 @@
 import os
 import sys
 
-import interactive_mg_runner
-import pytest
 from common import get_data_path, get_logs_path
+import interactive_mg_runner
 from neo4j import GraphDatabase, basic_auth
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

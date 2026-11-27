@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
+import pytest
 
 
 def check_storage_info(cursor, expected_values):

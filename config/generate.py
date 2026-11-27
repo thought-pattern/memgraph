@@ -2,13 +2,13 @@
 import argparse
 import copy
 import os
+from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
 import textwrap
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 import yaml
 

@@ -1,8 +1,8 @@
 import sys
 from textwrap import dedent
 
-import pytest
 from graphql_server import *
+import pytest
 
 
 @pytest.fixture

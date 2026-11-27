@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 # The disk backend keeps a one-sided range inside its own type by comparing each bound's type to the
 # value's. That rejects every value of a whole-type range -- the shape CONTAINS, ENDS WITH and an empty

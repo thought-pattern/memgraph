@@ -9,13 +9,11 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from functools import partial
 import os
 import subprocess
 import sys
-from functools import partial
 
-import interactive_mg_runner
-import pytest
 from common import (
     connect,
     execute_and_fetch_all,
@@ -27,7 +25,9 @@ from common import (
     show_replicas,
     update_tuple_value,
 )
+import interactive_mg_runner
 from mg_utils import mg_sleep_and_assert, mg_sleep_and_assert_multiple, mg_sleep_and_assert_until_role_change
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

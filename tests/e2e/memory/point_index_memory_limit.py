@@ -17,9 +17,9 @@ lands at different points of the change tracking.
 
 import sys
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 BOLT_PORT = 7687
 LIMITS_KB = range(1, 65)

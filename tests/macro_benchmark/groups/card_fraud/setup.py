@@ -11,6 +11,7 @@
 
 import random
 
+
 def init_data(card_count, pos_count):
     print("UNWIND range(0, {} - 1) AS id "
         "CREATE (:Card {{id: id, compromised: false}});".format(

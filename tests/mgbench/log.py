@@ -9,8 +9,8 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import logging
 from datetime import datetime
+import logging
 from typing import Dict
 
 from constants import (

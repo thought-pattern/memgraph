@@ -9,13 +9,13 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import multiprocessing
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import pytest
 from common import connect, execute_and_fetch_all, get_file_path
+import pytest
 
 # Long enough that a slow machine still gets the transfer under way before the abort is due, since
 # an abort landing first would prove nothing about a download.

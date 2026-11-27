@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+from pathlib import Path
 import platform
 import re
 import shutil
@@ -28,7 +29,6 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Optional
 
 # Ensure the mgbench directory is on sys.path so local modules resolve.
@@ -36,11 +36,6 @@ _MGBENCH_DIR = Path(__file__).resolve().parent
 if str(_MGBENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_MGBENCH_DIR))
 
-# helpers MUST be imported before runners/BenchmarkContext to initialise the
-# workloads package and avoid a circular import.
-import helpers  # noqa: F401 — side-effect import
-import log
-import runners
 from benchmark_context import BenchmarkContext
 from constants import (
     COUNT,
@@ -52,6 +47,12 @@ from constants import (
     WITHOUT_FINE_GRAINED_AUTHORIZATION,
     BenchmarkInstallationType,
 )
+
+# helpers MUST be imported before runners/BenchmarkContext to initialise the
+# workloads package and avoid a circular import.
+import helpers  # noqa: F401 — side-effect import
+import log
+import runners
 
 logger = logging.getLogger(__name__)
 

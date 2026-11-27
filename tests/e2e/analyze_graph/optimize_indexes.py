@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all, memgraph
+import pytest
 
 QUERY_PLAN = "QUERY PLAN"
 

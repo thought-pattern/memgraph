@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError
+import pytest
 
 URI = "bolt://localhost:7687"
 

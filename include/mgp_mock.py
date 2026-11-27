@@ -16,13 +16,13 @@ can develop procedures without setting Memgraph up for each run, and run them fr
 when they're implemented in full.
 """
 
+from collections import namedtuple
+from copy import deepcopy
 import datetime
+from functools import wraps
 import inspect
 import sys
 import typing
-from collections import namedtuple
-from copy import deepcopy
-from functools import wraps
 
 import _mgp_mock
 

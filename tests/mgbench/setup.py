@@ -10,11 +10,11 @@
 # licenses/APL.txt.
 
 import subprocess
-import sys
 from subprocess import CalledProcessError
+import sys
 
-import log
 from benchmark_context import BenchmarkContext
+import log
 
 
 def check_requirements(benchmark_context: BenchmarkContext):

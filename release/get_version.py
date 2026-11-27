@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from functools import wraps
 import json
 import os
 import re
@@ -9,7 +10,6 @@ import sys
 import threading
 import time
 import urllib.request
-from functools import wraps
 
 # This script is used to determine the current version of Memgraph. The script
 # determines the current version using `git` automatically. The user can also

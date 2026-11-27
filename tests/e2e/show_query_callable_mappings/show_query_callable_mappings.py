@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_show_query_callable_mappings_returns_correct_columns(memgraph):

@@ -26,14 +26,14 @@ refuse a column holding one.
 All queries use USING PARALLEL EXECUTION hint via the pq() wrapper.
 """
 
-import sys
 from enum import Enum, auto
+import sys
 from typing import List, Optional
 
-import pytest
 from common import *
 from common import pq
 from neo4j.exceptions import *
+import pytest
 
 # =============================================================================
 # Exception Origin Types

@@ -25,16 +25,16 @@ Environment Variables:
 """
 
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
 from typing import Any
 
-import networkx as nx
 from neo4j import GraphDatabase
+import networkx as nx
 
 # Configuration via environment variables with sensible defaults
 MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://localhost:7687")

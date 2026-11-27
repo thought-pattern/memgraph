@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def get_license_info_by_key(results, key):

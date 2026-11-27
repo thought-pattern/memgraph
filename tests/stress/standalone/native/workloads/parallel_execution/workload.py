@@ -23,13 +23,13 @@ This stress test validates the USING PARALLEL EXECUTION feature under load:
 """
 
 import argparse
+from dataclasses import dataclass
+from enum import Enum
 import math
 import multiprocessing
 import random
 import sys
 import time
-from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from neo4j import GraphDatabase

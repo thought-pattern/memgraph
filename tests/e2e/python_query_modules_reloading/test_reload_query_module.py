@@ -13,9 +13,9 @@
 import os
 import sys
 
+from common import connect, create_multi_db, execute_and_fetch_all, switch_db
 import mgclient
 import pytest
-from common import connect, create_multi_db, execute_and_fetch_all, switch_db
 
 COMMON_PATH_PREFIX_TEST1 = "procedures/mage/test_module"
 COMMON_PATH_PREFIX_TEST2 = "procedures/new_test_module_utils"

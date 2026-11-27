@@ -12,8 +12,8 @@
 import os
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all, get_file_path
+import pytest
 
 
 # Invalid token is just skipped

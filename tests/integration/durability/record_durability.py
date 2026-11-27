@@ -3,11 +3,11 @@ import argparse
 import glob
 import logging
 import os
+from pathlib import Path
 import shutil
 import signal
 import subprocess
 import tempfile
-from pathlib import Path
 
 from memgraph_server_context import memgraph_server
 

@@ -1,4 +1,5 @@
 import mgp
+
 from mage.node_classification.models.inductive_model import InductiveModel
 
 

@@ -1,7 +1,7 @@
 import sys
 
-import pytest
 from client import *
+import pytest
 
 query = "MATCH (n) CALL libmodule_test.node(n) YIELD node RETURN node;"
 

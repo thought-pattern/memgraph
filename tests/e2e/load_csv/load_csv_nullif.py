@@ -10,11 +10,11 @@
 # licenses/APL.txt.
 
 import os
-import sys
 from pathlib import Path
+import sys
 
-import pytest
 from gqlalchemy import Memgraph
+import pytest
 
 NULLIF_CSV_FILE = "nullif.csv"
 

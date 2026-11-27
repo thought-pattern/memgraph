@@ -16,10 +16,10 @@ import copy
 import multiprocessing
 import random
 
+from benchmark_context import BenchmarkContext
 import helpers
 import runners
 import workloads
-from benchmark_context import BenchmarkContext
 from workloads import base
 
 

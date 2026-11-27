@@ -1,9 +1,10 @@
+import os
+
 from conan import ConanFile
 from conan.errors import ConanException
 from conan.tools.cmake import CMake, CMakeToolchain, cmake_layout
 from conan.tools.files import apply_conandata_patches, collect_libs, copy, export_conandata_patches, get, rmdir, trim_conandata
 from conan.tools.scm import Version
-import os
 
 required_conan_version = ">=2.1"
 

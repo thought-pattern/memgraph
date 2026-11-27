@@ -12,9 +12,9 @@
 import os
 import sys
 
-import pytest
 from common import memgraph, provide_user
 from gqlalchemy import Memgraph
+import pytest
 
 
 def test_empty_show_active_users_info(memgraph):

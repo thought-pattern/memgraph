@@ -1,13 +1,13 @@
+from abc import ABC, abstractmethod
 import argparse
 import json
-import time
-from abc import ABC, abstractmethod
 from multiprocessing import Array, Lock, Manager, Process, Value
+import time
 
-import psycopg2
-import psycopg2.extras
 from falkordb import FalkorDB
 from neo4j import GraphDatabase
+import psycopg2
+import psycopg2.extras
 
 
 class PythonClient(ABC):

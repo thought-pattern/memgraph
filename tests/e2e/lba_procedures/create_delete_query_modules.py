@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import *
+import pytest
 
 AUTHORIZATION_ERROR_IDENTIFIER = "AuthorizationError"
 

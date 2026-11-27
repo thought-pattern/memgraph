@@ -6,10 +6,9 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
+from gqlalchemy import Memgraph
 import pytest
 import yaml
-from gqlalchemy import Memgraph
-
 
 INFRASTRUCTURE_OR_SCHEMA_ERROR_MARKERS = (
     "connection refused",

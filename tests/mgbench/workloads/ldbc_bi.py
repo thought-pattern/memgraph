@@ -11,12 +11,12 @@
 
 # ---  DISCLAIMER: This is NOT an official implementation of an LDBC Benchmark.  ---
 import inspect
-import random
 from pathlib import Path
+import random
 
-import helpers
 from benchmark_context import BenchmarkContext
 from constants import GraphVendors
+import helpers
 from workloads.base import Workload
 from workloads.importers.importer_ldbc_bi import ImporterLDBCBI
 

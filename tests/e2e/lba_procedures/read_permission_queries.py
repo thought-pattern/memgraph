@@ -12,8 +12,8 @@
 import sys
 from typing import List
 
-import pytest
 from common import *
+import pytest
 
 match_query = "MATCH (n) RETURN n;"
 match_by_id_query = "MATCH (n) WHERE ID(n) >= 0 RETURN n;"

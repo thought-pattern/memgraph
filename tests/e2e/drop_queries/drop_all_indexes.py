@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import get_results_length, memgraph
+import pytest
 
 
 def test_drop_all_indexes(memgraph):

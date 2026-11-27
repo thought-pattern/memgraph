@@ -11,9 +11,9 @@
 
 import sys
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 
 @pytest.fixture(name="admin")

@@ -12,9 +12,9 @@
 import sys
 import time
 
-import pytest
 from common import connect, execute_and_fetch_all
 from mg_utils import mg_sleep_and_assert, mg_sleep_and_assert_collection
+import pytest
 
 REPLICA_BOLT_PORTS = [7688, 7689]
 

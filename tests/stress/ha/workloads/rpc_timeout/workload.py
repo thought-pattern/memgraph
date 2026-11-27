@@ -13,6 +13,7 @@ Cluster port layout (from native deployment):
   - data_2 bolt=7688, mgmt=13012, repl=10002
   - data_3 bolt=7689, mgmt=13013, repl=10003
 """
+from datetime import datetime
 import multiprocessing
 import os
 import random
@@ -20,7 +21,6 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
 
 from neo4j import GraphDatabase
 

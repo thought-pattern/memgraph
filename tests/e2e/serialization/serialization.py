@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import serialization
+import pytest
 
 
 def test_serialization_on_creating_edges(serialization):

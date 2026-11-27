@@ -80,13 +80,13 @@ slowdown.
 
 from __future__ import annotations
 
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import sys
 import threading
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 # ---------------------------------------------------------------------------

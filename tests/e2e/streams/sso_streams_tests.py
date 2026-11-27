@@ -17,8 +17,8 @@ import sys
 
 import common
 import interactive_mg_runner
-import pytest
 from neo4j import Auth, GraphDatabase
+import pytest
 
 # Setup interactive_mg_runner paths
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))

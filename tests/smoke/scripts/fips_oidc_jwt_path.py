@@ -13,9 +13,9 @@ what is exercised, with the key generated in-process.
 import sys
 
 import _hashlib
-import jwt
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+import jwt
 
 AUDIENCE = "mg"
 

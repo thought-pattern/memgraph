@@ -11,9 +11,9 @@
 
 import sys
 
+from common import connect, execute_and_fetch_all, wait_for_results
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all, wait_for_results
 
 
 @pytest.fixture(scope="function")

@@ -11,9 +11,9 @@
 
 import sys
 
+from common import cursor, execute_and_fetch_all
 import mgclient
 import pytest
-from common import cursor, execute_and_fetch_all
 
 
 def _index_rows(cursor):

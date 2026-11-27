@@ -7,10 +7,9 @@ import os
 from pathlib import Path
 from typing import Dict
 
+from gqlalchemy import Memgraph
 import neo4j
 import pytest
-import yaml
-from gqlalchemy import Memgraph
 from query_neo_mem import (
     Graph,
     clean_memgraph_db,
@@ -27,6 +26,7 @@ from query_neo_mem import (
     run_memgraph_query,
     run_neo4j_query,
 )
+import yaml
 
 logging.basicConfig(format="%(asctime)-15s [%(levelname)s]: %(message)s")
 logger = logging.getLogger("e2e_correctness")

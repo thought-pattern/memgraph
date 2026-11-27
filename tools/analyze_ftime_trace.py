@@ -36,11 +36,11 @@ Output columns:
   Header     - Absolute path to the header file
 """
 
+from collections import defaultdict
 import glob
 import json
 import os
 import sys
-from collections import defaultdict
 
 
 def parse_trace_file(path):

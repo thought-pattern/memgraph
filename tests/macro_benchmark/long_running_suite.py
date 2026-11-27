@@ -9,11 +9,12 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import logging
 from argparse import ArgumentParser
-from common import get_absolute_path, APOLLO
+import logging
+
+from clients import LongRunningClient, QueryClient
+from common import APOLLO, get_absolute_path
 from databases import Memgraph, Neo
-from clients import QueryClient, LongRunningClient
 
 log = logging.getLogger(__name__)
 

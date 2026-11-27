@@ -13,7 +13,6 @@
 
 from random import randint, seed
 
-
 BATCH_SIZE = 100
 seed(0)
 

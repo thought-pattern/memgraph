@@ -30,15 +30,15 @@
 # directory is impractical, so the test lives next to the other coordinator tests and reuses
 # high_availability/common.py.
 
+from functools import partial
 import os
 import shutil
 import sys
-from functools import partial
 
-import interactive_mg_runner
-import pytest
 from common import connect, corrupt_snapshots, execute_and_fetch_all, get_data_path, get_logs_path, show_instances
+import interactive_mg_runner
 from mg_utils import mg_sleep_and_assert
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

@@ -27,26 +27,25 @@ Workloads are split into two lanes:
     the parallel lane.
 """
 
+from argparse import ArgumentParser
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import copy
+from dataclasses import dataclass
 import json
 import logging
 import multiprocessing
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
-from argparse import ArgumentParser
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import dataclass
-from pathlib import Path
 
 import interactive_mg_runner
-import yaml
-
 from memgraph import ENDPOINT_RE, EXTERNAL_SERVICE_PORTS, PORT_KEYWORD_RE
+import yaml
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PROJECT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))

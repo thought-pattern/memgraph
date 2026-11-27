@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all, memgraph
+import pytest
 
 
 def test_all_show_metrics_info_values_are_present(memgraph):

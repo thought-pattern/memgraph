@@ -18,13 +18,13 @@ there is lot of node creation and deletions compared
 to RES memory usage.
 """
 
+from argparse import Namespace as Args
 import atexit
+from dataclasses import dataclass
+from functools import wraps
 import logging
 import multiprocessing
 import time
-from argparse import Namespace as Args
-from dataclasses import dataclass
-from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from common import OutputData, SessionCache, connection_argument_parser, execute_till_success, try_execute

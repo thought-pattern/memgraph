@@ -12,8 +12,8 @@
 import sys
 
 import common
-import pytest
 from mgclient import DatabaseError
+import pytest
 
 
 def reset_and_prepare(admin_cursor):

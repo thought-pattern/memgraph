@@ -9,20 +9,20 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from functools import partial
 import os
+from pathlib import Path
 import re
 import sys
 import time
-from functools import partial
-from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import patch
 
+from common import drop_database_with_retry, execute_and_fetch_all, get_data_path, get_logs_path
 import interactive_mg_runner
+from mg_utils import mg_sleep_and_assert, mg_sleep_and_assert_collection
 import mgclient
 import pytest
-from common import drop_database_with_retry, execute_and_fetch_all, get_data_path, get_logs_path
-from mg_utils import mg_sleep_and_assert, mg_sleep_and_assert_collection
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

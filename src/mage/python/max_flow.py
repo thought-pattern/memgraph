@@ -3,6 +3,7 @@ from math import floor, log2
 from typing import Dict, List
 
 import mgp
+
 from mage.max_flow.bfs_weight_min_max import BFS_find_weight_min_max
 
 

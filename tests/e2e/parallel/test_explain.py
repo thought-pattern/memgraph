@@ -1,7 +1,7 @@
 import sys
 
-import pytest
 from common import pq, setup_thread_count_db
+import pytest
 
 
 class TestParallelExplain:
