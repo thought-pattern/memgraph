@@ -192,6 +192,7 @@ memgraphCypherKeyword : cypherKeyword
                       | SCHEMA
                       | SECURITY
                       | SERVER
+                      | SERVER_SIDE_DESCRIPTIONS
                       | SERVER_SIDE_PARAMETERS
                       | SERVICE_URL
                       | SESSION
@@ -612,6 +613,7 @@ privilege : CREATE
           | IMPERSONATE_USER
           | PROFILE_RESTRICTION
           | PARALLEL_EXECUTION
+          | SERVER_SIDE_DESCRIPTIONS
           | SERVER_SIDE_PARAMETERS
           | RELOAD_TLS
           | COORDINATOR_READ

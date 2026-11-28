@@ -79,7 +79,7 @@ struct DurabilityThroughput {
 using StorageSnapshotResolver = std::function<std::optional<StorageSnapshot>(utils::UUID const &uuid)>;
 
 #ifdef MG_ENTERPRISE
-using InstanceStatusResolver = std::function<std::vector<coordination::InstanceStatus>()>;
+using InstanceStatusResolver = std::function<std::optional<std::vector<coordination::InstanceStatus>>()>;
 #endif
 
 struct GlobalMetricHandles {
@@ -237,6 +237,8 @@ class PrometheusMetrics {
   uint64_t UpdateAndGetPeakMemoryRes(uint64_t current) const;
   void ObserveSnapshotThroughput(std::string const &instance_name, double bytes_per_second);
   void ObserveWalThroughput(std::string const &instance_name, double bytes_per_second);
+  void ObserveSnapshotApplyLatency(std::string const &instance_name, double seconds);
+  void ObserveWalApplyLatency(std::string const &instance_name, double seconds);
 
   // Drops the per-instance replication throughput series (snapshot + WAL) for `instance_name`. Call when a replica is
   // unregistered so the throughput maps and the registry don't grow unbounded across the main's lifetime.
@@ -523,12 +525,16 @@ class PrometheusMetrics {
   prometheus::Family<prometheus::Histogram> &gc_skiplist_cleanup_latency_family_;
   prometheus::Family<prometheus::Counter> &gc_index_sweeps_family_;
 
-  // Global metric family — per-instance snapshot throughput (bytes/s)
+  // Global metric family — per-instance snapshot/WAL transfer throughput (bytes/s) and apply latency (seconds)
   prometheus::Family<prometheus::Histogram> &snapshot_throughput_family_;
   prometheus::Family<prometheus::Histogram> &wal_throughput_family_;
+  prometheus::Family<prometheus::Histogram> &snapshot_apply_latency_family_;
+  prometheus::Family<prometheus::Histogram> &wal_apply_latency_family_;
 
   DurabilityThroughput snapshot_throughput_;
   DurabilityThroughput wal_throughput_;
+  DurabilityThroughput snapshot_apply_latency_;
+  DurabilityThroughput wal_apply_latency_;
 
 #ifdef MG_ENTERPRISE
   // Global metric families — HA instance status
@@ -536,6 +542,8 @@ class PrometheusMetrics {
   prometheus::Family<prometheus::Gauge> &instance_is_leader_family_;
   prometheus::Family<prometheus::Gauge> &instance_is_main_family_;
   prometheus::Family<prometheus::Gauge> &instance_last_response_seconds_family_;
+  prometheus::Family<prometheus::Gauge> &instance_status_refresh_failed_family_;
+  prometheus::Gauge *instance_status_refresh_failed_{nullptr};
 
   struct {
     std::mutex mutex;

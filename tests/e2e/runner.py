@@ -11,14 +11,14 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from argparse import ArgumentParser
 import logging
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
-from argparse import ArgumentParser
-from pathlib import Path
 
 import interactive_mg_runner
 import yaml

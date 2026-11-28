@@ -110,6 +110,7 @@ enum class TypeId : uint64_t {
   ORDERBY_PARALLEL,
   CONDITIONAL,
   CACHE_PROPERTIES,
+  SCAN_ALL_BY_EDGE_ID,
 
   // Replication
   // NOTE: these NEED to be stable in the 2000+ range (see rpc version)

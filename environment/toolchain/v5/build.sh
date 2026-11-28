@@ -74,9 +74,6 @@ fi
 
 # Set the right operating system setup script.
 ENV_SCRIPT_RELATIVE="environment/os/$DISTRO.sh"
-if [[ "$for_arm" = true ]]; then
-    ENV_SCRIPT_RELATIVE="environment/os/$DISTRO-arm.sh"
-fi
 ENV_SCRIPT="$DIR/../../../$ENV_SCRIPT_RELATIVE"
 echo "ALL BUILD PACKAGES: $(${ENV_SCRIPT} list TOOLCHAIN_BUILD_DEPS)"
 ${ENV_SCRIPT} check TOOLCHAIN_BUILD_DEPS
@@ -107,6 +104,21 @@ if [ ! -d $PREFIX ] || [ ! -w $PREFIX ]; then
         fi
     done
 fi
+prev_stdcxx=""
+if [ -f "$PREFIX/.toolchain-stdcxx" ]; then
+    prev_stdcxx="$(cat "$PREFIX/.toolchain-stdcxx")"
+elif [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]; then
+    if [ -d "$PREFIX/include/c++/v1" ]; then
+        prev_stdcxx="libc++"
+    else
+        prev_stdcxx="libstdc++"
+    fi
+fi
+if [ -n "$prev_stdcxx" ] && [ "$prev_stdcxx" != "$TOOLCHAIN_STDCXX" ]; then
+    echo "TOOLCHAIN_STDCXX changed ($prev_stdcxx -> $TOOLCHAIN_STDCXX); cleaning $PREFIX..."
+    find "$PREFIX" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+printf '%s\n' "$TOOLCHAIN_STDCXX" > "$PREFIX/.toolchain-stdcxx"
 
 # create archives directory
 mkdir -p archives && pushd archives
@@ -129,9 +141,12 @@ fi
 if [ ! -d llvmorg-$LLVM_VERSION ]; then
     git clone --depth 1 --branch llvmorg-$LLVM_VERSION https://github.com/llvm/llvm-project.git llvmorg-$LLVM_VERSION
 fi
+PAHOLE_SHA256="7abd613e4dfabeb46d8ef312ef85b280808a369301db21cb7c2b76a6660b53de"
 if [ ! -f pahole-gdb-master.zip ]; then
-    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip
+    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip.tmp
+    mv -f pahole-gdb-master.zip.tmp pahole-gdb-master.zip
 fi
+echo "$PAHOLE_SHA256  pahole-gdb-master.zip" | sha256sum -c -
 if [ ! -f swig-$SWIG_VERSION.tar.gz ]; then
     wget https://github.com/swig/swig/archive/refs/tags/v$SWIG_VERSION.tar.gz -O swig-$SWIG_VERSION.tar.gz
 fi
@@ -307,7 +322,7 @@ if [ ! -f $PREFIX/bin/ld.gold ]; then
 fi
 
 log_tool_name "GDB $GDB_VERSION"
-if [[ ! -f "$PREFIX/bin/gdb" && "$DISTRO" -ne "amzn-2" ]]; then
+if [[ ! -f "$PREFIX/bin/gdb" && "$DISTRO" != "amzn-2" ]]; then
     if [ -d gdb-$GDB_VERSION ]; then
         rm -rf gdb-$GDB_VERSION
     fi
@@ -475,7 +490,7 @@ if [ ! -d swig-$SWIG_VERSION/install ]; then
 fi
 
 log_tool_name "LLVM $LLVM_VERSION"
-if [ ! -f $PREFIX/bin/clang ]; then
+if [[ ! -f "$PREFIX/bin/clang" || ( "$TOOLCHAIN_STDCXX" = "libc++" && ! -d "$PREFIX/include/c++/v1" ) ]]; then
     if [ -d llvmorg-$LLVM_VERSION ]; then
         rm -rf llvmorg-$LLVM_VERSION
     fi
@@ -779,26 +794,20 @@ cat libaio-CHECKSUMS | grep "SHA256 (libaio-$LIBAIO_VERSION.tar.gz)" | sha256sum
 if [ ! -f libevent-$LIBEVENT_VERSION.tar.gz.asc ]; then
     wget https://github.com/libevent/libevent/releases/download/release-$LIBEVENT_VERSION/libevent-$LIBEVENT_VERSION.tar.gz.asc
 fi
-if false; then
-    $GPG --keyserver $KEYSERVER --recv-keys 0x9E3AC83A27974B84D1B3401DB86086848EF8686D
-    $GPG --verify libevent-$LIBEVENT_VERSION.tar.gz.asc libevent-$LIBEVENT_VERSION.tar.gz
-fi
+$GPG --keyserver $KEYSERVER --recv-keys 0x9E3AC83A27974B84D1B3401DB86086848EF8686D
+$GPG --verify libevent-$LIBEVENT_VERSION.tar.gz.asc libevent-$LIBEVENT_VERSION.tar.gz
 # verify libsodium
 if [ ! -f libsodium-$LIBSODIUM_VERSION.tar.gz.sig ]; then
     curl https://download.libsodium.org/libsodium/releases/libsodium-$LIBSODIUM_VERSION.tar.gz.sig -o libsodium-$LIBSODIUM_VERSION.tar.gz.sig
 fi
-if false; then
-    $GPG --keyserver $KEYSERVER --recv-keys 0x0C7983A8FD9A104C623172CB62F25B592B6F76DA
-    $GPG --verify libsodium-$LIBSODIUM_VERSION.tar.gz.sig libsodium-$LIBSODIUM_VERSION.tar.gz
-fi
+$GPG --keyserver $KEYSERVER --recv-keys 0x0C7983A8FD9A104C623172CB62F25B592B6F76DA
+$GPG --verify libsodium-$LIBSODIUM_VERSION.tar.gz.sig libsodium-$LIBSODIUM_VERSION.tar.gz
 # verify libunwind
 if [ ! -f libunwind-$LIBUNWIND_VERSION.tar.gz.sig ]; then
     wget https://github.com/libunwind/libunwind/releases/download/v$LIBUNWIND_VERSION/libunwind-$LIBUNWIND_VERSION.tar.gz.sig
 fi
-if false; then
-    $GPG --keyserver $KEYSERVER --recv-keys 0x75D2CFC56CC2E935A4143297015A268A17D55FA4
-    $GPG --verify libunwind-$LIBUNWIND_VERSION.tar.gz.sig libunwind-$LIBUNWIND_VERSION.tar.gz
-fi
+$GPG --keyserver $KEYSERVER --recv-keys 0x75D2CFC56CC2E935A4143297015A268A17D55FA4
+$GPG --verify libunwind-$LIBUNWIND_VERSION.tar.gz.sig libunwind-$LIBUNWIND_VERSION.tar.gz
 # verify lz4
 echo "$LZ4_SHA256  lz4-$LZ4_VERSION.tar.gz" | sha256sum -c
 # verify proxygen
@@ -809,26 +818,20 @@ echo "$SNAPPY_SHA256  snappy-$SNAPPY_VERSION.tar.gz" | sha256sum -c
 if [ ! -f xz-$XZ_VERSION.tar.gz.sig ]; then
     wget https://tukaani.org/xz/xz-$XZ_VERSION.tar.gz.sig
 fi
-if false; then
-    $GPG --import ../xz_pgp.txt
-    $GPG --verify xz-$XZ_VERSION.tar.gz.sig xz-$XZ_VERSION.tar.gz
-fi
+$GPG --import ../xz_pgp.txt
+$GPG --verify xz-$XZ_VERSION.tar.gz.sig xz-$XZ_VERSION.tar.gz
 # verify zlib
 if [ ! -f zlib-$ZLIB_VERSION.tar.gz.asc ]; then
     wget https://zlib.net/zlib-$ZLIB_VERSION.tar.gz.asc
 fi
-if false; then
-    $GPG --keyserver $KEYSERVER --recv-keys 0x783FCD8E58BCAFBA
-    $GPG --verify zlib-$ZLIB_VERSION.tar.gz.asc zlib-$ZLIB_VERSION.tar.gz
-fi
+$GPG --keyserver $KEYSERVER --recv-keys 0x783FCD8E58BCAFBA
+$GPG --verify zlib-$ZLIB_VERSION.tar.gz.asc zlib-$ZLIB_VERSION.tar.gz
 #verify zstd
 if [ ! -f zstd-$ZSTD_VERSION.tar.gz.sig ]; then
     wget https://github.com/facebook/zstd/releases/download/v$ZSTD_VERSION/zstd-$ZSTD_VERSION.tar.gz.sig
 fi
-if false; then
-    $GPG --keyserver $KEYSERVER --recv-keys 0xEF8FE99528B52FFD
-    $GPG --verify zstd-$ZSTD_VERSION.tar.gz.sig zstd-$ZSTD_VERSION.tar.gz
-fi
+$GPG --keyserver $KEYSERVER --recv-keys 0xEF8FE99528B52FFD
+$GPG --verify zstd-$ZSTD_VERSION.tar.gz.sig zstd-$ZSTD_VERSION.tar.gz
 # verify wangle
 echo "$WANGLE_SHA256 wangle-$FBLIBS_VERSION.tar.gz" | sha256sum -c
 popd
@@ -1226,19 +1229,28 @@ popd
 mkdir -p output
 pushd output
 # Create the toolchain archive.
-if [ ! -f $NAME-binaries-$DISTRO_FULL_NAME.tar.gz ]; then
-    tar --owner=root --group=root -cpvzf $NAME-binaries-$DISTRO_FULL_NAME.tar.gz -C /opt $NAME
+ARCHIVE_FILE="$NAME-binaries-$DISTRO_FULL_NAME.tar.gz"
+if [ -f "$ARCHIVE_FILE" ] && ! (gzip -t "$ARCHIVE_FILE" >/dev/null 2>&1 && tar -tzf "$ARCHIVE_FILE" >/dev/null 2>&1); then
+    echo "Removing unreadable toolchain archive '$ARCHIVE_FILE' before rebuilding..."
+    rm -f "$ARCHIVE_FILE"
+fi
+if [ ! -f "$ARCHIVE_FILE" ]; then
+    rm -f "$ARCHIVE_FILE.tmp."*
+    tar --owner=root --group=root -cpvzf "$ARCHIVE_FILE.tmp.$$" -C /opt "$NAME"
+    gzip -t "$ARCHIVE_FILE.tmp.$$"
+    tar -tzf "$ARCHIVE_FILE.tmp.$$" >/dev/null
+    mv -f "$ARCHIVE_FILE.tmp.$$" "$ARCHIVE_FILE"
 else
-  echo "NOTE: Skipping archiving because the file already exists"
+    echo "NOTE: Skipping archiving because the file already exists"
 fi
 
 # output final instructions
 echo -e "\n\n"
 echo "All tools have been built. They are installed in '$PREFIX'."
-echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'build' directory."
+echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'output' directory."
 echo "If you want to install the packed tools you should execute the following command:"
 echo
-echo "    tar -xvzf output/$NAME-binaries.tar.gz -C /opt"
+echo "    tar -xvzf output/$ARCHIVE_FILE -C /opt"
 echo
 echo "Because the tools were built on this machine, you should probably change the permissions of the installation directory using:"
 echo

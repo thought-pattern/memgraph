@@ -78,6 +78,9 @@ class ModuleRegistry final {
   bool TryEraseAllModules();
 
   /// requires lock on registry
+  bool AreAnyCustomModulesInUse() const;
+
+  /// requires lock on registry
   bool RegisterModule(std::string_view name, std::unique_ptr<Module> module);
 
   /// requires lock
@@ -87,8 +90,8 @@ class ModuleRegistry final {
   /// @return Whether the module was loaded
   bool LoadModuleIfFound(const std::filesystem::path &modules_dir, std::string_view name);
 
-  /// requires lock on registry
-  void LoadModulesFromDirectory(const std::filesystem::path &modules_dir);
+  /// requires lock on registry; returns paths of module files that failed to load
+  std::vector<std::filesystem::path> LoadModulesFromDirectory(const std::filesystem::path &modules_dir);
 
  public:
   ModuleRegistry();
@@ -133,6 +136,12 @@ class ModuleRegistry final {
   bool RegisterMgProcedure(std::string_view name, mgp_proc proc);
 
   const std::filesystem::path &InternalModuleDir() const noexcept;
+
+  std::expected<std::string, std::string> ReadModuleFileContent(const std::filesystem::path &path) const;
+  std::expected<std::filesystem::path, std::string> CreateModuleFile(std::string_view filename,
+                                                                     std::string_view content);
+  std::expected<void, std::string> UpdateModuleFile(const std::filesystem::path &path, std::string_view content);
+  std::expected<void, std::string> DeleteModuleFile(const std::filesystem::path &path);
 
  private:
   std::vector<std::filesystem::path> modules_dirs_;

@@ -536,7 +536,8 @@ TypedValue Properties(const TypedValue *args, int64_t nargs, const FunctionConte
   });
 }
 
-TypedValue RandomUuid(const TypedValue * /*args*/, int64_t /*nargs*/, const FunctionContext &ctx) {
+TypedValue RandomUuid(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
+  FType<void>("randomUUID", args, nargs);
   return TypedValue(utils::GenerateUUID(), ctx.memory);
 }
 
@@ -564,8 +565,12 @@ TypedValue Size(const TypedValue *args, int64_t nargs, const FunctionContext &ct
 TypedValue PropertySize(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
   FType<Or<Null, Vertex, Edge>, Or<String>>("propertySize", args, nargs);
 
-  auto *dba = ctx.db_accessor;
+  const auto &graph_entity = args[0];
+  if (graph_entity.IsNull()) {
+    return TypedValue(ctx.memory);
+  }
 
+  auto *dba = ctx.db_accessor;
   const auto &property_name = args[1].ValueString();
   const auto maybe_property_id = dba->NameToPropertyIfExists(property_name);
 
@@ -573,12 +578,69 @@ TypedValue PropertySize(const TypedValue *args, int64_t nargs, const FunctionCon
     return TypedValue(0, ctx.memory);
   }
 
+  auto const *checker = ctx.auth_checker;
   uint64_t property_size = 0;
-  const auto &graph_entity = args[0];
   if (graph_entity.IsVertex()) {
-    property_size = graph_entity.ValueVertex().GetPropertySize(*maybe_property_id, ctx.view).value();
-  } else if (graph_entity.IsEdge()) {
-    property_size = graph_entity.ValueEdge().GetPropertySize(*maybe_property_id, ctx.view).value();
+    const auto &vertex = graph_entity.ValueVertex();
+    if (checker) {
+      auto maybe_labels = vertex.Labels(ctx.view);
+      if (!maybe_labels) {
+        ThrowVertexLabelsReadFailure(maybe_labels.error());
+      }
+      if (!checker->HasPropertyPermission(*maybe_labels, *maybe_property_id, AuthQuery::PropertyPermissionType::READ)) {
+        return TypedValue(0, ctx.memory);
+      }
+    }
+      auto maybe_size = vertex.GetPropertySize(*maybe_property_id, ctx.view);
+      if (!maybe_size) {
+        switch (maybe_size.error()) {
+          case storage::Error::DELETED_OBJECT:
+            throw QueryRuntimeException("Trying to get a property from a deleted object.");
+          case storage::Error::NONEXISTENT_OBJECT:
+            throw QueryRuntimeException("Trying to get a property from an object that doesn't exist.");
+          case storage::Error::SERIALIZATION_ERROR:
+          case storage::Error::VERTEX_HAS_EDGES:
+          case storage::Error::PROPERTIES_DISABLED:
+            throw QueryRuntimeException("Unexpected error when getting a property.");
+        }
+      }
+      property_size = *maybe_size;
+    } else if (graph_entity.IsEdge()) {
+      const auto &edge = graph_entity.ValueEdge();
+      if (checker &&
+          !checker->HasPropertyPermission(edge.EdgeType(), *maybe_property_id, AuthQuery::PropertyPermissionType::READ)) {
+        return TypedValue(0, ctx.memory);
+      }
+      auto maybe_size = edge.GetPropertySize(*maybe_property_id, ctx.view);
+      if (!maybe_size) {
+        switch (maybe_size.error()) {
+          case storage::Error::DELETED_OBJECT:
+            throw QueryRuntimeException("Trying to get a property from a deleted object.");
+          case storage::Error::NONEXISTENT_OBJECT:
+            throw QueryRuntimeException("Trying to get a property from an object that doesn't exist.");
+          case storage::Error::SERIALIZATION_ERROR:
+          case storage::Error::VERTEX_HAS_EDGES:
+          case storage::Error::PROPERTIES_DISABLED:
+            throw QueryRuntimeException("Unexpected error when getting a property.");
+        }
+      }
+      property_size = *maybe_size;
+  } else if (graph_entity.IsVirtualNode()) {
+    const auto val = graph_entity.ValueVirtualNode().GetProperty(*maybe_property_id);
+    if (!val.IsNull()) {
+      storage::PropertyStore temp_store;
+      std::map<storage::PropertyId, storage::PropertyValue> props{{*maybe_property_id, val}};
+      temp_store.InitProperties(props);
+      property_size = temp_store.PropertySize(*maybe_property_id);
+    }
+  } else if (graph_entity.IsVirtualEdge()) {
+    const auto val = graph_entity.ValueVirtualEdge().GetProperty(*maybe_property_id);
+    if (!val.IsNull()) {
+      storage::PropertyStore temp_store;
+      std::map<storage::PropertyId, storage::PropertyValue> props{{*maybe_property_id, val}};
+      temp_store.InitProperties(props);
+      property_size = temp_store.PropertySize(*maybe_property_id);
+    }
   }
 
   return TypedValue(static_cast<int64_t>(property_size), ctx.memory);
@@ -649,6 +711,10 @@ TypedValue IsEmpty(const TypedValue *args, int64_t nargs, const FunctionContext 
 TypedValue Degree(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
   FType<Or<Null, Vertex>>("degree", args, nargs);
   if (args[0].IsNull()) return TypedValue(ctx.memory);
+  if (args[0].IsVirtualNode()) {
+    const auto &vn = args[0].ValueVirtualNode();
+    return TypedValue(static_cast<int64_t>(vn.OutDegree() + vn.InDegree()), ctx.memory);
+  }
   const auto &vertex = args[0].ValueVertex();
   size_t out_degree = UnwrapDegreeResult(vertex.OutDegree(ctx.view));
   size_t in_degree = UnwrapDegreeResult(vertex.InDegree(ctx.view));
@@ -658,6 +724,9 @@ TypedValue Degree(const TypedValue *args, int64_t nargs, const FunctionContext &
 TypedValue InDegree(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
   FType<Or<Null, Vertex>>("inDegree", args, nargs);
   if (args[0].IsNull()) return TypedValue(ctx.memory);
+  if (args[0].IsVirtualNode()) {
+    return TypedValue(static_cast<int64_t>(args[0].ValueVirtualNode().InDegree()), ctx.memory);
+  }
   const auto &vertex = args[0].ValueVertex();
   size_t in_degree = UnwrapDegreeResult(vertex.InDegree(ctx.view));
   return TypedValue(static_cast<int64_t>(in_degree), ctx.memory);
@@ -666,6 +735,9 @@ TypedValue InDegree(const TypedValue *args, int64_t nargs, const FunctionContext
 TypedValue OutDegree(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
   FType<Or<Null, Vertex>>("outDegree", args, nargs);
   if (args[0].IsNull()) return TypedValue(ctx.memory);
+  if (args[0].IsVirtualNode()) {
+    return TypedValue(static_cast<int64_t>(args[0].ValueVirtualNode().OutDegree()), ctx.memory);
+  }
   const auto &vertex = args[0].ValueVertex();
   size_t out_degree = UnwrapDegreeResult(vertex.OutDegree(ctx.view));
   return TypedValue(static_cast<int64_t>(out_degree), ctx.memory);
@@ -748,8 +820,11 @@ std::pair<StringToInteger, int64_t> ParseInteger(std::string_view text) {
   // fewer significant digits than int64, so going through one would round large
   // values onto a neighbouring integer or off the end of the range.
   int64_t parsed{};
-  const auto *const begin = trimmed.data();
-  const auto *const end = begin + trimmed.size();
+  const auto unsigned_trimmed =
+      (trimmed.size() >= 2 && trimmed[0] == '+' && trimmed[1] >= '0' && trimmed[1] <= '9') ? trimmed.substr(1)
+                                                                                           : trimmed;
+  const auto *const begin = unsigned_trimmed.data();
+  const auto *const end = begin + unsigned_trimmed.size();
   if (const auto [stopped_at, ec] = std::from_chars(begin, end, parsed); stopped_at == end) {
     if (ec == std::errc{}) return {StringToInteger::kOk, parsed};
     if (ec == std::errc::result_out_of_range) return {StringToInteger::kOutOfRange, 0};
@@ -776,7 +851,7 @@ TypedValue ToInteger(const TypedValue *args, int64_t nargs, const FunctionContex
   if (value.IsNull()) {
     return TypedValue(ctx.memory);
   } else if (value.IsBool()) {
-    return TypedValue(value.ValueBool() ? 1L : 0L, ctx.memory);
+    return TypedValue(int64_t{value.ValueBool() ? 1 : 0}, ctx.memory);
   } else if (value.IsInt()) {
     return TypedValue(value, ctx.memory);
   } else if (value.IsDouble()) {
@@ -1146,18 +1221,34 @@ TypedValue Range(const TypedValue *args, int64_t nargs, const FunctionContext &c
   auto rbound = args[1].ValueInt();
   int64_t step = nargs == 3 ? args[2].ValueInt() : 1;
   TypedValue::TVector list(ctx.memory);
+  constexpr __int128 kMaxRangeElements =
+      static_cast<__int128>(std::numeric_limits<size_t>::max() / sizeof(TypedValue));
   if (lbound <= rbound && step > 0) {
-    int64_t n = ((rbound - lbound + 1) + (step - 1)) / step;
+    const __int128 span = static_cast<__int128>(rbound) - static_cast<__int128>(lbound);
+    const __int128 ustep = static_cast<__int128>(step);
+    const __int128 count128 = span / ustep + 1;
+    if (count128 > kMaxRangeElements) {
+      throw QueryRuntimeException("Range size exceeds maximum supported list length.");
+    }
+    const auto n = static_cast<size_t>(count128);
     list.reserve(n);
-    for (auto i = lbound; i <= rbound; i += step) {
-      list.emplace_back(i);
+    __int128 cur = lbound;
+    for (size_t idx = 0; idx < n; ++idx, cur += ustep) {
+      list.emplace_back(static_cast<int64_t>(cur));
     }
     MG_ASSERT(list.size() == n);
   } else if (lbound >= rbound && step < 0) {
-    int64_t n = ((lbound - rbound + 1) + (-step - 1)) / -step;
+    const __int128 span = static_cast<__int128>(lbound) - static_cast<__int128>(rbound);
+    const __int128 ustep = -static_cast<__int128>(step);
+    const __int128 count128 = span / ustep + 1;
+    if (count128 > kMaxRangeElements) {
+      throw QueryRuntimeException("Range size exceeds maximum supported list length.");
+    }
+    const auto n = static_cast<size_t>(count128);
     list.reserve(n);
-    for (auto i = lbound; i >= rbound; i += step) {
-      list.emplace_back(i);
+    __int128 cur = lbound;
+    for (size_t idx = 0; idx < n; ++idx, cur -= ustep) {
+      list.emplace_back(static_cast<int64_t>(cur));
     }
     MG_ASSERT(list.size() == n);
   }
@@ -1210,7 +1301,11 @@ TypedValue Abs(const TypedValue *args, int64_t nargs, const FunctionContext &ctx
   if (value.IsNull()) {
     return TypedValue(ctx.memory);
   } else if (value.IsInt()) {
-    return TypedValue(std::abs(value.ValueInt()), ctx.memory);
+    const auto v = value.ValueInt();
+    if (v == std::numeric_limits<int64_t>::min()) {
+      throw QueryRuntimeException("Integer overflow in 'abs': magnitude of {} exceeds signed 64-bit integer.", v);
+    }
+    return TypedValue(std::abs(v), ctx.memory);
   } else {
     return TypedValue(std::abs(value.ValueDouble()), ctx.memory);
   }
@@ -1367,7 +1462,14 @@ TypedValue Counter(const TypedValue *args, int64_t nargs, const FunctionContext 
 
   auto [it, inserted] = context.counters->emplace(args[0].ValueString(), args[1].ValueInt());
   auto value = it->second;
-  it->second += step;
+  int64_t next_value = 0;
+  if (__builtin_add_overflow(value, step, &next_value)) {
+    if (inserted) {
+      context.counters->erase(it);
+    }
+    throw QueryRuntimeException("Counter '{}' overflowed signed 64-bit integer range.", args[0].ValueString());
+  }
+  it->second = next_value;
 
   return TypedValue(value, context.memory);
 }
@@ -2013,24 +2115,34 @@ TypedValue Point(const TypedValue *args, int64_t nargs, const FunctionContext &c
     return std::nullopt;
   });
 
-  if (from_longitude != from_latitude) {
+  if (from_longitude != from_latitude || (z_opt.has_value() && z_opt->second != from_longitude)) {
     throw QueryRuntimeException("Use either x, y, z or longitude, latitude, height.");
   }
 
   auto crs = std::invoke([&]() -> std::optional<std::string_view> {
     auto value = input.find("crs");
-    if (value == input.end() || !value->second.IsString()) {
+    if (value == input.end()) {
       return std::nullopt;
+    }
+    if (!value->second.IsString()) {
+      throw QueryRuntimeException("Invalid CRS.");
     }
     return value->second.ValueString();
   });
 
-  auto srid = std::invoke([&]() -> std::optional<int> {
+  auto srid = std::invoke([&]() -> std::optional<storage::Srid> {
     auto value = input.find("srid");
-    if (value == input.end() || !value->second.IsInt()) {
+    if (value == input.end()) {
       return std::nullopt;
     }
-    return value->second.ValueInt();
+    if (!value->second.IsInt()) {
+      throw QueryRuntimeException("Invalid SRID.");
+    }
+    const auto raw_srid = value->second.ValueInt();
+    if (raw_srid < 0 || raw_srid > static_cast<int64_t>(std::numeric_limits<uint16_t>::max())) {
+      throw QueryRuntimeException("Invalid SRID.");
+    }
+    return storage::Srid{static_cast<uint16_t>(raw_srid)};
   });
 
   if (crs.has_value() && srid.has_value()) {
@@ -2044,13 +2156,13 @@ TypedValue Point(const TypedValue *args, int64_t nargs, const FunctionContext &c
       throw QueryRuntimeException("Invalid CRS.");
     }
   } else if (srid) {
-    mg_crs = storage::SridToCrs(static_cast<storage::Srid>(*srid));
+    mg_crs = storage::SridToCrs(*srid);
     if (!mg_crs) {
       throw QueryRuntimeException("Invalid SRID.");
     }
   }
 
-  auto inferred_as_wgs = (from_longitude || from_latitude);
+  auto inferred_as_wgs = (from_longitude || from_latitude || (z_opt.has_value() && z_opt->second));
   if (mg_crs && storage::IsCartesian(*mg_crs) && inferred_as_wgs) {
     throw QueryRuntimeException("Cartesian points must be constructed with x, y, z not longitude, latitude, height");
   }
@@ -2141,12 +2253,13 @@ TypedValue WithinBBox(const TypedValue *args, int64_t nargs, const FunctionConte
 }
 
 // Returns the current hops limit if set, otherwise null.
-TypedValue GetHopsCounter(const TypedValue * /*args*/, int64_t /*nargs*/, const FunctionContext &ctx) {
+TypedValue GetHopsCounter(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
+  FType<void>("getHopsCounter", args, nargs);
   return TypedValue(ctx.hops_counter, ctx.memory);
 }
 
-TypedValue Username(const TypedValue * /*args*/, int64_t /*nargs*/, const FunctionContext &ctx) {
-  FType<void>("username", /*args*/ nullptr, /*nargs*/ 0);
+TypedValue Username(const TypedValue *args, int64_t nargs, const FunctionContext &ctx) {
+  FType<void>("username", args, nargs);
   // In triggers, use triggering_user (invoker), otherwise use user_or_role
   const auto &user = ctx.triggering_user ? ctx.triggering_user : ctx.user_or_role;
   if (!user) {
@@ -2316,12 +2429,13 @@ auto UserFunction(const mgp_func &func, const std::string &fully_qualified_name)
   return [func, fully_qualified_name](const TypedValue *args, int64_t nargs, const FunctionContext &ctx) -> TypedValue {
     procedure::ValidateArguments(std::span(args, args + nargs), func, fully_qualified_name);
 
-    auto graph = mgp_graph::NonWritableGraph(*ctx.db_accessor, ctx.view);
+    auto graph = mgp_graph::NonWritableGraph(*ctx.db_accessor, ctx.view, ctx.auth_checker);
     auto function_argument_list = mgp_list(ctx.memory);
     procedure::ConstructArguments(std::span(args, args + nargs), func, function_argument_list, graph);
 
-    auto functx = mgp_func_context{ctx.db_accessor, ctx.view};
+    auto functx = mgp_func_context{ctx.db_accessor, ctx.view, ctx.auth_checker};
     auto maybe_res = mgp_func_result{};
+    maybe_res.db_accessor = ctx.db_accessor;
     auto memory = mgp_memory{ctx.memory};
     {
       const utils::MemoryTracker::RefusalHandledScope refusal_handled;

@@ -32,6 +32,7 @@
 #include "metrics/scoped_histogram_timer.hpp"
 #include "utils/likely.hpp"
 #include "utils/logging.hpp"
+#include "utils/on_scope_exit.hpp"
 
 namespace memgraph::io::network {
 
@@ -369,7 +370,25 @@ auto Socket::Write(const uint8_t *data, size_t len, bool have_more, std::optiona
   // connection dies mid-write, the socket will only return an EPIPE error.
   constexpr unsigned msg_nosignal = MSG_NOSIGNAL;
   constexpr unsigned msg_more = MSG_MORE;
-  const unsigned flags = msg_nosignal | (have_more ? msg_more : 0);
+  const auto deadline = timeout_ms
+                            ? std::make_optional(std::chrono::steady_clock::now() + std::chrono::milliseconds(*timeout_ms))
+                            : std::nullopt;
+  int orig_flags = -1;
+  if (deadline) {
+    orig_flags = fcntl(socket_, F_GETFL, 0);
+    if (orig_flags >= 0 && (orig_flags & O_NONBLOCK) == 0) {
+      if (fcntl(socket_, F_SETFL, orig_flags | O_NONBLOCK) < 0) {
+        orig_flags = -1;
+      }
+    }
+  }
+  auto restore_blocking = utils::OnScopeExit{[this, orig_flags] {
+    if (orig_flags >= 0 && (orig_flags & O_NONBLOCK) == 0 && socket_ >= 0) {
+      (void)fcntl(socket_, F_SETFL, orig_flags);
+    }
+  }};
+  const unsigned flags =
+      msg_nosignal | (have_more ? msg_more : 0U) | (deadline ? static_cast<unsigned>(MSG_DONTWAIT) : 0U);
   while (len > 0) {
     auto written = send(socket_, data, len, static_cast<int>(flags));
     if (written == -1) {
@@ -377,15 +396,21 @@ auto Socket::Write(const uint8_t *data, size_t len, bool have_more, std::optiona
         if (errno == ETIMEDOUT) {
           spdlog::warn("TCP_USER_TIMEOUT triggered on socket write (fd={}): unacknowledged data exceeded timeout",
                        socket_);
-        } else {
-          spdlog::warn("Socket write error (fd={}, errno={}): {}", socket_, errno, strerror(errno));
+          return std::unexpected{ClientCommunicationError::TIMEOUT_ERROR};
         }
+        spdlog::warn("Socket write error (fd={}, errno={}): {}", socket_, errno, strerror(errno));
         return std::unexpected{ClientCommunicationError::GENERIC_ERROR};
       }
-      // Non-fatal error, retry after the socket is ready. This is here to
-      // implement a non-busy wait. If we just continue with the loop we have a
-      // busy wait.
-      if (!WaitForReadyWrite(timeout_ms)) {
+      std::optional<int> wait_ms = std::nullopt;
+      if (deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= *deadline) {
+          return std::unexpected{ClientCommunicationError::TIMEOUT_ERROR};
+        }
+        wait_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now).count());
+      }
+      if (!WaitForReadyWrite(wait_ms)) {
         return std::unexpected{ClientCommunicationError::TIMEOUT_ERROR};
       }
     } else if (written == 0) {
@@ -490,6 +515,10 @@ bool Socket::WaitForReadyWrite(std::optional<int> timeout_ms) const {
   }
   if (ret == 0) {
     spdlog::error("Waiting too long to get in ready state for writing. Timeout occurred.");
+    return false;
+  }
+  constexpr unsigned poll_err_mask = POLLERR | POLLHUP | POLLNVAL;
+  if (static_cast<unsigned>(p.revents) & poll_err_mask) {
     return false;
   }
   constexpr unsigned pollout = POLLOUT;

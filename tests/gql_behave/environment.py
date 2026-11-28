@@ -58,6 +58,9 @@ def before_all(context):
 def before_scenario(context, scenario):
     context.test_parameters = TestParameters()
     context.exception = None
+    context.side_effect_deltas = None
+    context.installed_module_sources = {}
+    context.installed_module_paths = {}
 
 
 def after_step(context, step):

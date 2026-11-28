@@ -43,6 +43,7 @@ struct KnownLength {
 struct ExpressionAnalysis {
   std::optional<storage::ExternalPropertyValue> known_constant_value;
   std::optional<KnownLength> known_length;
+  bool has_impure{false};
 
   void merge(ExpressionAnalysis const &other);
 
@@ -114,6 +115,12 @@ struct analysis : analysis_variant {
         return expr->known_length->value;
     }
     return std::nullopt;
+  }
+
+  /// Whether evaluating this e-class can invoke a nondeterministic or side-effecting function.
+  [[nodiscard]] auto has_impure() const -> bool {
+    auto const *expr = expression();
+    return expr != nullptr && expr->has_impure;
   }
 };
 

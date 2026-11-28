@@ -34,7 +34,7 @@ constexpr const char *kAlgorithmIn = "in";
 
 void InsertDegreeCentralityRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, std::uint64_t node_id,
                                   double degree) {
-  auto *node = mg_utility::GetNodeForInsertion(static_cast<int>(node_id), graph, memory);
+  auto *node = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(node_id), graph, memory);
   if (!node) return;
 
   auto *record = mgp::result_new_record(result);

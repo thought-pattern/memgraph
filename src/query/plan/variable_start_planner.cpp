@@ -85,15 +85,24 @@ void AddNextExpansions(const Symbol &atom_symbol, const Matching &matching, cons
       bool can_flip = true;
       if (expansion.edge->filter_lambda_.accumulated_path) {
         can_flip = false;  // Path order matters when accumulated path is used
-      } else if (expansion.edge->filter_lambda_.expression && expansion.edge->filter_lambda_.inner_node) {
-        // When filter references inner_node (e.g. n.id <> 3), flipping is unsafe: both BFS and DFS
-        // only filter the node we expand TO, not the start vertex. When flipped, the new start is
-        // never filtered, so paths from filtered-out nodes can appear. See ExpandVariableCursor
-        // (DFS) try_expand and SingleSourceShortestPathCursor (BFS) expand_pair in operator.cpp.
-        UsedSymbolsCollector collector(symbol_table);
-        expansion.edge->filter_lambda_.expression->Accept(collector);
-        if (collector.symbols_.contains(symbol_table.at(*expansion.edge->filter_lambda_.inner_node))) {
-          can_flip = false;
+      } else {
+        if (expansion.edge->filter_lambda_.expression && expansion.edge->filter_lambda_.inner_node) {
+          // When filter references inner_node (e.g. n.id <> 3), flipping is unsafe: both BFS and DFS
+          // only filter the node we expand TO, not the start vertex. When flipped, the new start is
+          // never filtered, so paths from filtered-out nodes can appear. See ExpandVariableCursor
+          // (DFS) try_expand and SingleSourceShortestPathCursor (BFS) expand_pair in operator.cpp.
+          UsedSymbolsCollector collector(symbol_table);
+          expansion.edge->filter_lambda_.expression->Accept(collector);
+          if (collector.symbols_.contains(symbol_table.at(*expansion.edge->filter_lambda_.inner_node))) {
+            can_flip = false;
+          }
+        }
+        if (can_flip && expansion.edge->weight_lambda_.expression && expansion.edge->weight_lambda_.inner_node) {
+          UsedSymbolsCollector weight_collector(symbol_table);
+          expansion.edge->weight_lambda_.expression->Accept(weight_collector);
+          if (weight_collector.symbols_.contains(symbol_table.at(*expansion.edge->weight_lambda_.inner_node))) {
+            can_flip = false;
+          }
         }
       }
       if (is_expanding_from_node2 && can_flip) {

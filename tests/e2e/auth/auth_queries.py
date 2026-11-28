@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from common import memgraph, provide_user
 from gqlalchemy import Memgraph
+import pytest
 
 
 def test_user_creation(memgraph):

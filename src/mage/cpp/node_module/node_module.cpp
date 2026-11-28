@@ -46,6 +46,20 @@ extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *mem
         module,
         memory);
 
+    mgp::AddFunction(Node::RelationshipsExistFunc,
+                     Node::kProcedureRelationshipsExist,
+                     {mgp::Parameter(Node::kArgumentNodesRelationshipsExist, mgp::Type::Node),
+                      mgp::Parameter(Node::kArgumentRelationshipsRelationshipsExist, mgp::Type::Any)},
+                     module,
+                     memory);
+
+    mgp::AddFunction(Node::RelationshipExistsFunc,
+                     Node::kProcedureRelationshipExists,
+                     {mgp::Parameter(Node::kArgumentsNode, mgp::Type::Node),
+                      mgp::Parameter(Node::kArgumentsPattern, mgp::Type::Any, "")},
+                     module,
+                     memory);
+
     mgp::AddFunction(Node::DegreeIn,
                      Node::kFunctionDegreeIn,
                      {mgp::Parameter(Node::kDegreeInArg1, mgp::Type::Node),

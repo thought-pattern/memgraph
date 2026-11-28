@@ -9,19 +9,20 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import logging
-import os
-import time
-import itertools
-import subprocess
-import json
 from argparse import ArgumentParser
 from collections import defaultdict
+import itertools
+import json
+import logging
+import os
+from statistics import mean, median, stdev
+import subprocess
 import tempfile
-from statistics import median, mean, stdev
-from common import get_absolute_path, WALL_TIME, CPU_TIME, MAX_MEMORY, APOLLO
-from databases import Memgraph, Neo
+import time
+
 from clients import QueryClient
+from common import APOLLO, CPU_TIME, MAX_MEMORY, WALL_TIME, get_absolute_path
+from databases import Memgraph, Neo
 
 log = logging.getLogger(__name__)
 
@@ -237,7 +238,7 @@ class NeoRunner(_QueryRunner):
                           help="Path to neo config file")
         self.args, remaining_args = argp.parse_known_args(args)
         database = Neo(remaining_args, self.args.runner_config)
-        super(NeoRunner, self).__init__(remaining_args, database)
+        super(NeoRunner, self).__init__(remaining_args, database, 1)
 
 
 class NeoParallelRunner(_QueryRunner):
@@ -255,7 +256,7 @@ class NeoParallelRunner(_QueryRunner):
         assert not APOLLO or self.args.num_client_workers, \
                 "--client-num-clients is obligatory flag on apollo"
         database = Neo(remaining_args, self.args.runner_config)
-        super(NeoRunner, self).__init__(
+        super(NeoParallelRunner, self).__init__(
                 remaining_args, database, self.args.num_client_workers)
 
 

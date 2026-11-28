@@ -56,7 +56,11 @@ class PruningBFSRewriter final : public HierarchicalLogicalOperatorVisitor {
     // The whole predicate is in expression_, which is what the cursor evaluates.
     // all_filters_ describes it for the planner and is empty for some filters.
     CollectSymbolsFromExpression(op.expression_);
-    return true;
+    for (const auto &pattern_filter : op.pattern_filters_) {
+      VisitSubquery(*pattern_filter);
+    }
+    op.input_->Accept(*this);
+    return false;
   }
 
   bool PreVisit(ConstructNamedPath &op) override {
@@ -193,7 +197,7 @@ class PruningBFSRewriter final : public HierarchicalLogicalOperatorVisitor {
   bool PostVisit(Merge &) override { return true; }
 
   bool PreVisit(RollUpApply &op) override {
-    VisitSubquery(*op.list_collection_branch_);
+    VisitSubquery(*op.list_collection_branch_, op.fold_ == Fold::kBool);
     op.input_->Accept(*this);
     return false;
   }
@@ -212,7 +216,17 @@ class PruningBFSRewriter final : public HierarchicalLogicalOperatorVisitor {
 
   bool PostVisit(Conditional &) override { return true; }
 
-  bool PreVisit(EvaluatePatternFilter &) override { return true; }
+  bool PreVisit(EvaluatePatternFilter &op) override {
+    dedup_stack_.push_back(deduplicates_);
+    deduplicates_ = (op.fold_ == Fold::kBool);
+    return true;
+  }
+
+  bool PostVisit(EvaluatePatternFilter &) override {
+    deduplicates_ = dedup_stack_.back();
+    dedup_stack_.pop_back();
+    return true;
+  }
 
   bool PreVisit(Expand &) override { return true; }
 
@@ -278,9 +292,11 @@ class PruningBFSRewriter final : public HierarchicalLogicalOperatorVisitor {
   // A block raised inside the branch merges out for the same reason: it means an
   // operator there was never analysed, so the symbols it reads were never
   // recorded either, and the branch can read symbols the main pipeline binds.
-  void VisitSubquery(LogicalOperator &branch) {
+  void VisitSubquery(LogicalOperator &branch, bool branch_deduplicates = false) {
     auto saved_dedup = deduplicates_;
-    auto saved_stack = dedup_stack_;
+    auto saved_stack = std::move(dedup_stack_);
+    deduplicates_ = branch_deduplicates;
+    dedup_stack_.clear();
 
     branch.Accept(*this);
 

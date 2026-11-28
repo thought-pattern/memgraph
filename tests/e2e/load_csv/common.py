@@ -10,12 +10,12 @@
 # licenses/APL.txt.
 
 import os
-import typing
 from pathlib import Path
+import typing
 
+from gqlalchemy import Memgraph
 import mgclient
 import pytest
-from gqlalchemy import Memgraph
 
 
 def connect(**kwargs) -> mgclient.Connection:

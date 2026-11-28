@@ -11,9 +11,9 @@
 
 import sys
 
+from common import memgraph
 import mgclient
 import pytest
-from common import memgraph
 
 
 def test_label_index_hint(memgraph):

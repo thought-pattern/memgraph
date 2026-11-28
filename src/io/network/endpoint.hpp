@@ -70,7 +70,7 @@ class Endpoint {
   using RetValue = std::tuple<std::string, uint16_t, Endpoint::IpFamily>;
   static std::optional<RetValue> TryResolveAddress(std::string_view address, uint16_t port);
 
-  static auto ValidatePort(std::optional<uint16_t> port) -> bool;
+  static auto ParseValidatedPort(std::string_view port_str) -> std::optional<uint16_t>;
 
   std::string address_{};
   uint16_t port_{0};

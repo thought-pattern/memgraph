@@ -22,16 +22,16 @@ constexpr char const *kProcedureGet = "get";
 constexpr char const *kFieldVertex = "node";
 constexpr char const *kFieldComponentId = "component_id";
 
-void InsertWeaklyComponentResult(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const int component_id,
-                                 const int vertex_id) {
-  auto *vertex = mg_utility::GetNodeForInsertion(vertex_id, graph, memory);
+void InsertWeaklyComponentResult(mgp_graph *graph, mgp_result *result, mgp_memory *memory,
+                                 const std::uint64_t component_id, const std::uint64_t vertex_id) {
+  auto *vertex = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(vertex_id), graph, memory);
   if (!vertex) return;
 
   auto *record = mgp::result_new_record(result);
   if (record == nullptr) throw mg_exception::NotEnoughMemoryException();
 
   mg_utility::InsertNodeValueResult(record, kFieldVertex, vertex, memory);
-  mg_utility::InsertIntValueResult(record, kFieldComponentId, component_id, memory);
+  mg_utility::InsertIntValueResult(record, kFieldComponentId, static_cast<std::int64_t>(component_id), memory);
 }
 
 /// Finds weakly connected components of a graph.
@@ -73,11 +73,7 @@ void Weak(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_mem
 
     for (const auto [vertex_id, component_id] : vertex_component) {
       // Insert each weakly component record
-      InsertWeaklyComponentResult(memgraph_graph,
-                                  result,
-                                  memory,
-                                  static_cast<int>(component_id),
-                                  static_cast<int>(graph->GetMemgraphNodeId(vertex_id)));
+      InsertWeaklyComponentResult(memgraph_graph, result, memory, component_id, graph->GetMemgraphNodeId(vertex_id));
     }
   } catch (const std::exception &e) {
     // We must not let any exceptions out of our module.

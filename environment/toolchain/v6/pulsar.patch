@@ -55,8 +55,9 @@ index 508e4f4..87c5f2a 100644
      SharedBuffer decompressed = SharedBuffer::allocate(uncompressedSize);
  
 -    int result = LZ4_decompress_fast(encoded.data(), decompressed.mutableData(), uncompressedSize);
-+    int result = PULSAR_LZ4_decompress_fast(encoded.data(), decompressed.mutableData(), uncompressedSize);
-     if (result > 0) {
+-    if (result > 0) {
++    int result = PULSAR_LZ4_decompress_safe(encoded.data(), decompressed.mutableData(), encoded.readableBytes(), uncompressedSize);
++    if (result >= 0 && static_cast<uint32_t>(result) == uncompressedSize) {
          decompressed.bytesWritten(uncompressedSize);
          decoded = decompressed;
 diff --git a/pulsar-client-cpp/lib/lz4/lz4.c b/pulsar-client-cpp/lib/lz4/lz4.c

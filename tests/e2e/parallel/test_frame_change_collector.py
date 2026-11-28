@@ -29,8 +29,8 @@ Test patterns include:
 import sys
 from typing import Any, Dict, List
 
-import pytest
 from common import clear_database, pq, setup_thread_count_db
+import pytest
 
 # =============================================================================
 # Helper Functions

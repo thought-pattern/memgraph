@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 URI = "bolt://localhost:7687"
 AUTH = ("", "")

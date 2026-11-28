@@ -9,12 +9,15 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <range/v3/all.hpp>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "storage/v2/access_type.hpp"
@@ -44,6 +47,7 @@
 #include "utils/crc_accumulator.hpp"
 #include "utils/file_locker.hpp"
 #include "utils/logging.hpp"
+#include "utils/on_scope_exit.hpp"
 #include "utils/tag.hpp"
 #include "utils/variant_helpers.hpp"
 
@@ -423,7 +427,7 @@ template <bool is_read>
 auto Decode(utils::tag_type<uint16_t> /*unused*/, BaseDecoder *decoder, const uint64_t /*version*/)
     -> std::conditional_t<is_read, uint16_t, void> {
   const auto uint16 = decoder->ReadUint();
-  if (!uint16) throw RecoveryFailure(kInvalidWalErrorMessage);
+  if (!uint16 || *uint16 > std::numeric_limits<uint16_t>::max()) throw RecoveryFailure(kInvalidWalErrorMessage);
   if constexpr (is_read) {
     return static_cast<uint16_t>(*uint16);
   }
@@ -433,7 +437,7 @@ template <bool is_read>
 auto Decode(utils::tag_type<uint8_t> /*unused*/, BaseDecoder *decoder, const uint64_t /*version*/)
     -> std::conditional_t<is_read, uint8_t, void> {
   const auto uint8 = decoder->ReadUint();
-  if (!uint8) throw RecoveryFailure(kInvalidWalErrorMessage);
+  if (!uint8 || *uint8 > std::numeric_limits<uint8_t>::max()) throw RecoveryFailure(kInvalidWalErrorMessage);
 
   if constexpr (is_read) {
     return static_cast<uint8_t>(*uint8);
@@ -1009,11 +1013,13 @@ WalHeader DecodeWalHeader(Decoder &wal, const std::filesystem::path &path, uint6
 
     if (!from_timestamp || !to_timestamp || !num_deltas || !crc_trailer ||
         !utils::CrcAccumulator::Verify(wal.CrcAccValue())) {
-      throw RecoveryFailure("Durability mismatch in the summary of WAL file {}", path);
-    }
-
-    // A file that was never finalized has no summary to offer; its deltas have to be parsed.
-    if (*num_deltas != 0) {
+      spdlog::warn("Durability mismatch in the summary of WAL file {}; falling back to delta scan.", path);
+      header.summary = std::nullopt;
+      header.summary_corrupted = true;
+      if (!wal.SetPosition(header.offset_deltas)) {
+        throw RecoveryFailure(kInvalidWalErrorMessage);
+      }
+    } else if (*num_deltas != 0) {
       header.summary =
           WalSummary{.from_timestamp = *from_timestamp, .to_timestamp = *to_timestamp, .num_deltas = *num_deltas};
     }
@@ -1022,68 +1028,117 @@ WalHeader DecodeWalHeader(Decoder &wal, const std::filesystem::path &path, uint6
   return header;
 }
 
+bool IsInterruptedTwoPhaseCommitCrc(uint32_t const trailing_crc, uint64_t const bytes_after_commit_byte) {
+  constexpr auto old_value_byte = static_cast<uint8_t>(Marker::VALUE_FALSE);
+  constexpr auto new_value_byte = static_cast<uint8_t>(Marker::VALUE_TRUE);
+  constexpr auto delta = static_cast<unsigned char>(old_value_byte ^ new_value_byte);
+  constexpr unsigned char zero = 0;
+  auto const t_delta = static_cast<uint32_t>(crc32(0, &delta, 1) ^ crc32(0, &zero, 1));
+  auto const patched = utils::CrcAccumulator::PatchByte(trailing_crc, t_delta, bytes_after_commit_byte);
+  return utils::CrcAccumulator::Verify(patched);
+}
+
+struct ScannedWalResult {
+  WalInfo info{};
+  std::unordered_set<uint64_t> interrupted_2pc_txn_starts;
+};
+
 // Derives what the file holds by parsing every delta, and so also verifies every transaction's CRC. Expects the
 // decoder positioned at the first delta, as DecodeWalHeader leaves it.
-WalInfo ScanWalDeltas(Decoder &wal, uint64_t const version, WalHeader header) {
-  WalInfo info;
-  info.offset_metadata = header.offset_metadata;
-  info.offset_deltas = header.offset_deltas;
-  info.uuid = std::move(header.uuid);
-  info.epoch_id = std::move(header.epoch_id);
-  info.seq_num = header.seq_num;
+ScannedWalResult ScanWalDeltasDetailed(Decoder &wal, uint64_t const version, WalHeader header,
+                                       bool const strict_verification) {
+  if (strict_verification && header.summary_corrupted) {
+    throw RecoveryFailure("Durability mismatch in the summary of WAL file");
+  }
+  bool const finalized_extent = header.summary.has_value();
 
-  // Read deltas.
-  info.num_deltas = 0;
-  auto validate_delta = [&wal, version]() -> std::optional<std::pair<uint64_t, bool>> {
-    try {
-      auto timestamp = ReadWalDeltaHeader(&wal);
-      auto is_transaction_end = SkipWalDeltaData(&wal, version);
-      if (is_transaction_end) {
-        if (version >= kCrcProtection && !utils::CrcAccumulator::Verify(wal.CrcAccValue())) {
-          spdlog::error("Durability CRC mismatch");
-          return std::nullopt;
-        }
-        wal.ResetCrcAcc();
-      }
+  ScannedWalResult result;
+  result.info.offset_metadata = header.offset_metadata;
+  result.info.offset_deltas = header.offset_deltas;
+  result.info.uuid = std::move(header.uuid);
+  result.info.epoch_id = std::move(header.epoch_id);
+  result.info.seq_num = header.seq_num;
+  result.info.num_deltas = 0;
 
-      return {{timestamp, is_transaction_end}};
-    } catch (const RecoveryFailure &e) {
-      spdlog::error("Error occurred while reading WAL info: {}", e.what());
-      return std::nullopt;
-    }
-  };
-  auto size = wal.GetSize();
-  // CRC verification mirrors LoadWal. Parsing the magic, version, offsets and metadata sections above folded those
-  // bytes into the decoder's CRC accumulator; the position is now at the first delta, so reset the accumulator here.
-  // Each transaction's CRC is then computed over exactly its own byte range (txn start + deltas + transaction-end frame
-  // + CRC trailer), matching EncodeTransactionStart on the write side, and the accumulator is reset again after every
-  // verified transaction end below.
+  auto const size = wal.GetSize();
   wal.ResetCrcAcc();
   std::optional<uint64_t> current_timestamp;
+  std::optional<uint64_t> current_txn_start_pos;
+  std::optional<uint64_t> current_txn_commit_byte_pos;
   uint64_t num_deltas_in_txn = 0;
-  while (wal.GetPosition() < size) {
-    auto ret = validate_delta();
-    if (!ret) break;
-    auto [timestamp, is_end_of_transaction] = *ret;
-    if (!current_timestamp) current_timestamp = timestamp;
-    if (*current_timestamp != timestamp) break;
-    ++num_deltas_in_txn;
-    if (is_end_of_transaction) {
-      // Update from_timestamp only the 1st time
-      if (info.num_deltas == 0) {
-        info.from_timestamp = timestamp;
-      }
+  bool stopped_at_truncated_tail = false;
 
-      info.to_timestamp = timestamp;
-      info.num_deltas += num_deltas_in_txn;
-      current_timestamp = std::nullopt;
-      num_deltas_in_txn = 0;
+  while (wal.GetPosition() < size) {
+    wal.ClearTruncatedRead();
+    auto const delta_start_pos = wal.GetPosition();
+    try {
+      auto const timestamp = ReadWalDeltaHeader(&wal);
+      if (!current_timestamp.has_value() && version >= kTxnStart) {
+        current_txn_start_pos = delta_start_pos;
+        auto const next_marker = wal.PeekMarker();
+        if (next_marker && *next_marker == Marker::DELTA_TRANSACTION_START) {
+          current_txn_commit_byte_pos = wal.GetPosition() + 2;
+        } else {
+          current_txn_commit_byte_pos = std::nullopt;
+        }
+      }
+      auto const is_end_of_transaction = SkipWalDeltaData(&wal, version);
+      if (current_timestamp.has_value() && *current_timestamp != timestamp) {
+        throw RecoveryFailure("WAL transaction timestamp mismatch");
+      }
+      if (!current_timestamp.has_value()) {
+        current_timestamp = timestamp;
+      }
+      ++num_deltas_in_txn;
+
+      if (is_end_of_transaction) {
+        if (version >= kCrcProtection && !utils::CrcAccumulator::Verify(wal.CrcAccValue())) {
+          if (!finalized_extent && !strict_verification && current_txn_commit_byte_pos.has_value() &&
+              IsInterruptedTwoPhaseCommitCrc(wal.CrcAccValue(),
+                                             wal.GetPosition() - (*current_txn_commit_byte_pos + 1))) {
+            result.interrupted_2pc_txn_starts.insert(*current_txn_start_pos);
+          } else {
+            throw RecoveryFailure("Durability CRC mismatch in WAL file");
+          }
+        }
+        wal.ResetCrcAcc();
+        if (result.info.num_deltas == 0) {
+          result.info.from_timestamp = timestamp;
+        }
+        result.info.to_timestamp = timestamp;
+        result.info.num_deltas += num_deltas_in_txn;
+        current_timestamp = std::nullopt;
+        current_txn_start_pos = std::nullopt;
+        current_txn_commit_byte_pos = std::nullopt;
+        num_deltas_in_txn = 0;
+      }
+    } catch (const RecoveryFailure &e) {
+      if (finalized_extent || !wal.TruncatedRead()) {
+        spdlog::error("Error occurred while reading WAL info: {}", e.what());
+        throw;
+      }
+      stopped_at_truncated_tail = true;
+      break;
     }
   }
 
-  if (info.num_deltas == 0) throw RecoveryFailure(kInvalidWalErrorMessage);
+  if (finalized_extent) {
+    if (current_timestamp.has_value() || wal.GetPosition() != size ||
+        result.info.num_deltas != header.summary->num_deltas ||
+        result.info.from_timestamp != header.summary->from_timestamp ||
+        result.info.to_timestamp != header.summary->to_timestamp) {
+      throw RecoveryFailure(kInvalidWalErrorMessage);
+    }
+  }
 
-  return info;
+  if (result.info.num_deltas == 0) {
+    if (!finalized_extent && !strict_verification && (size == result.info.offset_deltas || stopped_at_truncated_tail)) {
+      throw RecoveryFailure("No complete transactions in unfinalized WAL");
+    }
+    throw RecoveryFailure(kInvalidWalErrorMessage);
+  }
+
+  return result;
 }
 
 }  // namespace
@@ -1099,7 +1154,7 @@ WalInfo ReadWalInfo(const std::filesystem::path &path) {
   Decoder wal;
   uint64_t version{};
   auto header = DecodeWalHeader(wal, path, version);
-  return ScanWalDeltas(wal, version, std::move(header));
+  return ScanWalDeltasDetailed(wal, version, std::move(header), true).info;
 }
 
 WalInfo ReadWalContents(const std::filesystem::path &path, std::optional<WalHeader> known_header) {
@@ -1127,7 +1182,7 @@ WalInfo ReadWalContents(const std::filesystem::path &path, std::optional<WalHead
     wal.SetPosition(header.offset_deltas);
   }
 
-  return ScanWalDeltas(wal, version, std::move(header));
+  return ScanWalDeltasDetailed(wal, version, std::move(header), false).info;
 }
 
 // Function used to read the WAL delta header. The function returns the delta
@@ -1386,13 +1441,16 @@ std::optional<RecoveryInfo> LoadWal(
   // the last whole transaction and replay stops there.
   uint64_t to_timestamp{0};
   uint64_t num_deltas{0};
+  std::unordered_set<uint64_t> interrupted_2pc_txn_starts;
   if (header.summary) {
     to_timestamp = header.summary->to_timestamp;
     num_deltas = header.summary->num_deltas;
   } else {
-    auto const info = ReadWalInfo(path);
-    to_timestamp = info.to_timestamp;
-    num_deltas = info.num_deltas;
+    wal.SetPosition(header.offset_deltas);
+    auto scanned = ScanWalDeltasDetailed(wal, version, header, false);
+    to_timestamp = scanned.info.to_timestamp;
+    num_deltas = scanned.info.num_deltas;
+    interrupted_2pc_txn_starts = std::move(scanned.interrupted_2pc_txn_starts);
   }
 
   // Check timestamp.
@@ -1408,11 +1466,20 @@ std::optional<RecoveryInfo> LoadWal(
   // WAL files after this one then build on, which is a wrong dataset rather than a stale one.
   wal.SetPosition(header.offset_deltas);
   wal.ResetCrcAcc();
-  auto const verify_txn_crc = [&wal, &path, version](bool const is_transaction_end) {
+  bool active_txn_interrupted_2pc = false;
+  std::optional<uint64_t> active_txn_commit_byte_pos;
+  auto const verify_txn_crc = [&wal, &path, version, &active_txn_interrupted_2pc, &active_txn_commit_byte_pos](
+                                  bool const is_transaction_end) {
     if (!is_transaction_end) return;
     if (version >= kCrcProtection && !utils::CrcAccumulator::Verify(wal.CrcAccValue())) {
-      throw RecoveryFailure("Durability CRC mismatch in WAL file {}", path);
+      if (!(active_txn_interrupted_2pc && active_txn_commit_byte_pos.has_value() &&
+            IsInterruptedTwoPhaseCommitCrc(wal.CrcAccValue(),
+                                           wal.GetPosition() - (*active_txn_commit_byte_pos + 1)))) {
+        throw RecoveryFailure("Durability CRC mismatch in WAL file {}", path);
+      }
     }
+    active_txn_interrupted_2pc = false;
+    active_txn_commit_byte_pos = std::nullopt;
     wal.ResetCrcAcc();
   };
 
@@ -1439,6 +1506,17 @@ std::optional<RecoveryInfo> LoadWal(
   };
 
   std::unordered_map<Gid, EdgeRecoveryCacheEntry> edge_recovery_cache;
+  if (items.properties_on_edges && items.storage_light_edge) {
+    for (auto &existing_vertex : vertex_acc) {
+      for (auto const &[existing_type, existing_to, existing_ref] : existing_vertex.out_edges) {
+        edge_recovery_cache.insert_or_assign(existing_ref.ptr->gid,
+                                             EdgeRecoveryCacheEntry{.edge_ref = existing_ref,
+                                                                    .edge_type = existing_type,
+                                                                    .from_vertex = &existing_vertex,
+                                                                    .to_vertex = existing_to});
+      }
+    }
+  }
 
   auto delta_apply = utils::Overloaded{
       [&](WalVertexCreate const &data) {
@@ -1515,6 +1593,11 @@ std::optional<RecoveryInfo> LoadWal(
         auto edge_ref = std::invoke([&]() -> EdgeRef {
           if (items.properties_on_edges) {
             if (items.storage_light_edge) {
+              if (edge_recovery_cache.contains(data.gid)) {
+                throw RecoveryFailure("The light edge with gid {} already exists! Current ldt is: {}",
+                                      data.gid.AsUint(),
+                                      ret->last_durable_timestamp);
+              }
               auto *edge_ptr = InMemoryStorage::LightEdgePool::Create(data.gid, nullptr);
               if (!edge_ptr)
                 throw RecoveryFailure("Failed to allocate a light edge! Current ldt is: {}",
@@ -1528,20 +1611,33 @@ std::optional<RecoveryInfo> LoadWal(
           }
           return EdgeRef{data.gid};
         });
+        bool linked_out = false;
+        bool linked_in = false;
+        bool committed_light_edge = false;
+        utils::OnScopeExit const light_edge_guard([&]() noexcept {
+          if (items.properties_on_edges && items.storage_light_edge && !committed_light_edge) {
+            if (linked_in) {
+              to_vertex->in_edges.pop_back();
+            }
+            if (linked_out) {
+              from_vertex->out_edges.pop_back();
+            }
+            edge_recovery_cache.erase(data.gid);
+            InMemoryStorage::LightEdgePool::Destroy(edge_ref.ptr);
+          }
+        });
         auto out_link = std::tuple{edge_type_id, &*to_vertex, edge_ref};
         if (r::contains(from_vertex->out_edges, out_link)) {
-          // The light edge is not yet wired into any vertex adjacency, so the constructor's
-          // ClearLightEdges() catch-net (which walks out_edges/graveyard/deleted_edges_) cannot
-          // reach it — free it here to avoid leaking the pool Edge* on this corrupt-WAL path.
-          if (items.storage_light_edge) InMemoryStorage::LightEdgePool::Destroy(edge_ref.ptr);
           throw RecoveryFailure("The from vertex already has this edge! Current ldt is: {}",
                                 ret->last_durable_timestamp);
         }
         from_vertex->out_edges.push_back(out_link);
+        linked_out = true;
         auto in_link = std::tuple{edge_type_id, &*from_vertex, edge_ref};
         if (r::contains(to_vertex->in_edges, in_link))
           throw RecoveryFailure("The to vertex already has this edge! Current ldt is: {}", ret->last_durable_timestamp);
         to_vertex->in_edges.push_back(in_link);
+        linked_in = true;
 
         ret->next_edge_id = std::max(ret->next_edge_id, data.gid.AsUint() + 1);
 
@@ -1558,6 +1654,7 @@ std::optional<RecoveryInfo> LoadWal(
         if (schema_info) {
           schema_info->CreateEdge(&*from_vertex, &*to_vertex, edge_type_id);
         }
+        committed_light_edge = true;
       },
       [&](WalEdgeDelete const &data) {
         const auto from_vertex = vertex_acc.find(data.from_vertex);
@@ -2047,10 +2144,21 @@ std::optional<RecoveryInfo> LoadWal(
         }
       },
       [&](WalVectorIndexCreate const &data) {
+        if (data.dimension == 0 || data.resize_coefficient == 0) {
+          throw RecoveryFailure(kInvalidWalErrorMessage);
+        }
         const auto property_id = PropertyId::FromUint(name_id_mapper->NameToId(data.property));
-        const auto unum_metric_kind = MetricFromName(data.metric_kind);
-        const auto scalar_kind = data.scalar_kind ? static_cast<unum::usearch::scalar_kind_t>(*data.scalar_kind)
-                                                  : unum::usearch::scalar_kind_t::f32_k;
+        unum::usearch::metric_kind_t unum_metric_kind{};
+        unum::usearch::scalar_kind_t scalar_kind = unum::usearch::scalar_kind_t::f32_k;
+        try {
+          unum_metric_kind = MetricFromName(data.metric_kind);
+          if (data.scalar_kind) {
+            scalar_kind = static_cast<unum::usearch::scalar_kind_t>(*data.scalar_kind);
+            (void)NameFromScalar(scalar_kind);
+          }
+        } catch (const VectorSearchException &e) {
+          throw RecoveryFailure("Invalid vector index metadata in WAL: {}", e.what());
+        }
         std::vector<LabelId> labels;
         labels.reserve(data.label_filter.ids.size());
         for (const auto &name : data.label_filter.ids) {
@@ -2069,9 +2177,18 @@ std::optional<RecoveryInfo> LoadWal(
         indices_constraints->indices.vector_indices.emplace_back(VectorIndexRecoveryInfo{.spec = spec});
       },
       [&](WalVectorEdgeIndexCreate const &data) {
+        if (data.dimension == 0 || data.resize_coefficient == 0) {
+          throw RecoveryFailure(kInvalidWalErrorMessage);
+        }
         const auto property_id = PropertyId::FromUint(name_id_mapper->NameToId(data.property));
-        const auto unum_metric_kind = MetricFromName(data.metric_kind);
+        unum::usearch::metric_kind_t unum_metric_kind{};
         const auto scalar_kind = static_cast<unum::usearch::scalar_kind_t>(data.scalar_kind);
+        try {
+          unum_metric_kind = MetricFromName(data.metric_kind);
+          (void)NameFromScalar(scalar_kind);
+        } catch (const VectorSearchException &e) {
+          throw RecoveryFailure("Invalid vector edge index metadata in WAL: {}", e.what());
+        }
         std::vector<EdgeTypeId> edge_types;
         edge_types.reserve(data.edge_type_filter.ids.size());
         for (const auto &name : data.edge_type_filter.ids) {
@@ -2225,15 +2342,22 @@ std::optional<RecoveryInfo> LoadWal(
   };
 
   for (uint64_t i = 0; i < num_deltas; ++i) {
+    auto const delta_start_pos = wal.GetPosition();
     // Read WAL delta header to find out the delta timestamp.
-    if (auto delta_ts = ReadWalDeltaHeader(&wal);
-        (!last_applied_delta_timestamp || delta_ts > *last_applied_delta_timestamp)) {
+    auto const delta_ts = ReadWalDeltaHeader(&wal);
+    if (interrupted_2pc_txn_starts.contains(delta_start_pos)) {
+      active_txn_interrupted_2pc = true;
+      active_txn_commit_byte_pos = wal.GetPosition() + 2;
+    }
+    if (!last_applied_delta_timestamp || delta_ts > *last_applied_delta_timestamp) {
       // This delta should be loaded.
       auto delta = ReadWalDeltaData(&wal, version);
       // We should always check if the delta is WalTransactionStart to update should_commit
       if (auto *txn_start = std::get_if<WalTransactionStart>(&delta.data_)) {
-        should_commit = txn_start->commit.value_or(true);
-        ++deltas_applied;
+        should_commit = active_txn_interrupted_2pc ? false : txn_start->commit.value_or(true);
+        if (!active_txn_interrupted_2pc) {
+          ++deltas_applied;
+        }
       } else if (should_commit) {
         // First delta which is not WalTransactionStart -> allocate RecoveryInfo
         if (!ret) {
@@ -2276,7 +2400,6 @@ WalFile::WalFile(const std::filesystem::path &wal_directory, utils::UUID const &
                  utils::FileRetainer *file_retainer)
     : items_(items),
       name_id_mapper_(name_id_mapper),
-      path_(wal_directory / MakeWalName()),
       from_timestamp_(0),
       to_timestamp_(0),
       count_(0),
@@ -2285,8 +2408,19 @@ WalFile::WalFile(const std::filesystem::path &wal_directory, utils::UUID const &
   // Ensure that the storage directory exists.
   utils::EnsureDirOrDie(wal_directory);
 
-  // Initialize the WAL file.
-  MG_ASSERT(wal_.Initialize(path_, kWalMagic, kVersion), "Failed to open WAL file {}", path_);
+  // Initialize a fresh WAL file exclusively so a clock collision never overwrites an existing log.
+  auto const date_str = utils::Timestamp::Now().ToString(kTimestampFormat);
+  for (uint64_t collision_index = 0;; ++collision_index) {
+    auto candidate = wal_directory / MakeWalNameForDate(date_str, collision_index);
+    if (std::filesystem::exists(candidate)) {
+      continue;
+    }
+    if (wal_.InitializeNew(candidate, kWalMagic, kVersion)) {
+      path_ = std::move(candidate);
+      break;
+    }
+    MG_ASSERT(std::filesystem::exists(candidate), "Failed to open WAL file {}", candidate);
+  }
 
   wal_.WriteMarker(Marker::SECTION_OFFSETS);
   auto const crc_header_prefix = wal_.CrcAccValue();
@@ -2369,10 +2503,11 @@ void WalFile::FinalizeWal() {
     // The WAL crashes on a failed write, so this never reports an error.
     std::ignore = wal_.Finalize();
     wal_.Close();
-    // Rename file.
+    // Rename file and update path_ only when the rename actually succeeds.
     std::filesystem::path new_path(RemakeWalName(path_, from_timestamp_, to_timestamp_));
-    file_retainer_->RenameFile(path_, new_path);
-    path_ = std::move(new_path);
+    if (file_retainer_->RenameFile(path_, new_path)) {
+      path_ = std::move(new_path);
+    }
   }
 }
 
@@ -2410,10 +2545,6 @@ void WalFile::UpdateCommitStatus(WalTxnDataPos const &wal_positions) {
   // below before it seeks, so the patch lands at the right offset.
   auto const end_pos = wal_.GetPosition();
 
-  // Flip the commit flag inside the already-written transaction-start frame.
-  wal_.SetPosition(wal_positions.commit_flag_wal_position_);
-  wal_.WriteBool(true);
-
   constexpr auto old_value_byte = static_cast<uint8_t>(Marker::VALUE_FALSE);
   constexpr auto new_value_byte = static_cast<uint8_t>(Marker::VALUE_TRUE);
   constexpr auto delta = static_cast<unsigned char>(old_value_byte ^ new_value_byte);
@@ -2427,10 +2558,14 @@ void WalFile::UpdateCommitStatus(WalTxnDataPos const &wal_positions) {
   auto const bytes_after = wal_positions.crc_wal_pos_ - changed_byte_pos;
   auto const new_crc = utils::CrcAccumulator::PatchByte(wal_positions.stored_crc_, t_delta, bytes_after);
 
-  // Overwrite the stored CRC value in place.
+  // Overwrite the stored CRC trailer first so an interruption before flipping the commit byte leaves VALUE_FALSE.
   wal_.WriteCrcAt(wal_positions.crc_wal_pos_, new_crc);
 
-  // Restore the append position; seeking flushes the rewritten CRC to disk.
+  // Flip the commit flag inside the already-written transaction-start frame.
+  wal_.SetPosition(wal_positions.commit_flag_wal_position_);
+  wal_.WriteBool(true);
+
+  // Restore the append position; seeking flushes the rewritten commit flag to disk.
   wal_.SetPosition(end_pos);
 }
 
@@ -2731,10 +2866,16 @@ auto UpgradeForNestedIndices(CompositeStr v) -> std::vector<PathStr> {
 };
 
 auto CompositePropertyPaths::convert(NameIdMapper *mapper) const -> std::vector<PropertyPath> {
+  if (property_paths_.empty()) {
+    throw RecoveryFailure(kInvalidWalErrorMessage);
+  }
   auto to_propertyid = [&](std::string_view prop_name) -> PropertyId {
     return PropertyId::FromUint(mapper->NameToId(prop_name));
   };
   auto to_path = [&](PathStr const &path) -> PropertyPath {
+    if (path.empty()) {
+      throw RecoveryFailure(kInvalidWalErrorMessage);
+    }
     return PropertyPath{path | rv::transform(to_propertyid) | r::to_vector};
   };
   return property_paths_ | rv::transform(to_path) | r::to_vector;

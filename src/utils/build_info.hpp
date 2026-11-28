@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <span>
 #include <string>
 
 namespace memgraph::utils {
@@ -22,6 +23,10 @@ struct BuildInfo {
 };
 
 BuildInfo GetBuildInfo();
+
+// Parses a raw ELF PT_NOTE segment and returns the hex-encoded GNU build-id, or
+// empty if absent or truncated.
+std::string ParseElfNoteSegmentBuildId(std::span<const unsigned char> segment);
 
 // Hex-encoded GNU build-id of the running executable, or empty if absent. Used to
 // match a stripped binary to its debug-symbol sidecar when symbolizing.

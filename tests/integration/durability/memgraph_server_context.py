@@ -1,10 +1,10 @@
+from contextlib import contextmanager
 import logging
+from pathlib import Path
 import signal
 import socket
 import subprocess
 import time
-from contextlib import contextmanager
-from pathlib import Path
 
 
 def is_port_free(port: int, host: str = "127.0.0.1") -> bool:

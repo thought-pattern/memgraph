@@ -263,6 +263,10 @@ template <typename Symbol, typename Analysis, bool DevMode>
 void VMExecutor<Symbol, Analysis, DevMode>::execute(CompiledMatcher<Symbol> const &pattern,
                                                     MatcherIndex<Symbol, Analysis> &index, MatchArena &arena,
                                                     std::vector<PatternMatch> &results, RootRestriction roots) {
+  if constexpr (DevMode) {
+    collector_.reset();
+  }
+
   // Pattern with no slots has nothing to bind - skip execution
   if (pattern.num_slots() == 0) return;
 
@@ -273,9 +277,6 @@ void VMExecutor<Symbol, Analysis, DevMode>::execute(CompiledMatcher<Symbol> cons
   active_root_set_ = roots.matches_all() ? nullptr : &roots.restricted_roots();
 
   state_.reset(pattern.state_config());
-  if constexpr (DevMode) {
-    collector_.reset();
-  }
   code_ = pattern.code();
   symbols_ = pattern.symbols();
 

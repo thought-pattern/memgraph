@@ -450,6 +450,35 @@ std::vector<std::vector<memgraph::query::TypedValue>> ShowPropertyPermissions(
   return result;
 }
 
+std::vector<std::vector<memgraph::query::TypedValue>> ShowScopedUserPropertyPermissions(
+    memgraph::auth::User const &user, std::optional<std::string_view> db_name = std::nullopt) {
+  if (!memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+    return {};
+  }
+  if (db_name && !user.HasAccess(*db_name)) {
+    return {};
+  }
+
+  auto result = ShowPropertyPermissions(user.property_access_handler(), "USER");
+
+  memgraph::auth::PropertyAccessPermissions role_label_perms{};
+  memgraph::auth::PropertyAccessPermissions role_edge_perms{};
+  bool has_scoped_role = false;
+  for (auto const &role : user.roles()) {
+    if (!db_name || role.HasAccess(*db_name)) {
+      role_label_perms = Merge(role_label_perms, role.property_access_handler().label_properties());
+      role_edge_perms = Merge(role_edge_perms, role.property_access_handler().edge_type_properties());
+      has_scoped_role = true;
+    }
+  }
+  if (has_scoped_role) {
+    EmitPropertyPermissions(role_label_perms, memgraph::auth::PropertyEntityKind::NODE, "ROLE", result);
+    EmitPropertyPermissions(role_edge_perms, memgraph::auth::PropertyEntityKind::EDGE, "ROLE", result);
+  }
+  DeduplicatePermissionRows(result);
+  return result;
+}
+
 // Converting values from query to user profile framework
 memgraph::auth::UserProfiles::Limits name_to_limit(const auto &name) {
   auto it = std::find(memgraph::auth::UserProfiles::kLimits.begin(), memgraph::auth::UserProfiles::kLimits.end(), name);
@@ -492,12 +521,15 @@ auto convert_limit_value(const memgraph::auth::UserProfiles::Profile &profile) {
       limit_value_result.quantity.value = std::get<uint64_t>(limit_value);
     } else if (limit_type == memgraph::auth::UserProfiles::Limits::kTransactionsMemory) {
       limit_value_result.type = memgraph::query::UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT;
-      if (std::get<uint64_t>(limit_value) >= 1024UL * 1024UL) {  // Convert to MB
-        limit_value_result.mem_limit.value = std::get<uint64_t>(limit_value) / 1024 / 1024;
-        limit_value_result.mem_limit.scale = 1024UL * 1024UL;
-      } else {  // Convert to KB
-        limit_value_result.mem_limit.value = std::get<uint64_t>(limit_value) / 1024;
-        limit_value_result.mem_limit.scale = 1024;
+      const auto bytes = std::get<uint64_t>(limit_value);
+      constexpr uint64_t kMegabyte = 1024UL * 1024UL;
+      constexpr uint64_t kKilobyte = 1024UL;
+      if (bytes >= kMegabyte && bytes % kMegabyte == 0) {  // Exact MB multiple
+        limit_value_result.mem_limit.value = bytes / kMegabyte;
+        limit_value_result.mem_limit.scale = kMegabyte;
+      } else {  // Convert to KB so fractional MB limits are not rounded down
+        limit_value_result.mem_limit.value = bytes / kKilobyte;
+        limit_value_result.mem_limit.scale = kKilobyte;
       }
     }
     query_profile.emplace_back(memgraph::auth::UserProfiles::kLimits[static_cast<int>(limit_type)], limit_value_result);
@@ -898,19 +930,26 @@ std::vector<query::RolenameResult> AuthQueryHandler::GetRolenamesForUser(
 
 std::vector<memgraph::query::TypedValue> AuthQueryHandler::GetUsernamesForRole(
     const std::string &rolename, memgraph::auth::AuthTransaction *auth_tx) {
+  return GetUsernamesForRoleWithDiagnostics(rolename, auth_tx).usernames;
+}
+
+query::RoleMemberNamesResult AuthQueryHandler::GetUsernamesForRoleWithDiagnostics(
+    const std::string &rolename, memgraph::auth::AuthTransaction *auth_tx) {
   try {
     auto locked_auth = ReadLock(auth_tx);
     auto role = locked_auth->GetRole(rolename);
     if (!role) {
       throw memgraph::query::QueryRuntimeException("Role '{}' doesn't exist.", rolename);
     }
-    std::vector<memgraph::query::TypedValue> usernames;
-    const auto &users = locked_auth->AllUsersForRole(rolename);
-    usernames.reserve(users.size());
-    for (const auto &user : users) {
-      usernames.emplace_back(user.username());
+    auto listing = locked_auth->ListUsersForRole(rolename);
+    query::RoleMemberNamesResult result;
+    result.usernames.reserve(listing.users.size());
+    for (const auto &user : listing.users) {
+      result.usernames.emplace_back(user.username());
     }
-    return usernames;
+    result.unreadable_entries = std::move(listing.unreadable_entries);
+    result.complete = listing.complete;
+    return result;
   } catch (const memgraph::auth::AuthException &e) {
     throw memgraph::query::QueryRuntimeException(e.what());
   }
@@ -1107,12 +1146,7 @@ std::vector<std::vector<memgraph::query::TypedValue>> AuthQueryHandler::GetPrivi
       if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
         fine_grained_grants = ShowFineGrainedUserPrivileges(user, db_name);
         DeduplicatePermissionRows(fine_grained_grants);
-        auto property_rows = ShowPropertyPermissions(user->property_access_handler(), "USER");
-        for (auto const &role : user->roles()) {
-          property_rows.append_range(ShowPropertyPermissions(role.property_access_handler(), "ROLE"));
-        }
-        DeduplicatePermissionRows(property_rows);
-        fine_grained_grants.append_range(std::move(property_rows));
+        fine_grained_grants.append_range(ShowScopedUserPropertyPermissions(*user, db_name));
       }
 #endif
     } else if (role) {
@@ -1120,7 +1154,9 @@ std::vector<std::vector<memgraph::query::TypedValue>> AuthQueryHandler::GetPrivi
 #ifdef MG_ENTERPRISE
       if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
         fine_grained_grants = ShowFineGrainedRolePrivileges(role, db_name);
-        fine_grained_grants.append_range(ShowPropertyPermissions(role->property_access_handler(), "ROLE"));
+        if (!db_name || role->HasAccess(*db_name)) {
+          fine_grained_grants.append_range(ShowPropertyPermissions(role->property_access_handler(), "ROLE"));
+        }
       }
 #endif
     } else {
@@ -1615,21 +1651,34 @@ void AuthQueryHandler::CreateProfile(const std::string &profile_name,
   for (const auto &[limit_name, limit_value] : defined_limits) {
     const auto limit_type = name_to_limit(limit_name);
     is_limit_supported(limit_value.type, limit_type);  // throw on failure
+    bool inserted = false;
     switch (limit_value.type) {
       case query::UserProfileQuery::LimitValueResult::Type::UNLIMITED:
-        limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{});
+        inserted = limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{}).second;
         break;
       case query::UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT: {
-        limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale);
+        if (limit_value.mem_limit.scale == 0 ||
+            limit_value.mem_limit.value > std::numeric_limits<uint64_t>::max() / limit_value.mem_limit.scale) {
+          throw memgraph::query::QueryRuntimeException(
+              "Memory limit overflow for '{}' in profile '{}'.", limit_name, profile_name);
+        }
+        inserted = limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale).second;
       } break;
       case query::UserProfileQuery::LimitValueResult::Type::QUANTITY: {
-        limits.emplace(limit_type, limit_value.quantity.value);
+        inserted = limits.emplace(limit_type, limit_value.quantity.value).second;
       } break;
     }
+    if (!inserted) {
+      throw memgraph::query::QueryRuntimeException("Duplicate limit '{}' in profile definition.", limit_name);
+    }
   }
-  auto locked_auth = layer_.Lock();
-  if (!locked_auth->CreateProfile(profile_name, std::move(limits), usernames, system_tx)) {
-    throw memgraph::query::QueryRuntimeException("Profile '{}' already exists.", profile_name);
+  try {
+    auto locked_auth = layer_.Lock();
+    if (!locked_auth->CreateProfile(profile_name, std::move(limits), usernames, system_tx)) {
+      throw memgraph::query::QueryRuntimeException("Profile '{}' already exists.", profile_name);
+    }
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
   }
 }
 
@@ -1640,29 +1689,52 @@ void AuthQueryHandler::UpdateProfile(const std::string &profile_name,
   for (const auto &[limit_name, limit_value] : updated_limits) {
     const auto limit_type = name_to_limit(limit_name);
     is_limit_supported(limit_value.type, limit_type);  // throw on failure
+    bool inserted = false;
     switch (limit_value.type) {
       case query::UserProfileQuery::LimitValueResult::Type::UNLIMITED:
-        limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{});
+        inserted = limits.emplace(limit_type, auth::UserProfiles::unlimitted_t{}).second;
         break;
       case query::UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT: {
-        limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale);
+        if (limit_value.mem_limit.scale == 0 ||
+            limit_value.mem_limit.value > std::numeric_limits<uint64_t>::max() / limit_value.mem_limit.scale) {
+          throw memgraph::query::QueryRuntimeException(
+              "Memory limit overflow for '{}' in profile '{}'.", limit_name, profile_name);
+        }
+        inserted = limits.emplace(limit_type, limit_value.mem_limit.value * limit_value.mem_limit.scale).second;
       } break;
       case query::UserProfileQuery::LimitValueResult::Type::QUANTITY: {
-        limits.emplace(limit_type, limit_value.quantity.value);
+        inserted = limits.emplace(limit_type, limit_value.quantity.value).second;
       } break;
     }
+    if (!inserted) {
+      throw memgraph::query::QueryRuntimeException("Duplicate limit '{}' in profile update.", limit_name);
+    }
   }
-  auto locked_auth = layer_.Lock();
-  const auto &profile = locked_auth->UpdateProfile(profile_name, limits, system_tx);
-  if (!profile) {
-    throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+  try {
+    auto locked_auth = layer_.Lock();
+    const auto &profile = locked_auth->UpdateProfile(profile_name, limits, system_tx);
+    if (!profile) {
+      throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+    }
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
   }
 }
 
 void AuthQueryHandler::DropProfile(const std::string &profile_name, system::Transaction *system_tx) {
-  auto locked_auth = layer_.Lock();
-  if (locked_auth->DropProfile(profile_name, system_tx) != auth::UserProfiles::DropResult::kDropped) {
-    throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+  try {
+    auto locked_auth = layer_.Lock();
+    switch (locked_auth->DropProfile(profile_name, system_tx)) {
+      case auth::UserProfiles::DropResult::kDropped:
+        return;
+      case auth::UserProfiles::DropResult::kAbsent:
+        throw memgraph::query::QueryRuntimeException("Profile '{}' does not exist.", profile_name);
+      case auth::UserProfiles::DropResult::kFailed:
+        throw memgraph::query::QueryRuntimeException("Failed to delete resource profile '{}' from storage.",
+                                                     profile_name);
+    }
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
   }
 }
 
@@ -1720,8 +1792,16 @@ void AuthQueryHandler::RevokeProfile(const std::string &user_or_role, system::Tr
 }
 
 std::optional<std::string> AuthQueryHandler::GetProfileForUser(const std::string &user_or_role) {
-  auto locked_auth = layer_.ReadLock();
-  return locked_auth->GetProfileForUsername(user_or_role);
+  try {
+    auto locked_auth = layer_.ReadLock();
+    auto profile = locked_auth->GetProfileForUsername(user_or_role);
+    if (!profile && !locked_auth->HasUser(user_or_role)) {
+      throw memgraph::query::QueryRuntimeException("User '{}' does not exist.", user_or_role);
+    }
+    return profile;
+  } catch (const memgraph::auth::AuthException &e) {
+    throw memgraph::query::QueryRuntimeException(e.what());
+  }
 }
 
 std::vector<std::string> AuthQueryHandler::GetUsernamesForProfile(const std::string &profile_name) {

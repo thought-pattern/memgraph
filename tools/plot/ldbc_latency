@@ -5,19 +5,19 @@
 Latency Barchart (Based on LDBC JSON output).
 '''
 
+from argparse import ArgumentParser
 import json
 import os
-import numpy as np
-from argparse import ArgumentParser
 import string
 
 import matplotlib
+import numpy as np
+
 # Must set 'Agg' backend before importing pyplot
 # This is so the script works on headless machines (without X11)
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from matplotlib.cbook import get_sample_data
-
+import matplotlib.pyplot as plt
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 COLORS = ['#ff7300', '#008cc2']

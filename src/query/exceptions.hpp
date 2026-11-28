@@ -429,7 +429,7 @@ class ShowQueryCallableMappingsInMulticommandTxException : public MulticommandTx
 class TriggerModificationInMulticommandTxException : public MulticommandTxException {
  public:
   TriggerModificationInMulticommandTxException() : MulticommandTxException("Managing triggers") {}
-  SPECIALIZE_GET_EXCEPTION_NAME(ShowConfigModificationInMulticommandTxException)
+  SPECIALIZE_GET_EXCEPTION_NAME(TriggerModificationInMulticommandTxException)
 };
 
 class StreamQueryInMulticommandTxException : public MulticommandTxException {

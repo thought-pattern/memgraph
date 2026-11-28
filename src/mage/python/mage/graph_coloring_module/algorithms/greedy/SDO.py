@@ -1,14 +1,17 @@
-import random
-from queue import PriorityQueue
-from typing import Any, Dict, List
+"""Utilities for SDO."""
 
-from mage.graph_coloring_module.algorithms.algorithm import Algorithm
+from queue import PriorityQueue
+from random import choice as random_choice, randint as random_randint
+
+from mage.graph_coloring_module.algorithms.algorithm import Algorithm, no_host_abort
 from mage.graph_coloring_module.components.individual import Individual
 from mage.graph_coloring_module.graph import Graph
 from mage.graph_coloring_module.parameters import Parameter
 from mage.graph_coloring_module.utils.available_colors import available_colors
 from mage.graph_coloring_module.utils.parameters_utils import param_value
 from mage.graph_coloring_module.utils.validation import validate
+
+DEFAULT_ARGUMENT_DICT = {}
 
 
 class SDO(Algorithm):
@@ -22,41 +25,52 @@ class SDO(Algorithm):
         return "SDO"
 
     @validate(Parameter.NO_OF_COLORS)
-    def run(self, graph: Graph, parameters: Dict[str, Any] = None) -> Individual:
+    def run(
+        self,
+        graph: Graph,
+        parameters: dict = DEFAULT_ARGUMENT_DICT,
+        abort_check=no_host_abort,
+    ) -> Individual:
         """Returns the individual that represents the result of the SDO algorithm."""
 
+        if parameters is DEFAULT_ARGUMENT_DICT:
+            parameters = DEFAULT_ARGUMENT_DICT.copy()
         no_of_colors = param_value(graph, parameters, Parameter.NO_OF_COLORS)
 
         processed = [False for _ in graph.nodes]
+        neighbor_colors: list[set[int]] = [set() for _ in graph.nodes]
         saturation_degrees = [0 for _ in graph.nodes]
         chromosome = [-1 for _ in graph.nodes]
 
-        while self._get_non_processed_node(processed) is not None:
-            current_node = self._get_non_processed_node(processed)
+        while not all(processed):
+            current_node = self.get_non_processed_node(processed)
             sorted_nodes = PriorityQueue()
-            sorted_nodes.put((saturation_degrees[current_node], current_node))
+            sorted_nodes.put((-1 * saturation_degrees[current_node], current_node))
 
             while not sorted_nodes.empty():
                 node = sorted_nodes.get()[1]
                 if not processed[node]:
+                    abort_check()
                     processed[node] = True
 
                     colors = available_colors(graph, no_of_colors, chromosome, node)
                     if len(colors) > 0:
-                        color = random.choice(colors)
+                        color = random_choice(colors)
                     else:
-                        color = random.randint(0, no_of_colors - 1)
+                        color = random_randint(0, no_of_colors - 1)
                     chromosome[node] = color
 
                     for neigh in graph[node]:
-                        if not processed[neigh]:
-                            saturation_degrees[neigh] += 1
+                        if not processed[neigh] and color not in neighbor_colors[neigh]:
+                            neighbor_colors[neigh].add(color)
+                            saturation_degrees[neigh] = len(neighbor_colors[neigh])
                             sorted_nodes.put((-1 * saturation_degrees[neigh], neigh))
 
-        return Individual(no_of_colors, graph, chromosome)
+        computed_return_value = Individual(no_of_colors, graph, chromosome)
+        return computed_return_value
 
-    def _get_non_processed_node(self, processed: List[bool]) -> bool:
+    def get_non_processed_node(self, processed: list[bool]) -> int:
         for i, flag in enumerate(processed):
             if not flag:
                 return i
-        return None
+        raise RuntimeError("No unprocessed graph node remains")

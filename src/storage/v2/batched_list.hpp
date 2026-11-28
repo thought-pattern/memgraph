@@ -46,7 +46,55 @@ class BatchedList {
   static constexpr std::size_t kBatchBytes = 16UL * 1024UL;
   static constexpr std::size_t kBatchCapacity = std::max(std::size_t{1}, kBatchBytes / sizeof(T));
 
+  BatchedList() = default;
+  BatchedList(const BatchedList &) = default;
+  BatchedList &operator=(const BatchedList &) = default;
+
+  BatchedList(BatchedList &&other) noexcept
+      : batches_(std::move(other.batches_)), size_(std::exchange(other.size_, 0)), fill_it_(batches_.end()) {
+    other.fill_it_ = other.batches_.end();
+  }
+
+  BatchedList &operator=(BatchedList &&other) noexcept {
+    if (this != &other) {
+      batches_ = std::move(other.batches_);
+      size_ = std::exchange(other.size_, 0);
+      fill_it_ = batches_.end();
+      other.fill_it_ = other.batches_.end();
+    }
+    return *this;
+  }
+
+  /// Pre-allocates batch nodes and element storage for at least `count` elements so subsequent
+  /// `push_back` calls up to `count` require no heap allocation.
+  void reserve_elements(std::size_t count) {
+    std::size_t available = 0;
+    for (const auto &b : batches_) {
+      available += (b.capacity() > b.size()) ? (b.capacity() - b.size()) : 0;
+    }
+    while (available < count) {
+      const std::size_t chunk = std::min(count - available, kBatchCapacity);
+      batches_.emplace_back();
+      batches_.back().reserve(chunk);
+      available += batches_.back().capacity();
+    }
+    fill_it_ = batches_.begin();
+    while (fill_it_ != batches_.end() && fill_it_->size() >= fill_it_->capacity()) {
+      ++fill_it_;
+    }
+  }
+
   void push_back(T value) {
+    if (fill_it_ != batches_.end()) {
+      while (fill_it_ != batches_.end() && fill_it_->size() >= fill_it_->capacity()) {
+        ++fill_it_;
+      }
+      if (fill_it_ != batches_.end()) {
+        fill_it_->push_back(std::move(value));
+        ++size_;
+        return;
+      }
+    }
     if (batches_.empty() || batches_.back().size() >= kBatchCapacity) batches_.emplace_back();
     batches_.back().push_back(std::move(value));
     ++size_;
@@ -55,18 +103,26 @@ class BatchedList {
   /// Constant time whatever the two hold: the elements are not touched, only the batches holding
   /// them change hands. `other` is left empty.
   void splice(BatchedList &other) {
+    if (this == &other) return;
+    while (!other.batches_.empty() && other.batches_.back().empty()) {
+      other.batches_.pop_back();
+    }
     batches_.splice(batches_.end(), other.batches_);
     size_ += std::exchange(other.size_, 0);
+    other.fill_it_ = other.batches_.end();
   }
 
   void swap(BatchedList &other) noexcept {
     batches_.swap(other.batches_);
     std::swap(size_, other.size_);
+    fill_it_ = batches_.end();
+    other.fill_it_ = other.batches_.end();
   }
 
   void clear() {
     batches_.clear();
     size_ = 0;
+    fill_it_ = batches_.end();
   }
 
   [[nodiscard]] bool empty() const { return size_ == 0; }
@@ -81,8 +137,10 @@ class BatchedList {
   [[nodiscard]] std::size_t batch_count() const { return batches_.size(); }
 
  private:
-  std::list<Batch, memory::DbAwareAllocator<Batch>> batches_;
+  using BatchList = std::list<Batch, memory::DbAwareAllocator<Batch>>;
+  BatchList batches_;
   std::size_t size_{0};
+  typename BatchList::iterator fill_it_{batches_.end()};
 };
 
 }  // namespace memgraph::storage

@@ -2017,7 +2017,7 @@ class ParallelMerge : public memgraph::query::plan::LogicalOperator {
 class AggregateParallel : public memgraph::query::plan::LogicalOperator {
  public:
   static constexpr utils::TypeInfo kType{
-      utils::TypeId::AGGREGATE_PARALLEL, "AggregateParallel", &query::plan::ParallelMerge::kType};
+      utils::TypeId::AGGREGATE_PARALLEL, "AggregateParallel", &query::plan::LogicalOperator::kType};
 
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
@@ -2469,6 +2469,7 @@ class Limit : public memgraph::query::plan::LogicalOperator {
     // init limit_ to -1, indicating
     // that it's still unknown (Cursor has not been Pulled yet)
     int64_t limit_{-1};
+    bool exhausted_{false};
     std::optional<utils::SharedQuota> shared_quota_{std::nullopt};
   };
 };
@@ -2896,6 +2897,7 @@ class CallProcedure : public memgraph::query::plan::LogicalOperator {
 
   static void IncrementCounter(const std::string &procedure_name);
   static std::unordered_map<std::string, int64_t> GetAndResetCounters();
+  static void RestoreCounters(const std::unordered_map<std::string, int64_t> &counters);
 
   std::shared_ptr<memgraph::query::plan::LogicalOperator> input_;
   std::string procedure_name_;
@@ -2924,9 +2926,8 @@ class LoadCsv : public memgraph::query::plan::LogicalOperator {
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
   LoadCsv() = default;
-  LoadCsv(std::shared_ptr<LogicalOperator> input, Expression *file,
-          std::unordered_map<Expression *, Expression *> config_map, bool with_header, bool ignore_bad,
-          Expression *delimiter, Expression *quote, Expression *nullif, Symbol row_var);
+  LoadCsv(std::shared_ptr<LogicalOperator> input, Expression *file, ConfigMap config_map, bool with_header,
+          bool ignore_bad, Expression *delimiter, Expression *quote, Expression *nullif, Symbol row_var);
   bool Accept(HierarchicalLogicalOperatorVisitor &visitor) override;
   UniqueCursorPtr MakeCursor(utils::MemoryResource *, metrics::DatabaseMetricHandles &) const override;
   std::vector<Symbol> OutputSymbols(const SymbolTable &) const override;
@@ -2946,7 +2947,7 @@ class LoadCsv : public memgraph::query::plan::LogicalOperator {
   Expression *quote_{nullptr};
   Expression *nullif_{nullptr};
   Symbol row_var_;
-  std::unordered_map<Expression *, Expression *> config_map_;
+  ConfigMap config_map_;
 
   std::string ToString(const DbAccessor *dba) const override;
 
@@ -2960,8 +2961,7 @@ class LoadParquet : public memgraph::query::plan::LogicalOperator {
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
   LoadParquet() = default;
-  LoadParquet(std::shared_ptr<LogicalOperator> input, Expression *file,
-              std::unordered_map<Expression *, Expression *> config_map, Symbol row_var);
+  LoadParquet(std::shared_ptr<LogicalOperator> input, Expression *file, ConfigMap config_map, Symbol row_var);
   bool Accept(HierarchicalLogicalOperatorVisitor &visitor) override;
   UniqueCursorPtr MakeCursor(utils::MemoryResource *, metrics::DatabaseMetricHandles &) const override;
   std::vector<Symbol> OutputSymbols(const SymbolTable &) const override;
@@ -2978,7 +2978,7 @@ class LoadParquet : public memgraph::query::plan::LogicalOperator {
 
   std::shared_ptr<memgraph::query::plan::LogicalOperator> input_;
   Expression *file_;
-  std::unordered_map<Expression *, Expression *> config_map_;
+  ConfigMap config_map_;
   Symbol row_var_;
 };
 
@@ -2989,8 +2989,7 @@ class LoadJsonl : public memgraph::query::plan::LogicalOperator {
   const utils::TypeInfo &GetTypeInfo() const override { return kType; }
 
   LoadJsonl() = default;
-  LoadJsonl(std::shared_ptr<LogicalOperator> input, Expression *file,
-            std::unordered_map<Expression *, Expression *> config_map, Symbol row_var);
+  LoadJsonl(std::shared_ptr<LogicalOperator> input, Expression *file, ConfigMap config_map, Symbol row_var);
   bool Accept(HierarchicalLogicalOperatorVisitor &visitor) override;
   UniqueCursorPtr MakeCursor(utils::MemoryResource *, metrics::DatabaseMetricHandles &) const override;
   std::vector<Symbol> OutputSymbols(const SymbolTable &) const override;
@@ -3008,7 +3007,7 @@ class LoadJsonl : public memgraph::query::plan::LogicalOperator {
   std::shared_ptr<memgraph::query::plan::LogicalOperator> input_;
   Expression *file_;
   Symbol row_var_;
-  std::unordered_map<Expression *, Expression *> config_map_;
+  ConfigMap config_map_;
 };
 
 /// Iterates over a collection of elements and applies one or more update

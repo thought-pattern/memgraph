@@ -90,7 +90,7 @@ BENCHMARK_REGISTER_F(ManyRulesFixture, Saturate)
     ->Unit(benchmark::kMicrosecond);
 
 // ============================================================================
-// Saturation Loop Overhead (no-op rule)
+// Saturation Loop Overhead (multi-pass loop scaling)
 // ============================================================================
 
 class SaturationLoopFixture : public RewriterFixtureBase {
@@ -100,19 +100,41 @@ class SaturationLoopFixture : public RewriterFixtureBase {
 
   void SetUp(const benchmark::State &state) override {
     max_iterations_ = state.range(0);
-    rules_ = TestRuleSet::Build(RuleNoOp());
-    SetupGraphAndRewriter([](TestEGraph &g) { BuildIndependentAdds(g, kMedium); }, rules_);
+    rules_ = TestRuleSet::Build(RuleStepProgress());
+    SetupGraphAndRewriter(
+        [](TestEGraph &g) {
+          BuildIndependentAdds(g, kMedium);
+          auto anchor = g.emplace(Op::Var, uint64_t{999999}).eclass_id;
+          g.emplace(Op::F, {anchor});
+        },
+        rules_);
   }
 };
 
 BENCHMARK_DEFINE_F(SaturationLoopFixture, Overhead)(benchmark::State &state) {
   RewriteConfig config;
   config.max_iterations = static_cast<std::size_t>(max_iterations_);
+  int64_t executed_passes = 0;
   for (auto _ : state) {
+    state.PauseTiming();
+    rules_ = TestRuleSet::Build(RuleStepProgress());
+    SetupGraphAndRewriter(
+        [](TestEGraph &g) {
+          BuildIndependentAdds(g, kMedium);
+          auto anchor = g.emplace(Op::Var, uint64_t{999999}).eclass_id;
+          g.emplace(Op::F, {anchor});
+        },
+        rules_);
+    state.ResumeTiming();
     auto result = rewriter_->saturate_full(config);
+    if (result.iterations != static_cast<std::size_t>(max_iterations_)) {
+      state.SkipWithError("SaturationLoopFixture did not execute expected number of passes");
+      return;
+    }
+    executed_passes += static_cast<int64_t>(result.iterations);
     benchmark::DoNotOptimize(result);
   }
-  state.SetItemsProcessed(state.iterations() * max_iterations_);
+  state.SetItemsProcessed(executed_passes);
 }
 
 BENCHMARK_REGISTER_F(SaturationLoopFixture, Overhead)
@@ -142,10 +164,13 @@ class SingleIterationFixture : public RewriterFixtureBase {
 
 BENCHMARK_DEFINE_F(SingleIterationFixture, Once)(benchmark::State &state) {
   for (auto _ : state) {
+    state.PauseTiming();
+    SetupGraphAndRewriter([this](TestEGraph &g) { BuildNegChains(g, num_chains_, 2); }, rules_);
+    state.ResumeTiming();
     auto rewrites = rewriter_->iterate_once();
     benchmark::DoNotOptimize(rewrites);
   }
-  state.SetItemsProcessed(state.iterations());
+  state.SetItemsProcessed(state.iterations() * num_chains_);
 }
 
 BENCHMARK_REGISTER_F(SingleIterationFixture, Once)
@@ -226,12 +251,22 @@ class RewriteFixture : public MatcherFixtureBase {
 };
 
 BENCHMARK_DEFINE_F(RewriteFixture, Apply)(benchmark::State &state) {
+  auto const expected_rewrites = static_cast<std::size_t>(num_chains_ * (chain_depth_ - 1));
   for (auto _ : state) {
+    state.PauseTiming();
+    SetupGraphAndMatcher([this](TestEGraph &g) { BuildNegChains(g, num_chains_, chain_depth_); });
+    vm_executor_ = TestVMExecutor(egraph_);
+    ctx_.clear_new_eclasses();
+    state.ResumeTiming();
     rule_.match(*matcher_, vm_executor_, ctx_.matcher_ctx());
     auto rewrites = rule_.apply(ctx_.rule_ctx(), ctx_.matcher_ctx());
+    if (rewrites != expected_rewrites) {
+      state.SkipWithError("Rewrite/MatchApply/DoubleNeg did not apply expected rewrite count");
+      return;
+    }
     benchmark::DoNotOptimize(rewrites);
   }
-  state.SetItemsProcessed(state.iterations() * num_chains_ * (chain_depth_ - 1));
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_rewrites));
 }
 
 BENCHMARK_REGISTER_F(RewriteFixture, Apply)

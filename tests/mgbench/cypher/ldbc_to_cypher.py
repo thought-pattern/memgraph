@@ -13,10 +13,10 @@
 
 # ---  DISCLAIMER: This is NOT an official implementation of an LDBC Benchmark.  ---
 import argparse
-import csv
-import sys
 from collections import defaultdict
+import csv
 from pathlib import Path
+import sys
 
 import helpers
 

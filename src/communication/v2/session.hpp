@@ -117,6 +117,7 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
   }
 
   ~Session() override {
+    ReleaseSessionMetrics_();
     if constexpr (requires { session_.UUID(); }) {
       SessionRegistry::Instance().Deregister(session_.UUID(), this);
     }
@@ -133,6 +134,7 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
     }
 
     metrics::Metrics().global.active_sessions->Increment();
+    counted_active_session_.store(true, std::memory_order_release);
 
     execution_active_ = true;
 
@@ -141,10 +143,16 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
     }
 
     if (std::holds_alternative<SSLSocket>(socket_)) {
-      utils::OnScopeExit increment_counter([] { metrics::Metrics().global.active_ssl_sessions->Increment(); });
+      utils::OnScopeExit increment_counter([this] {
+        metrics::Metrics().global.active_ssl_sessions->Increment();
+        counted_transport_session_.store(true, std::memory_order_release);
+      });
       boost::asio::dispatch(strand_, [shared_this = shared_from_this()] { shared_this->DoSSLHandshake(); });
     } else {
-      utils::OnScopeExit increment_counter([] { metrics::Metrics().global.active_tcp_sessions->Increment(); });
+      utils::OnScopeExit increment_counter([this] {
+        metrics::Metrics().global.active_tcp_sessions->Increment();
+        counted_transport_session_.store(true, std::memory_order_release);
+      });
       boost::asio::dispatch(strand_, [shared_this = shared_from_this()] { shared_this->DoFirstRead(); });
     }
     return true;
@@ -232,6 +240,9 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
                                    socket.lowest_layer().non_blocking(false);
                                  }},
                socket_);
+    if constexpr (requires { session_.SetRemoteEndpoint(remote_endpoint_); }) {
+      session_.SetRemoteEndpoint(remote_endpoint_);
+    }
     spdlog::info("Accepted a connection from {}: {}", service_name_, remote_endpoint_);
   }
 
@@ -240,24 +251,28 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
   void DoAccept(boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> req) {
     DMG_ASSERT(std::holds_alternative<WebSocket>(socket_), "DoAccept is only for WebSocket communication");
     metrics::Metrics().global.active_websocket_sessions->Increment();
+    counted_websocket_session_.store(true, std::memory_order_release);
     auto &ws = std::get<WebSocket>(socket_);
 
     // Set suggested timeout settings for the websocket
     ws.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
     boost::asio::socket_base::keep_alive option(true);
 
-    // Set a decorator to change the Server of the handshake
-    ws.set_option(boost::beast::websocket::stream_base::decorator([&req](boost::beast::websocket::response_type &res) {
-      res.set(boost::beast::http::field::server, std::string("Memgraph Bolt WS"));
+    const auto secondary_protocol = req.base().find(boost::beast::http::field::sec_websocket_protocol);
+    const bool send_binary_subprotocol =
+        secondary_protocol != req.base().end() && secondary_protocol->value() == "binary";
 
-      // We need to do this to support WASM clients, which explicitly send this flag
-      // in their upgrade request
-      // Neo4j client breaks when this flag is sent
-      if (const auto secondary_protocol = req.base().find(boost::beast::http::field::sec_websocket_protocol);
-          secondary_protocol != res.base().end() && secondary_protocol->value() == "binary") {
-        res.set(boost::beast::http::field::sec_websocket_protocol, "binary");
-      }
-    }));
+    // Set a decorator to change the Server of the handshake
+    ws.set_option(boost::beast::websocket::stream_base::decorator(
+        [send_binary_subprotocol](boost::beast::websocket::response_type &res) {
+          res.set(boost::beast::http::field::server, std::string("Memgraph Bolt WS"));
+
+          // Support WASM clients that explicitly send this flag in their upgrade request without sending it to
+          // Neo4j drivers that omit the header.
+          if (send_binary_subprotocol) {
+            res.set(boost::beast::http::field::sec_websocket_protocol, "binary");
+          }
+        }));
     ws.binary(true);
 
     // Accept the websocket handshake
@@ -344,17 +359,57 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
         strand_, [self = shared_from_this()] { self->ArmRead_(std::bind_front(&Session::OnFirstRead, self)); });
   }
 
-  std::optional<boost::beast::http::request<boost::beast::http::string_body>> IsWebsocketUpgrade(uint8_t *data,
-                                                                                                 size_t size) {
+  enum class UpgradeInspectStatus : uint8_t {
+    kNotHttpUpgrade,
+    kNeedMoreBytes,
+    kValidUpgrade,
+  };
+
+  struct UpgradeInspectResult {
+    UpgradeInspectStatus status{UpgradeInspectStatus::kNotHttpUpgrade};
+    size_t consumed{0};
+    std::optional<boost::beast::http::request<boost::beast::http::string_body>> request{};
+  };
+
+  static UpgradeInspectResult InspectWebsocketUpgrade(const uint8_t *data, size_t size) {
+    if (size == 0) {
+      return {UpgradeInspectStatus::kNeedMoreBytes, 0, std::nullopt};
+    }
+    // Binary Bolt connections start with the 0x60 0x60 0xB0 0x17 preamble.
+    if (data[0] == 0x60) {
+      return {UpgradeInspectStatus::kNotHttpUpgrade, 0, std::nullopt};
+    }
     boost::beast::http::request_parser<boost::beast::http::string_body> parser;
     boost::system::error_code error_code_parsing;
-    parser.put(boost::asio::buffer(data, size), error_code_parsing);
-    if (error_code_parsing) {
-      return std::nullopt;
+    const size_t consumed = parser.put(boost::asio::buffer(data, size), error_code_parsing);
+    if (error_code_parsing == boost::beast::http::error::need_more || (!error_code_parsing && !parser.is_done())) {
+      return {UpgradeInspectStatus::kNeedMoreBytes, 0, std::nullopt};
     }
+    if (error_code_parsing) {
+      return {UpgradeInspectStatus::kNotHttpUpgrade, 0, std::nullopt};
+    }
+    if (boost::beast::websocket::is_upgrade(parser.get())) {
+      return {UpgradeInspectStatus::kValidUpgrade, consumed, parser.release()};
+    }
+    return {UpgradeInspectStatus::kNotHttpUpgrade, 0, std::nullopt};
+  }
 
-    if (boost::beast::websocket::is_upgrade(parser.get())) return parser.release();
-    return std::nullopt;
+  void DispatchBufferedInput() {
+    switch (GetSchedulerType()) {
+      using enum SchedulerType;
+      case ASIO:
+        try {
+          while (session_.Execute()) {
+          }
+          DoReadAsio();
+        } catch (const std::exception & /* unused */) {
+          HandleException(std::current_exception());
+        }
+        break;
+      case PRIORITY_QUEUE_WITH_SIDECAR:
+        DoWork();
+        break;
+    }
   }
 
   void OnFirstRead(const boost::system::error_code &ec, const size_t bytes_transferred) {
@@ -364,31 +419,28 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
       return OnError(ec);
     }
 
-    // Can be a websocket connection only on the first read, since it is not
-    // expected from clients to upgrade from tcp to websocket
+    input_buffer_.write_end()->Written(bytes_transferred);
 
-    if (auto req = IsWebsocketUpgrade(input_buffer_.read_end()->data(), bytes_transferred); req) {
+    auto upgrade = InspectWebsocketUpgrade(input_buffer_.read_end()->data(), input_buffer_.read_end()->size());
+    if (upgrade.status == UpgradeInspectStatus::kNeedMoreBytes) {
+      DoFirstRead();
+      return;
+    }
+    if (upgrade.status == UpgradeInspectStatus::kValidUpgrade) {
       spdlog::info("Switching {} to websocket connection", remote_endpoint_);
       if (std::holds_alternative<TCPSocket>(socket_)) {
+        input_buffer_.read_end()->Shift(upgrade.consumed);
         WebSocket ws{std::get<TCPSocket>(std::move(socket_))};
         socket_.emplace<WebSocket>(std::move(ws));
-        DoAccept(std::move(*req));
+        DoAccept(std::move(*upgrade.request));
         return;
       }
       spdlog::error("Error while upgrading connection to websocket");
       DoShutdown();
+      return;
     }
 
-    // Start branch based on the selected scheduler. Each function is self-calling, no need for further checks.
-    switch (GetSchedulerType()) {
-      using enum SchedulerType;
-      case ASIO:
-        OnReadAsio(ec, bytes_transferred);
-        break;
-      case PRIORITY_QUEUE_WITH_SIDECAR:
-        OnRead(ec, bytes_transferred);
-        break;
-    }
+    DispatchBufferedInput();
   }
 
   void HandleException(const std::exception_ptr eptr) {
@@ -518,12 +570,8 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
     if (ec == boost::asio::error::operation_aborted) {
       return;
     }
-    // This indicates that the WebsocketSession was closed
-    if (ec == boost::beast::websocket::error::closed) {
-      return;
-    }
 
-    if (ec == boost::asio::error::eof) {
+    if (ec == boost::beast::websocket::error::closed || ec == boost::asio::error::eof) {
       spdlog::info("Session closed by peer {}", remote_endpoint_);
     } else {
       spdlog::error("Session error: {}", ec.message());
@@ -550,45 +598,60 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
     CloseSocket_(guard);
   }
 
+  void ReleaseSessionMetrics_() noexcept {
+    if (counted_websocket_session_.exchange(false, std::memory_order_acq_rel)) {
+      metrics::Metrics().global.active_websocket_sessions->Decrement();
+    }
+    if (counted_transport_session_.exchange(false, std::memory_order_acq_rel)) {
+      if (ssl_context_) {
+        metrics::Metrics().global.active_ssl_sessions->Decrement();
+      } else {
+        metrics::Metrics().global.active_tcp_sessions->Decrement();
+      }
+    }
+    if (counted_active_session_.exchange(false, std::memory_order_acq_rel)) {
+      metrics::Metrics().global.active_sessions->Decrement();
+    }
+  }
+
   // Requires arm_lock_ held (the guard is proof-of-lock); SpinLock is non-recursive, so never re-acquire.
   void CloseSocket_(const ArmGuard & /*arm_lock_held*/) {
-    if (!IsConnected()) {
+    if (!execution_active_.exchange(false, std::memory_order_acq_rel)) {
       return;
     }
-    execution_active_ = false;
 
     std::visit(utils::Overloaded{[this](WebSocket &ws) {
-                                   ws.async_close(
-                                       boost::beast::websocket::close_code::normal,
-                                       boost::asio::bind_executor(
-                                           strand_, [shared_this = shared_from_this()](boost::beast::error_code ec) {
-                                             memgraph::metrics::Metrics().global.active_websocket_sessions->Decrement();
-                                             if (ec) {
-                                               shared_this->OnError(ec);
-                                             }
-                                           }));
+                                   if (ws.is_open()) {
+                                     ws.async_close(
+                                         boost::beast::websocket::close_code::normal,
+                                         boost::asio::bind_executor(
+                                             strand_, [shared_this = shared_from_this()](boost::beast::error_code ec) {
+                                               if (ec && ec != boost::beast::websocket::error::closed &&
+                                                   ec != boost::asio::error::operation_aborted) {
+                                                 spdlog::debug("WebSocket async_close finished with: {}", ec.message());
+                                               }
+                                             }));
+                                   } else {
+                                     boost::system::error_code ec;
+                                     boost::beast::get_lowest_layer(ws).socket().close(ec);
+                                   }
                                  },
                                  [](auto &socket) {
-                                   boost::system::error_code ec;
-                                   socket.lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-                                   if (ec) {
-                                     spdlog::error("Session shutdown failed: {}", ec.what());
-                                   }
-                                   socket.lowest_layer().close(ec);
-                                   if (ec) {
-                                     spdlog::error("Session close failed: {}", ec.what());
+                                   if (socket.lowest_layer().is_open()) {
+                                     boost::system::error_code ec;
+                                     socket.lowest_layer().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+                                     if (ec && ec != boost::asio::error::not_connected) {
+                                       spdlog::error("Session shutdown failed: {}", ec.what());
+                                     }
+                                     socket.lowest_layer().close(ec);
+                                     if (ec) {
+                                       spdlog::error("Session close failed: {}", ec.what());
+                                     }
                                    }
                                  }},
                socket_);
 
-    // Update metrics
-    if (ssl_context_) {
-      metrics::Metrics().global.active_ssl_sessions->Decrement();
-    } else {
-      metrics::Metrics().global.active_tcp_sessions->Decrement();
-    }
-
-    metrics::Metrics().global.active_sessions->Decrement();
+    ReleaseSessionMetrics_();
   }
 
   void DoSSLHandshake() {
@@ -662,6 +725,9 @@ class Session final : public std::enable_shared_from_this<Session<TSession, TSes
   std::optional<tcp::endpoint> remote_endpoint_;
   std::string_view service_name_;
   std::atomic_bool execution_active_{false};
+  std::atomic_bool counted_active_session_{false};
+  std::atomic_bool counted_transport_session_{false};
+  std::atomic_bool counted_websocket_session_{false};
   // Set by any thread via RequestTermination; only ever set, never cleared. Re-checked under arm_lock_
   // at every read-arm (ArmLocked_), so a request made while a worker owns the socket can't be lost.
   std::atomic_bool terminate_requested_{false};

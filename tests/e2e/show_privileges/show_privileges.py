@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import *
+import pytest
 
 
 def test_show_privileges_basic(connect):

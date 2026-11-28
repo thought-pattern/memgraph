@@ -12,11 +12,14 @@
 module;
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <streambuf>
 #include <string>
@@ -47,6 +50,16 @@ using simdjson::ondemand::number_type;
 
 void IterateObject(simdjson::ondemand::object &obj, auto &out, memgraph::utils::MemoryResource *resource);
 
+std::string_view TrimJsonToken(std::string_view token) {
+  while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) {
+    token.remove_prefix(1);
+  }
+  while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) {
+    token.remove_suffix(1);
+  }
+  return token;
+}
+
 // .value() method may fail and in that the exception will be thrown.
 auto ToTypedValue(simdjson::ondemand::value &val, memgraph::utils::MemoryResource *resource) -> TypedValue {
   switch (val.type()) {
@@ -66,12 +79,16 @@ auto ToTypedValue(simdjson::ondemand::value &val, memgraph::utils::MemoryResourc
           return TypedValue{val.get_int64().value(), resource};
         }
         case number_type::unsigned_integer: {
-          // NOTE: uint64_t read as int64_t
-          return TypedValue{static_cast<int64_t>(val.get_uint64().value()), resource};
+          auto const raw = TrimJsonToken(val.raw_json_token());
+          auto const uval = val.get_uint64().value();
+          if (uval <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return TypedValue{static_cast<int64_t>(uval), resource};
+          }
+          return TypedValue{raw, resource};
         }
         case number_type::big_integer: {
           // NOTE: big integer read as raw json
-          return TypedValue{val.raw_json_token(), resource};
+          return TypedValue{TrimJsonToken(val.raw_json_token()), resource};
         }
         default: {
           std::unreachable();

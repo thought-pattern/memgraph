@@ -9,11 +9,11 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import time
-import typing
 from functools import partial
 from itertools import chain
 from multiprocessing import Barrier, Process, Value
+import time
+import typing
 
 import mgclient
 import pytest

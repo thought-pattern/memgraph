@@ -1,26 +1,62 @@
-import enum
-from collections import defaultdict
-from typing import Dict, List, Tuple
+"""Utilities for mgp igraph."""
 
-import igraph
-import mgp
+from enum import Enum as enum_Enum
+
+from igraph import EdgeSeq as igraph_EdgeSeq, Graph as igraph_Graph
 
 
-class MemgraphIgraph(igraph.Graph):
-    def __init__(self, ctx: mgp.ProcCtx, directed: bool):
+class MemgraphIgraph(igraph_Graph):
+    """igraph Graph built from the Memgraph procedure context; igraph vertex ids map back to Memgraph vertices."""
+
+    def __init__(self, ctx, directed: bool):
+        if not hasattr(ctx, "graph"):
+            raise TypeError("MemgraphIgraph requires a context with a graph")
+        vertex_count, edge_list, vertex_properties, edge_properties, id_mapping, inverted_id_mapping = graph_structure_from_ctx(ctx)
+        super().__init__(directed=directed, n=vertex_count, edges=edge_list)
+        assign_present_attributes(self.es, edge_properties)
+        assign_present_attributes(self.vs, vertex_properties)
         self.ctx_graph = ctx.graph
-        self.id_mappings, self.reverse_id_mappings = self._create_igraph_from_ctx(ctx=ctx, directed=directed)
+        self.id_mappings = id_mapping
+        self.reverse_id_mappings = inverted_id_mapping
 
-    def maxflow(self, source: mgp.Vertex, target: mgp.Vertex, capacity: str) -> float:
-        return (
-            super()
-            .maxflow(
-                self.id_mappings[source.id],
-                self.id_mappings[target.id],
-                capacity=capacity,
-            )
-            .value
+    def get_igraph_vertex_id(self, vertex) -> int:
+        if not hasattr(vertex, "id"):
+            raise TypeError("Memgraph vertices must provide an integer id")
+        vertex_id = vertex.id
+        if not isinstance(vertex_id, int):
+            raise TypeError(f"Memgraph vertex id must be an int, received {type(vertex_id)}")
+        igraph_vertex_id = self.id_mappings.get(vertex_id, -1)
+        if igraph_vertex_id < 0:
+            raise KeyError(f"Memgraph vertex {vertex_id} is absent from the igraph mapping")
+        return igraph_vertex_id
+
+    def edge_attribute_option(self, option: str, attribute) -> dict:
+        """igraph keyword arguments for an optional edge weight/capacity attribute.
+
+        A disabled attribute (Memgraph null, the procedures' False default or an
+        empty name) is omitted so igraph runs unweighted; igraph would read
+        False as an attribute name. A named attribute must be set on every edge,
+        because igraph handles unset values differently per algorithm (some
+        reject them, others silently substitute a value).
+        """
+        if not attribute or not self.ecount():
+            return {}
+        if attribute not in self.es.attribute_names():
+            raise KeyError(f"no edge provides property {attribute!r}")
+        # igraph reports an attribute value that was never set on an edge as None.
+        missing = sum(1 for value in self.es[attribute] if value is None)
+        if missing:
+            raise ValueError(f"{missing} of {self.ecount()} edges lack property {attribute!r}")
+        options = {option: attribute}
+        return options
+
+    def maxflow(self, source, target, capacity: str) -> float:
+        flow = super().maxflow(
+            self.get_igraph_vertex_id(source),
+            self.get_igraph_vertex_id(target),
+            **self.edge_attribute_option("capacity", capacity),
         )
+        return flow.value
 
     def pagerank(
         self,
@@ -28,28 +64,34 @@ class MemgraphIgraph(igraph.Graph):
         directed: bool,
         damping: float,
         implementation: str,
-    ) -> List[Tuple[mgp.Vertex, float]]:
+    ) -> list[tuple[object, float]]:
         pagerank_values = super().pagerank(
-            weights=weights,
             directed=directed,
             damping=damping,
             implementation=implementation,
+            **self.edge_attribute_option("weights", weights),
         )
 
-        return [(self.get_vertex_by_id(node_id), rank) for node_id, rank in enumerate(pagerank_values)]
+        computed_return_value = [(self.get_vertex_by_id(node_id), rank) for node_id, rank in enumerate(pagerank_values)]
+        return computed_return_value
 
-    def get_all_simple_paths(self, v: mgp.Vertex, to: mgp.Vertex, cutoff: int) -> List[List[mgp.Vertex]]:
+    def get_all_simple_paths(self, v, to, cutoff: int) -> list[list[object]]:
+        # The procedure's cutoff is igraph's maxlen: the longest path considered,
+        # where a negative value (the procedure default -1) considers every length.
         paths = [
-            self._convert_vertex_ids_to_mgp_vertices(path)
+            self.convert_vertex_ids_to_mgp_vertices(path)
             for path in super().get_all_simple_paths(
-                v=self.id_mappings[v.id], to=self.id_mappings[to.id], cutoff=cutoff
+                v=self.get_igraph_vertex_id(v),
+                to=self.get_igraph_vertex_id(to),
+                maxlen=cutoff,
             )
         ]
         return paths
 
-    def topological_sort(self, mode: str) -> List[mgp.Vertex]:
+    def topological_sort(self, mode: str) -> list[object]:
         sorted_vertex_ids = super().topological_sorting(mode=mode)
-        return self._convert_vertex_ids_to_mgp_vertices(sorted_vertex_ids)
+        computed_return_value = self.convert_vertex_ids_to_mgp_vertices(sorted_vertex_ids)
+        return computed_return_value
 
     def community_leiden(
         self,
@@ -58,80 +100,91 @@ class MemgraphIgraph(igraph.Graph):
         n_iterations,
         beta=0.01,
         objective_function="CPM",
-        initial_membership=None,
-        node_weights=None,
-    ) -> List[Tuple[mgp.Vertex, int]]:
-        communities = super().community_leiden(
-            resolution_parameter=resolution_parameter,
-            weights=weights,
-            n_iterations=n_iterations,
-            objective_function=objective_function,
-            beta=beta,
-            initial_membership=initial_membership,
-            node_weights=node_weights,
-        )
-        return [(self.get_vertex_by_id(member), i) for i, members in enumerate(communities) for member in members]
+        initial_membership=False,
+        node_weights=False,
+    ) -> list[tuple[object, int]]:
+        parameters = {
+            "resolution": resolution_parameter,
+            "n_iterations": n_iterations,
+            "objective_function": objective_function,
+            "beta": beta,
+        }
+        parameters.update(self.edge_attribute_option("weights", weights))
+        if initial_membership:
+            parameters["initial_membership"] = initial_membership
+        if node_weights:
+            parameters["node_weights"] = node_weights
+        communities = super().community_leiden(**parameters)
+        computed_return_value = [(self.get_vertex_by_id(member), i) for i, members in enumerate(communities) for member in members]
+        return computed_return_value
 
-    def mincut(self, source: mgp.Vertex, target: mgp.Vertex, capacity: str) -> Tuple[List[mgp.Vertex], float]:
+    def mincut(self, source, target, capacity: str) -> tuple[list[list[object]], float]:
         cut = super().mincut(
-            source=self.id_mappings[source.id],
-            target=self.id_mappings[target.id],
-            capacity=capacity,
+            source=self.get_igraph_vertex_id(source),
+            target=self.get_igraph_vertex_id(target),
+            **self.edge_attribute_option("capacity", capacity),
         )
 
-        partition_vertices = [
-            self._convert_vertex_ids_to_mgp_vertices(vertex_ids=partition) for partition in cut.partition
-        ]
+        partition_vertices = [self.convert_vertex_ids_to_mgp_vertices(vertex_ids=partition) for partition in cut.partition]
         return partition_vertices, cut.value
 
     def spanning_tree(
         self,
         weights: str,
-    ) -> List[List[mgp.Vertex]]:
-        if weights:
-            weights = self.es[weights]
+    ) -> list[list[object]]:
+        min_spanning_tree_edges = super().spanning_tree(return_tree=False, **self.edge_attribute_option("weights", weights))
 
-        min_spanning_tree_edges = super().spanning_tree(weights=weights, return_tree=False)
+        computed_return_value = self.get_min_span_tree_vertex_pairs(min_spanning_tree_edges=self.es[min_spanning_tree_edges])
+        return computed_return_value
 
-        return self._get_min_span_tree_vertex_pairs(min_spanning_tree_edges=self.es[min_spanning_tree_edges])
-
-    def shortest_path_length(self, source: mgp.Vertex, target: mgp.Vertex, weights: str) -> float:
-        length = super().distances(
-            source=self.id_mappings[source.id],
-            target=self.id_mappings[target.id],
-            weights=weights,
-        )[0][0]
-
-        return float(length)
-
-    def all_shortest_path_lengths(self, weights: str) -> List[List[float]]:
-        return super().distances(
-            weights=weights,
+    def shortest_path_length(self, source, target, weights: str) -> float:
+        source_id = self.get_igraph_vertex_id(source)
+        target_id = self.get_igraph_vertex_id(target)
+        distances = super().distances(
+            source=source_id,
+            target=target_id,
+            **self.edge_attribute_option("weights", weights),
         )
+        if not distances or not distances[0]:
+            raise RuntimeError("igraph returned no shortest-path distance")
+        length = distances[0][0]
 
-    def get_shortest_path(self, source: mgp.Vertex, target: mgp.Vertex, weights: str) -> List[mgp.Vertex]:
-        path = super().get_shortest_paths(
-            v=self.id_mappings[source.id],
-            to=self.id_mappings[target.id],
-            weights=weights,
-        )[0]
+        computed_return_value = float(length)
+        return computed_return_value
 
-        return self._convert_vertex_ids_to_mgp_vertices(path)
+    def all_shortest_path_lengths(self, weights: str) -> list[list[float]]:
+        computed_return_value = super().distances(**self.edge_attribute_option("weights", weights))
+        return computed_return_value
 
-    def get_vertex_by_id(self, id: int) -> mgp.Vertex:
-        return self.ctx_graph.get_vertex_by_id(self.reverse_id_mappings[id])
+    def get_shortest_path(self, source, target, weights: str) -> list[object]:
+        source_id = self.get_igraph_vertex_id(source)
+        target_id = self.get_igraph_vertex_id(target)
+        paths = super().get_shortest_paths(v=source_id, to=target_id, **self.edge_attribute_option("weights", weights))
+        if not paths:
+            raise RuntimeError("igraph returned no shortest path result")
+        path = paths[0]
 
-    def _convert_vertex_ids_to_mgp_vertices(self, vertex_ids: List[int]) -> List[mgp.Vertex]:
+        computed_return_value = self.convert_vertex_ids_to_mgp_vertices(path)
+        return computed_return_value
+
+    def get_vertex_by_id(self, vertex_id: int) -> object:
+        memgraph_vertex_id = self.reverse_id_mappings.get(vertex_id, -1)
+        if memgraph_vertex_id < 0:
+            raise KeyError(f"igraph vertex {vertex_id} is absent from the Memgraph mapping")
+        computed_return_value = self.ctx_graph.get_vertex_by_id(memgraph_vertex_id)
+        return computed_return_value
+
+    def convert_vertex_ids_to_mgp_vertices(self, vertex_ids: list[int]) -> list[object]:
         vertices = []
-        for id in vertex_ids:
-            vertices.append(self.ctx_graph.get_vertex_by_id(self.reverse_id_mappings[id]))
+        for vertex_id in vertex_ids:
+            vertices.append(self.get_vertex_by_id(vertex_id))
 
         return vertices
 
-    def _get_min_span_tree_vertex_pairs(
+    def get_min_span_tree_vertex_pairs(
         self,
-        min_spanning_tree_edges: igraph.EdgeSeq,
-    ) -> List[List[mgp.Vertex]]:
+        min_spanning_tree_edges: igraph_EdgeSeq,
+    ) -> list[list[object]]:
         """Function for getting vertex pairs that are connected in minimum spanning tree.
 
         Args:
@@ -145,51 +198,62 @@ class MemgraphIgraph(igraph.Graph):
         for edge in min_spanning_tree_edges:
             min_span_tree.append(
                 [
-                    self.ctx_graph.get_vertex_by_id(self.reverse_id_mappings[edge.source]),
-                    self.ctx_graph.get_vertex_by_id(self.reverse_id_mappings[edge.target]),
+                    self.get_vertex_by_id(edge.source),
+                    self.get_vertex_by_id(edge.target),
                 ]
             )
 
         return min_span_tree
 
-    def _create_igraph_from_ctx(
-        self, ctx: mgp.ProcCtx, directed: bool = False
-    ) -> Tuple[Dict[int, int], Dict[int, int]]:
-        """Function for creating igraph.Graph from mgp.ProcCtx.
 
-        Args:
-            ctx (mgp.ProcCtx): memgraph ProcCtx object
-            directed (bool, optional): Is graph directed. Defaults to False.
+def graph_structure_from_ctx(ctx) -> tuple[int, list[tuple[int, int]], list[dict], list[dict], dict[int, int], dict[int, int]]:
+    """Reads the igraph structure of the graph in an mgp.ProcCtx.
 
-        Returns:
-            Tuple[igraph.Graph, Dict[int, int], Dict[int, int]]: Returns Igraph.Graph object, vertex id mappings and inverted_id_mapping vertex id mappings
-        """
+    Args:
+        ctx (mgp.ProcCtx): memgraph ProcCtx object
 
-        vertex_attrs = defaultdict(list)
-        edge_list = []
-        edge_attrs = defaultdict(list)
-        id_mapping = {vertex.id: i for i, vertex in enumerate(ctx.graph.vertices)}
-        inverted_id_mapping = {i: vertex.id for i, vertex in enumerate(ctx.graph.vertices)}
-        for vertex in ctx.graph.vertices:
-            for name, value in vertex.properties.items():
-                vertex_attrs[name].append(value)
-            for edge in vertex.out_edges:
-                for name, value in edge.properties.items():
-                    edge_attrs[name].append(value)
-                edge_list.append((id_mapping[edge.from_vertex.id], id_mapping[edge.to_vertex.id]))
+    Returns:
+        The vertex count, the edge list as igraph vertex id pairs, the vertex and edge property maps by position, and
+        the Memgraph-to-igraph vertex id mapping with its inverse.
+    """
 
-        super().__init__(
-            directed=directed,
-            n=len(ctx.graph.vertices),
-            edges=edge_list,
-            edge_attrs=edge_attrs,
-            vertex_attrs=vertex_attrs,
-        )
+    vertices = list(ctx.graph.vertices)
+    edge_list = []
+    vertex_properties = []
+    edge_properties = []
+    id_mapping = {vertex.id: i for i, vertex in enumerate(vertices)}
+    inverted_id_mapping = {i: vertex.id for i, vertex in enumerate(vertices)}
+    for vertex in vertices:
+        vertex_properties.append(dict(vertex.properties.items()))
+        for edge in vertex.out_edges:
+            edge_properties.append(dict(edge.properties.items()))
+            source_id = id_mapping.get(edge.from_vertex.id, -1)
+            target_id = id_mapping.get(edge.to_vertex.id, -1)
+            if source_id < 0 or target_id < 0:
+                raise KeyError("Memgraph edge references a vertex outside the graph context")
+            edge_list.append((source_id, target_id))
 
-        return id_mapping, inverted_id_mapping
+    structure = (len(vertices), edge_list, vertex_properties, edge_properties, id_mapping, inverted_id_mapping)
+    return structure
 
 
-class PageRankImplementationOptions(enum.Enum):
+def assign_present_attributes(sequence, property_maps: list[dict]) -> None:
+    """Set each property only on the vertices or edges, by position, that carry it.
+
+    igraph leaves every other element of a partially assigned attribute unset, so values
+    never shift onto another element and no concrete false value reads as a 0 weight or capacity.
+    """
+    present = {}
+    for position, properties in enumerate(property_maps):
+        for name, value in properties.items():
+            positions, values = present.setdefault(name, ([], []))
+            positions.append(position)
+            values.append(value)
+    for name, (positions, values) in present.items():
+        sequence.select(positions)[name] = values
+
+
+class PageRankImplementationOptions(enum_Enum):
     PRPACK = "prpack"
     ARPACK = "arpack"
 
@@ -198,7 +262,7 @@ class InvalidPageRankImplementationOption(Exception):
     pass
 
 
-class TopologicalSortingModes(enum.Enum):
+class TopologicalSortingModes(enum_Enum):
     IN = "in"
     OUT = "out"
 
@@ -207,7 +271,7 @@ class InvalidTopologicalSortingModeException(Exception):
     pass
 
 
-class CommunityDetectionObjectiveFunctionOptions(enum.Enum):
+class CommunityDetectionObjectiveFunctionOptions(enum_Enum):
     CPM = "CPM"
     MODULARITY = "modularity"
 

@@ -116,7 +116,7 @@ struct Indices {
     /// answered by scanning the deltas; past that the scanning is what costs, so they are indexed.
     static constexpr auto kMissesBeforeIndexing = 8;
     unsigned misses_{0};
-    std::optional<std::vector<std::tuple<Edge *, EdgeTypeId, Vertex *>>> out_edge_links_{};
+    std::optional<std::unordered_map<Edge *, std::pair<EdgeTypeId, Vertex *>>> out_edge_links_{};
   };
 
   auto GetAbortProcessor(ActiveIndices const &active_indices) const -> AbortProcessor;

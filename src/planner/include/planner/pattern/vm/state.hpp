@@ -60,19 +60,23 @@ struct SetIter {
 
   SetIter() = default;
 
-  explicit SetIter(Set const &set) : it(set.begin()), end(set.end()) {}
+  explicit SetIter(Set const &set) : it(set.begin()), end(set.end()), rem_(set.size()) {}
 
   [[nodiscard]] auto exhausted() const -> bool { return it == end; }
 
-  [[nodiscard]] auto remaining() const -> std::size_t { return static_cast<std::size_t>(std::distance(it, end)); }
+  [[nodiscard]] auto remaining() const -> std::size_t { return rem_; }
 
   [[nodiscard]] auto current() const -> value_type { return *it; }
 
-  void advance() { ++it; }
+  void advance() {
+    ++it;
+    if (rem_ > 0) --rem_;
+  }
 
  private:
   iterator it{};
   iterator end{};
+  std::size_t rem_{0};
 };
 
 /// Iterating parent e-nodes

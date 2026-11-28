@@ -1,13 +1,17 @@
 FROM quay.io/centos/centos:stream10
 
 ARG TOOLCHAIN_VERSION
+ARG TOOLCHAIN_SHA256
 
 RUN dnf install -y wget git
 # Do NOT be smart here and clean the cache because the container is used in the
 # stateful context.
 
-RUN wget -q --max-redirect=0 https://s3-eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-${TOOLCHAIN_VERSION}/toolchain-${TOOLCHAIN_VERSION}-binaries-x86_64.tar.gz \
+RUN test -n "${TOOLCHAIN_SHA256}" \
+    && printf '%s' "${TOOLCHAIN_SHA256}" | grep -Eq '^[0-9a-fA-F]{64}$' \
+    && wget -q --https-only --max-redirect=0 https://s3-eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-${TOOLCHAIN_VERSION}/toolchain-${TOOLCHAIN_VERSION}-binaries-x86_64.tar.gz \
     -O toolchain-${TOOLCHAIN_VERSION}-binaries-x86_64.tar.gz \
+    && printf '%s  %s\n' "${TOOLCHAIN_SHA256}" "toolchain-${TOOLCHAIN_VERSION}-binaries-x86_64.tar.gz" | sha256sum -c - \
     && tar xzvf toolchain-${TOOLCHAIN_VERSION}-binaries-x86_64.tar.gz -C /opt \
     && rm toolchain-${TOOLCHAIN_VERSION}-binaries-x86_64.tar.gz
 

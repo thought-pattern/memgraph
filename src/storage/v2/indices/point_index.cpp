@@ -123,14 +123,14 @@ std::vector<std::pair<LabelId, PropertyId>> PointIndexStorage::ActiveIndices::Li
 // ---- PointIndexStorage (owner) methods ----
 
 void PointIndexStorage::PublishActiveIndices(ActiveIndicesUpdater const &updater) {
-  updater(std::make_shared<PointIndexStorage::ActiveIndices>(indexes_));
+  updater(std::make_shared<PointIndexStorage::ActiveIndices>(LoadIndexes()));
 }
 
 bool PointIndexStorage::CreatePointIndex(LabelId label, PropertyId property,
                                          utils::SkipListDb<Vertex>::Accessor vertices,
                                          ProgressCallback const &on_progress) {
   auto key = LabelPropKey{label, property};
-  if (indexes_->contains(key)) return false;
+  if (LoadIndexes()->contains(key)) return false;
 
   auto points_2d_WGS = std::vector<Entry<IndexPointWGS2d>>{};
   auto points_2d_Crt = std::vector<Entry<IndexPointCartesian2d>>{};
@@ -138,6 +138,7 @@ bool PointIndexStorage::CreatePointIndex(LabelId label, PropertyId property,
   auto points_3d_Crt = std::vector<Entry<IndexPointCartesian3d>>{};
 
   for (auto const &v : vertices) {
+    if (on_progress) on_progress();
     if (v.deleted()) continue;
     if (!std::ranges::contains(v.labels, label)) continue;
 
@@ -168,79 +169,69 @@ bool PointIndexStorage::CreatePointIndex(LabelId label, PropertyId property,
       default:
         continue;
     }
-
-    if (on_progress) on_progress();
   }
-  // Skip the COW copy when the key already exists - matches the symmetric
-  // early-return in DropPointIndex.
-  if (indexes_->contains(key)) return false;
+  auto cur_indexes = LoadIndexes();
+  if (cur_indexes->contains(key)) return false;
   auto new_index = std::make_shared<PointIndex>(points_2d_WGS, points_2d_Crt, points_3d_WGS, points_3d_Crt);
-  // Copy-on-write: create a new map so existing ActiveIndices snapshots are not affected.
-  auto new_indexes = std::make_shared<index_container_t>(*indexes_);
+  auto new_indexes = std::make_shared<index_container_t>(*cur_indexes);
   new_indexes->try_emplace(key, std::move(new_index));
-  indexes_ = std::move(new_indexes);
+  StoreIndexes(std::move(new_indexes));
   return true;
 }
 
 void PointIndexStorage::RestorePointIndex(LabelId label, PropertyId property, std::shared_ptr<PointIndex const> index) {
   if (!index) return;
   auto key = LabelPropKey{label, property};
-  if (indexes_->contains(key)) return;
-  auto new_indexes = std::make_shared<index_container_t>(*indexes_);
+  auto cur_indexes = LoadIndexes();
+  if (cur_indexes->contains(key)) return;
+  auto new_indexes = std::make_shared<index_container_t>(*cur_indexes);
   new_indexes->emplace(key, std::move(index));
-  indexes_ = std::move(new_indexes);
+  StoreIndexes(std::move(new_indexes));
 }
 
 std::shared_ptr<PointIndex const> PointIndexStorage::DropPointIndex(LabelId label, PropertyId property) {
   auto key = LabelPropKey{label, property};
-  auto it = indexes_->find(key);
-  if (it == indexes_->end()) return nullptr;
+  auto cur_indexes = LoadIndexes();
+  auto it = cur_indexes->find(key);
+  if (it == cur_indexes->end()) return nullptr;
 
-  // Copy-on-write: create a new map so existing ActiveIndices snapshots are not affected.
   auto evicted = it->second;
-  auto new_indexes = std::make_shared<index_container_t>(*indexes_);
+  auto new_indexes = std::make_shared<index_container_t>(*cur_indexes);
   new_indexes->erase(key);
-  indexes_ = std::move(new_indexes);
+  StoreIndexes(std::move(new_indexes));
   return evicted;
 }
 
 void PointIndexStorage::InstallNewPointIndex(PointIndexChangeCollector &collector, PointIndexContext &context,
                                              ActiveIndicesUpdater const &updater) {
   if (!context.UsingLocalIndex() && !collector.CurrentChanges().AnyChanges()) {
-    // Hence TXN didn't do AdvanceCommand that required new private local index
-    // no modification during the last command to require new index now
     return;
   }
 
-  auto noOtherIndexUpdate = indexes_ == context.orig_indexes_;
+  auto cur_indexes = LoadIndexes();
+  auto noOtherIndexUpdate = cur_indexes == context.orig_indexes_;
   if (noOtherIndexUpdate) {
-    // TODO: make a special case for inplace modification
-    //    if (!context.UsingLocalIndex() && context.orig_indexes_.use_count() == 3) { /* ??? */}
-    //    3 becasue indexes_ + orig_indexes_ + current_indexes_ should be the only references
     context.update_current(collector);
-    indexes_ = context.current_indexes_;
+    StoreIndexes(context.current_indexes_);
   } else {
-    // Another txn made a commit, we need to build from indexes_ + all collected changes (even from AdvanceCommand)
-    // TODO: make a special case for inplace modification
-    //    if (indexes_.use_count() == 1) { /* ??? */ }
-    context.rebuild_current(indexes_, collector);
-    indexes_ = context.current_indexes_;
+    context.rebuild_current(cur_indexes, collector);
+    StoreIndexes(context.current_indexes_);
   };
 
   PublishActiveIndices(updater);
 }
 
-void PointIndexStorage::Clear() { indexes_ = std::make_shared<index_container_t>(); }
+void PointIndexStorage::Clear() { StoreIndexes(std::make_shared<index_container_t>()); }
 
 std::vector<std::pair<LabelId, PropertyId>> PointIndexStorage::ListIndices() {
-  auto indexes = indexes_;  // local copy of shared_ptr, for safety
+  auto indexes = LoadIndexes();
   auto keys = *indexes | std::views::keys |
               std::views::transform([](LabelPropKey key) { return std::pair{key.label(), key.property()}; });
   return {keys.begin(), keys.end()};
 }
 
 bool PointIndexStorage::PointIndexExists(LabelId labelId, PropertyId propertyId) {
-  auto indexes = indexes_;  // local copy of shared_ptr, for safety
+  auto indexes = LoadIndexes();
   return indexes->contains(LabelPropKey{labelId, propertyId});
 }
 
@@ -571,7 +562,7 @@ double toDegrees(double radians) { return radians * 180.0 / M_PI; }
 
 template <typename point_type>
   requires std::is_same_v<typename bg::traits::coordinate_system<point_type>::type, bg::cs::cartesian>
-auto create_bounding_box(const point_type &center_point, double boundary) -> bg::model::box<point_type> {
+auto create_outer_bounding_box(const point_type &center_point, double boundary) -> bg::model::box<point_type> {
   constexpr auto n_dimensions = bg::traits::dimension<point_type>::value;
   return [&]<auto... I>(std::index_sequence<I...>) {
     auto const min_corner = point_type{(bg::get<I>(center_point) - boundary)...};
@@ -581,11 +572,26 @@ auto create_bounding_box(const point_type &center_point, double boundary) -> bg:
 }
 
 template <typename point_type>
+  requires std::is_same_v<typename bg::traits::coordinate_system<point_type>::type, bg::cs::cartesian>
+auto create_inner_exclusion_box(const point_type &center_point, double boundary)
+    -> std::optional<bg::model::box<point_type>> {
+  constexpr auto n_dimensions = bg::traits::dimension<point_type>::value;
+  auto const offset = boundary / std::sqrt(n_dimensions);
+  auto const slightly_smaller = std::max(0.0, std::nexttoward(offset, 0.0));
+  if (slightly_smaller <= 0.0) {
+    return std::nullopt;
+  }
+  return create_outer_bounding_box(center_point, slightly_smaller);
+}
+
+template <typename point_type>
   requires std::is_same_v<typename bg::traits::coordinate_system<point_type>::type, bg::cs::geographic<bg::degree>>
-auto create_bounding_box(const point_type &center_point, double boundary) -> bg::model::box<point_type> {
-  // Our approximation for earth radius
-  constexpr double MEAN_EARTH_RADIUS = 6'371'009;
-  double const radDist = boundary / MEAN_EARTH_RADIUS;
+auto create_outer_bounding_box(const point_type &center_point, double boundary) -> bg::model::box<point_type> {
+  // Minimum meridional/normal radius of curvature on the WGS-84 ellipsoid (a*(1 - e^2) at the equator).
+  // Every WGS-84 tangent vector is at least kWgs84MinCurvatureRadius * unit-sphere arc length, so dividing
+  // by a conservative floor strictly below a*(1 - e^2) guarantees the box covers every point within `boundary`.
+  constexpr double kWgs84MinCurvatureRadius = 6'335'439.0;
+  double const radDist = boundary / kWgs84MinCurvatureRadius;
 
   auto const radLon = toRadians(bg::get<0>(center_point));
   auto const radLat = toRadians(bg::get<1>(center_point));
@@ -601,18 +607,19 @@ auto create_bounding_box(const point_type &center_point, double boundary) -> bg:
 
   double minLon;  // NOLINT(cppcoreguidelines-init-variables)
   double maxLon;  // NOLINT(cppcoreguidelines-init-variables)
-  // check if latitude needs to truncate at the poles
-  if (minLat > MIN_LAT && maxLat < MAX_LAT) {
-    double const deltaLon = std::asin(std::sin(radDist) / std::cos(radLat));
-    minLon = radLon - deltaLon;
-    if (minLon < MIN_LON) minLon += 2.0 * M_PI;
-    maxLon = radLon + deltaLon;
-    if (maxLon > MAX_LON) maxLon -= 2.0 * M_PI;
-
-    // for rtree `covered_by` needs the box the have lb <= ub
-    // it internally will deal with these non-normalised degrees
-    if (maxLon < minLon) maxLon += 2.0 * M_PI;
-
+  if (radDist < M_PI_2 && minLat > MIN_LAT && maxLat < MAX_LAT) {
+    double const ratio = std::sin(radDist) / std::cos(radLat);
+    if (ratio < 1.0) {
+      double const deltaLon = std::asin(ratio);
+      minLon = radLon - deltaLon;
+      if (minLon < MIN_LON) minLon += 2.0 * M_PI;
+      maxLon = radLon + deltaLon;
+      if (maxLon > MAX_LON) maxLon -= 2.0 * M_PI;
+      if (maxLon < minLon) maxLon += 2.0 * M_PI;
+    } else {
+      minLon = MIN_LON;
+      maxLon = MAX_LON;
+    }
   } else {
     minLat = std::max(minLat, MIN_LAT);
     maxLat = std::min(maxLat, MAX_LAT);
@@ -630,6 +637,53 @@ auto create_bounding_box(const point_type &center_point, double boundary) -> bg:
     auto min_corner = point_type{toDegrees(minLon), toDegrees(minLat), height_center - boundary};
     auto max_corner = point_type{toDegrees(maxLon), toDegrees(maxLat), height_center + boundary};
     return bg::model::box<point_type>{min_corner, max_corner};
+  }
+}
+
+template <typename point_type>
+  requires std::is_same_v<typename bg::traits::coordinate_system<point_type>::type, bg::cs::geographic<bg::degree>>
+auto create_inner_exclusion_box(const point_type &center_point, double boundary)
+    -> std::optional<bg::model::box<point_type>> {
+  // Maximum meridional/normal radius of curvature on the WGS-84 ellipsoid (a^2/b at the poles).
+  // Clamping the inscribed box strictly inside [-90, 90] and [-180, 180] and scaling by cos_max guarantees
+  // every point covered by this box has WGS-84 distance strictly less than `boundary` even near the poles.
+  constexpr double kWgs84MaxCurvatureRadius = 6'399'594.0;
+  constexpr auto n_dimensions = bg::traits::dimension<point_type>::value;
+  double const component_budget = (boundary / std::sqrt(n_dimensions)) * 0.999999;
+  if (!(component_budget > 0.0)) {
+    return std::nullopt;
+  }
+
+  auto const radLon = toRadians(bg::get<0>(center_point));
+  auto const radLat = toRadians(bg::get<1>(center_point));
+  double const lat_room = std::min(radLat - (-M_PI_2), M_PI_2 - radLat);
+  double const lon_room = std::min(radLon - (-M_PI), M_PI - radLon);
+  double const dLat = std::min(component_budget / kWgs84MaxCurvatureRadius, lat_room * 0.999999);
+  if (!(dLat > 0.0) || !(lon_room > 0.0)) {
+    return std::nullopt;
+  }
+
+  double const minLat = radLat - dLat;
+  double const maxLat = radLat + dLat;
+  double const cos_max = (minLat <= 0.0 && 0.0 <= maxLat) ? 1.0 : std::max(std::cos(minLat), std::cos(maxLat));
+  if (!(cos_max > 1e-12)) {
+    return std::nullopt;
+  }
+  double const dLon = std::min((component_budget / kWgs84MaxCurvatureRadius) / cos_max, lon_room * 0.999999);
+  if (!(dLon > 0.0)) {
+    return std::nullopt;
+  }
+
+  double const minLon = radLon - dLon;
+  double const maxLon = radLon + dLon;
+  if constexpr (n_dimensions == 2) {
+    return bg::model::box<point_type>{point_type{toDegrees(minLon), toDegrees(minLat)},
+                                      point_type{toDegrees(maxLon), toDegrees(maxLat)}};
+  } else {
+    auto const height_center = bg::get<2>(center_point);
+    return bg::model::box<point_type>{
+        point_type{toDegrees(minLon), toDegrees(minLat), height_center - component_budget},
+        point_type{toDegrees(maxLon), toDegrees(maxLat), height_center + component_budget}};
   }
 }
 
@@ -666,32 +720,15 @@ auto get_index_iterator_distance(Index const &index, PropertyValue const &point_
     }
   });
 
-  auto inner_exclusion_box = [&] {
-    // dimensional scaling
-    auto offset = boundary / std::sqrt(dimensions);
-    // Need to ensure this inner box will not intersect with actual boundary,
-    // because `bgi::covered_by` includes edges we are using `!bgi::covered_by` for our OUTSIDE
-    // conditions.
-    auto slightly_smaller = std::max(0.0, std::nexttoward(offset, 0.0));
-
-    return create_bounding_box(center_point, slightly_smaller);
-  };
-
   auto outer_inclusion_box = [&] {
     auto slightly_larger = std::nexttoward(boundary, std::numeric_limits<long double>::infinity());
-    return create_bounding_box(center_point, slightly_larger);
+    return create_outer_bounding_box(center_point, slightly_larger);
   };
 
   auto true_distance = [](auto a, auto b) {
     if constexpr (is_cartesian || dimensions == 2) {
       return bg::distance(a, b);
     } else {
-      // SPECIAL CASE: WGS-84 3D
-
-      // We could reply on boost implementation that ignores the height for distance, but for possible future
-      // boost changes, going to hand code operations to the 2d equivilant.
-
-      // distance using average height of the two points
       auto h1 = bg::get<2>(a);
       auto h2 = bg::get<2>(b);
       auto middle = std::midpoint(h1, h2);
@@ -699,16 +736,19 @@ auto get_index_iterator_distance(Index const &index, PropertyValue const &point_
       auto avg_b = point_type{bg::get<0>(b), bg::get<1>(b), middle};
       auto distance_spherical = bg::distance(avg_a, avg_b);
 
-      // use Pythagoras' theorem, combining height difference
       auto height_diff = h1 - h2;
-      return std::sqrt(height_diff * height_diff + distance_spherical * distance_spherical);
+      return std::hypot(height_diff, distance_spherical);
     }
   };
 
   switch (condition) {
     case PointDistanceCondition::OUTSIDE: {
-      // BOOST 1.81.0 covered_by geometry must be box
-      return index.qbegin(!bgi::covered_by(inner_exclusion_box()) && bgi::satisfies([=](const auto &value) {
+      if (auto const inner_box = create_inner_exclusion_box(center_point, boundary); inner_box.has_value()) {
+        return index.qbegin(!bgi::covered_by(*inner_box) && bgi::satisfies([=](const auto &value) {
+          return true_distance(value.point(), center_point) > boundary;
+        }));
+      }
+      return index.qbegin(bgi::satisfies([=](const auto &value) {
         return true_distance(value.point(), center_point) > boundary;
       }));
     }
@@ -723,7 +763,12 @@ auto get_index_iterator_distance(Index const &index, PropertyValue const &point_
                           }));
     }
     case PointDistanceCondition::OUTSIDE_AND_BOUNDARY: {
-      return index.qbegin(!bgi::covered_by(inner_exclusion_box()) && bgi::satisfies([=](const auto &value) {
+      if (auto const inner_box = create_inner_exclusion_box(center_point, boundary); inner_box.has_value()) {
+        return index.qbegin(!bgi::covered_by(*inner_box) && bgi::satisfies([=](const auto &value) {
+          return true_distance(value.point(), center_point) >= boundary;
+        }));
+      }
+      return index.qbegin(bgi::satisfies([=](const auto &value) {
         return true_distance(value.point(), center_point) >= boundary;
       }));
     }
@@ -779,6 +824,10 @@ auto get_index_iterator_withinbbox(Index &index, PropertyValue const &bottom_lef
 }  // namespace
 
 auto PointIterable::begin() const -> PointIterator {
+  if (!pimpl) {
+    static const index_t<IndexPointCartesian2d> empty_index{};
+    return PointIterator{nullptr, nullptr, CoordinateReferenceSystem::Cartesian_2d, empty_index.qend()};
+  }
   auto apply_index = [&](CoordinateReferenceSystem crs, auto &&func) {
     switch (crs) {
       case CoordinateReferenceSystem::WGS84_2d:
@@ -814,6 +863,10 @@ auto PointIterable::begin() const -> PointIterator {
 }
 
 auto PointIterable::end() const -> PointIterator {
+  if (!pimpl) {
+    static const index_t<IndexPointCartesian2d> empty_index{};
+    return PointIterator{nullptr, nullptr, CoordinateReferenceSystem::Cartesian_2d, empty_index.qend()};
+  }
   switch (pimpl->crs_) {
     case CoordinateReferenceSystem::WGS84_2d:
       return PointIterator{pimpl->storage_, pimpl->transaction_, pimpl->crs_, pimpl->wgs84_2d_->qend()};

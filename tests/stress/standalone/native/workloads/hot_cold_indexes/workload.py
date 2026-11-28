@@ -82,12 +82,12 @@ slowdown.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Driver import: mirror hot_cold_oom/workload.py — fall back to direct neo4j import.

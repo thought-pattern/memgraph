@@ -36,12 +36,16 @@ class DurableMetadata {
   std::optional<uint64_t> LoadTimestampIfExists() const;
   std::optional<uint64_t> LoadVertexCountIfExists() const;
   std::optional<uint64_t> LoadEdgeCountIfExists() const;
+  std::optional<uint64_t> LoadNextVertexIdIfExists() const;
+  std::optional<uint64_t> LoadNextEdgeIdIfExists() const;
   std::optional<std::vector<std::string>> LoadLabelIndexInfoIfExists() const;
   std::optional<std::vector<std::string>> LoadLabelPropertyIndexInfoIfExists() const;
+  std::optional<std::vector<std::string>> LoadTextIndexInfoIfExists() const;
   std::optional<std::vector<std::string>> LoadExistenceConstraintInfoIfExists() const;
   std::optional<std::vector<std::string>> LoadUniqueConstraintInfoIfExists() const;
 
-  void UpdateMetaData(uint64_t timestamp, uint64_t vertex_count, uint64_t edge_count);
+  [[nodiscard]] bool UpdateMetaData(uint64_t timestamp, uint64_t vertex_count, uint64_t edge_count,
+                                    uint64_t next_vertex_id = 0, uint64_t next_edge_id = 0);
 
   bool PersistLabelIndexCreation(LabelId label);
 

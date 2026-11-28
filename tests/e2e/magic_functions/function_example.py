@@ -12,9 +12,9 @@
 import sys
 import typing
 
+from common import execute_and_fetch_all, has_n_result_row
 import mgclient
 import pytest
-from common import execute_and_fetch_all, has_n_result_row
 
 
 @pytest.fixture(scope="function")

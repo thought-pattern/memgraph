@@ -1,6 +1,7 @@
 FROM ubuntu:24.04
 
 ARG TOOLCHAIN_VERSION
+ARG TOOLCHAIN_SHA256
 
 # Stops tzdata interactive configuration.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,8 +11,11 @@ RUN apt update && apt install -y --no-install-recommends \
 # Do NOT be smart here and clean the cache because the container is used in the
 # stateful context.
 
-RUN wget -q --max-redirect=0 https://s3-eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-${TOOLCHAIN_VERSION}/toolchain-${TOOLCHAIN_VERSION}-binaries-aarch64.tar.gz \
+RUN test -n "${TOOLCHAIN_SHA256}" \
+    && printf '%s' "${TOOLCHAIN_SHA256}" | grep -Eq '^[0-9a-fA-F]{64}$' \
+    && wget -q --https-only --max-redirect=0 https://s3-eu-west-1.amazonaws.com/deps.memgraph.io/toolchain-${TOOLCHAIN_VERSION}/toolchain-${TOOLCHAIN_VERSION}-binaries-aarch64.tar.gz \
     -O toolchain-${TOOLCHAIN_VERSION}-binaries-aarch64.tar.gz \
+    && printf '%s  %s\n' "${TOOLCHAIN_SHA256}" "toolchain-${TOOLCHAIN_VERSION}-binaries-aarch64.tar.gz" | sha256sum -c - \
     && tar xzvf toolchain-${TOOLCHAIN_VERSION}-binaries-aarch64.tar.gz -C /opt \
     && rm toolchain-${TOOLCHAIN_VERSION}-binaries-aarch64.tar.gz
 

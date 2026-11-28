@@ -79,7 +79,7 @@ struct TextIndexActiveIndices {
                                                text_search_mode search_mode, const TextSearchConfig &config,
                                                const Transaction &tx) = 0;
   virtual std::string Aggregate(const std::string &index_name, const std::string &search_query,
-                                const std::string &aggregation_query) = 0;
+                                const std::string &aggregation_query, const Transaction &tx) = 0;
 
   virtual bool IndexExists(const std::string &index_name) const = 0;
   virtual std::vector<TextIndexSpec> ListIndices() const = 0;
@@ -110,7 +110,7 @@ class TextIndex {
                                          text_search_mode search_mode, const TextSearchConfig &config,
                                          const Transaction &tx) override;
     std::string Aggregate(const std::string &index_name, const std::string &search_query,
-                          const std::string &aggregation_query) override;
+                          const std::string &aggregation_query, const Transaction &tx) override;
 
     bool IndexExists(const std::string &index_name) const override;
     std::vector<TextIndexSpec> ListIndices() const override;

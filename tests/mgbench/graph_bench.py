@@ -13,8 +13,8 @@
 
 import argparse
 import json
-import subprocess
 from pathlib import Path
+import subprocess
 
 from constants import BenchmarkClientLanguage, BenchmarkInstallationType, GraphVendors
 

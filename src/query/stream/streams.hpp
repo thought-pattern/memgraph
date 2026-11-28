@@ -34,6 +34,7 @@
 #include "utils/rw_lock.hpp"
 #include "utils/synchronized.hpp"
 
+struct mgp_graph;
 class StreamsTest;
 
 namespace memgraph::query {
@@ -88,6 +89,9 @@ class Streams final {
   /// @param interpreter_context context to use to run the result of transformations
   /// @param directory a directory path to store the persisted streams metadata
   explicit Streams(std::filesystem::path directory, memory::ArenaPool *arena_pool = nullptr);
+  ~Streams();
+
+  void BindStorageUuid(const utils::UUID &uuid);
 
   /// Restores the streams from the persisted metadata.
   /// The restoration is done in a best effort manner, therefore no exception is thrown on failure, but the error is
@@ -192,6 +196,7 @@ class Streams final {
     std::optional<std::string> owner;
     std::vector<std::string> owner_roles;
     std::unique_ptr<SynchronizedStreamSource<TStream>> stream_source;
+    InterpreterContext *interpreter_context{nullptr};
   };
 
   using StreamDataVariant = std::variant<StreamData<KafkaStream>, StreamData<PulsarStream>>;
@@ -217,10 +222,13 @@ class Streams final {
   void RegisterKafkaProcedures();
   void RegisterPulsarProcedures();
 
+  static Streams &ResolveStreamsForGraph(mgp_graph *graph);
+
   kvstore::KVStore storage_;
 
   SynchronizedStreamsMap streams_;
   memory::ArenaPool *arena_pool_{nullptr};
+  std::optional<utils::UUID> bound_storage_uuid_;
 };
 
 }  // namespace stream

@@ -618,6 +618,8 @@ class Databases final {
 
   const std::string &GetMain() const;
 
+  const std::string &ConfiguredMain() const noexcept { return main_db_; }
+
   nlohmann::json Serialize() const;
   /// @throw AuthException if unable to deserialize.
   static Databases Deserialize(const nlohmann::json &data);
@@ -876,11 +878,7 @@ class Roles {
   PropertyAccessPermissions GetPropertyEdgeTypePermissions(
       std::optional<std::string_view> db_name = std::nullopt) const;
 
-  // No way to define a higher priority database, so we return the first one
-  const std::string &GetMain() const {
-    static std::string empty_db;
-    return roles_.empty() ? empty_db : roles_.begin()->GetMain();
-  }
+  const std::string &GetMain() const;
 
   bool DeniesDB(std::string_view db_name) const {
     return std::ranges::any_of(roles_, [db_name](const auto &role) { return role.DeniesDB(db_name); });
@@ -903,6 +901,8 @@ class Roles {
   }
 
   bool CanImpersonate(const User &user, std::optional<std::string_view> db_name = std::nullopt) const {
+    if (GetPermissions(db_name).Has(Permission::IMPERSONATE_USER) != PermissionLevel::GRANT) return false;
+    if (db_name && !HasAccess(*db_name)) return false;
     return !UserImpIsDenied(user, db_name) && UserImpIsGranted(user, db_name);
   }
 

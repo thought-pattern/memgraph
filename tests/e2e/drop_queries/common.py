@@ -9,8 +9,8 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import pytest
 from gqlalchemy import Memgraph
+import pytest
 
 
 def get_results_length(memgraph, query):

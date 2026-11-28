@@ -74,7 +74,7 @@ PropertyValue MakeSpilledVectorIndexValue() {
   // ids spill to the heap at >=2 entries and floats at >=3.
   return PropertyValue(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{1, 2},
-                                       .vector = memgraph::utils::small_vector<float>{1.0F, 2.0F, 3.0F}});
+                                       .vector = memgraph::utils::small_vector<double>{1.0, 2.0, 3.0}});
 }
 
 void EmplaceVectorIndexBeforeImage(delta_container &container) {

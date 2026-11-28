@@ -292,26 +292,26 @@ inline double SimilarityFromDistance(unum::usearch::metric_kind_t metric, double
   }
 }
 
-/// @brief Non-throwing conversion of a PropertyValue list to a vector of floats.
-/// @return The float vector, or nullopt if the value is not a numeric list.
-inline std::optional<utils::small_vector<float>> TryListToVector(const PropertyValue &value) {
-  if (value.IsNull()) return utils::small_vector<float>{};
+/// @brief Non-throwing conversion of a PropertyValue list to a vector of doubles.
+/// @return The double vector, or nullopt if the value is not a numeric list.
+inline std::optional<utils::small_vector<double>> TryListToVector(const PropertyValue &value) {
+  if (value.IsNull()) return utils::small_vector<double>{};
   if (!value.IsAnyList()) return std::nullopt;
 
   const auto list_size = value.ListSize();
-  utils::small_vector<float> vector;
+  utils::small_vector<double> vector;
   vector.reserve(list_size);
   for (std::size_t i = 0; i < list_size; i++) {
     auto numeric_value = GetNumericValueAt(value, i);
     if (!numeric_value) return std::nullopt;
-    vector.push_back(std::visit([](auto val) { return static_cast<float>(val); }, *numeric_value));
+    vector.push_back(std::visit([](auto val) { return static_cast<double>(val); }, *numeric_value));
   }
   return vector;
 }
 
-/// @brief Converts a PropertyValue list to a vector of floats.
+/// @brief Converts a PropertyValue list to a vector of doubles.
 /// @throws VectorSearchException if the value is not a list or contains non-numeric values.
-inline utils::small_vector<float> ListToVector(const PropertyValue &value) {
+inline utils::small_vector<double> ListToVector(const PropertyValue &value) {
   auto result = TryListToVector(value);
   if (!result) {
     throw VectorSearchException("Vector index property must be a list of floats or integers.");
@@ -320,8 +320,8 @@ inline utils::small_vector<float> ListToVector(const PropertyValue &value) {
 }
 
 /// @brief Registers an index ID in the property, converting a raw list to VectorIndexId if needed.
-/// @return The float vector to insert into uSearch.
-inline utils::small_vector<float> RegisterIndexId(PropertyValue &property, uint64_t index_id) {
+/// @return The double vector to insert into uSearch.
+inline utils::small_vector<double> RegisterIndexId(PropertyValue &property, uint64_t index_id) {
   if (property.IsVectorIndexId()) {
     auto &ids = property.ValueVectorIndexIds();
     if (!std::ranges::contains(ids, index_id)) ids.push_back(index_id);
@@ -409,7 +409,7 @@ inline std::size_t GetVectorIndexThreadCount() {
 /// @param thread_id Optional thread ID hint for usearch's internal thread-local optimizations.
 /// @throws VectorSearchException if dimension mismatch or add fails for reasons other than capacity.
 template <typename SyncIndex, typename Key, typename Spec>
-void UpdateVectorIndex(SyncIndex &mg_index, Spec &spec, const Key &key, const utils::small_vector<float> &vector,
+void UpdateVectorIndex(SyncIndex &mg_index, Spec &spec, const Key &key, const utils::small_vector<double> &vector,
                        std::optional<std::size_t> thread_id = std::nullopt) {
   if (vector.empty()) {
     // Setting empty vector on Abort

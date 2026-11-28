@@ -226,18 +226,23 @@ struct CompiledMatcherInfo {
 
 /// Non-empty bytecode ending with Halt.
 template <typename Reporter>
-void ValidateCodeStructure(Reporter &r, std::span<Instruction const> code, auto const &bc) {
-  if (!r.assert_true(!code.empty(), "Bytecode must not be empty")) return;
+auto ValidateCodeStructure(Reporter &r, std::span<Instruction const> code, auto const &bc) -> bool {
+  if (!r.assert_true(!code.empty(), "Bytecode must not be empty")) return false;
   r.expect_eq(
       code.back().op, VMOp::Halt, "Last instruction must be Halt, got {}\nBytecode:\n{}", op_name(code.back().op), bc);
+  return code.back().op == VMOp::Halt;
 }
 
 /// All jump/backtrack targets in bounds, no unpatched 0xFFFF placeholders.
 /// Must pass before any validator that indexes code[target].
 template <typename Reporter>
-void ValidateJumpTargetsInBounds(Reporter &r, std::span<Instruction const> code, auto const &bc) {
+auto ValidateJumpTargetsInBounds(Reporter &r, std::span<Instruction const> code, auto const &bc) -> bool {
+  bool all_in_bounds = true;
   for (std::size_t i = 0; i < code.size(); ++i) {
     if (!has_backtrack_target(code[i].op) && code[i].op != VMOp::Jump) continue;
+    if (code[i].target >= code.size() || code[i].target == uint16_t{0xFFFF}) {
+      all_in_bounds = false;
+    }
     r.expect_lt(code[i].target,
                 code.size(),
                 "Jump target out of bounds: instr[{}] {} target={} >= code.size()={}\nBytecode:\n{}",
@@ -253,6 +258,7 @@ void ValidateJumpTargetsInBounds(Reporter &r, std::span<Instruction const> code,
                 op_name(code[i].op),
                 bc);
   }
+  return all_in_bounds;
 }
 
 /// Symbol table, slot, and register index bounds.
@@ -348,6 +354,7 @@ void ValidateBacktracksToNextOrHalt(Reporter &r, std::span<Instruction const> co
   for (std::size_t i = 0; i < code.size(); ++i) {
     if (!has_backtrack_target(code[i].op)) continue;
     auto target = code[i].target;
+    if (target >= code.size()) continue;
     r.expect_true(is_valid_backtrack_target(code[target].op),
                   "Backtrack at {} ({}) targets {} ({}), expected NextX, MarkSeen, or Halt\nBytecode:\n{}",
                   i,
@@ -364,6 +371,7 @@ void ValidateJumpTargetSemantics(Reporter &r, std::span<Instruction const> code,
   for (std::size_t i = 0; i < code.size(); ++i) {
     if (code[i].op != VMOp::Jump) continue;
     auto target = code[i].target;
+    if (target >= code.size()) continue;
 
     if (target <= i) {
       r.expect_true(is_next_op(code[target].op) || code[target].op == VMOp::MarkSeen,
@@ -395,6 +403,7 @@ void ValidateNextBacktracksEarlierOrHalt(Reporter &r, std::span<Instruction cons
   for (std::size_t i = 0; i < code.size(); ++i) {
     if (!is_next_op(code[i].op)) continue;
     auto target = code[i].target;
+    if (target >= code.size()) continue;
     auto target_op = code[target].op;
     if (target_op == VMOp::Halt) {
       r.expect_gt(target,
@@ -456,8 +465,12 @@ void ValidateIterationPairing(Reporter &r, std::span<Instruction const> code, au
 
   for (auto const &iter : iters) {
     int match_count = 0;
+    std::size_t matching_next_pos = 0;
     for (std::size_t i = 0; i < code.size(); ++i) {
-      if (code[i].op == iter.expected_next && code[i].dst == iter.dst) ++match_count;
+      if (code[i].op == iter.expected_next && code[i].dst == iter.dst) {
+        ++match_count;
+        matching_next_pos = i;
+      }
     }
     r.expect_eq(match_count,
                 1,
@@ -468,19 +481,35 @@ void ValidateIterationPairing(Reporter &r, std::span<Instruction const> code, au
                 match_count,
                 op_name(iter.expected_next),
                 bc);
+    if (match_count == 1) {
+      r.expect_lt(iter.pos,
+                  matching_next_pos,
+                  "{} at {} (dst={}) appears after its {} at {}\nBytecode:\n{}",
+                  op_name(code[iter.pos].op),
+                  iter.pos,
+                  iter.dst,
+                  op_name(iter.expected_next),
+                  matching_next_pos,
+                  bc);
+    }
   }
 
   for (std::size_t i = 0; i < code.size(); ++i) {
     if (!is_next_op(code[i].op)) continue;
-    bool has_iter = false;
+    int iter_count = 0;
     for (auto const &iter : iters) {
       if (iter.expected_next == code[i].op && iter.dst == code[i].dst) {
-        has_iter = true;
-        break;
+        ++iter_count;
       }
     }
-    r.expect_true(
-        has_iter, "{} at {} (dst={}) has no matching IterX\nBytecode:\n{}", op_name(code[i].op), i, code[i].dst, bc);
+    r.expect_eq(iter_count,
+                1,
+                "{} at {} (dst={}) has {} matching IterX (expected 1)\nBytecode:\n{}",
+                op_name(code[i].op),
+                i,
+                code[i].dst,
+                iter_count,
+                bc);
   }
 }
 
@@ -856,6 +885,13 @@ void ValidateBindingOrder(Reporter &r, std::span<Instruction const> code, Compil
   // slot_to_order is inverse
   for (std::size_t i = 0; i < binding_order.size(); ++i) {
     auto slot = binding_order[i];
+    r.expect_lt(value_of(slot),
+                slot_to_order.size(),
+                "slot_to_order size {} does not cover bound slot {} at binding_order[{}]\nBytecode:\n{}",
+                slot_to_order.size(),
+                slot,
+                i,
+                bc);
     if (value_of(slot) < slot_to_order.size()) {
       r.expect_eq(slot_to_order[value_of(slot)],
                   static_cast<uint8_t>(i),
@@ -926,6 +962,7 @@ void ValidateYieldJumpCoversBindSlots(Reporter &r, std::span<Instruction const> 
     if (jump_target > i) continue;
 
     auto effective_target = ResolveYieldJumpTarget(code, jump_target);
+    if (effective_target >= code.size()) continue;
 
     for (auto j = effective_target + 1; j < i; ++j) {
       if (code[j].op == VMOp::BindSlot) {
@@ -969,9 +1006,12 @@ void ValidateBytecodeInvariants(Reporter &r, CompiledMatcher<Symbol> const &comp
                                   .binding_order = compiled.binding_order(),
                                   .slot_to_order = compiled.slot_to_order()};
   // Phase 1: structural preconditions
-  ValidateCodeStructure(r, code, bc);
-  ValidateJumpTargetsInBounds(r, code, bc);
-  ValidateIndexBounds(r, code, info, bc);
+  bool const structure_ok = ValidateCodeStructure(r, code, bc);
+  bool const jumps_ok = structure_ok && ValidateJumpTargetsInBounds(r, code, bc);
+  if (structure_ok) {
+    ValidateIndexBounds(r, code, info, bc);
+  }
+  if (!jumps_ok) return;
   // Phase 2: jump target semantics
   ValidateBacktracksToNextOrHalt(r, code, bc);
   ValidateJumpTargetSemantics(r, code, bc);

@@ -155,8 +155,12 @@ class InMemoryLabelPropertyIndex : public storage::LabelPropertyIndex {
       for (auto const &[label, by_label] : indices) {
         for (auto const &[propertyPaths, entry] : by_label) {
           auto const ed = EntryDetailT{&propertyPaths, &entry};
+          utils::small_vector<PropertyId> seen_roots;
           for (auto const &prop : propertyPaths) {
-            reverse_lookup[prop[0]].emplace(label, ed);
+            if (!std::ranges::contains(seen_roots, prop[0])) {
+              seen_roots.push_back(prop[0]);
+              reverse_lookup[prop[0]].emplace(label, ed);
+            }
           }
         }
       }
@@ -350,10 +354,22 @@ class InMemoryLabelPropertyIndex : public storage::LabelPropertyIndex {
 
     class Iterator {
      public:
-      Iterator(ChunkedIterable *self, typename utils::SkipListDb<EntryT>::ChunkedIterator index_iterator)
-          : self_(self), index_iterator_(index_iterator), current_vertex_accessor_(nullptr, self_->storage_, nullptr) {
+      struct EndTag {};
+
+      Iterator(ChunkedIterable *self, typename utils::SkipListDb<EntryT>::ChunkedIterator index_iterator,
+               typename utils::SkipListDb<EntryT>::ChunkedIterator chunk_end)
+          : self_(self),
+            index_iterator_(index_iterator),
+            chunk_end_(chunk_end),
+            current_vertex_accessor_(nullptr, self_->storage_, nullptr) {
         AdvanceUntilValid();
       }
+
+      Iterator(ChunkedIterable *self, typename utils::SkipListDb<EntryT>::ChunkedIterator chunk_end, EndTag)
+          : self_(self),
+            index_iterator_(chunk_end),
+            chunk_end_(chunk_end),
+            current_vertex_accessor_(nullptr, self_->storage_, nullptr) {}
 
       VertexAccessor const &operator*() const { return current_vertex_accessor_; }
 
@@ -372,6 +388,7 @@ class InMemoryLabelPropertyIndex : public storage::LabelPropertyIndex {
 
       ChunkedIterable *self_;
       typename utils::SkipListDb<EntryT>::ChunkedIterator index_iterator_;
+      typename utils::SkipListDb<EntryT>::ChunkedIterator chunk_end_;
       VertexAccessor current_vertex_accessor_;
       Vertex *current_vertex_{nullptr};
       // See the corresponding member on Iterable::Iterator.
@@ -384,7 +401,7 @@ class InMemoryLabelPropertyIndex : public storage::LabelPropertyIndex {
 
      public:
       Chunk(ChunkedIterable *self, typename utils::SkipListDb<EntryT>::Chunk &chunk)
-          : begin_{self, chunk.begin()}, end_{self, chunk.end()} {}
+          : begin_{self, chunk.begin(), chunk.end()}, end_{self, chunk.end(), typename Iterator::EndTag{}} {}
 
       Iterator begin() { return begin_; }
 
@@ -428,6 +445,8 @@ class InMemoryLabelPropertyIndex : public storage::LabelPropertyIndex {
     bool IndexExists(LabelId label, std::span<PropertyPath const> properties) const override;
 
     bool IndexReady(LabelId label, std::span<PropertyPath const> properties) const override;
+
+    bool IndexReady(LabelId label, std::span<PropertyPath const> properties, IndexOrder order) const override;
 
     auto RelevantLabelPropertiesIndicesInfo(std::span<LabelId const> labels,
                                             std::span<PropertyPath const> properties) const

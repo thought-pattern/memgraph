@@ -36,6 +36,9 @@ if (MGCXX_TEXT_SEARCH_ENABLE_LTO)
   set(MGCXX_TEXT_SEARCH_RUST_FLAGS "-Clinker-plugin-lto" "-Clinker=clang" "-Clink-arg=-fuse-ld=lld")
 endif()
 
+set(MGCXX_TEXT_SEARCH_CARGO_TOML    "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml")
+set(MGCXX_TEXT_SEARCH_CARGO_LOCK    "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.lock")
+set(MGCXX_TEXT_SEARCH_BUILD_RS      "${CMAKE_CURRENT_SOURCE_DIR}/build.rs")
 set(MGCXX_TEXT_SEARCH_BRIDGE_LIB_RS "${CMAKE_CURRENT_SOURCE_DIR}/src/lib.rs")
 set(MGCXX_TEXT_SEARCH_BRIDGE_CC     "${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/tantivy_text_search/src/lib.rs.cc")
 set(MGCXX_TEXT_SEARCH_BRIDGE_H      "${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/tantivy_text_search/src/lib.rs.h")
@@ -44,45 +47,75 @@ set(MGCXX_TEXT_SEARCH_RUST_LIB      "${CMAKE_CURRENT_BINARY_DIR}/${MGCXX_TEXT_SE
 set(MGCXX_TEXT_SEARCH_RUST_CPP      "${CMAKE_CURRENT_BINARY_DIR}/mgcxx_text_search.cpp")
 set(MGCXX_TEXT_SEARCH_RUST_HPP      "${CMAKE_CURRENT_BINARY_DIR}/mgcxx_text_search.hpp")
 set(MGCXX_TEXT_SEARCH_RUST_CXX      "${CMAKE_CURRENT_BINARY_DIR}/cxx.hpp")
+set(TEXT_SEARCH_HPP_OUTPUT          "${CMAKE_CURRENT_BINARY_DIR}/text_search.hpp")
 
-# Mark the Rust library file as generated so CMake knows it will be created during build
-# This is critical when using add_subdirectory instead of ExternalProject
-set_source_files_properties("${MGCXX_TEXT_SEARCH_RUST_LIB}" PROPERTIES GENERATED TRUE)
+# Mark generated outputs so CMake tracks them across add_subdirectory builds.
+set_source_files_properties(
+  "${MGCXX_TEXT_SEARCH_RUST_LIB}"
+  "${MGCXX_TEXT_SEARCH_RUST_CPP}"
+  "${MGCXX_TEXT_SEARCH_RUST_HPP}"
+  "${MGCXX_TEXT_SEARCH_RUST_CXX}"
+  "${TEXT_SEARCH_HPP_OUTPUT}"
+  PROPERTIES GENERATED TRUE)
 
 # Join the RUSTFLAGS cmake list into a single space-separated string so it
 # becomes one RUSTFLAGS=... env assignment under `cmake -E env` below.
 string(JOIN " " MGCXX_TEXT_SEARCH_RUST_FLAGS_JOINED ${MGCXX_TEXT_SEARCH_RUST_FLAGS})
 
-add_library(mgcxx_text_search STATIC ${MGCXX_TEXT_SEARCH_RUST_CPP})
-# The custom command builds the C++ bridge files, Rust library, and copies the header
-# We list all outputs so CMake knows they will be generated
-set(TEXT_SEARCH_HPP_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/text_search.hpp")
+add_library(mgcxx_text_search STATIC
+  ${MGCXX_TEXT_SEARCH_RUST_CPP}
+  ${MGCXX_TEXT_SEARCH_RUST_HPP}
+  ${MGCXX_TEXT_SEARCH_RUST_CXX}
+  ${TEXT_SEARCH_HPP_OUTPUT})
 
-# Pin cargo's cc-rs invocations to the toolchain clang+sysroot. The previous
-# approach (--unset=CFLAGS --unset=CXXFLAGS) avoided leaking -ftime-trace
-# into cc-rs but also dropped --sysroot/--gcc-toolchain, so the C++ bridge
-# .cc files got compiled against host /usr/include and ended up with
-# host-glibc symbols (e.g. __libc_single_threaded@GLIBC_2.32) in
-# libtantivy_text_search.a. CC/CXX point at toolchain clang and CFLAGS/
-# CXXFLAGS carry only sysroot-relevant flags — no -ftime-trace.
-set(MGCXX_TEXT_SEARCH_CC_FLAGS "--sysroot=${MG_TOOLCHAIN_SYSROOT} --gcc-toolchain=${MG_TOOLCHAIN_ROOT}")
+set(MGCXX_TEXT_SEARCH_CARGO_ENV
+    "CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+    "RUSTFLAGS=${MGCXX_TEXT_SEARCH_RUST_FLAGS_JOINED}")
+if (MG_TOOLCHAIN_ROOT)
+  list(APPEND MGCXX_TEXT_SEARCH_CARGO_ENV
+       "CC=${MG_TOOLCHAIN_ROOT}/bin/clang"
+       "CXX=${MG_TOOLCHAIN_ROOT}/bin/clang++")
+elseif (CMAKE_C_COMPILER AND CMAKE_CXX_COMPILER)
+  list(APPEND MGCXX_TEXT_SEARCH_CARGO_ENV
+       "CC=${CMAKE_C_COMPILER}"
+       "CXX=${CMAKE_CXX_COMPILER}")
+endif()
+
+set(MGCXX_TEXT_SEARCH_CC_FLAGS_LIST "")
+if (MG_TOOLCHAIN_SYSROOT)
+  list(APPEND MGCXX_TEXT_SEARCH_CC_FLAGS_LIST "--sysroot=${MG_TOOLCHAIN_SYSROOT}")
+endif()
+if (MG_TOOLCHAIN_ROOT)
+  list(APPEND MGCXX_TEXT_SEARCH_CC_FLAGS_LIST "--gcc-toolchain=${MG_TOOLCHAIN_ROOT}")
+endif()
+if (MGCXX_TEXT_SEARCH_CC_FLAGS_LIST)
+  string(JOIN " " MGCXX_TEXT_SEARCH_CC_FLAGS ${MGCXX_TEXT_SEARCH_CC_FLAGS_LIST})
+  list(APPEND MGCXX_TEXT_SEARCH_CARGO_ENV
+       "CFLAGS=${MGCXX_TEXT_SEARCH_CC_FLAGS}"
+       "CXXFLAGS=${MGCXX_TEXT_SEARCH_CC_FLAGS}")
+endif()
 
 add_custom_command(
-  OUTPUT ${MGCXX_TEXT_SEARCH_RUST_CPP} ${MGCXX_TEXT_SEARCH_RUST_LIB} ${TEXT_SEARCH_HPP_OUTPUT}
+  OUTPUT
+    ${MGCXX_TEXT_SEARCH_RUST_CPP}
+    ${MGCXX_TEXT_SEARCH_RUST_HPP}
+    ${MGCXX_TEXT_SEARCH_RUST_CXX}
+    ${MGCXX_TEXT_SEARCH_RUST_LIB}
+    ${TEXT_SEARCH_HPP_OUTPUT}
   COMMAND ${CMAKE_COMMAND} -E env
-          CC=${MG_TOOLCHAIN_ROOT}/bin/clang
-          CXX=${MG_TOOLCHAIN_ROOT}/bin/clang++
-          CFLAGS=${MGCXX_TEXT_SEARCH_CC_FLAGS}
-          CXXFLAGS=${MGCXX_TEXT_SEARCH_CC_FLAGS}
-          CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
-          RUSTFLAGS=${MGCXX_TEXT_SEARCH_RUST_FLAGS_JOINED}
+          ${MGCXX_TEXT_SEARCH_CARGO_ENV}
           ${CARGO_CMD}
-  COMMAND cp ${MGCXX_TEXT_SEARCH_BRIDGE_CC} ${MGCXX_TEXT_SEARCH_RUST_CPP}
-  COMMAND cp ${MGCXX_TEXT_SEARCH_BRIDGE_H} ${MGCXX_TEXT_SEARCH_RUST_HPP}
-  COMMAND cp ${MGCXX_TEXT_SEARCH_BRIDGE_CXX} ${MGCXX_TEXT_SEARCH_RUST_CXX}
+  COMMAND ${CMAKE_COMMAND} -E copy ${MGCXX_TEXT_SEARCH_BRIDGE_CC} ${MGCXX_TEXT_SEARCH_RUST_CPP}
+  COMMAND ${CMAKE_COMMAND} -E copy ${MGCXX_TEXT_SEARCH_BRIDGE_H} ${MGCXX_TEXT_SEARCH_RUST_HPP}
+  COMMAND ${CMAKE_COMMAND} -E copy ${MGCXX_TEXT_SEARCH_BRIDGE_CXX} ${MGCXX_TEXT_SEARCH_RUST_CXX}
   COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/text_search.hpp ${TEXT_SEARCH_HPP_OUTPUT}
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  DEPENDS ${MGCXX_TEXT_SEARCH_BRIDGE_LIB_RS} ${CMAKE_CURRENT_SOURCE_DIR}/text_search.hpp
+  DEPENDS
+    ${MGCXX_TEXT_SEARCH_BRIDGE_LIB_RS}
+    ${MGCXX_TEXT_SEARCH_CARGO_TOML}
+    ${MGCXX_TEXT_SEARCH_CARGO_LOCK}
+    ${MGCXX_TEXT_SEARCH_BUILD_RS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/text_search.hpp
   COMMENT "Building Rust library, C++ bridge files, and copying header")
 target_link_libraries(mgcxx_text_search ${MGCXX_TEXT_SEARCH_RUST_LIB})
 target_include_directories(mgcxx_text_search INTERFACE "${CMAKE_CURRENT_BINARY_DIR}")

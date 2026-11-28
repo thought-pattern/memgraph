@@ -68,33 +68,45 @@ void RemoveDirIfEmpty(std::filesystem::path const &dir) {
 }
 
 // Move files to backup_dir
-void MoveFiles(auto const &files, std::filesystem::path const &backup_dir, utils::FileRetainer *file_retainer) {
+bool MoveFiles(auto const &files, std::filesystem::path const &backup_dir, utils::FileRetainer *file_retainer) {
+  bool all_moved = true;
   for (auto const &old_path : files) {
     auto const new_path = backup_dir / old_path.filename();
     spdlog::trace("Moving file {} to {}", old_path, new_path);
     file_retainer->RenameFile(old_path, new_path);
+    std::error_code ec;
+    if (std::filesystem::exists(old_path, ec) || ec) {
+      spdlog::error("Failed to move obsolete durability file {} to {}.", old_path, new_path);
+      all_moved = false;
+    }
   }
+  return all_moved;
 }
 
-void DeleteFiles(std::vector<std::filesystem::path> const &files, utils::FileRetainer *file_retainer) {
+bool DeleteFiles(std::vector<std::filesystem::path> const &files, utils::FileRetainer *file_retainer) {
+  bool all_deleted = true;
   for (auto const &path : files) {
     spdlog::trace("Deleting file: {}", path);
     file_retainer->DeleteFile(path);
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) || ec) {
+      spdlog::error("Failed to delete obsolete durability file {}.", path);
+      all_deleted = false;
+    }
   }
+  return all_deleted;
 }
 
 // Move snapshots and WALs
-void MoveDurabilityFiles(std::vector<std::filesystem::path> const &snapshot_files,
+bool MoveDurabilityFiles(std::vector<std::filesystem::path> const &snapshot_files,
                          std::filesystem::path const &backup_snapshot_dir,
                          std::vector<std::filesystem::path> const &wal_files,
                          std::filesystem::path const &backup_wal_dir, utils::FileRetainer *file_retainer) {
-  // Move snapshots
-  MoveFiles(snapshot_files, backup_snapshot_dir, file_retainer);
-  // Move WAL files
-  MoveFiles(wal_files, backup_wal_dir, file_retainer);
-  // Clean DIR
+  const bool snaps_ok = MoveFiles(snapshot_files, backup_snapshot_dir, file_retainer);
+  const bool wals_ok = MoveFiles(wal_files, backup_wal_dir, file_retainer);
   RemoveDirIfEmpty(backup_snapshot_dir);
   RemoveDirIfEmpty(backup_wal_dir);
+  return snaps_ok && wals_ok;
 }
 
 struct BackupDirectories {
@@ -138,26 +150,64 @@ auto CreateBackupDirectories(std::filesystem::path const &current_snapshot_dir,
                            .backup_wal_dir = std::move(backup_wal_dir)};
 }
 
-void ProcessOldDurableFiles(bool const reset_needed, std::filesystem::path const &current_snapshot_dir,
+bool ProcessOldDurableFiles(bool const reset_needed, std::filesystem::path const &current_snapshot_dir,
                             std::filesystem::path const &current_wal_dir,
                             std::vector<std::filesystem::path> const &old_wal_files,
                             utils::FileRetainer *file_retainer) {
-  if (reset_needed) {
+  if (!reset_needed) {
+    return true;
+  }
+  try {
     auto const old_snapshot_files = utils::GetFilesFromDir(current_snapshot_dir);
 
     if (FLAGS_storage_backup_dir_enabled) {
       auto const maybe_backup_dirs = CreateBackupDirectories(current_snapshot_dir, current_wal_dir);
       if (!maybe_backup_dirs) {
         spdlog::error("Couldn't create backup directories. Old durable files won't be moved to .old directory.");
-        return;
+        return false;
       }
       auto const &[backup_snapshot_dir, backup_wal_dir] = *maybe_backup_dirs;
 
-      MoveDurabilityFiles(old_snapshot_files, backup_snapshot_dir, old_wal_files, backup_wal_dir, file_retainer);
-    } else {
-      DeleteFiles(old_snapshot_files, file_retainer);
-      DeleteFiles(old_wal_files, file_retainer);
+      return MoveDurabilityFiles(
+          old_snapshot_files, backup_snapshot_dir, old_wal_files, backup_wal_dir, file_retainer);
     }
+    const bool snaps_ok = DeleteFiles(old_snapshot_files, file_retainer);
+    const bool wals_ok = DeleteFiles(old_wal_files, file_retainer);
+    return snaps_ok && wals_ok;
+  } catch (const std::exception &e) {
+    spdlog::error("Failed to process old durability files: {}", e.what());
+    return false;
+  }
+}
+
+bool CleanupSnapshotOldDurabilityFiles(std::filesystem::path const &current_snapshot_dir,
+                                       std::filesystem::path const &current_wal_directory,
+                                       std::filesystem::path const &dst_snapshot_file,
+                                       utils::FileRetainer *file_retainer) {
+  try {
+    auto const curr_snapshot_files = utils::GetFilesFromDir(current_snapshot_dir);
+    auto const curr_wal_files = utils::GetFilesFromDir(current_wal_directory);
+    auto const not_recovery_snapshot = [&dst_snapshot_file](auto const &snapshot_path) {
+      return snapshot_path != dst_snapshot_file;
+    };
+    auto snapshots_to_process = curr_snapshot_files | rv::filter(not_recovery_snapshot) | r::to_vector;
+
+    if (FLAGS_storage_backup_dir_enabled) {
+      auto const maybe_backup_dirs = CreateBackupDirectories(current_snapshot_dir, current_wal_directory);
+      if (!maybe_backup_dirs) {
+        spdlog::error("Couldn't create backup directories. Old durable files won't be moved to .old directory.");
+        return false;
+      }
+      auto const &[backup_snapshot_dir, backup_wal_dir] = *maybe_backup_dirs;
+      return MoveDurabilityFiles(
+          snapshots_to_process, backup_snapshot_dir, curr_wal_files, backup_wal_dir, file_retainer);
+    }
+    const bool snaps_ok = DeleteFiles(snapshots_to_process, file_retainer);
+    const bool wals_ok = DeleteFiles(curr_wal_files, file_retainer);
+    return snaps_ok && wals_ok;
+  } catch (const std::exception &e) {
+    spdlog::error("Failed to clean up old durability files after snapshot recovery: {}", e.what());
+    return false;
   }
 }
 
@@ -364,7 +414,11 @@ void InMemoryReplicationHandlers::SwapMainUUIDHandler(
   replication_coordination_glue::SwapMainUUIDReq req;
   rpc::LoadWithUpgrade(req, request_version, req_reader);
   spdlog::info("Set replica data UUID to main uuid {}", std::string(req.uuid));
-  locked_repl_state->TryPersistRoleReplica(replica_data.config, req.uuid);
+  if (!locked_repl_state->TryPersistRoleReplica(replica_data.config, req.uuid)) {
+    spdlog::error("Failed to persist main UUID {} on replica; rejecting SwapMainUUID.", std::string(req.uuid));
+    rpc::SendFinalResponse(replication_coordination_glue::SwapMainUUIDRes{false}, request_version, res_builder);
+    return;
+  }
   replica_data.uuid_ = req.uuid;
 
   rpc::SendFinalResponse(replication_coordination_glue::SwapMainUUIDRes{true}, request_version, res_builder);
@@ -719,8 +773,35 @@ void InMemoryReplicationHandlers::SnapshotHandler(rpc::FileReplicationHandler co
   }
 
   auto const &active_files = file_replication_handler.GetActiveFileNames();
-  DMG_ASSERT(active_files.size() == 1, "Received {} snapshot files but expecting only one!", active_files.size());
+  if (active_files.size() != 1) {
+    spdlog::error("Received {} snapshot files for db {} but expected exactly 1.", active_files.size(), storage->name());
+    heartbeat.Stop();
+    rpc::SendFinalResponse(storage::replication::SnapshotRes{std::nullopt, 0}, request_version, res_builder);
+    return;
+  }
   auto const &src_snapshot_file = active_files[0];
+  try {
+    const auto header_info = storage::durability::ReadSnapshotInfo(src_snapshot_file);
+#ifdef MG_ENTERPRISE
+    if (header_info.uuid != std::string{req.storage_uuid}) {
+      spdlog::error("Snapshot file {} carries tenant UUID '{}', expected '{}'; refusing recovery for db {}.",
+                    src_snapshot_file,
+                    header_info.uuid,
+                    std::string{req.storage_uuid},
+                    storage->name());
+      heartbeat.Stop();
+      rpc::SendFinalResponse(storage::replication::SnapshotRes{std::nullopt, 0}, request_version, res_builder);
+      return;
+    }
+#else
+    (void)header_info;
+#endif
+  } catch (const storage::durability::RecoveryFailure &e) {
+    spdlog::error("Failed to inspect snapshot header {}: {}", src_snapshot_file, e.what());
+    heartbeat.Stop();
+    rpc::SendFinalResponse(storage::replication::SnapshotRes{std::nullopt, 0}, request_version, res_builder);
+    return;
+  }
   auto const dst_snapshot_file = current_snapshot_dir / active_files[0].filename();
 
   {
@@ -750,7 +831,8 @@ void InMemoryReplicationHandlers::SnapshotHandler(rpc::FileReplicationHandler co
 
     spdlog::info("Clearing database {} before recovering from snapshot.", storage->name());
 
-    // Clear the database
+    // Mark the tenant unavailable before clearing so local readers never observe an empty graph as ready.
+    storage->SetBroken(true);
     storage->Clear(record_progress);
 
     try {
@@ -769,6 +851,13 @@ void InMemoryReplicationHandlers::SnapshotHandler(rpc::FileReplicationHandler co
           &storage->ttl_,
           &storage->description_store_,
           record_progress);
+#ifdef MG_ENTERPRISE
+      if (snapshot_info.uuid != std::string{req.storage_uuid}) {
+        throw storage::durability::RecoveryFailure("Snapshot UUID '{}' does not match requested tenant '{}'.",
+                                                   snapshot_info.uuid,
+                                                   std::string{req.storage_uuid});
+      }
+#endif
       // If this step is present it should always be the first step of
       // the recovery so we use the UUID we read from snapshot
       storage->uuid().set(snapshot_info.uuid);
@@ -796,6 +885,7 @@ void InMemoryReplicationHandlers::SnapshotHandler(rpc::FileReplicationHandler co
                           storage->edges_metadata_index_ ? &*storage->edges_metadata_index_ : nullptr,
                           storage->config_.salient.items.properties_on_edges,
                           record_progress);
+      storage->RebuildLabelCounts();
     } catch (const storage::durability::RecoveryFailure &e) {
       spdlog::error(
           "Couldn't load the snapshot from {} because of: {}. Storage will be cleared. Snapshot and WAL files are "
@@ -809,51 +899,26 @@ void InMemoryReplicationHandlers::SnapshotHandler(rpc::FileReplicationHandler co
       return;
     }
 
-    // A successful snapshot load is the moment a broken replica tenant becomes healthy: the main has just full-synced
-    // it. Clearing the broken flag re-enables background durability and lets queries touch the tenant again (slice 1
-    // guards writes behind IsBroken(), so clearing the flag is sufficient to resume normal operation). Cleared under
-    // main_lock_ so the healthy transition is atomic with the recovered state.
+    // Remove or archive obsolete durability files BEFORE publishing readiness or acknowledging success so a restart
+    // never encounters stale log segments alongside the replacement chain.
+    if (!CleanupSnapshotOldDurabilityFiles(
+            current_snapshot_dir, storage->recovery_.wal_directory_, dst_snapshot_file, &storage->file_retainer_)) {
+      spdlog::error(
+          "Snapshot recovery for db {} failed because obsolete durability files could not be retired; keeping tenant "
+          "unavailable.",
+          storage->name());
+      heartbeat.Stop();
+      const storage::replication::SnapshotRes res{std::nullopt, 0};
+      rpc::SendFinalResponse(res, request_version, res_builder, storage->name());
+      return;
+    }
+
     storage->SetBroken(false);
     heartbeat.Stop();
   }
   spdlog::debug("Snapshot from {} loaded successfully.", dst_snapshot_file);
 
   auto const [ldt, num_committed_txns] = storage->repl_storage_state_.commit_ts_info_.load(std::memory_order_acquire);
-
-  // The old durability files (WALs and snapshots that predate this recovery snapshot) must be removed
-  // regardless of whether sending the response below succeeds. If SendFinalResponse throws (e.g. the
-  // connection to main drops mid-flush), leaving them behind orphans a stale WAL chain next to the
-  // freshly reset seq_num 0 WAL, which corrupts the next recovery. The guard body must never throw
-  // because it can run during stack unwinding.
-  utils::OnScopeExit const cleanup_old_durability_files{[&] {
-    try {
-      auto const current_wal_directory = storage->recovery_.wal_directory_;
-      auto const curr_snapshot_files = utils::GetFilesFromDir(current_snapshot_dir);
-      auto const curr_wal_files = utils::GetFilesFromDir(current_wal_directory);
-      auto const not_recovery_snapshot = [&dst_snapshot_file](auto const &snapshot_path) {
-        return snapshot_path != dst_snapshot_file;
-      };
-      auto snapshots_to_process = curr_snapshot_files | rv::filter(not_recovery_snapshot) | r::to_vector;
-
-      if (FLAGS_storage_backup_dir_enabled) {
-        auto const maybe_backup_dirs = CreateBackupDirectories(current_snapshot_dir, current_wal_directory);
-        if (!maybe_backup_dirs) {
-          spdlog::error("Couldn't create backup directories. Old durable files won't be moved to .old directory.");
-          return;
-        }
-        auto const &[backup_snapshot_dir, backup_wal_dir] = *maybe_backup_dirs;
-        MoveDurabilityFiles(
-            snapshots_to_process, backup_snapshot_dir, curr_wal_files, backup_wal_dir, &(storage->file_retainer_));
-      } else {
-        DeleteFiles(snapshots_to_process, &storage->file_retainer_);
-        DeleteFiles(curr_wal_files, &storage->file_retainer_);
-      }
-      spdlog::debug("Replication recovery from snapshot finished!");
-    } catch (const std::exception &e) {
-      spdlog::error("Failed to clean up old durability files after snapshot recovery: {}", e.what());
-    }
-  }};
-
   const storage::replication::SnapshotRes res{ldt, num_committed_txns};
   rpc::SendFinalResponse(res, request_version, res_builder, storage->name());
 }
@@ -928,6 +993,63 @@ void InMemoryReplicationHandlers::WalFilesHandler(
     return;
   }
 
+  const auto wal_file_number = req.file_number;
+  auto const &active_files = file_replication_handler.GetActiveFileNames();
+  if (active_files.size() != wal_file_number) {
+    spdlog::error("WalFilesHandler for db {} expected {} WAL file(s) from request but received {}; aborting recovery.",
+                  storage->name(),
+                  wal_file_number,
+                  active_files.size());
+    heartbeat.Stop();
+    rpc::SendFinalResponse(storage::replication::WalFilesRes{std::nullopt, 0}, request_version, res_builder);
+    return;
+  }
+
+  std::optional<std::string> batch_uuid;
+  for (const auto &wal_file : active_files) {
+    try {
+      const auto info = storage::durability::ReadWalContents(wal_file);
+#ifdef MG_ENTERPRISE
+      if (info.uuid != std::string{req.uuid}) {
+        spdlog::error("WAL file {} carries tenant UUID '{}', expected '{}'; refusing recovery for db {}.",
+                      wal_file,
+                      info.uuid,
+                      std::string{req.uuid},
+                      storage->name());
+        heartbeat.Stop();
+        rpc::SendFinalResponse(storage::replication::WalFilesRes{std::nullopt, 0}, request_version, res_builder);
+        return;
+      }
+#else
+      if (!batch_uuid) {
+        batch_uuid = info.uuid;
+        if (!req.reset_needed && storage->wal_seq_num_ > 0 && info.uuid != std::string{storage->uuid()}) {
+          spdlog::error("WAL file {} carries UUID '{}', expected '{}'; refusing recovery.",
+                        wal_file,
+                        info.uuid,
+                        std::string{storage->uuid()});
+          heartbeat.Stop();
+          rpc::SendFinalResponse(storage::replication::WalFilesRes{std::nullopt, 0}, request_version, res_builder);
+          return;
+        }
+      } else if (info.uuid != *batch_uuid) {
+        spdlog::error("WAL file {} carries mismatched UUID '{}' within transfer batch '{}'; refusing recovery.",
+                      wal_file,
+                      info.uuid,
+                      *batch_uuid);
+        heartbeat.Stop();
+        rpc::SendFinalResponse(storage::replication::WalFilesRes{std::nullopt, 0}, request_version, res_builder);
+        return;
+      }
+#endif
+    } catch (const utils::BasicException &e) {
+      spdlog::error("Failed to validate WAL file {} before recovery: {}", wal_file, e.what());
+      heartbeat.Stop();
+      rpc::SendFinalResponse(storage::replication::WalFilesRes{std::nullopt, 0}, request_version, res_builder);
+      return;
+    }
+  }
+
   std::vector<std::filesystem::path> old_wal_files;
 
   // Creating a snapshot on replica is mutually exclusive with force resetting from WalFilesHandler
@@ -959,6 +1081,7 @@ void InMemoryReplicationHandlers::WalFilesHandler(
 
       spdlog::info("Clearing replica storage for db {} because the reset is needed while recovering from WalFiles.",
                    storage->name());
+      storage->SetBroken(true);
       storage->Clear(record_progress);
     }
 
@@ -966,10 +1089,8 @@ void InMemoryReplicationHandlers::WalFilesHandler(
     old_wal_files = utils::GetFilesFromDir(current_wal_directory);
   }
 
-  const auto wal_file_number = req.file_number;
   spdlog::debug("Received {} WAL files.", wal_file_number);
 
-  auto const &active_files = file_replication_handler.GetActiveFileNames();
   for (auto const &wal_file : active_files) {
     spdlog::info("Received WAL file {} from main for db {}: {}",
                  wal_file.filename(),
@@ -977,26 +1098,26 @@ void InMemoryReplicationHandlers::WalFilesHandler(
                  ReceivedFileSize(wal_file));
   }
 
-  // On a force reset the storage was cleared above, so the old durability files must be removed regardless of
-  // whether sending the response succeeds; otherwise a SendFinalResponse throw would orphan a stale WAL chain
-  // next to the reset seq_num 0 WAL and corrupt the next recovery. ProcessOldDurableFiles is a no-op when the
-  // reset wasn't requested. The guard body must never throw because it can run during stack unwinding.
+  bool old_files_cleaned = false;
   utils::OnScopeExit const cleanup_old_durability_files{[&] {
-    try {
-      ProcessOldDurableFiles(req.reset_needed,
-                             storage->recovery_.snapshot_directory_,
-                             current_wal_directory,
-                             old_wal_files,
-                             &storage->file_retainer_);
-    } catch (const std::exception &e) {
-      spdlog::error("Failed to clean up old durability files after WAL files recovery: {}", e.what());
-    }
+    if (old_files_cleaned) return;
+    (void)ProcessOldDurableFiles(req.reset_needed,
+                                 storage->recovery_.snapshot_directory_,
+                                 current_wal_directory,
+                                 old_wal_files,
+                                 &storage->file_retainer_);
   }};
+
+#ifdef MG_ENTERPRISE
+  const std::optional<utils::UUID> expected_tenant_uuid{req.uuid};
+#else
+  const std::optional<utils::UUID> expected_tenant_uuid{};
+#endif
 
   uint64_t num_committed_txns{0};
   bool all_applied = true;
   for (auto i = 0UL; i < wal_file_number; ++i) {
-    const auto [success, num_txns_committed] = LoadWal(active_files[i], storage, heartbeat);
+    const auto [success, num_txns_committed] = LoadWal(active_files[i], storage, heartbeat, expected_tenant_uuid);
 
     if (!success) {
       spdlog::debug("Replication recovery from WAL files failed while loading one of WAL files for db {}.",
@@ -1007,10 +1128,17 @@ void InMemoryReplicationHandlers::WalFilesHandler(
     num_committed_txns += num_txns_committed;
   }
 
+  old_files_cleaned = true;
+  const bool cleanup_ok = ProcessOldDurableFiles(req.reset_needed,
+                                                 storage->recovery_.snapshot_directory_,
+                                                 current_wal_directory,
+                                                 old_wal_files,
+                                                 &storage->file_retainer_);
+
   // Every exit from here on writes a response, so the heartbeat must be off first.
   heartbeat.Stop();
 
-  if (!all_applied) {
+  if (!all_applied || !cleanup_ok) {
     const storage::replication::WalFilesRes res{std::nullopt, 0};
     rpc::SendFinalResponse(res, request_version, res_builder);
     return;
@@ -1018,10 +1146,6 @@ void InMemoryReplicationHandlers::WalFilesHandler(
 
   spdlog::debug("Replication recovery from WAL files succeeded for db {}.", storage->name());
 
-  // A broken replica tenant reports commit-ts 0 and the main heals it during RECOVERY. The recovery steps need not
-  // include a snapshot: when the main's WAL chain reaches back to the start (e.g. the main never took a snapshot),
-  // GetRecoverySteps sends WAL files only. Having fully applied them, the tenant is consistent with the main, so the
-  // broken flag is cleared here too (mirrors SnapshotHandler) to re-enable queries and background durability.
   storage->SetBroken(false);
 
   const storage::replication::WalFilesRes res{
@@ -1096,6 +1220,46 @@ void InMemoryReplicationHandlers::CurrentWalHandler(
     return;
   }
 
+  auto const &active_files = file_replication_handler.GetActiveFileNames();
+  if (active_files.size() != 1) {
+    spdlog::error("CurrentWalHandler for db {} expected 1 WAL file but received {}; aborting recovery.",
+                  storage->name(),
+                  active_files.size());
+    heartbeat.Stop();
+    rpc::SendFinalResponse(storage::replication::CurrentWalRes{std::nullopt, 0}, request_version, res_builder);
+    return;
+  }
+  try {
+    const auto info = storage::durability::ReadWalContents(active_files[0]);
+#ifdef MG_ENTERPRISE
+    if (info.uuid != std::string{req.uuid}) {
+      spdlog::error("Current WAL file {} carries tenant UUID '{}', expected '{}'; refusing recovery for db {}.",
+                    active_files[0],
+                    info.uuid,
+                    std::string{req.uuid},
+                    storage->name());
+      heartbeat.Stop();
+      rpc::SendFinalResponse(storage::replication::CurrentWalRes{std::nullopt, 0}, request_version, res_builder);
+      return;
+    }
+#else
+    if (!req.reset_needed && storage->wal_seq_num_ > 0 && info.uuid != std::string{storage->uuid()}) {
+      spdlog::error("Current WAL file {} carries UUID '{}', expected '{}'; refusing recovery.",
+                    active_files[0],
+                    info.uuid,
+                    std::string{storage->uuid()});
+      heartbeat.Stop();
+      rpc::SendFinalResponse(storage::replication::CurrentWalRes{std::nullopt, 0}, request_version, res_builder);
+      return;
+    }
+#endif
+  } catch (const utils::BasicException &e) {
+    spdlog::error("Failed to validate current WAL file {} before recovery: {}", active_files[0], e.what());
+    heartbeat.Stop();
+    rpc::SendFinalResponse(storage::replication::CurrentWalRes{std::nullopt, 0}, request_version, res_builder);
+    return;
+  }
+
   std::vector<std::filesystem::path> old_wal_files;
 
   // Creating a snapshot on replica is mutually exclusive with force resetting from CurrentWalHandler
@@ -1125,6 +1289,7 @@ void InMemoryReplicationHandlers::CurrentWalHandler(
       record_progress();
       spdlog::info("Clearing replica storage for db {} because the reset is needed while recovering from WalFiles.",
                    storage->name());
+      storage->SetBroken(true);
       storage->Clear(record_progress);
     }
 
@@ -1132,47 +1297,50 @@ void InMemoryReplicationHandlers::CurrentWalHandler(
     old_wal_files = utils::GetFilesFromDir(current_wal_directory);
   }
 
-  // Even if loading wal file failed, we return last_durable_timestamp to the main because it is not a fatal error
-  // When loading a single WAL file, we don't care about saving number of deltas
-  auto const &active_files = file_replication_handler.GetActiveFileNames();
-  MG_ASSERT(active_files.size() == 1, "Received {} files but expected 1 in CurrentWalHandler", active_files.size());
+  bool old_files_cleaned = false;
+  utils::OnScopeExit const cleanup_old_durability_files{[&] {
+    if (old_files_cleaned) return;
+    (void)ProcessOldDurableFiles(req.reset_needed,
+                                 storage->recovery_.snapshot_directory_,
+                                 current_wal_directory,
+                                 old_wal_files,
+                                 &storage->file_retainer_);
+  }};
+
   spdlog::info("Received current WAL file {} from main for db {}: {}",
                active_files[0].filename(),
                storage->name(),
                ReceivedFileSize(active_files[0]));
-  auto const load_wal_res = LoadWal(active_files[0], storage, heartbeat);
+#ifdef MG_ENTERPRISE
+  const std::optional<utils::UUID> expected_tenant_uuid{req.uuid};
+#else
+  const std::optional<utils::UUID> expected_tenant_uuid{};
+#endif
+  auto const load_wal_res = LoadWal(active_files[0], storage, heartbeat, expected_tenant_uuid);
+  old_files_cleaned = true;
+  const bool cleanup_ok = ProcessOldDurableFiles(req.reset_needed,
+                                                 storage->recovery_.snapshot_directory_,
+                                                 current_wal_directory,
+                                                 old_wal_files,
+                                                 &storage->file_retainer_);
   heartbeat.Stop();
+  if (!cleanup_ok) {
+    const storage::replication::CurrentWalRes res{std::nullopt, 0};
+    rpc::SendFinalResponse(res, request_version, res_builder, storage->name());
+    return;
+  }
   if (!load_wal_res.success) {
     spdlog::debug(
         "Replication recovery from current WAL didn't end successfully but the error is non-fatal error. DB {}.",
         storage->name());
   } else {
     spdlog::debug("Replication recovery from current WAL ended successfully! DB {}.", storage->name());
-    // The current WAL can be the only recovery step the main sends to heal a broken tenant (commit-ts 0, no snapshot
-    // on the main). On success the tenant is consistent with the main, so clear the broken flag here too, just like
-    // SnapshotHandler and WalFilesHandler do.
     storage->SetBroken(false);
   }
 
   const storage::replication::CurrentWalRes res{
       storage->repl_storage_state_.commit_ts_info_.load(std::memory_order_acquire).ldt_,
       load_wal_res.num_txns_committed};
-
-  // On a force reset the storage was cleared above, so the old durability files must be removed regardless of
-  // whether sending the response succeeds; otherwise a SendFinalResponse throw would orphan a stale WAL chain
-  // next to the reset seq_num 0 WAL and corrupt the next recovery. ProcessOldDurableFiles is a no-op when the
-  // reset wasn't requested. The guard body must never throw because it can run during stack unwinding.
-  utils::OnScopeExit const cleanup_old_durability_files{[&] {
-    try {
-      ProcessOldDurableFiles(req.reset_needed,
-                             storage->recovery_.snapshot_directory_,
-                             current_wal_directory,
-                             old_wal_files,
-                             &storage->file_retainer_);
-    } catch (const std::exception &e) {
-      spdlog::error("Failed to clean up old durability files after current WAL recovery: {}", e.what());
-    }
-  }};
 
   rpc::SendFinalResponse(res, request_version, res_builder, storage->name());
 }
@@ -1184,9 +1352,9 @@ void InMemoryReplicationHandlers::CurrentWalHandler(
 // 4.) If reading WAL info fails
 // 5.) If applying some of the deltas failed
 // If WAL file doesn't contain any new changes, we ignore it and consider WAL file as successfully applied.
-InMemoryReplicationHandlers::LoadWalStatus InMemoryReplicationHandlers::LoadWal(std::filesystem::path const &wal_path,
-                                                                                storage::InMemoryStorage *storage,
-                                                                                rpc::ProgressHeartbeat &heartbeat) {
+InMemoryReplicationHandlers::LoadWalStatus InMemoryReplicationHandlers::LoadWal(
+    std::filesystem::path const &wal_path, storage::InMemoryStorage *storage, rpc::ProgressHeartbeat &heartbeat,
+    std::optional<utils::UUID> expected_uuid) {
   spdlog::trace("Received WAL saved to {}", wal_path);
 
   // A finalized file states how much it holds, so it is replayed straight from its header. Only main's current WAL,
@@ -1197,6 +1365,23 @@ InMemoryReplicationHandlers::LoadWalStatus InMemoryReplicationHandlers::LoadWal(
     wal_info = storage::durability::ReadWalContents(wal_path);
   } catch (const utils::BasicException &e) {
     spdlog::error("Loading WAL info from {} failed because of {}.", wal_path, e.what());
+    return LoadWalStatus{.success = false, .num_txns_committed = 0};
+  }
+
+  if (expected_uuid && wal_info.uuid != std::string{*expected_uuid}) {
+    spdlog::error("WAL file {} carries tenant UUID '{}', expected '{}' for db {}; refusing replay.",
+                  wal_path,
+                  wal_info.uuid,
+                  std::string{*expected_uuid},
+                  storage->name());
+    return LoadWalStatus{.success = false, .num_txns_committed = 0};
+  }
+  if (!expected_uuid && storage->wal_seq_num_ > 0 && wal_info.uuid != std::string{storage->uuid()}) {
+    spdlog::error("WAL file {} carries UUID '{}', expected '{}' for db {}; refusing replay.",
+                  wal_path,
+                  wal_info.uuid,
+                  std::string{storage->uuid()},
+                  storage->name());
     return LoadWalStatus{.success = false, .num_txns_committed = 0};
   }
 
@@ -1265,14 +1450,14 @@ InMemoryReplicationHandlers::LoadWalStatus InMemoryReplicationHandlers::LoadWal(
                     wal_path,
                     local_delta_idx,
                     e.what());
-      return LoadWalStatus{.success = false, .num_txns_committed = 0};
+      return LoadWalStatus{.success = false, .num_txns_committed = num_txns_committed};
     }
 
     if (deltas_res) {
       local_delta_idx += deltas_res->current_delta_idx;
       num_txns_committed += deltas_res->num_txns_committed;
     } else {
-      return LoadWalStatus{.success = false, .num_txns_committed = 0};
+      return LoadWalStatus{.success = false, .num_txns_committed = num_txns_committed};
     }
   }
 
@@ -1285,7 +1470,7 @@ InMemoryReplicationHandlers::LoadWalStatus InMemoryReplicationHandlers::LoadWal(
                   wal_path,
                   wal_info.num_deltas,
                   local_delta_idx);
-    return LoadWalStatus{.success = false, .num_txns_committed = 0};
+    return LoadWalStatus{.success = false, .num_txns_committed = num_txns_committed};
   }
 
   spdlog::trace("Replication from WAL file {} successful!", wal_path);
@@ -1758,7 +1943,7 @@ std::optional<storage::SingleTxnDeltasProcessingResult> InMemoryReplicationHandl
           auto property_paths = data.composite_property_paths.convert(mapper);
           if (!transaction->CreateIndex(storage->NameToLabel(data.label),
                                         std::move(property_paths),
-                                        storage::IndexOrder::ASC,
+                                        data.order.value_or(storage::IndexOrder::ASC),
                                         schema_progress))
             throw utils::BasicException(
                 "Failed to create label+property index on :{} ({}).", data.label, data.composite_property_paths);

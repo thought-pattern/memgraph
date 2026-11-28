@@ -124,19 +124,11 @@ void RemoveRecoveredIndexIfPresent(std::vector<TObj> *list, TObj obj) {
   }
 }
 
-// Helper function used to remove indices stats from the recovered
-// indices/constraints object.
-// @note multiple stats can be pushed one after the other; when removing, remove from the back
-// @throw RecoveryFailure
+// Helper function used to remove all index stats matching `label` from the
+// recovered indices/constraints object, tolerating the case where none exist.
 template <typename TObj, typename K>
-void RemoveRecoveredIndexStats(std::vector<TObj> *list, K label, const char *error_message) {
-  for (auto it = list->rbegin(); it != list->rend(); ++it) {
-    if (it->first == label) {
-      list->erase(std::next(it).base());  // erase using a reverse iterator
-      return;
-    }
-  }
-  throw RecoveryFailure(error_message);
+void RemoveRecoveredIndexStats(std::vector<TObj> *list, K label, [[maybe_unused]] const char *error_message = nullptr) {
+  std::erase_if(*list, [&](const TObj &entry) { return entry.first == label; });
 }
 
 }  // namespace memgraph::storage::durability

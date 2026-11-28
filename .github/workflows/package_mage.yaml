@@ -45,6 +45,10 @@ on:
         type: boolean
         description: "Push the image to S3?"
         default: false
+      push_to_github:
+        type: boolean
+        description: "Upload built packages, offline installer, and Docker archives to GitHub?"
+        default: false
       s3_dest_dir:
         type: string
         description: "Destination directory in S3 bucket"
@@ -120,6 +124,10 @@ on:
         type: boolean
         description: "Push the image to S3?"
         default: false
+      push_to_github:
+        type: boolean
+        description: "Upload built packages, offline installer, and Docker archives to GitHub?"
+        default: false
       s3_dest_dir:
         type: string
         description: "Destination directory in S3 bucket"
@@ -166,6 +174,7 @@ jobs:
       package_suite: ${{ steps.setup.outputs.package_suite }}
     env:
       GH_CONTEXT: ${{ toJson(github) }}
+      WORKFLOW_INPUTS_JSON: ${{ toJson(inputs) }}
       GH_CONTEXT_FILE_NAME: github_context.json
     steps:
       - name: Checkout repository
@@ -178,7 +187,7 @@ jobs:
 
       - name: Set up package execution
         id: setup
-        run: python3 tools/ci/package_mage_setup.py --gh-context-path "$GH_CONTEXT_FILE_NAME"
+        run: python3 tools/ci/package_mage_setup.py --gh-context-path "$GH_CONTEXT_FILE_NAME" --workflow-inputs-json "$WORKFLOW_INPUTS_JSON"
 
 
   BuildMage:
@@ -204,6 +213,7 @@ jobs:
       cuda: ${{ matrix.cuda == 'true' }}
       cugraph: ${{ matrix.cugraph == 'true' }}
       push_to_s3: ${{ matrix.push_to_s3 == 'true' }}
+      push_to_github: ${{ matrix.push_to_github == 'true' }}
       print_output_url: true
       upload_debug_symbols: ${{ matrix.push_to_s3 == 'true' }}
       malloc: ${{ matrix.malloc == 'true' }}

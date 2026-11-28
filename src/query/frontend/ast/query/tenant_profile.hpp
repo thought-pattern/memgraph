@@ -55,7 +55,10 @@ class TenantProfileQuery : public memgraph::query::Query {
     object->action_ = action_;
     object->profile_name_ = profile_name_;
     object->db_name_ = db_name_;
-    object->limits_ = limits_;
+    object->limits_.reserve(limits_.size());
+    for (const auto &[name, val] : limits_) {
+      object->limits_.emplace_back(name, val.Clone(storage));
+    }
     return object;
   }
 

@@ -411,6 +411,19 @@ bool FineGrainedAuthChecker::HasPropertyPermission(storage::EdgeTypeId const &ed
   return level == auth::PermissionLevel::GRANT;
 }
 
+bool FineGrainedAuthChecker::HasGlobalEdgePropertyPermission(storage::PropertyId property,
+                                                             query::AuthQuery::PropertyPermissionType type) const {
+  if (HasUnrestrictedAccessToEdgeTypeProperties()) return true;
+  if (!memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
+    return true;
+  }
+  auto const perm_type = type == query::AuthQuery::PropertyPermissionType::WRITE ? auth::PropertyPermissionType::WRITE
+                                                                                 : auth::PropertyPermissionType::READ;
+  auto const &permissions = GetCachedPropertyEdgeTypePermissions();
+  auto const &prop_name = dba_->PropertyToName(property);
+  return permissions.HasGlobal(prop_name, perm_type) == auth::PermissionLevel::GRANT;
+}
+
 void FineGrainedAuthChecker::MakeThreadSafe() const {
   PopulateCachedPermissions();
   (void)HasPropertyRestrictions();

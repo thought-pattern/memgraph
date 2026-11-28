@@ -11,9 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
-
+import pytest
 import requests
 
 METRICS_URL = "http://localhost:9091/metrics"

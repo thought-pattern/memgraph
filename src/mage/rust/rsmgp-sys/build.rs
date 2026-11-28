@@ -3,12 +3,22 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    let mg_procedure_path = "mgp/mg_procedure.h";
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let server_header = manifest_dir.join("../../../../include/mg_procedure.h");
+    let local_header = manifest_dir.join("mgp/mg_procedure.h");
+    let mg_procedure_path = if server_header.exists() {
+        server_header
+    } else {
+        local_header
+    };
+    let mg_procedure_str = mg_procedure_path
+        .to_str()
+        .expect("Invalid mg_procedure.h path");
 
-    println!("cargo:rerun-if-changed={}", mg_procedure_path);
+    println!("cargo:rerun-if-changed={}", mg_procedure_str);
 
     let bindings = bindgen::Builder::default()
-        .header(mg_procedure_path)
+        .header(mg_procedure_str)
         .blocklist_function("mgp_*")
         .rustified_enum("mgp_error")
         .rustified_enum("mgp_value_type")
@@ -17,11 +27,11 @@ fn main() {
         .expect("Unable to generate bindings")
         .to_string();
 
-    let mut bindings_string = "#[cfg(test)] use mockall::automock;\n".to_owned();
-    bindings_string.push_str("#[cfg_attr(test, automock)]\npub(crate) mod ffi {\nuse super::*;\n");
+    let mut bindings_string = "#[cfg_attr(test, mockall::automock)]\npub mod ffi {\nuse super::*;"
+        .to_owned();
     bindings_string.push_str(
         &bindgen::Builder::default()
-            .header(mg_procedure_path)
+            .header(mg_procedure_str)
             .blocklist_type(".*")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .generate()

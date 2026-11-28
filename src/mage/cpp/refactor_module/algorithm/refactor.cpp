@@ -140,9 +140,9 @@ void Refactor::RenameNodeProperty(mgp_list *args, mgp_graph * /*memgraph_graph*/
   }
 }
 
-void Refactor::InsertCloneNodesRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const int cycle_id,
-                                      const int node_id) {
-  auto *node = mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = static_cast<int64_t>(node_id)}, memory);
+void Refactor::InsertCloneNodesRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const int64_t cycle_id,
+                                      const int64_t node_id) {
+  auto *node = mgp::graph_get_vertex_by_id(graph, mgp_vertex_id{.as_int = node_id}, memory);
   if (!node) {
     if (mgp::graph_is_transactional(graph)) {
       throw mg_exception::InvalidIDException();
@@ -211,8 +211,7 @@ void CloneNodesImpl(const std::vector<mgp::Node> &nodes, const mgp::List &standi
       }
     }
     old_new_node_mirror.insert({node, new_node});
-    Refactor::InsertCloneNodesRecord(
-        memgraph_graph, result, memory, static_cast<int>(node.Id().AsInt()), static_cast<int>(new_node.Id().AsInt()));
+    Refactor::InsertCloneNodesRecord(memgraph_graph, result, memory, node.Id().AsInt(), new_node.Id().AsInt());
   }
 }
 
@@ -402,10 +401,10 @@ void Refactor::CloneNodes(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
     const auto nodes = arguments[0].ValueList();
     const auto clone_rels = arguments[1].ValueBool();
     const auto skip_props = arguments[2].ValueList();
-    std::unordered_set<std::string_view> skip_props_searchable;
+    std::unordered_set<std::string> skip_props_searchable;
 
     for (const auto &property_key : skip_props) {
-      skip_props_searchable.insert(property_key.ValueString());
+      skip_props_searchable.emplace(property_key.ValueString());
     }
 
     for (const auto &node : nodes) {
@@ -423,20 +422,26 @@ void Refactor::CloneNodes(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
       }
 
       if (clone_rels) {
+        auto copy_rel_props = [&skip_props, &skip_props_searchable](const mgp::Relationship &src_rel,
+                                                                    mgp::Relationship &dst_rel) {
+          for (const auto &prop : src_rel.Properties()) {
+            if (skip_props.Empty() || !skip_props_searchable.contains(prop.first)) {
+              dst_rel.SetProperty(prop.first, prop.second);
+            }
+          }
+        };
         for (auto rel : old_node.InRelationships()) {
-          graph.CreateRelationship(rel.From(), new_node, rel.Type());
+          auto new_rel = graph.CreateRelationship(rel.From(), new_node, rel.Type());
+          copy_rel_props(rel, new_rel);
         }
 
         for (auto rel : old_node.OutRelationships()) {
-          graph.CreateRelationship(new_node, rel.To(), rel.Type());
+          auto new_rel = graph.CreateRelationship(new_node, rel.To(), rel.Type());
+          copy_rel_props(rel, new_rel);
         }
       }
 
-      InsertCloneNodesRecord(memgraph_graph,
-                             result,
-                             memory,
-                             static_cast<int>(old_node.Id().AsInt()),
-                             static_cast<int>(new_node.Id().AsInt()));
+      InsertCloneNodesRecord(memgraph_graph, result, memory, old_node.Id().AsInt(), new_node.Id().AsInt());
     }
   } catch (const std::exception &e) {
     mgp::result_set_error_msg(result, e.what());
@@ -977,10 +982,14 @@ void Refactor::MergeNodes(mgp_list *args, mgp_graph *memgraph_graph, mgp_result 
 
     // Get the first node as the target node
     auto target_node = nodes[0].ValueNode();
+    std::unordered_set<int64_t> processed_node_ids{target_node.Id().AsInt()};
 
     // Process remaining nodes
     for (size_t i = 1; i < nodes.Size(); ++i) {
       auto source_node = nodes[i].ValueNode();
+      if (!processed_node_ids.insert(source_node.Id().AsInt()).second) {
+        continue;
+      }
 
       // Handle properties based on strategy
       // Discard properties keeps the target properties so it's not handled in if-else

@@ -62,10 +62,12 @@ class IncrementalUpdateFixture : public MatcherFixtureBase {
 };
 
 BENCHMARK_DEFINE_F(IncrementalUpdateFixture, Update)(benchmark::State &state) {
-  int64_t var_counter = initial_size_ * 2;
   for (auto _ : state) {
     state.PauseTiming();
+    SetupGraphAndMatcher([this](TestEGraph &g) { BuildIndependentAdds(g, initial_size_); });
+    int64_t var_counter = initial_size_ * 2;
     std::vector<EClassId> added_eclasses;
+    added_eclasses.reserve(static_cast<std::size_t>(increment_size_) * 3);
     for (int64_t i = 0; i < increment_size_; ++i) {
       auto var1 = egraph_.emplace(Op::Var, static_cast<uint64_t>(var_counter++)).eclass_id;
       auto var2 = egraph_.emplace(Op::Var, static_cast<uint64_t>(var_counter++)).eclass_id;

@@ -221,9 +221,11 @@ auto UnwindFlatMap(CostFrontier const &input, CostFrontier const &list, planner:
       // we have it (constant lists), otherwise the estimator's per-expression
       // cardinality (e.g. range(0, n) -> n+1).
       auto const list_length = known_length.has_value() ? static_cast<double>(*known_length) : list_alt.cardinality;
-      auto const cost = input_alt.cost + ((list_alt.cost + kUnwindPerRowOverhead) * input_alt.cardinality) + sym_cost;
+      auto const output_cardinality = input_alt.cardinality * list_length;
+      auto const cost =
+          input_alt.cost + (list_alt.cost * input_alt.cardinality) + (kUnwindPerRowOverhead * output_cardinality) + sym_cost;
       emit({.cost = cost,
-            .cardinality = input_alt.cardinality * list_length,
+            .cardinality = output_cardinality,
             .required = {},
             .introduces = input_alt.introduces.union_bit(sym_bit),
             .enode_id = enode_id});
@@ -234,7 +236,7 @@ auto UnwindFlatMap(CostFrontier const &input, CostFrontier const &list, planner:
         // length as a fact and never evaluates the list, but under-costing the
         // dead alt (free rows) would be worse than over-costing it.
         emit({.cost = input_alt.cost + (list_alt.cost * input_alt.cardinality),
-              .cardinality = input_alt.cardinality * list_length,
+              .cardinality = output_cardinality,
               .required = {},
               .introduces = input_alt.introduces,
               .enode_id = enode_id});
@@ -407,6 +409,13 @@ struct symbol_cost_traits<Subquery> {
     }
     auto exposed_syms = ctx.syms.variable_index.to_variable_set(n.children().subspan(first_exposed));
     return SubqueryFlatMap(*children[outer], *children[inner], std::move(exposed_syms), id);
+  }
+};
+
+template <>
+struct symbol_cost_traits<Distinct> {
+  static auto cost(ENodeT const &, ENodeId id, CostChildren children, CostCtx const &) -> CostFrontier {
+    return Restamp(*children[child::distinct::input], 1.0, id);
   }
 };
 

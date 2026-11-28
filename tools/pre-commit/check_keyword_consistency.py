@@ -8,9 +8,9 @@ in stripped_lexer_constants.hpp
 
 """
 
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
 
 
 def extract_lexer_tokens(lexer_file):

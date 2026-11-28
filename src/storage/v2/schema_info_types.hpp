@@ -102,10 +102,10 @@ struct EdgeKey {
  */
 template <template <class...> class TContainer = utils::ConcurrentUnorderedMap>
 struct PropertyInfo {
-  std::atomic_int n{0};                                     //!< Number of objects with this property
-  TContainer<ExtendedPropertyType, std::atomic_int> types;  //!< Numer of property instances with a specific type
+  std::atomic<int64_t> n{0};                                     //!< Number of objects with this property
+  TContainer<ExtendedPropertyType, std::atomic<int64_t>> types;  //!< Number of property instances with a specific type
 
-  nlohmann::json ToJson(const EnumStore &enum_store, std::string_view key, uint32_t max_count) const;
+  nlohmann::json ToJson(const EnumStore &enum_store, std::string_view key, int64_t max_count) const;
 };
 
 /**
@@ -113,7 +113,7 @@ struct PropertyInfo {
  */
 template <template <class...> class TContainer = utils::ConcurrentUnorderedMap>
 struct TrackingInfo {
-  std::atomic_int n{0};                                         //!< Number of tracked objects
+  std::atomic<int64_t> n{0};                                    //!< Number of tracked objects
   TContainer<PropertyId, PropertyInfo<TContainer>> properties;  //!< Property statistics defined by the tracked object
 
   nlohmann::json ToJson(NameIdMapper &name_id_mapper, const EnumStore &enum_store) const;
@@ -125,10 +125,11 @@ struct TrackingInfo {
   TrackingInfo &operator+=(const TrackingInfo<TOtherContainer> &rhs) {
     n += rhs.n;
     for (const auto &[id, val] : rhs.properties) {
-      auto &prop = properties[id];
+      auto &&prop_ref = properties[id];
+      auto &prop = utils::UnwrapConcurrentValue(prop_ref);
       prop.n += val.n;
-      for (const auto &[type, n] : val.types) {
-        prop.types[type] += n;
+      for (const auto &[type, count] : val.types) {
+        prop.types[type] += count;
       }
     }
     return *this;
@@ -206,7 +207,7 @@ template <>
 class hash<memgraph::storage::SchemaInfoEdge> {
  public:
   size_t operator()(const memgraph::storage::SchemaInfoEdge &pp) const {
-    return pp.edge_ref.gid.AsUint();  // Both ptr and gid are the same size and unique
+    return static_cast<size_t>(pp.edge_ref.RawBits());
   }
 };
 

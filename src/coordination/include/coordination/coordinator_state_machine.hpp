@@ -86,6 +86,10 @@ class CoordinatorStateMachine final : public state_machine {
 
   auto commit_config(ulong log_idx, ptr<cluster_config> & /*new_conf*/) -> void override;
 
+  void ReplayCommittedLog(ulong log_idx, buffer &data);
+
+  void ReplayCommittedConfig(ulong log_idx, ptr<cluster_config> &new_conf);
+
   auto rollback(ulong log_idx, buffer &data) -> void override;
 
   auto read_logical_snp_obj(snapshot & /*snapshot*/, void *& /*user_snp_ctx*/, ulong /*obj_id*/, ptr<buffer> &data_out,
@@ -136,6 +140,7 @@ class CoordinatorStateMachine final : public state_machine {
   std::atomic<uint64_t> last_committed_idx_{0};
 
   std::map<uint64_t, ptr<SnapshotCtx>> snapshots_;
+  std::map<uint64_t, ptr<snapshot>> staged_snapshots_;
   std::mutex snapshots_lock_;
 
   LoggerWrapper logger_;

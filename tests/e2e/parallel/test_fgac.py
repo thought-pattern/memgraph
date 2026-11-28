@@ -16,13 +16,13 @@ These tests verify that labels and edges are correctly filtered based on user pe
 when queries are executed using the parallel execution engine.
 """
 
-import sys
 from enum import Enum
+import sys
 
-import pytest
 from common import pq, setup_thread_count_db
 from conftest import MemgraphWrapper
 from neo4j import GraphDatabase
+import pytest
 
 
 class RestrictionScenario(Enum):

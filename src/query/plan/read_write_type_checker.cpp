@@ -44,6 +44,8 @@ PRE_VISIT(ScanAllByEdgeTypeProperty, RWType::R, true)
 PRE_VISIT(ScanAllByEdgeProperty, RWType::R, true)
 PRE_VISIT(ScanAllByEdgeId, RWType::R, true)
 PRE_VISIT(ScanAllByVertexProperty, RWType::R, true)
+PRE_VISIT(ScanAllByPointDistance, RWType::R, true)
+PRE_VISIT(ScanAllByPointWithinbbox, RWType::R, true)
 
 PRE_VISIT(Expand, RWType::R, true)
 PRE_VISIT(ExpandVariable, RWType::R, true)
@@ -54,7 +56,12 @@ PRE_VISIT(Filter, RWType::NONE, true)
 PRE_VISIT(EdgeUniquenessFilter, RWType::NONE, true)
 
 PRE_VISIT(Merge, RWType::RW, false)
-PRE_VISIT(Optional, RWType::NONE, true)
+
+bool ReadWriteTypeChecker::PreVisit(Optional &op) {
+  op.input_->Accept(*this);
+  op.optional_->Accept(*this);
+  return false;
+}
 
 bool ReadWriteTypeChecker::PreVisit(Cartesian &op) {
   op.left_op_->Accept(*this);

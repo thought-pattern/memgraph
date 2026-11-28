@@ -1,7 +1,6 @@
-from typing import Tuple
+"""Utilities for memory updater."""
 
-import torch
-import torch.nn as nn
+from torch import Tensor as torch_Tensor, device as torch_device, nn
 
 
 class MemoryUpdater(nn.Module):
@@ -9,7 +8,7 @@ class MemoryUpdater(nn.Module):
     This is base class for memory updater implementation
     """
 
-    def __init__(self, memory_dimension: int, message_dimension: int, device: torch.device):
+    def __init__(self, memory_dimension: int, message_dimension: int, device: torch_device):
         super().__init__()
         self.memory_dimension = memory_dimension
         self.message_dimension = message_dimension
@@ -17,12 +16,14 @@ class MemoryUpdater(nn.Module):
 
 
 class MemoryUpdaterGRU(MemoryUpdater):
-    def __init__(self, memory_dimension: int, message_dimension: int, device: torch.device):
+    """Updates node memory with a GRU cell."""
+
+    def __init__(self, memory_dimension: int, message_dimension: int, device: torch_device):
         super().__init__(memory_dimension, message_dimension, device)
 
         self.memory_updater_net = nn.GRUCell(input_size=message_dimension, hidden_size=memory_dimension).to(self.device)
 
-    def forward(self, data: Tuple[torch.Tensor, torch.Tensor]):
+    def forward(self, data: tuple[torch_Tensor, torch_Tensor]):
         # messages shape = (1, message_dim)
         # memory shape = (memory_dim,)
         messages, memory = data
@@ -30,16 +31,19 @@ class MemoryUpdaterGRU(MemoryUpdater):
         # memory_dim = (1, memory_dim)
         memory = memory.unsqueeze(0)
 
-        return self.memory_updater_net(messages, memory)
+        computed_return_value = self.memory_updater_net(messages, memory)
+        return computed_return_value
 
 
 class MemoryUpdaterRNN(MemoryUpdater):
-    def __init__(self, memory_dimension: int, message_dimension: int, device: torch.device):
+    """Updates node memory with an RNN cell."""
+
+    def __init__(self, memory_dimension: int, message_dimension: int, device: torch_device):
         super().__init__(memory_dimension, message_dimension, device)
 
         self.memory_updater_net = nn.RNNCell(input_size=message_dimension, hidden_size=memory_dimension).to(self.device)
 
-    def forward(self, data: Tuple[torch.Tensor, torch.Tensor]):
+    def forward(self, data: tuple[torch_Tensor, torch_Tensor]):
         # messages shape = (1, message_dim)
         # memory shape = (memory_dim,)
         messages, memory = data
@@ -47,4 +51,5 @@ class MemoryUpdaterRNN(MemoryUpdater):
         # memory_dim = (1, memory_dim)
         memory = memory.unsqueeze(0)
 
-        return self.memory_updater_net(messages, memory)
+        computed_return_value = self.memory_updater_net(messages, memory)
+        return computed_return_value

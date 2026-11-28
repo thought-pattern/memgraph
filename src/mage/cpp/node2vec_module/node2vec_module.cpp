@@ -84,8 +84,10 @@ node2vec_alg::N2vGraph BuildGraph(const mgp::Graph &graph, const Params &prm) {
   for (const auto node : graph.Nodes()) {
     graph.CheckMustAbort();
     const int64_t from = node.Id().AsInt();
+    n2v.AddNode(from);
     for (const auto rel : node.OutRelationships()) {
       const int64_t to = rel.To().Id().AsInt();
+      n2v.AddNode(to);
       double weight = 1.0;
       auto wval = rel.GetProperty(prm.edge_weight_property);
       if (wval.IsNumeric()) weight = wval.ValueNumeric();

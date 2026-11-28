@@ -38,6 +38,7 @@ constexpr auto *kReplicationRole = "replication_role";
 constexpr auto *kVersion = "durability_version";
 constexpr auto *kMainUUID = "main_uuid";
 constexpr auto *kDeltasBatchProgressSize = "deltas_batch_progress_size";
+constexpr auto *kNeedsMainUuidSync = "needs_main_uuid_sync";
 // Matches the range of --replication-replica-check-frequency-sec.
 constexpr auto kMinReplicaCheckFrequency = std::chrono::seconds{1};
 constexpr auto kMaxReplicaCheckFrequency = std::chrono::hours{24};
@@ -47,8 +48,12 @@ void to_json(nlohmann::json &j, const ReplicationRoleEntry &p) {
     auto common = nlohmann::json{{kVersion, p.version},
                                  {kReplicationRole, replication_coordination_glue::ReplicationRole::MAIN},
                                  {kDeltasBatchProgressSize, p.deltas_batch_progress_size}};
-    MG_ASSERT(main.main_uuid.has_value(), "Main should have id ready on version >= V3");
-    common[kMainUUID] = main.main_uuid.value();
+    if (p.version >= DurabilityVersion::V3) {
+      MG_ASSERT(main.main_uuid.has_value(), "Main should have id ready on version >= V3");
+      common[kMainUUID] = main.main_uuid.value();
+    } else if (main.main_uuid.has_value()) {
+      common[kMainUUID] = main.main_uuid.value();
+    }
     j = std::move(common);
   };
   auto processREPLICA = [&](ReplicaRole const &replica) {
@@ -114,6 +119,9 @@ void to_json(nlohmann::json &j, const ReplicationReplicaEntry &p) {
                                                            // Serialize always to nullptr for backward compatibility
   common[kSSLKeyFile] = nullptr;
   common[kSSLCertFile] = nullptr;
+  if (p.needs_main_uuid_sync) {
+    common[kNeedsMainUuidSync] = true;
+  }
 
   j = std::move(common);
 }
@@ -149,6 +157,7 @@ void from_json(const nlohmann::json &j, ReplicationReplicaEntry &p) {
   }();
 
   config.repl_server_endpoint = std::move(repl_server_endpoint);
-  p = ReplicationReplicaEntry{.config = std::move(config)};
+  const bool needs_uuid_sync = j.value(kNeedsMainUuidSync, false);
+  p = ReplicationReplicaEntry{.config = std::move(config), .needs_main_uuid_sync = needs_uuid_sync};
 }
 }  // namespace memgraph::replication::durability

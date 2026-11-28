@@ -14,6 +14,7 @@
 #include <cctype>
 #include <charconv>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -24,13 +25,61 @@
 
 namespace memgraph::query::frontend {
 
+namespace {
+
+std::pair<std::string_view, int> StripIntegerBasePrefix(std::string_view digits) {
+  if (digits.size() >= 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) {
+    return {digits.substr(2), 16};
+  }
+  if (digits.size() > 1 && digits[0] == '0') {
+    return {digits.substr(1), 8};
+  }
+  return {digits, 10};
+}
+
+}  // namespace
+
+bool IsInt64MinMagnitudeLiteral(std::string_view s) {
+  if (s.empty() || s[0] == '-' || s[0] == '+') return false;
+  auto const [digits, base] = StripIntegerBasePrefix(s);
+  if (digits.empty()) return false;
+  uint64_t mag = 0;
+  auto const [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), mag, base);
+  constexpr uint64_t kMinSignedMagnitude = static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1ULL;
+  return ec == std::errc{} && ptr == digits.data() + digits.size() && mag == kMinSignedMagnitude;
+}
+
 int64_t ParseIntegerLiteral(const std::string &s) {
-  try {
-    // Not really correct since long long can have a bigger range than int64_t.
-    return static_cast<int64_t>(std::stoll(s, 0, 0));
-  } catch (const std::out_of_range &) {
+  std::string_view sv{s};
+  bool negative = false;
+  if (!sv.empty() && (sv[0] == '-' || sv[0] == '+')) {
+    negative = (sv[0] == '-');
+    sv.remove_prefix(1);
+  }
+  auto const [digits, base] = StripIntegerBasePrefix(sv);
+  if (digits.empty()) {
     throw SemanticException("Integer literal exceeds 64 bits.");
   }
+  uint64_t mag = 0;
+  auto const [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), mag, base);
+  if (ec != std::errc{} || ptr != digits.data() + digits.size()) {
+    throw SemanticException("Integer literal exceeds 64 bits.");
+  }
+  constexpr uint64_t kMaxPos = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  constexpr uint64_t kMinSignedMagnitude = kMaxPos + 1ULL;
+  if (!negative) {
+    if (mag > kMaxPos) {
+      throw SemanticException("Integer literal exceeds 64 bits.");
+    }
+    return static_cast<int64_t>(mag);
+  }
+  if (mag > kMinSignedMagnitude) {
+    throw SemanticException("Integer literal exceeds 64 bits.");
+  }
+  if (mag == kMinSignedMagnitude) {
+    return std::numeric_limits<int64_t>::min();
+  }
+  return -static_cast<int64_t>(mag);
 }
 
 std::string ParseStringLiteral(const std::string &s) {
@@ -73,7 +122,7 @@ std::string ParseStringLiteral(const std::string &s) {
       const char *start = s.data() + i + 1;
       const char *end = start + kLongUnicodeLength;
       auto [ptr, ec] = std::from_chars(start, end, codepoint, 16);
-      if (ec != std::errc{} || ptr != end) {
+      if (ec != std::errc{} || ptr != end || codepoint > 0x10FFFFU || (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
         throw SemanticException("Invalid UTF codepoint.");
       }
       i += kLongUnicodeLength;
@@ -118,7 +167,7 @@ std::string ParseStringLiteral(const std::string &s) {
           throw SemanticException("Invalid UTF codepoint.");
         }
         ++j;
-        if (j >= static_cast<int>(s.size()) - 1 || (s[j] != 'u' && s[j] != 'U')) {
+        if (j >= static_cast<int>(s.size()) - 1 || s[j] != 'u') {
           throw SemanticException("Invalid UTF codepoint.");
         }
         ++j;
@@ -131,6 +180,9 @@ std::string ParseStringLiteral(const std::string &s) {
         }
 
         const uint16_t second_unit = ParseUtf16Unit(j);
+        if (!IsLowSurrogate(second_unit)) {
+          throw SemanticException("Invalid UTF codepoint.");
+        }
 
         // Convert UTF-16 surrogate pair to Unicode codepoint
         // Formula: 0x10000 + ((high & 0x3FF) << 10) | (low & 0x3FF)
@@ -230,7 +282,7 @@ std::string ParseParameter(const std::string &s) {
   if (s[1] != '`') return s.substr(1);
   // If parameter name is escaped symbolic name then symbolic name should be
   // unescaped and leading and trailing backquote should be removed.
-  DMG_ASSERT(s.size() > 3U && s.back() == '`', "Invalid string passed as parameter name");
+  DMG_ASSERT(s.size() >= 3U && s.back() == '`', "Invalid string passed as parameter name");
   std::string out;
   for (int i = 2; i < static_cast<int>(s.size()) - 1; ++i) {
     if (s[i] == '`') {

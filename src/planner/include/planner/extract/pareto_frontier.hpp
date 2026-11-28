@@ -349,7 +349,6 @@ struct ParetoFrontier {
     auto const lhs_alts = lhs.alts();
     auto const rhs_alts = rhs.alts();
     auto out = std::vector<Alt>{};
-    out.reserve(lhs_alts.size() * rhs_alts.size());  // upper bound; predicate may reduce
     for (Alt const &l : lhs_alts) {
       for (Alt const &r : rhs_alts) {
         if (!pred(l, r)) continue;

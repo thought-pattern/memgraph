@@ -970,7 +970,7 @@ TYPED_TEST(CppApiTestFixture, TestValuePrint) {
     mgp::Value duration_value{mgp::Duration{"P14DT17H2M45S"}};
     std::ostringstream oss_duration;
     oss_duration << duration_value;
-    ASSERT_EQ("1270965000000ms", oss_duration.str());
+    ASSERT_EQ("1270965000000us", oss_duration.str());
   }
 
   {
@@ -1037,7 +1037,7 @@ TYPED_TEST(CppApiTestFixture, TestValueToString) {
 
   /*duration*/
   mgp::Duration duration{"P14DT17H2M45S"};
-  ASSERT_EQ(mgp::Value(duration).ToString(), "1270965000000ms");
+  ASSERT_EQ(mgp::Value(duration).ToString(), "1270965000000us");
 
   /*zoned date time*/
   mgp::ZonedDateTime zoned_date_time_with_tz{"2024-01-01T13:02:40.100050+01:00[Europe/Zagreb]"};
@@ -1160,8 +1160,10 @@ TYPED_TEST(CppApiTestFixture, TestLabelPropertyIndex) {
 
     auto indices = mgp::ListAllLabelPropertyIndices(&raw_graph);
     ASSERT_EQ(indices.Size(), 1);
-    auto index_info = indices[0].ValueString();
-    ASSERT_EQ(index_info, "User:name");
+    auto index_info = indices[0].ValueList();
+    ASSERT_EQ(index_info.Size(), 2);
+    ASSERT_EQ(index_info[0].ValueString(), "User");
+    ASSERT_EQ(index_info[1].ValueString(), "name");
   }
   {
     auto storage_acc = this->DropIndexAccessor();
@@ -1204,8 +1206,10 @@ TYPED_TEST(CppApiTestFixture, TestNestedIndex) {
     mgp_graph raw_graph = this->CreateGraph(db_acc.get());
     auto indices = mgp::ListAllLabelPropertyIndices(&raw_graph);
     ASSERT_EQ(indices.Size(), 1);
-    auto index_info = indices[0].ValueString();
-    ASSERT_EQ(index_info, "Label:nested1.nested2.nested3");
+    auto index_info = indices[0].ValueList();
+    ASSERT_EQ(index_info.Size(), 2);
+    ASSERT_EQ(index_info[0].ValueString(), "Label");
+    ASSERT_EQ(index_info[1].ValueString(), "nested1.nested2.nested3");
   }
   {
     auto storage_acc = this->DropIndexAccessor();
@@ -1242,7 +1246,10 @@ TYPED_TEST(CppApiTestFixture, TestExistenceConstraint) {
 
     auto constraints = mgp::ListAllExistenceConstraints(&raw_graph);
     ASSERT_EQ(constraints.Size(), 1);
-    ASSERT_EQ(constraints[0].ValueString(), "User:email");
+    auto constraint_info = constraints[0].ValueList();
+    ASSERT_EQ(constraint_info.Size(), 2);
+    ASSERT_EQ(constraint_info[0].ValueString(), "User");
+    ASSERT_EQ(constraint_info[1].ValueString(), "email");
   }
   // Drop the constraint
   {

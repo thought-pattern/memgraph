@@ -1,23 +1,24 @@
-import types
-from typing import Any, Dict
+"""Utilities for parameters utils."""
+
+from inspect import isfunction as inspect_isfunction
 
 from mage.graph_coloring_module.graph import Graph
+from mage.graph_coloring_module.parameters import Parameter
 
 
-def param_value(graph: Graph, parameters: Dict[str, Any], param: str, initial_value: Any = None) -> Any:
-    if parameters is None:
-        if initial_value is None:
-            return None
-        return initial_value
+def param_value(graph: Graph, parameters: dict, param: Parameter):
+    if not isinstance(parameters, dict):
+        raise TypeError("graph-coloring parameters must be a dictionary")
+    if not isinstance(param, Parameter):
+        raise TypeError("graph-coloring parameter keys must be Parameter values")
 
-    param = parameters.get(param)
+    if param not in parameters:
+        raise KeyError(f"missing graph-coloring parameter {param.value}")
+    value = parameters.get(param, False)
+    if value is False:
+        raise ValueError(f"graph-coloring parameter {param.value} cannot be disabled")
 
-    if param is None:
-        if initial_value is None:
-            return None
-        return initial_value
+    if inspect_isfunction(value):
+        value = value(graph)
 
-    if isinstance(param, types.FunctionType):
-        param = param(graph)
-
-    return param
+    return value

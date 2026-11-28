@@ -1,5 +1,6 @@
-import numpy as np
-import torch
+"""Utilities for messages."""
+
+from torch import Tensor as torch_Tensor
 
 
 class RawMessage:
@@ -9,31 +10,38 @@ class RawMessage:
     """
 
     def __init__(self, source: int, timestamp: int):
-        super(RawMessage, self).__init__()
+        super().__init__()
         self.source = source
         self.timestamp = timestamp
 
-    def detach_memory(self) -> None:
-        raise Exception("Not implemented")
+    def detach_memory(self) -> bool:
+        raise NotImplementedError("RawMessage subclasses must implement detach_memory")
 
     def __str__(self):
-        return "{source},{timestamp}".format(source=self.source, timestamp=self.timestamp)
+        computed_return_value = f"{self.source},{self.timestamp}"
+        return computed_return_value
 
 
 class NodeRawMessage(RawMessage):
+    """Raw message of a node-wise event: source memory, timestamp and node features."""
+
     def __init__(
         self,
-        source_memory: np.array,
+        source_memory: torch_Tensor,
         timestamp: int,
-        node_features: np.array,
+        node_features: torch_Tensor,
         source: int,
     ):
-        super(NodeRawMessage, self).__init__(source, timestamp)
+        super().__init__(source, timestamp)
         self.source_memory = source_memory
         self.node_features = node_features
 
-    def detach_memory(self) -> None:
-        raise Exception("Not implemented")
+    def detach_memory(self) -> bool:
+        # Replace the owned references with detached views of the same values. The originals may be shared with
+        # stored node features or memory, so they are neither modified in place nor zeroed.
+        self.source_memory = self.source_memory.detach()
+        self.node_features = self.node_features.detach()
+        return False
 
 
 class InteractionRawMessage(RawMessage):
@@ -47,10 +55,10 @@ class InteractionRawMessage(RawMessage):
 
     def __init__(
         self,
-        source_memory: torch.Tensor,
-        dest_memory: torch.Tensor,
-        delta_time: torch.Tensor,
-        edge_features: torch.Tensor,
+        source_memory: torch_Tensor,
+        dest_memory: torch_Tensor,
+        delta_time: torch_Tensor,
+        edge_features: torch_Tensor,
         source: int,
         timestamp: int,
     ):
@@ -60,16 +68,11 @@ class InteractionRawMessage(RawMessage):
         self.delta_time = delta_time
         self.edge_features = edge_features
 
-    def detach_memory(self) -> None:
-        if self.source_memory.grad is not None:
-            self.source_memory.detach_()
-            self.source_memory.zero_()
-        if self.dest_memory.grad is not None:
-            self.dest_memory.detach_()
-            self.dest_memory.zero_()
-        if self.delta_time.grad is not None:
-            self.delta_time.detach_()
-            self.delta_time.zero_()
-        if self.edge_features.grad is not None:
-            self.edge_features.detach_()
-            self.edge_features.zero_()
+    def detach_memory(self) -> bool:
+        # Replace the owned references with detached views of the same values. The originals may be shared with
+        # stored edge features or memory, so they are neither modified in place nor zeroed.
+        self.source_memory = self.source_memory.detach()
+        self.dest_memory = self.dest_memory.detach()
+        self.delta_time = self.delta_time.detach()
+        self.edge_features = self.edge_features.detach()
+        return False

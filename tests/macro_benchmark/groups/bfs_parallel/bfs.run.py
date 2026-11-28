@@ -10,6 +10,7 @@
 # licenses/APL.txt.
 
 import random
+
 import common
 
 # Here we set seed to 1, instead of 0, because seed in setup is 0 and we want to

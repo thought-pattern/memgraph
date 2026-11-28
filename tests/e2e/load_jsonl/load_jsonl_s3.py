@@ -9,13 +9,13 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import sys
 from pathlib import Path
+import sys
 
 import boto3
-import pytest
 from common import connect, execute_and_fetch_all, get_file_path
 from mgclient import DatabaseError
+import pytest
 
 # LocalStack configuration
 # NOTE: If you are testing this locally change localstack-s3 to localhost

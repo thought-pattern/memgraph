@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from common import memgraph
 from gqlalchemy.exceptions import GQLAlchemyDatabaseError
+import pytest
 
 
 def test_match_dynamic_variable_node_error(memgraph):

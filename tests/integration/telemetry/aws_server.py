@@ -12,13 +12,13 @@
 # licenses/APL.txt.
 
 import argparse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import itertools
 import json
 import os
 import signal
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from field_validator import validate_telemetry, verify_telemetry_item
 

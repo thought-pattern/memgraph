@@ -117,18 +117,91 @@ def _valid_uuid(uuid_to_test: any, version: int = 4) -> any:
     return str(uuid_obj) == uuid_to_test
 
 
-def server_returned_expected(expected_string: str, server_response: requests.Response) -> bool:
+def _values_match(
+    expected_val: any,
+    actual_val: any,
+    *,
+    preserve_order: bool = True,
+    allow_generated_uuid: bool = False,
+) -> bool:
+    if expected_val is None:
+        return actual_val is None
+    if isinstance(expected_val, bool):
+        return isinstance(actual_val, bool) and expected_val == actual_val
+    if isinstance(expected_val, (int, float)):
+        return isinstance(actual_val, (int, float)) and not isinstance(actual_val, bool) and expected_val == actual_val
+    if isinstance(expected_val, str):
+        if not isinstance(actual_val, str):
+            return False
+        if expected_val == actual_val:
+            return True
+        return allow_generated_uuid and _valid_uuid(expected_val) and _valid_uuid(actual_val)
+    if isinstance(expected_val, dict):
+        if not isinstance(actual_val, dict) or set(expected_val.keys()) != set(actual_val.keys()):
+            return False
+        return all(
+            _values_match(
+                expected_val[key],
+                actual_val[key],
+                preserve_order=preserve_order,
+                allow_generated_uuid=allow_generated_uuid,
+            )
+            for key in expected_val
+        )
+    if isinstance(expected_val, list):
+        if not isinstance(actual_val, list) or len(expected_val) != len(actual_val):
+            return False
+        if preserve_order:
+            return all(
+                _values_match(
+                    exp_item,
+                    act_item,
+                    preserve_order=preserve_order,
+                    allow_generated_uuid=allow_generated_uuid,
+                )
+                for exp_item, act_item in zip(expected_val, actual_val)
+            )
+        remaining = list(actual_val)
+        for exp_item in expected_val:
+            matched_idx = next(
+                (
+                    idx
+                    for idx, candidate in enumerate(remaining)
+                    if _values_match(
+                        exp_item,
+                        candidate,
+                        preserve_order=preserve_order,
+                        allow_generated_uuid=allow_generated_uuid,
+                    )
+                ),
+                None,
+            )
+            if matched_idx is None:
+                return False
+            remaining.pop(matched_idx)
+        return True
+    return expected_val == actual_val
+
+
+def server_returned_expected(
+    expected_string: str,
+    server_response: requests.Response,
+    *,
+    preserve_order: bool = True,
+    allow_generated_uuid: bool = False,
+) -> bool:
+    if server_response is None or getattr(server_response, "status_code", 200) >= 400:
+        return False
     expected_json = json.loads(expected_string)
     server_response_json = json.loads(server_response.text)
-
-    expected = _flatten(_ordered(expected_json))
-    actual = _flatten(_ordered(server_response_json))
-
-    for expected_item, actual_item in zip(expected, actual):
-        if expected_item != actual_item and not (_valid_uuid(expected_item)):
-            return False
-
-    return True
+    if "errors" in server_response_json and "errors" not in expected_json:
+        return False
+    return _values_match(
+        expected_json,
+        server_response_json,
+        preserve_order=preserve_order,
+        allow_generated_uuid=allow_generated_uuid,
+    )
 
 
 def get_uuid_from_response(response: requests.Response) -> list:

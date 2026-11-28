@@ -12,10 +12,14 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
+#ifdef MG_HAS_LIBSECCOMP
 #include <seccomp.h>
+#endif
 #include <spdlog/spdlog.h>
 #include <sys/resource.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #include <array>
@@ -34,6 +38,8 @@
 
 #include "utils/nofile_limit.hpp"
 
+extern char **environ;
+
 namespace {
 
 /////////////////////////////////////////////////////////////////////////
@@ -48,47 +54,11 @@ const int kCommunicationFromModuleFd = 1001;
 
 const int kTerminateTimeoutSec = 5;
 
-///////////////////////////////////////////
-// char** wrapper used for C library calls.
-///////////////////////////////////////////
-
-const int kCharppMaxElements = 4096;
-
-class CharPP final {
- public:
-  CharPP() { data_.fill(nullptr); }
-
-  ~CharPP() {
-    for (size_t i = 0; i < size_; ++i) {
-      free(data_[i]);
-    }
-  }
-
-  CharPP(const CharPP &) = delete;
-  CharPP(CharPP &&) = delete;
-  CharPP &operator=(const CharPP &) = delete;
-  CharPP &operator=(CharPP &&) = delete;
-
-  void Add(const char *value) {
-    if (size_ == kCharppMaxElements) return;
-    char *item = strdup(value);
-    if (item == nullptr) return;
-    data_[size_++] = item;
-  }
-
-  void Add(const std::string &value) { Add(value.c_str()); }
-
-  char **Get() { return data_.data(); }
-
- private:
-  std::array<char *, kCharppMaxElements> data_;
-  size_t size_{0};
-};
-
 ////////////////////////////////////
 // Security functions and constants.
 ////////////////////////////////////
 
+#ifdef MG_HAS_LIBSECCOMP
 const std::vector<int> kSeccompSyscallsBlacklist = {
     SCMP_SYS(mknod),         SCMP_SYS(mount),        SCMP_SYS(setuid),
     SCMP_SYS(stime),         SCMP_SYS(ptrace),       SCMP_SYS(setgid),
@@ -133,6 +103,9 @@ bool SetupSeccomp() {
   seccomp_release(ctx);
   return ret == 0;
 }
+#else
+bool SetupSeccomp() { return true; }
+#endif
 
 bool SetLimit(int resource, rlim_t n) {
   struct rlimit limit;
@@ -140,19 +113,72 @@ bool SetLimit(int resource, rlim_t n) {
   return setrlimit(resource, &limit) == 0;
 }
 
+#ifdef __linux__
 // close_range(2); the toolchain's glibc 2.31 headers predate it, the number is the same on x86_64 and aarch64.
 constexpr long kSysCloseRange = 436;
+#endif
 
-void CloseFdRange(int first, int last) {
-  if (syscall(kSysCloseRange, first, last, 0) == 0) return;
-  // Kernels older than 5.9 lack close_range.
-  DIR *dir = opendir("/proc/self/fd");
-  if (dir == nullptr) return;
-  while (const auto *entry = readdir(dir)) {
-    const long fd = std::strtol(entry->d_name, nullptr, 10);
-    if (fd >= first && fd <= last && fd != dirfd(dir)) close(static_cast<int>(fd));
+bool CloseFdRangeImpl(int first, int last, bool allow_procfs) {
+  if (first > last) {
+    return true;
   }
-  closedir(dir);
+#ifdef __linux__
+  if (allow_procfs && syscall(kSysCloseRange, first, last, 0) == 0) return true;
+#endif
+  if (allow_procfs) {
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == nullptr) dir = opendir("/dev/fd");
+    if (dir != nullptr) {
+      const int dir_fd = dirfd(dir);
+      std::vector<int> to_close;
+      errno = 0;
+      while (const auto *entry = readdir(dir)) {
+        char *endptr = nullptr;
+        const long fd = std::strtol(entry->d_name, &endptr, 10);
+        if (endptr != entry->d_name && *endptr == '\0' && fd >= first && fd <= last && fd != dir_fd) {
+          to_close.push_back(static_cast<int>(fd));
+        }
+        errno = 0;
+      }
+      const int read_err = errno;
+      closedir(dir);
+      if (read_err == 0) {
+        for (int fd : to_close) {
+          (void)close(fd);
+        }
+        return true;
+      }
+    }
+  }
+
+  constexpr long kMaxFallbackScanFd = 4'194'304L;
+  long effective_last = -1;
+  if (static_cast<long>(last) - static_cast<long>(first) <= kMaxFallbackScanFd) {
+    effective_last = static_cast<long>(last);
+  } else {
+    struct rlimit rl{};
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0 &&
+        rl.rlim_cur <= static_cast<rlim_t>(kMaxFallbackScanFd)) {
+      effective_last = std::min<long>(last, static_cast<long>(rl.rlim_cur) - 1);
+    } else {
+      const long sc = sysconf(_SC_OPEN_MAX);
+      if (sc > 0 && sc <= kMaxFallbackScanFd) {
+        effective_last = std::min<long>(last, sc - 1);
+      }
+    }
+  }
+  if (effective_last < first) {
+    return false;
+  }
+  for (long fd = first; fd <= effective_last; ++fd) {
+    (void)close(static_cast<int>(fd));
+  }
+  for (long fd = first; fd <= effective_last; ++fd) {
+    if (fcntl(static_cast<int>(fd), F_GETFD) != -1 || errno != EBADF) {
+      return false;
+    }
+  }
+  return true;
 }
 
 ////////////////////////////////////////////////////
@@ -165,6 +191,10 @@ int Target(void *arg) {
 
   // Get a pointer to the passed arguments.
   auto *ta = reinterpret_cast<memgraph::auth::TargetArguments *>(arg);
+  if (ta == nullptr || !ta->argv.IsNullTerminated() || !ta->envp.IsNullTerminated()) {
+    std::cerr << "Invalid execution arguments for auth module!" << std::endl;
+    return EXIT_FAILURE;
+  }
 
   // Redirect `stdin` to `/dev/null`.
   int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -174,9 +204,13 @@ int Target(void *arg) {
     return EXIT_FAILURE;
   }
   if (dup2(fd, STDIN_FILENO) != STDIN_FILENO) {
+    close(fd);
     std::cerr << "Couldn't attach \"/dev/null\" to auth module stdin because of: " << strerror(errno) << " (" << errno
               << ")!" << std::endl;
     return EXIT_FAILURE;
+  }
+  if (fd != STDIN_FILENO) {
+    close(fd);
   }
 
   // Change the current directory to the module directory.
@@ -184,16 +218,6 @@ int Target(void *arg) {
     std::cerr << "Couldn't change directory to " << ta->module_executable_path.parent_path()
               << " for auth module stdin because of: " << strerror(errno) << " (" << errno << ")!" << std::endl;
     return EXIT_FAILURE;
-  }
-
-  // Create the executable CharPP object.
-  CharPP exe;
-  exe.Add(ta->module_executable_path);
-
-  // Create the environment CharPP object.
-  CharPP env;
-  for (uint64_t i = 0; environ[i] != nullptr; ++i) {
-    env.Add(environ[i]);
   }
 
   // Connect the communication input pipe.
@@ -214,20 +238,29 @@ int Target(void *arg) {
 
   // Don't leak the server's non-CLOEXEC fds (e.g. listening sockets, log file) into the module.
   static_assert(kCommunicationFromModuleFd == kCommunicationToModuleFd + 1);
-  CloseFdRange(STDERR_FILENO + 1, kCommunicationToModuleFd - 1);
-  CloseFdRange(kCommunicationFromModuleFd + 1, std::numeric_limits<int>::max());
+  if (!CloseFdRangeImpl(STDERR_FILENO + 1, kCommunicationToModuleFd - 1, true) ||
+      !CloseFdRangeImpl(kCommunicationFromModuleFd + 1, std::numeric_limits<int>::max(), true)) {
+    std::cerr << "Couldn't close inherited file descriptors for auth module!" << std::endl;
+    return EXIT_FAILURE;
+  }
 
   // Disable core dumps.
   if (!SetLimit(RLIMIT_CORE, 0)) {
     std::cerr << "Couldn't disable core dumps for auth module!" << std::endl;
-    // This isn't a fatal error.
+    return EXIT_FAILURE;
   }
 
-  // The server raises its soft open files limit; the module gets the original one.
+  // The server raises its soft open files limit; the module gets the original one (at least covering the comm fds).
   if (const auto &original = memgraph::utils::OriginalNoFileLimit()) {
-    if (setrlimit(RLIMIT_NOFILE, &*original) != 0) {
+    struct rlimit restored = *original;
+    const rlim_t min_comm_nofile = static_cast<rlim_t>(kCommunicationFromModuleFd + 1);
+    if (restored.rlim_cur != RLIM_INFINITY && restored.rlim_cur < min_comm_nofile) {
+      restored.rlim_cur =
+          (restored.rlim_max == RLIM_INFINITY) ? min_comm_nofile : std::min<rlim_t>(restored.rlim_max, min_comm_nofile);
+    }
+    if (setrlimit(RLIMIT_NOFILE, &restored) != 0) {
       std::cerr << "Couldn't restore the open files limit for auth module!\n";
-      // This isn't a fatal error.
+      return EXIT_FAILURE;
     }
   }
 
@@ -248,10 +281,10 @@ int Target(void *arg) {
   // Setup seccomp.
   if (!SetupSeccomp()) {
     std::cerr << "Couldn't enable seccomp for auth module!" << std::endl;
-    // This isn't a fatal error.
+    return EXIT_FAILURE;
   }
 
-  execve(*exe.Get(), exe.Get(), env.Get());
+  execve(ta->module_executable_path.c_str(), ta->argv.Data(), ta->envp.Data());
 
   // If the `execve` call succeeded then the process will exit from that call
   // and won't reach this piece of code ever.
@@ -267,7 +300,101 @@ int Target(void *arg) {
 /// The data that is being sent to the module process is always a newline
 /// terminated JSON encoded string.
 
-bool PutData(int fd, const nlohmann::json &data, int timeout_millisec) {
+bool EnsureNonBlockingFd(int fd) {
+  const int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return false;
+#ifdef F_SETNOSIGPIPE
+  (void)fcntl(fd, F_SETNOSIGPIPE, 1);
+#endif
+  if ((flags & O_NONBLOCK) != 0) return true;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+int RemainingDeadlineMs(std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return 0;
+  const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+  return rem > std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : static_cast<int>(rem);
+}
+
+bool CreateCloexecPipe(std::array<int, 2> &pipe_fds) {
+#ifdef __linux__
+  return pipe2(pipe_fds.data(), O_CLOEXEC) == 0;
+#else
+  if (pipe(pipe_fds.data()) != 0) {
+    return false;
+  }
+  for (int fd : pipe_fds) {
+    const int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+      close(pipe_fds[0]);
+      close(pipe_fds[1]);
+      pipe_fds = {-1, -1};
+      return false;
+    }
+  }
+  return true;
+#endif
+}
+
+}  // namespace
+
+namespace memgraph::auth {
+
+bool CloseInheritedFdRange(int first, int last, bool allow_procfs) {
+  return CloseFdRangeImpl(first, last, allow_procfs);
+}
+
+bool ExecStringArray::Build(const std::vector<std::string> &entries) {
+  try {
+    storage = entries;
+    pointers.clear();
+    pointers.reserve(storage.size() + 1);
+    for (auto &item : storage) {
+      pointers.push_back(item.data());
+    }
+    pointers.push_back(nullptr);
+    return true;
+  } catch (const std::bad_alloc &) {
+    storage.clear();
+    pointers.clear();
+    return false;
+  }
+}
+
+bool ExecStringArray::BuildFromNullTerminated(const char *const *entries) {
+  try {
+    storage.clear();
+    pointers.clear();
+    if (entries != nullptr) {
+      size_t count = 0;
+      while (entries[count] != nullptr) {
+        ++count;
+      }
+      storage.reserve(count);
+      for (size_t i = 0; i < count; ++i) {
+        storage.emplace_back(entries[i]);
+      }
+    }
+    pointers.reserve(storage.size() + 1);
+    for (auto &item : storage) {
+      pointers.push_back(item.data());
+    }
+    pointers.push_back(nullptr);
+    return true;
+  } catch (const std::bad_alloc &) {
+    storage.clear();
+    pointers.clear();
+    return false;
+  }
+}
+
+bool PutAuthModuleRequestWithDeadline(int fd, const nlohmann::json &data,
+                                      std::chrono::steady_clock::time_point deadline) {
+  if (fd < 0 || !EnsureNonBlockingFd(fd)) {
+    return false;
+  }
+
   std::string encoded;
   try {
     encoded = data.dump();
@@ -282,66 +409,121 @@ bool PutData(int fd, const nlohmann::json &data, int timeout_millisec) {
 
   size_t put = 0;
   while (put < encoded.size()) {
-    struct pollfd desc;
-    desc.fd = fd;
-    desc.events = POLLOUT;
-    desc.revents = 0;
-    if (poll(&desc, 1, timeout_millisec) <= 0) {
-      return false;
+    const ssize_t written = write(fd, encoded.data() + put, encoded.size() - put);
+    if (written > 0) {
+      put += static_cast<size_t>(written);
+      continue;
     }
-    int ret = write(fd, encoded.data() + put, encoded.size() - put);
-    if (ret > 0) {
-      put += ret;
-    } else if (ret == 0 || errno != EINTR) {
-      return false;
+    if (written == -1 && errno == EINTR) {
+      continue;
     }
+    if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      const int wait_ms = RemainingDeadlineMs(deadline);
+      if (wait_ms <= 0) {
+        return false;
+      }
+      struct pollfd desc{};
+      desc.fd = fd;
+      desc.events = POLLOUT;
+      const int prc = poll(&desc, 1, wait_ms);
+      if (prc < 0) {
+        if (errno == EINTR) continue;
+        return false;
+      }
+      if (prc == 0 || (desc.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        return false;
+      }
+      continue;
+    }
+    return false;
   }
   return true;
 }
 
-//////////////////////////////////////////////////////
-// Function used to get data from the started process.
-//////////////////////////////////////////////////////
-
-/// The data that is being received from the module process is always a newline
-/// terminated JSON encoded string. The JSON encoded string must be in a single
-/// line and all newline characters may only appear encoded as a part of a
-/// character string.
-
-nlohmann::json GetData(int fd, int timeout_millisec) {
-  std::string data;
-  while (true) {
-    struct pollfd desc;
-    desc.fd = fd;
-    desc.events = POLLIN;
-    desc.revents = 0;
-    if (poll(&desc, 1, timeout_millisec) <= 0) {
-      return {};
-    }
-    char ch;
-    // Because of the poll call above, this is not a blocking read.
-    // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection)
-    int ret = read(fd, &ch, 1);
-    if (ret > 0) {
-      data += ch;
-      if (ch == '\n') break;
-    } else if (ret == 0 || errno != EINTR) {
-      return {};
-    }
+nlohmann::json GetAuthModuleResponseWithDeadline(int fd, std::string &rx_buffer,
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 size_t max_response_bytes) {
+  if (fd < 0 || max_response_bytes == 0 || !EnsureNonBlockingFd(fd)) {
+    return {};
   }
-  try {
-    return nlohmann::json::parse(data);
-  } catch (const nlohmann::json::parse_error &) {
+
+  while (true) {
+    if (const auto nl = rx_buffer.find('\n'); nl != std::string::npos) {
+      if (nl > max_response_bytes) {
+        rx_buffer.clear();
+        return {};
+      }
+      const std::string line = rx_buffer.substr(0, nl);
+      rx_buffer.erase(0, nl + 1);
+      try {
+        return nlohmann::json::parse(line);
+      } catch (const nlohmann::json::parse_error &) {
+        return {};
+      }
+    }
+
+    if (rx_buffer.size() >= max_response_bytes) {
+      rx_buffer.clear();
+      return {};
+    }
+
+    char chunk[4096];
+    const size_t allowed = std::min(sizeof(chunk), max_response_bytes - rx_buffer.size() + 1);
+    const ssize_t got = read(fd, chunk, allowed);
+    if (got > 0) {
+      rx_buffer.append(chunk, static_cast<size_t>(got));
+      if (rx_buffer.find('\n') == std::string::npos && rx_buffer.size() > max_response_bytes) {
+        rx_buffer.clear();
+        return {};
+      }
+      continue;
+    }
+    if (got == 0) {
+      return {};
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      const int wait_ms = RemainingDeadlineMs(deadline);
+      if (wait_ms <= 0) {
+        return {};
+      }
+      struct pollfd desc{};
+      desc.fd = fd;
+      desc.events = POLLIN;
+      const int prc = poll(&desc, 1, wait_ms);
+      if (prc < 0) {
+        if (errno == EINTR) continue;
+        return {};
+      }
+      if (prc == 0) {
+        return {};
+      }
+      continue;
+    }
     return {};
   }
 }
 
-}  // namespace
-
-namespace memgraph::auth {
 Module::Module(const std::filesystem::path &module_executable_path) {
   if (!module_executable_path.empty()) {
     module_executable_path_ = std::filesystem::absolute(module_executable_path);
+  }
+}
+
+void Module::CloseAllPipes() noexcept {
+  for (int &fd : pipe_to_module_) {
+    if (fd >= 0) {
+      close(fd);
+      fd = -1;
+    }
+  }
+  for (int &fd : pipe_from_module_) {
+    if (fd >= 0) {
+      close(fd);
+      fd = -1;
+    }
   }
 }
 
@@ -355,49 +537,73 @@ bool Module::Startup() {
   Shutdown();
 
   // Setup communication pipes.
-  if (pipe2(pipe_to_module_.data(), O_CLOEXEC) != 0) {
+  if (!CreateCloexecPipe(pipe_to_module_)) {
     spdlog::error(
         "Couldn't create communication pipe from the database to "
         "the auth module!");
     return false;
   }
-  if (pipe2(pipe_from_module_.data(), O_CLOEXEC) != 0) {
+  if (!CreateCloexecPipe(pipe_from_module_)) {
     spdlog::error(
         "Couldn't create communication pipe from the auth module to "
         "the database!");
-    close(pipe_to_module_[kPipeReadEnd]);
-    close(pipe_to_module_[kPipeWriteEnd]);
+    CloseAllPipes();
     return false;
   }
 
-  // Find the top of the stack.
-  uint8_t *stack_top = stack_.get() + kStackSizeBytes;
-
-  // Set the target arguments.
+  // Set the target arguments and prepare complete null-terminated argv/envp arrays before spawning.
   target_arguments_->module_executable_path = module_executable_path_;
+  if (!target_arguments_->argv.Build({module_executable_path_.string()}) ||
+      !target_arguments_->envp.BuildFromNullTerminated(environ)) {
+    spdlog::error("Couldn't allocate execution arguments or environment for the auth module!");
+    CloseAllPipes();
+    return false;
+  }
   target_arguments_->pipe_to_module = pipe_to_module_[kPipeReadEnd];
   target_arguments_->pipe_from_module = pipe_from_module_[kPipeWriteEnd];
 
   // Create the process.
+#ifdef __linux__
+  uint8_t *stack_top = stack_.get() + kStackSizeBytes;
   pid_ = clone(Target, stack_top, CLONE_VFORK, target_arguments_.get());
+#else
+  pid_ = fork();
+  if (pid_ == 0) {
+    _exit(Target(target_arguments_.get()));
+  }
+#endif
   if (pid_ == -1) {
     spdlog::error("Couldn't start the auth module process!");
-    close(pipe_to_module_[kPipeReadEnd]);
-    close(pipe_to_module_[kPipeWriteEnd]);
-    close(pipe_from_module_[kPipeReadEnd]);
-    close(pipe_from_module_[kPipeWriteEnd]);
+    CloseAllPipes();
     return false;
   }
+
+  // Close child-only pipe ends in the parent immediately after spawning so EOF is observed if the child exits early.
+  close(pipe_to_module_[kPipeReadEnd]);
+  close(pipe_from_module_[kPipeWriteEnd]);
+  pipe_to_module_[kPipeReadEnd] = -1;
+  pipe_from_module_[kPipeWriteEnd] = -1;
 
   // Check whether the process is still running.
   if (waitpid(pid_, &status_, WNOHANG | WUNTRACED) != 0) {
     spdlog::error("The auth module process couldn't be started!");
+    if (WIFSTOPPED(status_)) {
+      Shutdown();
+    } else {
+      CloseAllPipes();
+      pid_ = -1;
+      status_ = 0;
+      rx_buffer_.clear();
+    }
     return false;
   }
 
-  // Close pipes that won't be used from the master process.
-  close(pipe_to_module_[kPipeReadEnd]);
-  close(pipe_from_module_[kPipeWriteEnd]);
+  if (!EnsureNonBlockingFd(pipe_to_module_[kPipeWriteEnd]) || !EnsureNonBlockingFd(pipe_from_module_[kPipeReadEnd])) {
+    spdlog::error("Couldn't configure non-blocking pipes for the auth module process!");
+    Shutdown();
+    return false;
+  }
+  rx_buffer_.clear();
 
   return true;
 }
@@ -410,22 +616,28 @@ nlohmann::json Module::Call(nlohmann::json params, int timeout_millisec) {
   // Ensure that the module is up and running.
   if (!Startup()) return {};
 
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, timeout_millisec));
+
   static constexpr auto kMemgraphCallIdKey = "memgraph_call_id";
   const auto call_id = ++call_id_;
   params[kMemgraphCallIdKey] = call_id;
 
-  // Put the request to the module process.
-  if (!PutData(pipe_to_module_[kPipeWriteEnd], params, timeout_millisec)) {
+  // Put the request to the module process under a single non-blocking request deadline.
+  if (!PutAuthModuleRequestWithDeadline(pipe_to_module_[kPipeWriteEnd], params, deadline)) {
     spdlog::error("Couldn't send data to the auth module process!");
+    Shutdown();
     return {};
   }
 
-  // Read responses until we get one with matching memgraph_call_id (skip stale).
+  // Read responses until we get one with matching memgraph_call_id (skip stale) under the same request deadline.
   const int kMaxResponses = 1000;
   for (int i = 0; i < kMaxResponses; ++i) {
-    auto ret = GetData(pipe_from_module_[kPipeReadEnd], timeout_millisec);
+    auto ret = GetAuthModuleResponseWithDeadline(
+        pipe_from_module_[kPipeReadEnd], rx_buffer_, deadline, kMaxAuthModuleResponseBytes);
     if (ret.is_null()) {
       spdlog::error("Couldn't receive data from the auth module process!");
+      Shutdown();
       return {};
     }
     if (!ret.is_object()) {
@@ -440,6 +652,7 @@ nlohmann::json Module::Call(nlohmann::json params, int timeout_millisec) {
     spdlog::trace("Auth module response had wrong memgraph_call_id, reading next.");
   }
   spdlog::error("Auth module did not return response with matching memgraph_call_id after {} attempts.", kMaxResponses);
+  Shutdown();
   return {};
 }
 
@@ -447,15 +660,16 @@ void Module::Shutdown() {
   if (pid_ == -1) return;
 
   // Try to terminate the process gracefully in `kTerminateTimeoutSec`.
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  for (int i = 0; i < kTerminateTimeoutSec * 10; ++i) {
-    spdlog::info("Terminating the auth module process with pid {}", pid_);
-    kill(pid_, SIGTERM);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  for (int i = 0; i < kTerminateTimeoutSec * 100; ++i) {
+    if (i % 10 == 0) {
+      spdlog::info("Terminating the auth module process with pid {}", pid_);
+      kill(pid_, SIGTERM);
+    }
     int ret = waitpid(pid_, &status_, WNOHANG | WUNTRACED);
     if (ret == pid_ || ret == -1) {
       break;
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
   // If the process is still alive, kill it and wait for it to die.
@@ -465,21 +679,11 @@ void Module::Shutdown() {
     waitpid(pid_, &status_, 0);
   }
 
-  // Close leftover open pipes.
-  // We have to be careful to close only the leftover open pipes (the
-  // pipe_to_module WriteEnd and pipe_from_module ReadEnd), the other two ends
-  // were closed in the function that created them because they aren't used from
-  // the master process (they are only used from the module process).
-  close(pipe_to_module_[kPipeWriteEnd]);
-  close(pipe_from_module_[kPipeReadEnd]);
-
-  // Reset variables.
+  // Close any remaining open pipe ends and reset state.
+  CloseAllPipes();
   pid_ = -1;
   status_ = 0;
-  pipe_to_module_[kPipeReadEnd] = -1;
-  pipe_to_module_[kPipeWriteEnd] = -1;
-  pipe_from_module_[kPipeReadEnd] = -1;
-  pipe_from_module_[kPipeWriteEnd] = -1;
+  rx_buffer_.clear();
 }
 
 Module::~Module() { Shutdown(); }

@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from common import connect, connect_with_autocommit, execute_and_fetch_all, memgraph
 from mgclient import DatabaseError
+import pytest
 
 
 def test_create_trigger_on_create_periodic_commit(memgraph):

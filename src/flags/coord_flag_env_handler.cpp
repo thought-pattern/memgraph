@@ -12,27 +12,69 @@
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
-#include <functional>
-#include <meta/meta.hpp>
+#include <expected>
+#include <limits>
 #include <optional>
-#include <range/v3/functional/bind_back.hpp>
-#include <range/v3/iterator/basic_iterator.hpp>
-#include <range/v3/range/conversion.hpp>
-#include <range/v3/utility/get.hpp>
-#include <range/v3/view/drop_while.hpp>
-#include <range/v3/view/take_while.hpp>
-#include <range/v3/view/transform.hpp>
-#include <range/v3/view/view.hpp>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "flags/coord_flag_env_handler.hpp"
 #include "flags/coordination.hpp"
+#include "utils/logging.hpp"
+#include "utils/string.hpp"
 
 namespace memgraph::flags {
+
+namespace {
+
+std::expected<int, std::string> ParsePortEnv(std::string_view var_name, std::string_view raw_value) {
+  const auto trimmed = utils::Trim(raw_value);
+  if (trimmed.empty()) {
+    return std::unexpected{fmt::format("{} cannot be empty", var_name)};
+  }
+  int32_t parsed = -1;
+  const auto [ptr, ec] = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), parsed);
+  if (ec != std::errc{} || ptr != trimmed.data() + trimmed.size() || parsed < 0 ||
+      parsed > static_cast<int32_t>(std::numeric_limits<uint16_t>::max())) {
+    return std::unexpected{fmt::format(
+        "Expected {} to be an integer port in range [0, {}], got '{}'",
+        var_name,
+        std::numeric_limits<uint16_t>::max(),
+        raw_value)};
+  }
+  return static_cast<int>(parsed);
+}
+
+std::expected<int32_t, std::string> ParseCoordinatorIdEnv(std::string_view var_name, std::string_view raw_value) {
+  const auto trimmed = utils::Trim(raw_value);
+  if (trimmed.empty()) {
+    return std::unexpected{fmt::format("{} cannot be empty", var_name)};
+  }
+  int32_t parsed = -1;
+  const auto [ptr, ec] = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(), parsed);
+  if (ec != std::errc{} || ptr != trimmed.data() + trimmed.size() || parsed < 0 || parsed >= kUnsetCoordinatorId) {
+    return std::unexpected{fmt::format(
+        "Expected {} to be a non-negative coordinator ID less than {}, got '{}'",
+        var_name,
+        kUnsetCoordinatorId,
+        raw_value)};
+  }
+  return parsed;
+}
+
+std::optional<std::string_view> ReadOptionalEnv(const char *env_val) {
+  if (env_val == nullptr) {
+    return std::nullopt;
+  }
+  return std::string_view{env_val};
+}
+
+}  // namespace
 
 std::string CoordinationSetup::ToString() {
   return fmt::format(
@@ -54,6 +96,32 @@ std::string CoordinationSetup::ToString() {
          management_port != 0;
 }
 
+std::expected<CoordinationSetup, std::string> ParseCoordinationSetupFromEnv(const CoordinationEnvInputs &envs) {
+  CoordinationSetup setup{};
+  if (envs.management_port.has_value()) {
+    auto port = ParsePortEnv(kMgManagementPort, *envs.management_port);
+    if (!port.has_value()) return std::unexpected{std::move(port.error())};
+    setup.management_port = *port;
+  }
+  if (envs.coordinator_port.has_value()) {
+    auto port = ParsePortEnv(kMgCoordinatorPort, *envs.coordinator_port);
+    if (!port.has_value()) return std::unexpected{std::move(port.error())};
+    setup.coordinator_port = *port;
+  }
+  if (envs.coordinator_id.has_value()) {
+    auto cid = ParseCoordinatorIdEnv(kMgCoordinatorId, *envs.coordinator_id);
+    if (!cid.has_value()) return std::unexpected{std::move(cid.error())};
+    setup.coordinator_id = *cid;
+  }
+  if (envs.nuraft_log_file.has_value()) {
+    setup.nuraft_log_file = std::string{utils::Trim(*envs.nuraft_log_file)};
+  }
+  if (envs.coordinator_hostname.has_value()) {
+    setup.coordinator_hostname = std::string{utils::Trim(*envs.coordinator_hostname)};
+  }
+  return setup;
+}
+
 auto CoordinationSetupInstance() -> CoordinationSetup & {
   static auto instance = CoordinationSetup{};
   return instance;
@@ -61,14 +129,17 @@ auto CoordinationSetupInstance() -> CoordinationSetup & {
 
 void SetFinalCoordinationSetup() {
 #ifdef MG_ENTERPRISE
+  const CoordinationEnvInputs env_inputs{
+      .management_port = ReadOptionalEnv(std::getenv(kMgManagementPort)),
+      .coordinator_port = ReadOptionalEnv(std::getenv(kMgCoordinatorPort)),
+      .coordinator_id = ReadOptionalEnv(std::getenv(kMgCoordinatorId)),
+      .nuraft_log_file = ReadOptionalEnv(std::getenv(kMgNuRaftLogFile)),
+      .coordinator_hostname = ReadOptionalEnv(std::getenv(kMgCoordinatorHostname)),
+  };
 
-  std::vector<char const *> const maybe_coord_envs{std::getenv(kMgManagementPort),
-                                                   std::getenv(kMgCoordinatorPort),
-                                                   std::getenv(kMgCoordinatorId),
-                                                   std::getenv(kMgNuRaftLogFile),
-                                                   std::getenv(kMgCoordinatorHostname)};
-
-  bool const any_envs_set = std::ranges::any_of(maybe_coord_envs, [](char const *env) { return env != nullptr; });
+  const bool any_envs_set = env_inputs.management_port.has_value() || env_inputs.coordinator_port.has_value() ||
+                            env_inputs.coordinator_id.has_value() || env_inputs.nuraft_log_file.has_value() ||
+                            env_inputs.coordinator_hostname.has_value();
 
   auto const is_flag_set = []<typename T>(T const &flag) { return flag != T{}; };
 
@@ -87,37 +158,36 @@ void SetFinalCoordinationSetup() {
       return CoordinationSetup{};
     }
 
-    auto const trim = [](char const *flag) -> std::optional<std::string> {
-      if (flag == nullptr) {
-        return std::nullopt;
-      }
-
-      auto const is_space = [](auto c) { return c == ' '; };
-
-      return std::string_view{flag} | ranges::views::drop_while(is_space) |
-             ranges::views::take_while(std::not_fn(is_space)) | ranges::to<std::string>;
-    };
-
-    auto const coord_envs =
-        maybe_coord_envs | ranges::views::transform(trim) | ranges::to<std::vector<std::optional<std::string>>>;
-
     if (any_envs_set) {
       spdlog::trace("Coordinator will be initialized using environment variables.");
-      return CoordinationSetup{.management_port = coord_envs[0] ? std::stoi(coord_envs[0].value()) : 0,
-                               .coordinator_port = coord_envs[1] ? std::stoi(coord_envs[1].value()) : 0,
-                               .coordinator_id = coord_envs[2] ? static_cast<int32_t>(std::stoul(coord_envs[2].value()))
-                                                               : kUnsetCoordinatorId,
-                               .nuraft_log_file = coord_envs[3] ? coord_envs[3].value() : "",
-                               .coordinator_hostname = coord_envs[4] ? coord_envs[4].value() : ""};
+      auto parsed = ParseCoordinationSetupFromEnv(env_inputs);
+      if (!parsed.has_value()) {
+        LOG_FATAL("Invalid coordinator environment configuration: {}", parsed.error());
+      }
+      return std::move(*parsed);
     }
 
     spdlog::trace("Coordinator will be initialized using flags.");
+    if (FLAGS_management_port < 0 || FLAGS_management_port > static_cast<int32_t>(std::numeric_limits<uint16_t>::max())) {
+      LOG_FATAL("Invalid --management-port={}: expected port in [0, {}]",
+                FLAGS_management_port,
+                std::numeric_limits<uint16_t>::max());
+    }
+    if (FLAGS_coordinator_port < 0 ||
+        FLAGS_coordinator_port > static_cast<int32_t>(std::numeric_limits<uint16_t>::max())) {
+      LOG_FATAL("Invalid --coordinator-port={}: expected port in [0, {}]",
+                FLAGS_coordinator_port,
+                std::numeric_limits<uint16_t>::max());
+    }
+    if (FLAGS_coordinator_id < 0) {
+      LOG_FATAL("Invalid --coordinator-id={}: expected non-negative coordinator ID", FLAGS_coordinator_id);
+    }
     return CoordinationSetup{.management_port = FLAGS_management_port,
                              .coordinator_port = FLAGS_coordinator_port,
                              .coordinator_id = FLAGS_coordinator_id,
-                             .nuraft_log_file = FLAGS_nuraft_log_file,
-                             .coordinator_hostname = FLAGS_coordinator_hostname};
-  }();  // iile
+                             .nuraft_log_file = std::string{utils::Trim(FLAGS_nuraft_log_file)},
+                             .coordinator_hostname = std::string{utils::Trim(FLAGS_coordinator_hostname)}};
+  }();
 #endif
 }
 

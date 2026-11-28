@@ -126,7 +126,7 @@ impl Path {
         unsafe {
             let mgp_edge = invoke_mgp_func_with_res!(
                 *mut mgp_edge,
-                Error::OutOfBoundPathVertexIndex,
+                Error::OutOfBoundPathEdgeIndex,
                 ffi::mgp_path_edge_at,
                 self.ptr,
                 index

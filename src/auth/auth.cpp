@@ -30,6 +30,7 @@
 #include "utils/resource_monitoring.hpp"
 #include "utils/settings.hpp"
 #include "utils/string.hpp"
+#include "utils/variant_helpers.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -163,7 +164,12 @@ constexpr auto kCurrentStoreVersion = kStoreV5;
 namespace {
 void MigrateVersions(kvstore::KVStore &store) {
   static constexpr auto kPasswordHashV0V1 = "password_hash";
-  auto version_str = store.Get(kStoreVersionKey);
+  auto version_lookup = store.GetStrict(kStoreVersionKey);
+  if (!version_lookup && version_lookup.error() == kvstore::KVStore::GetError::kReadError) {
+    throw AuthException("Couldn't read authentication store version!");
+  }
+  std::optional<std::string> version_str =
+      version_lookup ? std::optional<std::string>{*std::move(version_lookup)} : std::nullopt;
 
   if (!version_str) {
     using namespace std::string_literals;
@@ -201,9 +207,14 @@ void MigrateVersions(kvstore::KVStore &store) {
         }
       }
     }
+    if (it.HasError()) {
+      throw AuthException("Failed while scanning accounts for V1 migration: {}", it.ErrorMessage());
+    }
 
-    // Perform migration to V1
-    store.PutMultiple(puts);
+    // Perform migration to V1 in one checked batch
+    if (!store.PutMultiple(puts)) {
+      throw AuthException("Failed to persist authentication store migration to V1!");
+    }
     version_str = kStoreV1;
   }
 
@@ -215,7 +226,9 @@ void MigrateVersions(kvstore::KVStore &store) {
     auto deletes = std::vector<std::string>{};
 
     // Migrate all link entries from single role format to JSON array format
-    for (auto it = store.begin(kRoleLinkPrefix); it != store.end(kRoleLinkPrefix); ++it) {
+    auto it = store.begin(kRoleLinkPrefix);
+    auto const end_it = store.end(kRoleLinkPrefix);
+    for (; it != end_it; ++it) {
       auto const &[key, value] = *it;
 
       // Convert old format (single role name) to new format (JSON array)
@@ -228,13 +241,13 @@ void MigrateVersions(kvstore::KVStore &store) {
         deletes.push_back(key);
       }
     }
-
-    // Apply the migration
-    if (!puts.empty()) {
-      store.PutMultiple(puts);
+    if (it.HasError()) {
+      throw AuthException("Failed while scanning role links for V2 migration: {}", it.ErrorMessage());
     }
-    if (!deletes.empty()) {
-      store.DeleteMultiple(deletes);
+
+    // Apply puts, deletes, and version marker atomically in one checked batch
+    if (!store.PutAndDeleteMultiple(puts, deletes)) {
+      throw AuthException("Failed to persist authentication store migration to V2!");
     }
     version_str = kStoreV2;
 
@@ -252,7 +265,9 @@ void MigrateVersions(kvstore::KVStore &store) {
     auto puts = std::map<std::string, std::string>{{kStoreVersionKey, kStoreV5}};
 
     auto const migrate_entities = [&](auto const &prefix) {
-      for (auto it = store.begin(prefix); it != store.end(prefix); ++it) {
+      auto it = store.begin(prefix);
+      auto const end_it = store.end(prefix);
+      for (; it != end_it; ++it) {
         auto const &[key, value] = *it;
         try {
           auto data = nlohmann::json::parse(value);
@@ -265,12 +280,17 @@ void MigrateVersions(kvstore::KVStore &store) {
           throw auth::AuthException("Failed to migrate auth data for '{}': {}", key, e.what());
         }
       }
+      if (it.HasError()) {
+        throw auth::AuthException("Failed while scanning '{}' during V5 migration: {}", prefix, it.ErrorMessage());
+      }
     };
 
     migrate_entities(kUserPrefix);
     migrate_entities(kRolePrefix);
 
-    store.PutMultiple(puts);
+    if (!store.PutMultiple(puts)) {
+      throw auth::AuthException("Failed to persist authentication store migration to V5!");
+    }
     version_str = kStoreV5;
 
     spdlog::info("Auth storage migration to V5 completed successfully");
@@ -301,10 +321,8 @@ auto ParseJson(std::string_view str) {
   return data;
 }
 
-// Returns the role names of a successful auth-module response; nullopt if not authenticated, malformed, or no roles.
-// Shared by Auth::ResolveModuleResponse (data instances; roles checked in kvstore) and auth::SSOGetIdentity
-// (coordinator).
-std::optional<std::vector<std::string>> ExtractAuthenticatedRoleNames(const nlohmann::json &ret) {
+std::optional<std::vector<std::string>> ExtractAuthenticatedModuleRoles(const nlohmann::json &ret,
+                                                                        bool allow_empty_roles) {
   auto get_errors = [&ret]() -> std::string {
     std::string default_error = "Couldn't authenticate user: check stderr for auth module error messages.";
     if (!ret.contains("errors")) {
@@ -363,34 +381,49 @@ std::optional<std::vector<std::string>> ExtractAuthenticatedRoleNames(const nloh
 
   // Handle both single role and multiple roles.
   std::vector<std::string> role_names;
+  bool has_explicit_roles_field = false;
 
   // Check for "roles" field first (multiple roles).
   if (ret.contains("roles")) {
+    has_explicit_roles_field = true;
     const auto &roles_field = ret.at("roles");
     if (roles_field.is_array()) {
       for (const auto &role_name : roles_field) {
-        if (role_name.is_string()) {
-          role_names.push_back(role_name.get<std::string>());
+        if (!role_name.is_string()) {
+          spdlog::warn(utils::MessageWithLink(
+              "Couldn't authenticate user: every entry in \"roles\" returned by the external auth module needs to be a "
+              "string value.",
+              "https://memgr.ph/sso"));
+          return std::nullopt;
         }
+        role_names.push_back(role_name.get<std::string>());
       }
     } else if (roles_field.is_string()) {
       role_names.push_back(roles_field.get<std::string>());
+    } else {
+      spdlog::warn(utils::MessageWithLink(
+          "Couldn't authenticate user: the \"roles\" field returned by the external auth module needs to be an array "
+          "or string value.",
+          "https://memgr.ph/sso"));
+      return std::nullopt;
     }
   }
 
   // Fall back to single "role" field for backward compatibility.
-  if (role_names.empty()) {
+  if (role_names.empty() && ret.contains("role")) {
     const auto rolename = get_string_field("role");
     if (!rolename) {
-      spdlog::warn(utils::MessageWithLink(
-          "Couldn't authenticate external user because the role was not returned by the auth module.",
-          "https://memgr.ph/auth"));
       return std::nullopt;
     }
     role_names.push_back(*rolename);
+  } else if (role_names.empty() && !has_explicit_roles_field && !allow_empty_roles) {
+    spdlog::warn(utils::MessageWithLink(
+        "Couldn't authenticate external user because the role was not returned by the auth module.",
+        "https://memgr.ph/auth"));
+    return std::nullopt;
   }
 
-  if (role_names.empty()) {
+  if (!allow_empty_roles && role_names.empty()) {
     spdlog::warn(utils::MessageWithLink(
         "Couldn't authenticate user: no valid role(s) returned by the external auth module.", "https://memgr.ph/sso"));
     return std::nullopt;
@@ -408,38 +441,41 @@ std::optional<std::vector<std::string>> ExtractAuthenticatedRoleNames(const nloh
   return role_names;
 }
 
+std::optional<std::vector<std::string>> ExtractAuthenticatedRoleNames(const nlohmann::json &ret) {
+  return ExtractAuthenticatedModuleRoles(ret, /*allow_empty_roles=*/false);
+}
+
 std::optional<auth::SSOIdentity> ExtractSSOIdentity(const std::string &scheme, const nlohmann::json &ret) {
-  auto role_names = ExtractAuthenticatedRoleNames(ret);
+  auto role_names = ExtractAuthenticatedModuleRoles(ret, /*allow_empty_roles=*/true);
   if (!role_names) {
-    spdlog::warn("Coordinator SSO login failed for scheme '{}'.", scheme);
+    spdlog::warn("Coordinator SSO module check failed for scheme '{}'.", scheme);
     return std::nullopt;
   }
 
-  // The principal is recorded, not validated: a module that omits it still logs in (the coordinator authorizes by
-  // role), but its queries can't be attributed to anybody, so say so once at login instead of silently.
   auto username = std::invoke([&ret]() -> std::string {
-    if (const auto it = ret.find("username"); it != ret.end() && it->is_string()) {
+    if (const auto it = ret.find("username"); it != ret.end()) {
+      if (!it->is_string()) {
+        return {};
+      }
       return it->get<std::string>();
     }
     return {};
   });
+  if (ret.contains("username") && !ret.at("username").is_string() && !ret.at("username").is_null()) {
+    spdlog::warn("Coordinator SSO module check failed for scheme '{}': non-string username field.", scheme);
+    return std::nullopt;
+  }
   if (IsInternalSystemUsername(username)) {
     spdlog::warn("Coordinator SSO login failed for scheme '{}': the name {} is reserved for the internal system user.",
                  scheme,
                  username);
     return std::nullopt;
   }
-  if (username.empty()) {
-    spdlog::warn(utils::MessageWithLink(
-        "The coordinator SSO module returned no username; queries from this session will be recorded without a "
-        "principal.",
-        "https://memgr.ph/sso"));
-  }
 
-  spdlog::info("Coordinator SSO login succeeded for scheme '{}' as user '{}' with roles: {}.",
-               scheme,
-               username,
-               utils::JoinVector(*role_names, ", "));
+  spdlog::debug("Coordinator SSO module '{}' authenticated principal '{}' with role(s): [{}].",
+                scheme,
+                username,
+                utils::JoinVector(*role_names, ", "));
   return auth::SSOIdentity{.username = std::move(username), .roles = std::move(*role_names)};
 }
 
@@ -461,10 +497,33 @@ Auth::Auth(std::string storage_directory, Config config
     MigrateVersions(durability_);
   } else {
     // Clean storage; put the version
-    durability_.Put(kStoreVersionKey, kCurrentStoreVersion);
+    if (!durability_.Put(kStoreVersionKey, kCurrentStoreVersion)) {
+      throw AuthException("Failed to initialize authentication store version!");
+    }
   }
 
 #ifdef MG_ENTERPRISE
+  storage_.ForEachPendingDbCleanup([this](const std::string &db_name, const std::string &value) {
+    std::vector<std::string> targets;
+    try {
+      const auto parsed = nlohmann::json::parse(value);
+      if (parsed.is_array()) {
+        for (const auto &entry : parsed) {
+          if (entry.is_string()) targets.push_back(entry.template get<std::string>());
+        }
+      }
+    } catch (const nlohmann::json::exception &) {
+    }
+    pending_db_cleanups_[db_name] = std::move(targets);
+  });
+  if (!pending_db_cleanups_.empty()) {
+    try {
+      RetryPendingDatabaseCleanups();
+    } catch (const AuthException &e) {
+      spdlog::warn("Deferred incomplete database permission cleanup at startup: {}", e.what());
+    }
+  }
+
   if (user_resources_) {
     // Update user resources with the initial profile limits
     for (const auto &profile : user_profiles_.GetAll()) {
@@ -755,6 +814,8 @@ bool Auth::RemoveUser(const std::string &username_orig, system::Transaction *sys
 
 std::vector<User> Auth::AllUsers() const { return rules::AllUsers(storage_); }
 
+std::vector<User> Auth::AllUsersStrict() const { return rules::AllUsersStrict(storage_); }
+
 std::vector<std::string> Auth::AllUsernames() const { return rules::AllUsernames(storage_); }
 
 bool Auth::HasUsers() const { return rules::HasUsers(storage_); }
@@ -768,6 +829,12 @@ bool Auth::CreateProfile(const std::string &profile_name, UserProfiles::limits_t
                          const std::unordered_set<std::string> &usernames, system::Transaction *system_tx) {
   const auto res = user_profiles_.Create(profile_name, defined_limits, usernames);
   if (res) {
+    if (user_resources_ && !storage_.IsTransactional()) {
+      const auto created = user_profiles_.Get(profile_name);
+      for (const auto &username : usernames) {
+        UpdateProfileLimits(utils::ToLowerCase(username), created, *user_resources_);
+      }
+    }
     AddAuthAction(system_tx, [&] {
       return replication::AuthUpdateOp{UserProfiles::Profile{profile_name, defined_limits, usernames}};
     });
@@ -780,8 +847,8 @@ std::optional<UserProfiles::Profile> Auth::UpdateProfile(const std::string &prof
                                                          system::Transaction *system_tx) {
   const auto res = user_profiles_.Update(profile_name, updated_limits);
   if (res) {
-    // Update user resources
-    if (user_resources_) {
+    // Update user resources outside buffered transactions; transactional callers refresh after Flush.
+    if (user_resources_ && !storage_.IsTransactional()) {
       for (const auto &user : UsersConnectedToProfile(*this, profile_name)) {
         UpdateProfileLimits(user, res, *user_resources_);
       }
@@ -825,13 +892,13 @@ bool Auth::CreateOrUpdateProfile(const std::string &profile_name, UserProfiles::
 
 UserProfiles::DropResult Auth::DropProfile(const std::string &profile_name, system::Transaction *system_tx) {
   std::unordered_set<std::string> users;
-  if (user_resources_) {
+  if (user_resources_ && !storage_.IsTransactional()) {
     users = UsersConnectedToProfile(*this, profile_name);
   }
   const auto res = user_profiles_.Drop(profile_name);
   if (res == UserProfiles::DropResult::kDropped) {
     // Update user resources
-    if (user_resources_) {
+    if (user_resources_ && !storage_.IsTransactional()) {
       for (const auto &user : users) {
         UpdateProfileLimits(user, {}, *user_resources_);
       }
@@ -853,7 +920,7 @@ std::optional<UserProfiles::Profile> Auth::SetProfile(const std::string &profile
     throw AuthException("Couldn't set profile '{}' for user '{}'!", profile_name, name);
   }
 
-  if (user_resources_) {
+  if (user_resources_ && !storage_.IsTransactional()) {
     UpdateProfileLimits(name, profile, *user_resources_);
   }
 
@@ -881,12 +948,23 @@ void Auth::RevokeProfile(const std::string &name, system::Transaction *system_tx
       break;
   }
 
-  if (user_resources_) {
+  if (user_resources_ && !storage_.IsTransactional()) {
     UpdateProfileLimits(name, std::nullopt, *user_resources_);
   }
 
   if (auto const profile = user_profiles_.Get(*profile_name)) {
     AddAuthAction(system_tx, [&] { return replication::AuthUpdateOp{*profile}; });
+  }
+}
+
+void Auth::RefreshAllUserProfileResources() {
+  if (!user_resources_) return;
+  for (const auto &username : AllUsernames()) {
+    std::optional<UserProfiles::Profile> effective;
+    if (const auto prof_name = user_profiles_.GetProfileForUsername(username)) {
+      effective = user_profiles_.Get(*prof_name);
+    }
+    UpdateProfileLimits(username, effective, *user_resources_);
   }
 }
 
@@ -1020,6 +1098,8 @@ bool Auth::RemoveRole(const std::string &rolename_orig, bool force, system::Tran
       nlohmann::json json_data;
       try {
         json_data = ParseJson(value);
+      } catch (AuthException const &) {
+        return;
       } catch (nlohmann::detail::exception const &) {
         return;
       }
@@ -1038,9 +1118,12 @@ bool Auth::RemoveRole(const std::string &rolename_orig, bool force, system::Tran
       nlohmann::json json_data;
       try {
         json_data = ParseJson(value);
+      } catch (AuthException const &) {
+        return;
       } catch (nlohmann::detail::exception const &) {
         return;
       }
+      if (!json_data.is_object()) return;
       for (auto const &[db_name, role_names] : json_data.items()) {
         if (!role_names.is_array()) continue;
         for (auto const &role_name : role_names) {
@@ -1081,6 +1164,14 @@ std::vector<User> Auth::AllUsersForRole(const std::string &rolename) const {
 
 std::vector<std::string> Auth::AllUsernamesForRole(const std::string &rolename) const {
   return rules::AllUsernamesForRole(storage_, rolename);
+}
+
+rules::RoleMembersListing Auth::ListUsersForRole(const std::string &rolename) const {
+  return rules::ListUsersForRole(storage_, rolename);
+}
+
+rules::RoleMemberNamesListing Auth::ListUsernamesForRole(const std::string &rolename) const {
+  return rules::ListUsernamesForRole(storage_, rolename);
 }
 
 #ifdef MG_ENTERPRISE
@@ -1191,23 +1282,123 @@ void Auth::RevokeDatabase(const std::string &db, Role &role, system::Transaction
 }
 
 void Auth::DeleteDatabase(const std::string &db, system::Transaction *system_tx) {
-  storage_.ForEachUser([&](auto /*username*/, auto const &value) {
+  pending_db_cleanups_[db] = {};
+  (void)storage_.Put(Repository::PendingDbCleanupKey(db), nlohmann::json::array().dump());
+
+  std::vector<std::string> failures;
+  std::vector<std::string> remaining_targets;
+  std::vector<std::pair<std::string, std::string>> user_entries;
+  storage_.ForEachUser([&](auto username, auto const &value) {
+    user_entries.emplace_back(std::move(username), value);
+  });
+
+  // Clean accounts and their database-specific role mappings before revoking role database access so LinkUser still
+  // resolves roles on all databases cleanly.
+  for (const auto &[username, value] : user_entries) {
     try {
       User user = auth::User::Deserialize(rules::ParseAndMigrateJson(value));
-      if (!user.db_access().Revoke(db)) return;
       LinkUser(user);
-      SaveUser(user, system_tx);
-    } catch (AuthException &) {
+
+      bool raw_mt_had_db = false;
+      if (const auto raw_mt = StorageGet(Repository::MtLinkKey(user.username()))) {
+        const auto mt_json = ParseJson(*raw_mt);
+        if (!mt_json.is_object()) {
+          throw AuthException("Invalid multi-tenant role mapping for account '{}'.", user.username());
+        }
+        raw_mt_had_db = mt_json.contains(db);
+      }
+
+      const bool had_mt_mapping = user.GetMultiTenantRoleMappings().contains(db) || raw_mt_had_db;
+      user.ClearMultiTenantRoles(db);
+      const bool revoked_direct = user.db_access().Revoke(db);
+      if (had_mt_mapping || revoked_direct) {
+        SaveUser(user, system_tx);
+      }
+    } catch (const AuthException &e) {
+      failures.push_back(fmt::format("account '{}' ({})", username, e.what()));
+      remaining_targets.push_back("user:" + username);
+    } catch (const nlohmann::json::exception &e) {
+      failures.push_back(fmt::format("account '{}' ({})", username, e.what()));
+      remaining_targets.push_back("user:" + username);
     }
+  }
+
+  // Clean any orphaned mtlink entries whose account record is absent.
+  std::vector<std::pair<std::string, std::string>> mtlink_entries;
+  storage_.ForEachMtLink([&](auto username, auto const &value) {
+    mtlink_entries.emplace_back(std::move(username), value);
   });
-  storage_.ForEachRole([&](auto /*rolename*/, auto const &value) {
+  for (const auto &[username, value] : mtlink_entries) {
+    if (HasUser(username)) continue;
+    try {
+      auto mt_json = ParseJson(value);
+      if (!mt_json.is_object()) {
+        throw AuthException("Invalid orphaned multi-tenant role mapping for '{}'.", username);
+      }
+      if (!mt_json.contains(db)) continue;
+      mt_json.erase(db);
+      const bool ok = mt_json.empty() ? StorageDelete(Repository::MtLinkKey(username))
+                                      : StoragePutMultiple({{Repository::MtLinkKey(username), mt_json.dump()}});
+      if (!ok) {
+        throw AuthException("Couldn't update multi-tenant role mapping for '{}'!", username);
+      }
+      UpdateEpoch();
+    } catch (const AuthException &e) {
+      failures.push_back(fmt::format("role mapping '{}' ({})", username, e.what()));
+      remaining_targets.push_back("mtlink:" + username);
+    }
+  }
+
+  std::vector<std::pair<std::string, std::string>> role_entries;
+  storage_.ForEachRole([&](auto rolename, auto const &value) {
+    role_entries.emplace_back(std::move(rolename), value);
+  });
+  for (const auto &[rolename, value] : role_entries) {
     try {
       auto role = memgraph::auth::Role::Deserialize(rules::ParseAndMigrateJson(value));
-      if (!role.db_access().Revoke(db)) return;
+      if (!role.db_access().Revoke(db)) continue;
       SaveRole(role, system_tx);
-    } catch (AuthException &) {
+    } catch (const AuthException &e) {
+      failures.push_back(fmt::format("role '{}' ({})", rolename, e.what()));
+      remaining_targets.push_back("role:" + rolename);
+    } catch (const nlohmann::json::exception &e) {
+      failures.push_back(fmt::format("role '{}' ({})", rolename, e.what()));
+      remaining_targets.push_back("role:" + rolename);
     }
-  });
+  }
+
+  if (!failures.empty()) {
+    pending_db_cleanups_[db] = remaining_targets;
+    (void)storage_.Put(Repository::PendingDbCleanupKey(db), nlohmann::json(remaining_targets).dump());
+    throw AuthException(
+        "Failed to clean up permissions for deleted database '{}': {}", db, utils::JoinVector(failures, "; "));
+  }
+
+  if (!StorageDelete(Repository::PendingDbCleanupKey(db))) {
+    pending_db_cleanups_[db] = {};
+    throw AuthException("Failed to clear pending permission cleanup record for deleted database '{}'!", db);
+  }
+  pending_db_cleanups_.erase(db);
+}
+
+void Auth::RetryPendingDatabaseCleanups(system::Transaction *system_tx) {
+  std::vector<std::string> dbs;
+  dbs.reserve(pending_db_cleanups_.size());
+  for (const auto &[db_name, _] : pending_db_cleanups_) {
+    dbs.push_back(db_name);
+  }
+  std::vector<std::string> retry_errors;
+  for (const auto &db_name : dbs) {
+    try {
+      DeleteDatabase(db_name, system_tx);
+    } catch (const AuthException &e) {
+      retry_errors.push_back(e.what());
+    }
+  }
+  if (!retry_errors.empty()) {
+    throw AuthException("Pending database permission cleanup remains incomplete: {}",
+                        utils::JoinVector(retry_errors, " | "));
+  }
 }
 
 Auth::Result Auth::SetMainDatabase(std::string_view db, const std::string &name, UserOrRoleType type,

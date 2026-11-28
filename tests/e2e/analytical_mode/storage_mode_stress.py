@@ -17,14 +17,14 @@ storage mode in a loop while other connections read/write, and confirm the serve
 without crashing, hanging, or erroring.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 DURATION_SECONDS = 5
 NUM_WRITERS = 4

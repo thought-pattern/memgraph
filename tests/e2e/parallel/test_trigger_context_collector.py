@@ -34,8 +34,8 @@ import sys
 import time
 from typing import Any, Dict, List
 
-import pytest
 from common import clear_database, pq
+import pytest
 
 # =============================================================================
 # Helper Functions

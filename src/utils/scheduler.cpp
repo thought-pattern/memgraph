@@ -36,7 +36,7 @@ namespace memgraph::utils {
  */
 void Scheduler::Run(const std::string &service_name, const std::function<void()> &f) {
   // stop any running thread
-  thread_.request_stop();
+  Stop();
 
   // Thread setup
   thread_ = std::jthread([this, f = f, service_name = service_name](std::stop_token token) mutable {
@@ -216,16 +216,22 @@ void Scheduler::ThreadRun(std::string service_name, std::function<void()> f, std
 // Concurrent threads may request stopping the scheduler. In that case only one of them will
 // actually stop the scheduler, the other one won't. We need to know which one is the successful
 // one so that we don't try to join thread concurrently since this could cause undefined behavior.
-void Scheduler::Stop() {
+std::jthread Scheduler::StopAsync() {
   if (thread_.request_stop()) {
     {
       // Lock needs to be held when modifying cv even if atomic
       auto lk = std::unique_lock{mutex_};
       is_paused_ = false;
     }
-    condition_variable_.notify_one();
-    if (thread_.joinable()) thread_.join();
+    condition_variable_.notify_all();
+    return std::move(thread_);
   }
+  return {};
+}
+
+void Scheduler::Stop() {
+  auto worker = StopAsync();
+  if (worker.joinable()) worker.join();
 }
 
 // Sets atomic is_paused_ to true.

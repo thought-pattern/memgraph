@@ -12,8 +12,8 @@
 import math
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_indexed_join_with_indices(memgraph):

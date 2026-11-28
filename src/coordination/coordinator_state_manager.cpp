@@ -145,8 +145,11 @@ CoordinatorStateManager::CoordinatorStateManager(CoordinatorStateManagerConfig c
 // contains the current coordinator should be after shortly accepted.
 // Caller is responsible for obtaining the lock for updating cluster_config_
 void CoordinatorStateManager::TryUpdateClusterConfigFromDisk() {
-  auto const maybe_cluster_config = durability_.Get(kClusterConfigKey);
+  auto const maybe_cluster_config = durability_.GetStrict(kClusterConfigKey);
   if (!maybe_cluster_config) {
+    if (maybe_cluster_config.error() == kvstore::KVStore::GetError::kReadError) {
+      throw StoreClusterConfigException("Failed to read cluster config from RocksDB");
+    }
     spdlog::trace("Didn't find anything stored on disk for cluster config.");
     return;
   }
@@ -171,13 +174,14 @@ auto CoordinatorStateManager::save_config(cluster_config const &config) -> void 
   auto lock = std::lock_guard{config_mutex_};
 
   std::shared_ptr<buffer> const buf = config.serialize();
-  cluster_config_ = cluster_config::deserialize(*buf);
+  auto next_config = cluster_config::deserialize(*buf);
   nlohmann::json json;
   to_json(json, config);
 
   if (auto const ok = durability_.Put(kClusterConfigKey, json.dump()); !ok) {
     throw StoreClusterConfigException("Failed to store cluster config in RocksDb");
   }
+  cluster_config_ = std::move(next_config);
 
   // Lock already taken hence not needed
   NotifyObserver(GetCoordinatorInstancesAux<false>());
@@ -195,7 +199,9 @@ auto CoordinatorStateManager::save_state(srv_state const &state) -> void {
 
   nlohmann::json json;
   to_json(json, state);
-  durability_.Put(kServerStateKey, json.dump());
+  if (!durability_.Put(kServerStateKey, json.dump())) {
+    throw kvstore::KVStoreError("Failed to persist Raft server election state in RocksDB");
+  }
 
   std::shared_ptr<buffer> const buf = state.serialize();
   saved_state_ = srv_state::deserialize(*buf);
@@ -204,8 +210,11 @@ auto CoordinatorStateManager::save_state(srv_state const &state) -> void {
 auto CoordinatorStateManager::read_state() -> std::shared_ptr<srv_state> {
   spdlog::trace("Reading server state in coordinator state manager.");
 
-  auto const maybe_server_state = durability_.Get(kServerStateKey);
+  auto const maybe_server_state = durability_.GetStrict(kServerStateKey);
   if (!maybe_server_state) {
+    if (maybe_server_state.error() == kvstore::KVStore::GetError::kReadError) {
+      throw kvstore::KVStoreError("Failed to read Raft server election state from RocksDB");
+    }
     logger_.Log(nuraft_log_level::INFO, "Didn't find anything stored on disk for server state.");
     return saved_state_;
   }

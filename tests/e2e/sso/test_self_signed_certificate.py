@@ -1,16 +1,16 @@
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
+from pathlib import Path
 import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
-import pytest
 from oidc import validate_jwt_token
+import pytest
 
 # TODO: this is probably better way to import oidc
 # sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent / "src" / "auth" / "reference_modules"))

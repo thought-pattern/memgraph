@@ -3,14 +3,14 @@
 This is fairly simple installation setup (created for Ubuntu 20.04) to follow:
 
 
-#### 1. [IF NEEDED] Install the newer version of CMake (Version 20.0+) since it is requirement for cuGraph CMakeLists.txt. Example shows CMake 3.22.
+#### 1. [IF NEEDED] Install CMake 3.31+ as required by the root `CMakeLists.txt`. Example shows CMake 3.31.6.
 
 ```
 sudo apt remove --purge cmake
 sudo apt install build-essential libssl-dev
-wget https://github.com/Kitware/CMake/releases/download/v3.22.2/cmake-3.22.2.tar.gz
-tar -zxvf cmake-3.22.2.tar.gz
-cd cmake-3.22.2
+wget https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6.tar.gz
+tar -zxvf cmake-3.31.6.tar.gz
+cd cmake-3.31.6
 ./bootstrap
 make
 sudo make install
@@ -58,9 +58,9 @@ sudo apt-get update
 sudo apt install libnccl2=2.11.4-1+cuda11.6 libnccl-dev=2.11.4-1+cuda11.6
 ```
 
-#### 6. To use CUDA and NVIDIA cuGraph code, compile with the different flags.
+#### 6. To enable both MAGE and the NVIDIA cuGraph modules in the integrated build, configure with `MG_BUILD_MAGE` and `MG_ENABLE_CUGRAPH`:
 
 ```
-cmake -DMAGE_CUGRAPH_ENABLE=ON ..
+cmake -DMG_BUILD_MAGE=ON -DMG_ENABLE_CUGRAPH=ON ..
 make -j$(nproc)
 ```

@@ -175,6 +175,52 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
         if (!parent || parent->named_expressions_.size() != 1) return;
         auto *named_expr = maybe_produce->named_expressions_.front();
         if (agg.arg1 != nullptr && !expressions_same_symbol(agg.arg1, named_expr)) return;
+        if (agg.arg1 == nullptr && agg.op == Aggregation::Op::COUNT) {
+          // `WITH DISTINCT expr AS x RETURN count(*)` counts a null group as 1,
+          // whereas `count(DISTINCT expr)` skips null. Only rewrite when `expr`
+          // is guaranteed non-null.
+          auto const is_guaranteed_non_null = [&]() -> bool {
+            if (auto const *lit = dynamic_cast<const PrimitiveLiteral *>(named_expr->expression_)) {
+              return !lit->value_.IsNull();
+            }
+            auto const *ident = dynamic_cast<const Identifier *>(named_expr->expression_);
+            if (!ident) return false;
+            const LogicalOperator *cur = maybe_produce->input().get();
+            bool bound_by_entity_scan = false;
+            while (cur) {
+              const auto &ti = cur->GetTypeInfo();
+              if (ti == Once::kType) break;
+              if (utils::IsSubtype(ti, ScanAllByEdge::kType)) {
+                auto const *se = static_cast<const ScanAllByEdge *>(cur);
+                if (se->common_.edge_symbol.position() == ident->symbol_pos_ ||
+                    se->common_.node1_symbol.position() == ident->symbol_pos_ ||
+                    se->common_.node2_symbol.position() == ident->symbol_pos_) {
+                  bound_by_entity_scan = true;
+                }
+                cur = cur->input().get();
+              } else if (utils::IsSubtype(ti, ScanAll::kType)) {
+                auto const *sa = static_cast<const ScanAll *>(cur);
+                if (sa->output_symbol_.position() == ident->symbol_pos_) {
+                  bound_by_entity_scan = true;
+                }
+                cur = cur->input().get();
+              } else if (ti == Expand::kType) {
+                auto const *ex = static_cast<const Expand *>(cur);
+                if (ex->common_.edge_symbol.position() == ident->symbol_pos_ ||
+                    ex->common_.node_symbol.position() == ident->symbol_pos_) {
+                  bound_by_entity_scan = true;
+                }
+                cur = cur->input().get();
+              } else if (ti == Filter::kType || ti == EdgeUniquenessFilter::kType || ti == CacheProperties::kType) {
+                cur = cur->input().get();
+              } else {
+                return false;
+              }
+            }
+            return bound_by_entity_scan;
+          }();
+          if (!is_guaranteed_non_null) return;
+        }
         // Rewrite the query to MATCH(n) RETURN count(DISTINCT n)
         agg.distinct = true;
         agg.arg1 = named_expr->expression_;
@@ -336,13 +382,7 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
     } else {
       // Handle special case for multi-input operators
       // Try to set the correct child in multi-input operator (use only main/left branch)
-      if (auto *union_op = dynamic_cast<Union *>(scan_parent)) {
-        if (union_op->left_op_.get() == target_scan) {
-          union_op->left_op_ = scan_chunk;
-        } else {
-          return failure("Target scan not found in left branch of Union");
-        }
-      } else if (auto *cartesian_op = dynamic_cast<Cartesian *>(scan_parent)) {
+      if (auto *cartesian_op = dynamic_cast<Cartesian *>(scan_parent)) {
         if (cartesian_op->left_op_.get() == target_scan) {
           cartesian_op->left_op_ = scan_chunk;
         } else {
@@ -730,6 +770,11 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
           return true;
         }
         break;
+      } else if (auto *union_op = dynamic_cast<Union *>(current)) {
+        if (ConflictingOperators(union_op->left_op_.get()) || ConflictingOperators(union_op->right_op_.get())) {
+          return true;
+        }
+        break;
       } else if (dynamic_cast<Once *>(current) != nullptr || dynamic_cast<OutputTable *>(current) != nullptr ||
                  dynamic_cast<OutputTableStream *>(current) != nullptr) {
         // Terminal operators with no inputs - cannot have input symbols
@@ -866,13 +911,10 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
               input_symbol_positions.insert(sym.position());
             }
           }
-        } else if (auto *union_op = dynamic_cast<Union *>(current)) {
-          if (union_op->left_op_) {
-            auto left_symbols = union_op->left_op_->ModifiedSymbols(*symbol_table);
-            for (const auto &sym : left_symbols) {
-              input_symbol_positions.insert(sym.position());
-            }
-          }
+        } else if (dynamic_cast<Union *>(current) != nullptr) {
+          // Union concatenates both branches; partitioning only one branch causes
+          // every worker to re-read the unpartitioned branch in full.
+          return false;
         } else if (dynamic_cast<Once *>(current) != nullptr || dynamic_cast<OutputTable *>(current) != nullptr ||
                    dynamic_cast<OutputTableStream *>(current) != nullptr) {
           // Terminal operators with no inputs - cannot have input symbols
@@ -945,24 +987,18 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
         // However, the right branch needs to be checked for conflicting operators
         LogicalOperator *found_scan = nullptr;
         LogicalOperator *found_parent = current;
-        std::vector<LogicalOperator *> update_ops;
-        if (auto *union_op = dynamic_cast<Union *>(current)) {
-          if (ConflictingOperators(union_op->right_op_.get())) break;
-          if (FindScanForSymbols(
-                  union_op->left_op_.get(), symbols_to_find, found_scan, found_parent, update_ops, original_start)) {
-            target_scan = found_scan;
-            scan_parent = found_parent;
-          }
-        } else if (auto *cartesian_op = dynamic_cast<Cartesian *>(current)) {
+        std::vector<LogicalOperator *> branch_update_ops;
+        if (auto *cartesian_op = dynamic_cast<Cartesian *>(current)) {
           if (ConflictingOperators(cartesian_op->right_op_.get())) break;
           if (FindScanForSymbols(cartesian_op->left_op_.get(),
                                  symbols_to_find,
                                  found_scan,
                                  found_parent,
-                                 update_ops,
+                                 branch_update_ops,
                                  original_start)) {
             target_scan = found_scan;
             scan_parent = found_parent;
+            update_ops.insert(update_ops.end(), branch_update_ops.begin(), branch_update_ops.end());
           }
         } else if (auto *indexed_join_op = dynamic_cast<IndexedJoin *>(current)) {
           if (ConflictingOperators(indexed_join_op->sub_branch_.get())) break;
@@ -970,10 +1006,11 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
                                  symbols_to_find,
                                  found_scan,
                                  found_parent,
-                                 update_ops,
+                                 branch_update_ops,
                                  original_start)) {
             target_scan = found_scan;
             scan_parent = found_parent;
+            update_ops.insert(update_ops.end(), branch_update_ops.begin(), branch_update_ops.end());
           }
         } else if (auto *hash_join_op = dynamic_cast<HashJoin *>(current)) {
           if (ConflictingOperators(hash_join_op->right_op_.get())) break;
@@ -981,10 +1018,11 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
                                  symbols_to_find,
                                  found_scan,
                                  found_parent,
-                                 update_ops,
+                                 branch_update_ops,
                                  original_start)) {
             target_scan = found_scan;
             scan_parent = found_parent;
+            update_ops.insert(update_ops.end(), branch_update_ops.begin(), branch_update_ops.end());
           }
         } else if (auto *rollup_apply_op = dynamic_cast<RollUpApply *>(current)) {
           if (ConflictingOperators(rollup_apply_op->list_collection_branch_.get())) break;
@@ -992,17 +1030,11 @@ class ParallelRewriter final : public HierarchicalLogicalOperatorVisitor {
                                  symbols_to_find,
                                  found_scan,
                                  found_parent,
-                                 update_ops,
+                                 branch_update_ops,
                                  original_start)) {
             target_scan = found_scan;
             scan_parent = found_parent;
-          }
-        } else if (auto *union_op = dynamic_cast<Union *>(current)) {
-          if (ConflictingOperators(union_op->right_op_.get())) break;
-          if (FindScanForSymbols(
-                  union_op->left_op_.get(), symbols_to_find, found_scan, found_parent, update_ops, original_start)) {
-            target_scan = found_scan;
-            scan_parent = found_parent;
+            update_ops.insert(update_ops.end(), branch_update_ops.begin(), branch_update_ops.end());
           }
         } else if (dynamic_cast<Once *>(current) != nullptr || dynamic_cast<OutputTable *>(current) != nullptr ||
                    dynamic_cast<OutputTableStream *>(current) != nullptr) {
@@ -1038,8 +1070,8 @@ std::unique_ptr<LogicalOperator> RewriteParallelExecution(
         PrimitiveLiteralExpressionEvaluator evaluator{eval_ctx};
 
         TypedValue value = num_threads->Accept(evaluator);
-        if (!value.IsInt() || value.ValueInt() < 0) {
-          throw QueryException("Number of threads must be a non-negative integer");
+        if (!value.IsInt() || value.ValueInt() <= 0) {
+          throw QueryException("Number of threads must be a positive integer");
         }
         const auto threads = static_cast<size_t>(value.ValueInt());
         if (threads > FLAGS_bolt_num_workers) {

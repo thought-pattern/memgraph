@@ -70,7 +70,10 @@ class Builder {
   // task captures): nothing here may allocate. The moved-from builder keeps no segment; its write
   // entry points treat the missing buffer as "discard", matching the defunct write_func below.
   Builder(Builder &&other, std::function<void(const uint8_t *, size_t, bool)> write_func) noexcept
-      : write_func_{std::move(write_func)}, pos_{std::exchange(other.pos_, 0)}, segment_{std::move(other.segment_)} {
+      : file_data_{std::exchange(other.file_data_, false)},
+        write_func_{std::move(write_func)},
+        pos_{std::exchange(other.pos_, 0)},
+        segment_{std::move(other.segment_)} {
     other.write_func_ = [](const uint8_t *, size_t, bool) { /* Moved builder is defunct, no write possible */ };
   }
 
@@ -139,6 +142,11 @@ class Reader {
   void Finalize();
 
   size_t GetPos() const;
+
+  size_t RemainingRawBytes() const noexcept { return pos_ <= size_ ? (size_ - pos_) : 0; }
+
+  /// Total unread payload bytes remaining across the open segment and subsequent non-empty SLK segments.
+  size_t RemainingPayloadBytes() const noexcept;
 
   const uint8_t *GetData() const { return data_; }
 

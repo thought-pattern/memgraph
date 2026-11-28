@@ -13,31 +13,20 @@
 #include <gflags/gflags.h>
 #include <spdlog/spdlog.h>
 #include <cctype>
-#include <functional>
 #include <map>
 #include <nlohmann/json.hpp>
-#include <range/v3/algorithm/any_of.hpp>
-#include <range/v3/functional/bind_back.hpp>
-#include <range/v3/iterator/basic_iterator.hpp>
-#include <range/v3/range/conversion.hpp>
-#include <range/v3/utility/get.hpp>
-#include <range/v3/view/drop_while.hpp>
-#include <range/v3/view/single.hpp>
-#include <range/v3/view/split.hpp>
-#include <range/v3/view/take_while.hpp>
-#include <range/v3/view/transform.hpp>
-#include <range/v3/view/view.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "flags/experimental.hpp"
 #include "utils/flag_validation.hpp"
+#include "utils/string.hpp"
 
 using namespace std::string_view_literals;
-namespace rv = ranges::views;
 
 // The mapping tables MUST be defined before DEFINE_VALIDATED_string so the
 // help-string composition below sees them initialised.  Static-init order
@@ -61,13 +50,27 @@ auto const config_mapping = std::map<std::string_view, Experiments>{};
 
 namespace {
 
-auto const canonicalize_string = [](auto &&rng) {
-  auto const is_space = [](auto c) { return c == ' '; };
-  auto const to_lower = [](unsigned char c) { return std::tolower(c); };
+auto CanonicalizeExperimentToken(std::string_view raw_token) -> std::string {
+  return memgraph::utils::ToLowerCase(memgraph::utils::Trim(raw_token));
+}
 
-  return rng | rv::drop_while(is_space) | rv::take_while(std::not_fn(is_space)) | rv::transform(to_lower) |
-         ranges::to<std::string>;
-};
+auto SplitCommaSeparatedTokens(std::string_view raw_list) -> std::vector<std::string> {
+  std::vector<std::string> tokens;
+  if (raw_list.empty()) {
+    return tokens;
+  }
+  size_t start = 0;
+  while (true) {
+    const auto comma = raw_list.find(',', start);
+    if (comma == std::string_view::npos) {
+      tokens.push_back(CanonicalizeExperimentToken(raw_list.substr(start)));
+      break;
+    }
+    tokens.push_back(CanonicalizeExperimentToken(raw_list.substr(start, comma - start)));
+    start = comma + 1;
+  }
+  return tokens;
+}
 
 /// Compose "prefix Options [name1, name2, ...]" from a mapping table.
 /// Used to keep --help text in sync with the actual recognised options
@@ -122,7 +125,7 @@ auto ReadExperimental(std::string const &flags_experimental) -> Experiments {
   using underlying_type = std::underlying_type_t<Experiments>;
   auto to_set = underlying_type{};
 
-  for (auto &&experiment : flags_experimental | rv::split(',') | rv::transform(canonicalize_string)) {
+  for (auto const &experiment : SplitCommaSeparatedTokens(flags_experimental)) {
     if (auto it = mapping.find(experiment); it != mapping_end) {
       spdlog::info(fmt::format("Experimental feature {} is enabled.", it->first));
       to_set |= std::to_underlying(it->second);
@@ -150,8 +153,12 @@ auto ValidExperimentalFlag(std::string_view value) -> bool {
     return true;
   }
   auto const mapping_end = mapping.cend();
-  return !ranges::any_of(value | rv::split(',') | rv::transform(canonicalize_string),
-                         [&mapping_end](auto &&experiment) { return mapping.find(experiment) == mapping_end; });
+  for (auto const &experiment : SplitCommaSeparatedTokens(value)) {
+    if (mapping.find(experiment) == mapping_end) {
+      return false;
+    }
+  }
+  return true;
 }
 
 auto ValidExperimentalConfig(std::string_view json_config) -> bool {
@@ -167,7 +174,7 @@ auto ValidExperimentalConfig(std::string_view json_config) -> bool {
 
     auto const config_mapping_end = config_mapping.cend();
     for (auto const &[key, _] : json_flags.items()) {
-      auto const canonical_key = canonicalize_string(key);
+      auto const canonical_key = CanonicalizeExperimentToken(key);
       if (config_mapping.find(canonical_key) == config_mapping_end) {
         return false;
       }

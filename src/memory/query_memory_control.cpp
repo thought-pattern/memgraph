@@ -167,17 +167,27 @@ ThreadTrackingBlocker::~ThreadTrackingBlocker() {
 CrossThreadMemoryTracking::CrossThreadMemoryTracking(ArenaPool *arena_pool)
     : query_tracker(GetQueryTracker()), user_tracker(GetUserTracker()), db_arena_pool(arena_pool) {}
 
+CrossThreadMemoryTracking::~CrossThreadMemoryTracking() noexcept { StopTracking(); }
+
 void CrossThreadMemoryTracking::StartTracking() {
   DMG_ASSERT(!started_, "CrossThreadMemoryTracking::StartTracking called twice");
-  started_ = true;
-  prev_query_tracker_ = GetQueryTracker();
-  prev_user_tracker_ = GetUserTracker();
+  auto *const saved_query = GetQueryTracker();
+  auto *const saved_user = GetUserTracker();
   SetQueryTracker(query_tracker);
   SetUserTracker(user_tracker);
-  if (db_arena_pool) db_arena_scope_.emplace(db_arena_pool);
+  try {
+    if (db_arena_pool) db_arena_scope_.emplace(db_arena_pool);
+  } catch (...) {
+    SetQueryTracker(saved_query);
+    SetUserTracker(saved_user);
+    throw;
+  }
+  prev_query_tracker_ = saved_query;
+  prev_user_tracker_ = saved_user;
+  started_ = true;
 }
 
-void CrossThreadMemoryTracking::StopTracking() {
+void CrossThreadMemoryTracking::StopTracking() noexcept {
   if (!started_) return;
   SetQueryTracker(prev_query_tracker_);
   SetUserTracker(prev_user_tracker_);

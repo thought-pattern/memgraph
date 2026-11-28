@@ -395,8 +395,8 @@ Result<bool> VertexAccessor::HasAnyLabel(View view) const {
   bool deleted = false;
   bool has_any_label = false;
   Delta const *delta = nullptr;
-  VertexReadLock read_lock{vertex_};
   {
+    VertexReadLock read_lock{vertex_};
     auto const guard = read_lock.AcquireLock();
     deleted = vertex_->deleted();
     has_any_label = !vertex_->labels.empty();
@@ -470,13 +470,6 @@ Result<PropertyValue> VertexAccessor::SetProperty(PropertyId property, const Pro
 
   utils::MemoryTracker::OutOfMemoryExceptionEnabler oom_exception;
 
-  // Use converted value for vector index when applicable; otherwise use the input as-is.
-  std::optional<PropertyValue> converted;
-  if (!storage_->indices_.vector_index_.Empty()) {
-    converted = TryConvertToVectorIndexProperty(storage_, vertex_, property, value);
-  }
-  const auto &new_value = converted.value_or(value);
-
   // This has to be called before any object gets locked
   auto schema_acc = SchemaInfoAccessor(storage_, transaction_);
   auto guard = std::unique_lock{vertex_->lock};
@@ -485,8 +478,24 @@ Result<PropertyValue> VertexAccessor::SetProperty(PropertyId property, const Pro
 
   if (vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
+  if (!transaction_->active_constraints_->type_->empty()) {
+    if (auto validation_result = transaction_->active_constraints_->type_->Validate(*vertex_, property, value);
+        !validation_result.has_value()) {
+      HandleTypeConstraintViolation(storage_, validation_result.error());
+    }
+  }
+
+  // Convert vector property under vertex_->lock so vertex_->labels cannot race with concurrent label edits.
+  std::optional<PropertyValue> converted;
+  if (!storage_->indices_.vector_index_.Empty()) {
+    converted = TryConvertToVectorIndexProperty(storage_, vertex_, property, value);
+  } else if (PropertyStore::NeedsPrecisionNormalization()) {
+    converted = PropertyStore::NormalizeForStorage(value);
+  }
+  const auto &new_value = converted.value_or(value);
+
   PropertyValue old_value;
-  const bool skip_duplicate_write = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_write = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   auto const set_property_impl = [this,
                                   transaction = transaction_,
                                   vertex = vertex_,
@@ -499,12 +508,6 @@ Result<PropertyValue> VertexAccessor::SetProperty(PropertyId property, const Pro
         property,
         IndexedPropertyDecoder<Vertex>{
             .indices = &storage_->indices_, .name_id_mapper = storage_->name_id_mapper_.get(), .entity = vertex_});
-    // We could skip setting the value if the previous one is the same to the new
-    // one. This would save some memory as a delta would not be created as well as
-    // avoid copying the value. The reason we are not doing that is because the
-    // current code always follows the logical pattern of "create a delta" and
-    // "modify in-place". Additionally, the created delta will make other
-    // transactions get a SERIALIZATION_ERROR.
     if (skip_duplicate_write && old_value == new_value) return true;
     CreateAndLinkDelta(transaction, vertex, Delta::SetPropertyTag(), property, old_value);
     vertex->properties.SetProperty(property, new_value);
@@ -519,14 +522,6 @@ Result<PropertyValue> VertexAccessor::SetProperty(PropertyId property, const Pro
                             [](auto & /* unused */) { DMG_ASSERT(false, "Using the wrong accessor"); }},
           *schema_acc);
     }
-
-    if (!transaction_->active_constraints_->type_->empty()) {
-      if (auto validation_result = transaction_->active_constraints_->type_->Validate(*vertex_, property, new_value);
-          !validation_result.has_value()) {
-        HandleTypeConstraintViolation(storage_, validation_result.error());
-      }
-    }
-
     return false;
   };
 
@@ -555,14 +550,6 @@ Result<bool> VertexAccessor::InitProperties(std::map<storage::PropertyId, storag
 
   utils::MemoryTracker::OutOfMemoryExceptionEnabler oom_exception;
 
-  if (!storage_->indices_.vector_index_.Empty()) {
-    for (auto &[property_id, property_value] : properties) {
-      if (auto converted = TryConvertToVectorIndexProperty(storage_, vertex_, property_id, property_value)) {
-        property_value = std::move(*converted);
-      }
-    }
-  }
-
   // This has to be called before any object gets locked
   auto schema_acc = SchemaInfoAccessor(storage_, transaction_);
   auto guard = std::unique_lock{vertex_->lock};
@@ -570,6 +557,31 @@ Result<bool> VertexAccessor::InitProperties(std::map<storage::PropertyId, storag
   if (!PrepareForWrite(transaction_, vertex_)) return std::unexpected{Error::SERIALIZATION_ERROR};
 
   if (vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
+
+  if (!transaction_->active_constraints_->type_->empty()) {
+    for (auto const &[property_id, property_value] : properties) {
+      if (auto validation_result =
+              transaction_->active_constraints_->type_->Validate(*vertex_, property_id, property_value);
+          !validation_result.has_value()) {
+        HandleTypeConstraintViolation(storage_, validation_result.error());
+      }
+    }
+  }
+
+  if (!storage_->indices_.vector_index_.Empty()) {
+    for (auto &[property_id, property_value] : properties) {
+      if (auto converted = TryConvertToVectorIndexProperty(storage_, vertex_, property_id, property_value)) {
+        property_value = std::move(*converted);
+      } else if (PropertyStore::NeedsPrecisionNormalization()) {
+        property_value = PropertyStore::NormalizeForStorage(property_value);
+      }
+    }
+  } else if (PropertyStore::NeedsPrecisionNormalization()) {
+    for (auto &[property_id, property_value] : properties) {
+      property_value = PropertyStore::NormalizeForStorage(property_value);
+    }
+  }
+
   bool result{false};
   utils::AtomicMemoryBlock(
       [&result, &properties, storage = storage_, transaction = transaction_, vertex = vertex_, &schema_acc]() {
@@ -579,7 +591,6 @@ Result<bool> VertexAccessor::InitProperties(std::map<storage::PropertyId, storag
         }
         for (const auto &[property, new_value] : properties) {
           CreateAndLinkDelta(transaction, vertex, Delta::SetPropertyTag(), property, PropertyValue());
-          // TODO: defer until once all properties have been set, to make fewer entries ?
           storage->indices_.UpdateOnSetProperty(property, PropertyValue{}, new_value, vertex, *transaction);
           transaction->UpdateOnSetProperty(property, PropertyValue{}, new_value, vertex);
           if (transaction->constraint_verification_info) {
@@ -599,16 +610,6 @@ Result<bool> VertexAccessor::InitProperties(std::map<storage::PropertyId, storag
                 *schema_acc);
           }
         }
-        // TODO If not performant enough there is also InitProperty()
-        if (!transaction->active_constraints_->type_->empty()) {
-          for (auto const &[property_id, property_value] : properties) {
-            if (auto validation_result =
-                    transaction->active_constraints_->type_->Validate(*vertex, property_id, property_value);
-                !validation_result.has_value()) {
-              HandleTypeConstraintViolation(storage, validation_result.error());
-            }
-          }
-        }
         result = true;
       });
 
@@ -623,15 +624,6 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> Vertex
 
   utils::MemoryTracker::OutOfMemoryExceptionEnabler oom_exception;
 
-  // If there is a vector index, we might need to convert list type properties to vector index property value types.
-  if (!storage_->indices_.vector_index_.Empty()) {
-    r::for_each(properties, [&](auto &pair) {
-      if (auto converted = TryConvertToVectorIndexProperty(storage_, vertex_, pair.first, pair.second)) {
-        pair.second = std::move(*converted);
-      }
-    });
-  }
-
   // This has to be called before any object gets locked
   auto schema_acc = SchemaInfoAccessor(storage_, transaction_);
   auto guard = std::unique_lock{vertex_->lock};
@@ -640,7 +632,30 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> Vertex
 
   if (vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
-  const bool skip_duplicate_update = !storage_->config_.salient.items.delta_on_identical_property_update;
+  if (!transaction_->active_constraints_->type_->empty()) {
+    for (auto const &[property_id, property_value] : properties) {
+      if (auto validation_result =
+              transaction_->active_constraints_->type_->Validate(*vertex_, property_id, property_value);
+          !validation_result.has_value()) {
+        HandleTypeConstraintViolation(storage_, validation_result.error());
+      }
+    }
+  }
+
+  // Convert vector properties under vertex_->lock after type validation succeeds.
+  if (!storage_->indices_.vector_index_.Empty()) {
+    r::for_each(properties, [&](auto &pair) {
+      if (auto converted = TryConvertToVectorIndexProperty(storage_, vertex_, pair.first, pair.second)) {
+        pair.second = std::move(*converted);
+      } else if (PropertyStore::NeedsPrecisionNormalization()) {
+        pair.second = PropertyStore::NormalizeForStorage(pair.second);
+      }
+    });
+  } else if (PropertyStore::NeedsPrecisionNormalization()) {
+    r::for_each(properties, [&](auto &pair) { pair.second = PropertyStore::NormalizeForStorage(pair.second); });
+  }
+
+  const bool skip_duplicate_update = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   using ReturnType = decltype(vertex_->properties.UpdateProperties(properties));
   std::optional<ReturnType> id_old_new_change;
   utils::AtomicMemoryBlock([storage = storage_,
@@ -677,13 +692,6 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> Vertex
                        },
                        [](auto & /* unused */) { DMG_ASSERT(false, "Using the wrong accessor"); }},
                    *schema_acc);
-      }
-      // Validate type constraint using already-extracted value (avoids re-reading property store)
-      if (!transaction->active_constraints_->type_->empty()) {
-        if (auto validation_result = transaction->active_constraints_->type_->Validate(*vertex, id, new_value);
-            !validation_result.has_value()) {
-          HandleTypeConstraintViolation(storage, validation_result.error());
-        }
       }
     }
   });
@@ -836,6 +844,7 @@ Result<uint64_t> VertexAccessor::GetPropertySize(PropertyId property, View view)
     auto guard = std::shared_lock{vertex_->lock};
     Delta *delta = vertex_->delta();
     if (!delta) {
+      if (!for_deleted_ && vertex_->deleted()) return std::unexpected{Error::DELETED_OBJECT};
       return vertex_->properties.PropertySize(property);
     }
   }

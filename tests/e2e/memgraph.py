@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import copy
 import ctypes
+from datetime import datetime
 import json
 import logging
 import os
@@ -23,7 +24,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
 from typing import List, Optional
 
 import mgclient

@@ -11,9 +11,9 @@
 
 import typing
 
+from gqlalchemy import Memgraph
 import mgclient
 import pytest
-from gqlalchemy import Memgraph
 
 
 def execute_and_fetch_all(cursor: mgclient.Cursor, query: str, params: dict = {}) -> typing.List[tuple]:

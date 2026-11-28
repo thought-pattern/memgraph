@@ -11,53 +11,47 @@
 
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "mg_procedure.h"
 
-// Constants
-#define MAX_STRING_LENGTH 256
-#define MAX_PROPERTIES 16
-#define SMALL_MERGE_THRESHOLD 64
+#define INITIAL_CAPACITY 16
+#define SMALL_MERGE_BUCKETS 64
 #define HASH_TABLE_MIN_CAPACITY 8
 
-// Function names
 static const char *kProcedureToTree = "to_tree";
 
-// Parameter names
 static const char *kParameterPaths = "paths";
 static const char *kParameterConfig = "config";
 static const char *kParameterLowerCaseRels = "lowerCaseRels";
 
-// Return value name
 static const char *kReturnValue = "value";
 
-// Filter modes
 typedef enum { FILTER_MODE_INCLUDE, FILTER_MODE_EXCLUDE, FILTER_MODE_WILDCARD, FILTER_MODE_INVALID } filter_mode_t;
 
-// Generic property filter structure
 typedef struct {
   filter_mode_t mode;
-  char properties[MAX_PROPERTIES][MAX_STRING_LENGTH];
+  char **properties;
   size_t property_count;
+  size_t property_cap;
 } property_filter_t;
 
-// Node filter config structure
 typedef struct {
   size_t filter_count;
-  property_filter_t filters[MAX_PROPERTIES];
-  char labels[MAX_PROPERTIES][MAX_STRING_LENGTH];
+  size_t filter_cap;
+  property_filter_t *filters;
+  char **labels;
 } node_property_filter_config_t;
 
-// Relationship filter config structure
 typedef struct {
   size_t filter_count;
-  property_filter_t filters[MAX_PROPERTIES];
-  char rel_types[MAX_PROPERTIES][MAX_STRING_LENGTH];
+  size_t filter_cap;
+  property_filter_t *filters;
+  char **rel_types;
 } rel_property_filter_config_t;
 
-// Global filter config structure
 typedef struct {
   node_property_filter_config_t node_config;
   rel_property_filter_config_t rel_config;
@@ -65,324 +59,418 @@ typedef struct {
   bool has_rel_config;
 } filter_config_t;
 
-// Safe string length function
+typedef struct {
+  int64_t node_id;
+  int64_t edge_id;
+  struct mgp_map *map;
+  bool used;
+} bucket_t;
+
+typedef struct {
+  int64_t node_id;
+  int64_t edge_id;
+  bool valid;
+} merge_identity_t;
+
 static size_t safe_strlen(const char *str) { return str ? strlen(str) : 0; }
 
-// Safe string copy function
-static bool safe_strcpy(char *dest, const char *src, size_t dest_size) {
-  if (!dest || !src || dest_size == 0) {
+static bool alloc_bytes(struct mgp_memory *memory, size_t size, void **out_ptr) {
+  if (!memory || !out_ptr) {
     return false;
   }
-
-  size_t src_len = safe_strlen(src);
-  if (src_len >= dest_size) {
-    return false;  // Would overflow
+  size_t alloc_size = size == 0 ? 1 : size;
+  if (alloc_size > SIZE_MAX - 63ULL) {
+    return false;
   }
-
-  strcpy(dest, src);
+  alloc_size = (alloc_size + 63ULL) & ~63ULL;
+  void *ptr = NULL;
+  if (mgp_alloc(memory, alloc_size, &ptr) != MGP_ERROR_NO_ERROR || ptr == NULL) {
+    return false;
+  }
+  *out_ptr = ptr;
   return true;
 }
 
-// Safe string copy with truncation
-static bool safe_strcpy_truncate(char *dest, const char *src, size_t dest_size) {
-  if (!dest || !src || dest_size == 0) {
-    return false;
+static char *dup_cstr(const char *src, struct mgp_memory *memory) {
+  if (!src) {
+    return NULL;
   }
-
-  size_t src_len = safe_strlen(src);
-  if (src_len >= dest_size) {
-    // Truncate to fit
-    strncpy(dest, src, dest_size - 1);
-    dest[dest_size - 1] = '\0';
-  } else {
-    strcpy(dest, src);
+  size_t len = safe_strlen(src);
+  if (len == SIZE_MAX) {
+    return NULL;
   }
-  return true;
+  void *ptr = NULL;
+  if (!alloc_bytes(memory, len + 1, &ptr)) {
+    return NULL;
+  }
+  char *copy = (char *)ptr;
+  memcpy(copy, src, len + 1);
+  return copy;
 }
 
-// Safe string copy with dash removal
-static bool safe_strcpy_remove_dash(char *dest, const char *src, size_t dest_size) {
-  if (!dest || !src || dest_size == 0) {
-    return false;
+static char *dup_cstr_strip_dash(const char *src, struct mgp_memory *memory) {
+  if (!src || src[0] == '\0') {
+    return NULL;
   }
-
-  size_t src_len = safe_strlen(src);
-  if (src_len == 0) {
-    return false;
-  }
-
-  // Skip leading dash if present
-  const char *start = (src[0] == '-') ? src + 1 : src;
-  size_t actual_len = safe_strlen(start);
-
-  if (actual_len >= dest_size) {
-    // Truncate to fit
-    strncpy(dest, start, dest_size - 1);
-    dest[dest_size - 1] = '\0';
-  } else {
-    strcpy(dest, start);
-  }
-  return true;
+  const char *start = (src[0] == '-') ? (src + 1) : src;
+  return dup_cstr(start, memory);
 }
 
-// Helper function to convert string to lowercase
 static char *to_lowercase(const char *str, struct mgp_memory *memory) {
-  if (!str) return NULL;
+  if (!str) {
+    return NULL;
+  }
   size_t len = safe_strlen(str);
-  void *ptr;
-  // Align to 64 bytes
-  size_t alloc_size = len + 1;
-  alloc_size = (alloc_size + 63) & ~63ULL;
-  if (mgp_alloc(memory, alloc_size, &ptr) != MGP_ERROR_NO_ERROR) {
+  if (len == SIZE_MAX) {
+    return NULL;
+  }
+  void *ptr = NULL;
+  if (!alloc_bytes(memory, len + 1, &ptr)) {
     return NULL;
   }
   char *lower = (char *)ptr;
   for (size_t i = 0; i < len; i++) {
-    lower[i] = tolower(str[i]);
+    lower[i] = (char)tolower((unsigned char)str[i]);
   }
   lower[len] = '\0';
   return lower;
 }
 
-// Helper function to concatenate strings
-static char *concatenate_strings(const char *str1, const char *str2, struct mgp_memory *memory) {
-  if (!str1 || !str2) return NULL;
+static char *join_strings(const char *str1, const char *sep, const char *str2, struct mgp_memory *memory) {
+  if (!str1 || !sep || !str2) {
+    return NULL;
+  }
   size_t len1 = safe_strlen(str1);
+  size_t len_sep = safe_strlen(sep);
   size_t len2 = safe_strlen(str2);
+  if (len1 > SIZE_MAX - len_sep || (len1 + len_sep) > SIZE_MAX - len2 - 1) {
+    return NULL;
+  }
+  size_t total = len1 + len_sep + len2 + 1;
   void *ptr = NULL;
-  // Align to 64 bytes
-  size_t alloc_size = len1 + len2 + 1;
-  alloc_size = (alloc_size + 63) & ~63ULL;
-  if (mgp_alloc(memory, alloc_size, &ptr) != MGP_ERROR_NO_ERROR || ptr == NULL) {
+  if (!alloc_bytes(memory, total, &ptr)) {
     return NULL;
   }
-  char *result = (char *)ptr;
-
-  // Safe string operations
-  if (!safe_strcpy(result, str1, alloc_size)) {
-    mgp_free(memory, ptr);
-    return NULL;
-  }
-
-  if (!safe_strcpy(result + len1, str2, alloc_size - len1)) {
-    mgp_free(memory, ptr);
-    return NULL;
-  }
-
-  return result;
+  char *out = (char *)ptr;
+  memcpy(out, str1, len1);
+  memcpy(out + len1, sep, len_sep);
+  memcpy(out + len1 + len_sep, str2, len2 + 1);
+  return out;
 }
 
-typedef struct {
-  int64_t id;
-  uint64_t type_hash;
-  struct mgp_map *map;
-  bool used;
-} bucket_t;
+/* Inserts/replaces `key` in `map` by erasing any prior mapping first, then moving `*val`. */
+static bool map_put_move_borrowed(struct mgp_map *map, const char *key, struct mgp_value *val) {
+  if (!map || !key || !val) {
+    return false;
+  }
+  if (mgp_map_erase(map, key) != MGP_ERROR_NO_ERROR) {
+    return false;
+  }
+  return mgp_map_insert_move(map, key, val) == MGP_ERROR_NO_ERROR;
+}
 
-// Optimized hash function - combines type and id more efficiently
-static inline uint64_t optimized_hash(uint64_t type_hash, int64_t id) {
-  uint64_t h = type_hash;
-  h ^= (uint64_t)id;
+/* Inserts/replaces `key` in `map` by moving `*val`, then always destroys the standalone `val` wrapper. */
+static bool map_put_move_owned(struct mgp_map *map, const char *key, struct mgp_value *val) {
+  if (!val) {
+    return false;
+  }
+  bool ok = map_put_move_borrowed(map, key, val);
+  mgp_value_destroy(val);
+  return ok;
+}
+
+/* Appends `*val` into `list` by moving its payload, then always destroys the standalone `val` wrapper. */
+static bool list_append_move_owned(struct mgp_list *list, struct mgp_value *val) {
+  if (!list || !val) {
+    if (val) {
+      mgp_value_destroy(val);
+    }
+    return false;
+  }
+  enum mgp_error err = mgp_list_append_move(list, val);
+  mgp_value_destroy(val);
+  return err == MGP_ERROR_NO_ERROR;
+}
+
+static inline uint64_t hash_child_identity(int64_t node_id, int64_t edge_id) {
+  uint64_t h = 14695981039346656037ULL;
+  h ^= (uint64_t)node_id;
+  h *= 1099511628211ULL;
+  h ^= (uint64_t)edge_id;
   h *= 1099511628211ULL;
   return h;
 }
 
-// Optimized probe function with better collision handling
-static inline ssize_t optimized_probe(bucket_t *tbl, size_t cap, int64_t id, uint64_t type_hash, uint64_t h) {
+static inline ssize_t probe_child_bucket(bucket_t *tbl, size_t cap, int64_t node_id, int64_t edge_id, uint64_t h) {
   size_t mask = cap - 1;
   size_t pos = (size_t)h & mask;
-  size_t step = 1;
-
-  // Use quadratic probing for better distribution
-  while (true) {
-    if (!tbl[pos].used) return (ssize_t)pos;  // empty slot
-    if (tbl[pos].id == id && tbl[pos].type_hash == type_hash) return (ssize_t)pos;
-
-    // Quadratic probing: pos = (pos + step) & mask
-    pos = (pos + step) & mask;
-    step = (step + 1) & mask;  // increment step, but keep it within bounds
-    if (step == 0) step = 1;   // avoid step = 0
+  for (size_t probes = 0; probes < cap; ++probes) {
+    if (!tbl[pos].used) {
+      return (ssize_t)pos;
+    }
+    if (tbl[pos].node_id == node_id && tbl[pos].edge_id == edge_id) {
+      return (ssize_t)pos;
+    }
+    pos = (pos + 1) & mask;
   }
+  return -1;
 }
 
-// Helper function to check if a string is in the properties array
-static bool property_in_list(const char *prop_name, const char properties[][MAX_STRING_LENGTH], size_t count) {
+static bool property_in_list(const char *prop_name, char *const *properties, size_t count) {
   if (!prop_name) {
     return false;
   }
-
   for (size_t i = 0; i < count; i++) {
-    if (strcmp(prop_name, properties[i]) == 0) {
+    if (properties[i] && strcmp(prop_name, properties[i]) == 0) {
       return true;
     }
   }
   return false;
 }
 
-// Initialize property filter
 static void init_property_filter(property_filter_t *filter) {
   filter->mode = FILTER_MODE_INVALID;
+  filter->properties = NULL;
   filter->property_count = 0;
+  filter->property_cap = 0;
 }
 
-// Parse property filter from list
-static void parse_property_filter(property_filter_t *filter, struct mgp_list *props) {
+static void destroy_property_filter(property_filter_t *filter, struct mgp_memory *memory) {
+  if (!filter || !memory) {
+    return;
+  }
+  if (filter->properties) {
+    for (size_t i = 0; i < filter->property_count; i++) {
+      if (filter->properties[i]) {
+        mgp_free(memory, filter->properties[i]);
+      }
+    }
+    mgp_free(memory, filter->properties);
+  }
+  init_property_filter(filter);
+}
+
+static bool append_filter_property(property_filter_t *filter, char *owned_name, struct mgp_memory *memory) {
+  if (!owned_name) {
+    return false;
+  }
+  if (filter->property_count >= filter->property_cap) {
+    size_t next_cap = filter->property_cap == 0 ? INITIAL_CAPACITY : filter->property_cap * 2;
+    if (next_cap < filter->property_cap || next_cap > SIZE_MAX / sizeof(char *)) {
+      mgp_free(memory, owned_name);
+      return false;
+    }
+    void *new_buf = NULL;
+    if (!alloc_bytes(memory, next_cap * sizeof(char *), &new_buf)) {
+      mgp_free(memory, owned_name);
+      return false;
+    }
+    if (filter->properties) {
+      memcpy(new_buf, filter->properties, filter->property_count * sizeof(char *));
+      mgp_free(memory, filter->properties);
+    }
+    filter->properties = (char **)new_buf;
+    filter->property_cap = next_cap;
+  }
+  filter->properties[filter->property_count++] = owned_name;
+  return true;
+}
+
+static bool parse_property_filter(property_filter_t *filter, struct mgp_list *props, struct mgp_memory *memory) {
   init_property_filter(filter);
 
-  size_t list_size;
-  if (mgp_list_size(props, &list_size) != MGP_ERROR_NO_ERROR || list_size == 0) {
-    return;
+  size_t list_size = 0;
+  if (mgp_list_size(props, &list_size) != MGP_ERROR_NO_ERROR) {
+    return false;
+  }
+  if (list_size == 0) {
+    return true;
   }
 
-  // Check if all entries are strings
   for (size_t i = 0; i < list_size; i++) {
-    struct mgp_value *item;
-    if (mgp_list_at(props, i, &item) != MGP_ERROR_NO_ERROR) {
-      return;
+    struct mgp_value *item = NULL;
+    if (mgp_list_at(props, i, &item) != MGP_ERROR_NO_ERROR || item == NULL) {
+      return false;
     }
-    enum mgp_value_type item_type;
-    if (mgp_value_get_type(item, &item_type) != MGP_ERROR_NO_ERROR || item_type != MGP_VALUE_TYPE_STRING) {
-      return;
+    enum mgp_value_type item_type = MGP_VALUE_TYPE_NULL;
+    if (mgp_value_get_type(item, &item_type) != MGP_ERROR_NO_ERROR) {
+      return false;
+    }
+    if (item_type != MGP_VALUE_TYPE_STRING) {
+      /* Preserve invalid-filter semantics (mode stays FILTER_MODE_INVALID). */
+      return true;
     }
   }
 
-  // Get first item to determine mode
-  struct mgp_value *first_item;
-  if (mgp_list_at(props, 0, &first_item) != MGP_ERROR_NO_ERROR) {
-    return;
+  struct mgp_value *first_item = NULL;
+  if (mgp_list_at(props, 0, &first_item) != MGP_ERROR_NO_ERROR || first_item == NULL) {
+    return false;
   }
-  const char *first_str;
-  if (mgp_value_get_string(first_item, &first_str) != MGP_ERROR_NO_ERROR) {
-    return;
+  const char *first_str = NULL;
+  if (mgp_value_get_string(first_item, &first_str) != MGP_ERROR_NO_ERROR || first_str == NULL) {
+    return false;
   }
 
   if (strcmp(first_str, "*") == 0) {
     filter->mode = FILTER_MODE_WILDCARD;
-    return;
+    return true;
   }
 
-  if (first_str[0] == '-') {
-    filter->mode = FILTER_MODE_EXCLUDE;
-    for (size_t i = 0; i < list_size && i < MAX_PROPERTIES; i++) {
-      struct mgp_value *item;
-      if (mgp_list_at(props, i, &item) == MGP_ERROR_NO_ERROR) {
-        const char *val_str;
-        if (mgp_value_get_string(item, &val_str) == MGP_ERROR_NO_ERROR) {
-          if (safe_strcpy_remove_dash(filter->properties[filter->property_count], val_str, MAX_STRING_LENGTH)) {
-            filter->property_count++;
-          }
-        }
-      }
-    }
-    return;
-  }
+  bool is_exclude = (first_str[0] == '-');
+  filter->mode = is_exclude ? FILTER_MODE_EXCLUDE : FILTER_MODE_INCLUDE;
 
-  // Inclusion mode
-  filter->mode = FILTER_MODE_INCLUDE;
-  for (size_t i = 0; i < list_size && i < MAX_PROPERTIES; i++) {
-    struct mgp_value *item;
-    if (mgp_list_at(props, i, &item) == MGP_ERROR_NO_ERROR) {
-      const char *val_str;
-      if (mgp_value_get_string(item, &val_str) == MGP_ERROR_NO_ERROR) {
-        if (safe_strcpy_truncate(filter->properties[filter->property_count], val_str, MAX_STRING_LENGTH)) {
-          filter->property_count++;
-        }
-      }
+  for (size_t i = 0; i < list_size; i++) {
+    struct mgp_value *item = NULL;
+    if (mgp_list_at(props, i, &item) != MGP_ERROR_NO_ERROR || item == NULL) {
+      destroy_property_filter(filter, memory);
+      return false;
+    }
+    const char *val_str = NULL;
+    if (mgp_value_get_string(item, &val_str) != MGP_ERROR_NO_ERROR || val_str == NULL) {
+      destroy_property_filter(filter, memory);
+      return false;
+    }
+    if (is_exclude && (val_str[0] == '\0' || (val_str[0] == '-' && val_str[1] == '\0'))) {
+      continue;
+    }
+    char *copied = is_exclude ? dup_cstr_strip_dash(val_str, memory) : dup_cstr(val_str, memory);
+    if (!copied || !append_filter_property(filter, copied, memory)) {
+      destroy_property_filter(filter, memory);
+      return false;
     }
   }
+  return true;
 }
 
-// Get node property filter for a given label
 static const property_filter_t *get_node_property_filter(const node_property_filter_config_t *config,
                                                          const char *label) {
-  if (!config) {
+  if (!config || !label) {
     return NULL;
   }
-
   for (size_t i = 0; i < config->filter_count; i++) {
-    if (strcmp(config->labels[i], label) == 0) {
+    if (config->labels[i] && strcmp(config->labels[i], label) == 0) {
       return &config->filters[i];
     }
   }
-
-  // Return NULL if no filter found for this label
   return NULL;
 }
 
-// Check if node property should be included
 static bool should_include_node_property(const char *prop_name, const filter_config_t *filter_config,
-                                         struct mgp_vertex *node) {
+                                         struct mgp_vertex *node, bool *out_ok) {
+  *out_ok = true;
   if (!filter_config || !filter_config->has_node_config || !node) {
-    return true;  // No filtering config or invalid node: include all properties
-  }
-
-  // Get node labels with proper validation
-  size_t label_count = 0;
-  if (mgp_vertex_labels_count(node, &label_count) != MGP_ERROR_NO_ERROR) {
     return true;
   }
 
-  property_filter_t filters[MAX_PROPERTIES];
-  size_t filter_count = 0;
-  bool has_invalid_filter = false;
+  size_t label_count = 0;
+  if (mgp_vertex_labels_count(node, &label_count) != MGP_ERROR_NO_ERROR) {
+    *out_ok = false;
+    return false;
+  }
 
-  // Check each label for filters
+  size_t valid_filter_count = 0;
+  bool has_invalid_filter = false;
+  bool has_exclude_filter = false;
+  bool has_wildcard_filter = false;
+  bool included_by_any = false;
+
   for (size_t label_idx = 0; label_idx < label_count; label_idx++) {
     struct mgp_label label = {.name = NULL};
     if (mgp_vertex_label_at(node, label_idx, &label) != MGP_ERROR_NO_ERROR || !label.name) {
-      continue;  // Skip invalid labels
+      *out_ok = false;
+      return false;
     }
 
     const property_filter_t *filter = get_node_property_filter(&filter_config->node_config, label.name);
-    if (!filter) continue;
-    if (filter->mode != FILTER_MODE_INVALID && filter_count < MAX_PROPERTIES) {
-      filters[filter_count] = *filter;
-      filter_count++;
-    } else if (filter->mode == FILTER_MODE_INVALID) {
+    if (!filter) {
+      continue;
+    }
+    if (filter->mode == FILTER_MODE_INVALID) {
       has_invalid_filter = true;
+      continue;
+    }
+    valid_filter_count++;
+    if (filter->mode == FILTER_MODE_EXCLUDE) {
+      has_exclude_filter = true;
+      if (property_in_list(prop_name, filter->properties, filter->property_count)) {
+        return false;
+      }
+    } else if (filter->mode == FILTER_MODE_WILDCARD) {
+      has_wildcard_filter = true;
+    } else if (filter->mode == FILTER_MODE_INCLUDE) {
+      if (property_in_list(prop_name, filter->properties, filter->property_count)) {
+        included_by_any = true;
+      }
     }
   }
 
-  // If we have invalid filters, exclude all properties for affected labels
-  if (has_invalid_filter && filter_count == 0) {
+  if (has_invalid_filter && valid_filter_count == 0) {
     return false;
   }
-  if (filter_count == 0) {
+  if (valid_filter_count == 0) {
     return true;
   }
-
-  // Exclusion mode takes precedence if any filter is exclusion
-  for (size_t i = 0; i < filter_count; i++) {
-    if (filters[i].mode == FILTER_MODE_EXCLUDE) {
-      return !property_in_list(prop_name, filters[i].properties, filters[i].property_count);
-    }
+  if (has_exclude_filter) {
+    return true;
   }
-
-  // Wildcard mode if any filter is wildcard
-  for (size_t i = 0; i < filter_count; i++) {
-    if (filters[i].mode == FILTER_MODE_WILDCARD) {
-      return true;
-    }
+  if (has_wildcard_filter) {
+    return true;
   }
-
-  // Otherwise, inclusion mode: include if any filter includes the property
-  for (size_t i = 0; i < filter_count; i++) {
-    if (filters[i].mode == FILTER_MODE_INCLUDE &&
-        property_in_list(prop_name, filters[i].properties, filters[i].property_count)) {
-      return true;
-    }
-  }
-
-  return false;
+  return included_by_any;
 }
 
-// Initialize node property filter config
-static void init_node_property_filter_config(node_property_filter_config_t *config) { config->filter_count = 0; }
+static void init_node_property_filter_config(node_property_filter_config_t *config) {
+  config->filter_count = 0;
+  config->filter_cap = 0;
+  config->filters = NULL;
+  config->labels = NULL;
+}
 
-// Initialize relationship property filter config
-static void init_rel_property_filter_config(rel_property_filter_config_t *config) { config->filter_count = 0; }
+static void destroy_node_property_filter_config(node_property_filter_config_t *config, struct mgp_memory *memory) {
+  if (!config || !memory) {
+    return;
+  }
+  for (size_t i = 0; i < config->filter_count; i++) {
+    destroy_property_filter(&config->filters[i], memory);
+    if (config->labels && config->labels[i]) {
+      mgp_free(memory, config->labels[i]);
+    }
+  }
+  if (config->filters) {
+    mgp_free(memory, config->filters);
+  }
+  if (config->labels) {
+    mgp_free(memory, config->labels);
+  }
+  init_node_property_filter_config(config);
+}
 
-// Initialize global filter config
+static void init_rel_property_filter_config(rel_property_filter_config_t *config) {
+  config->filter_count = 0;
+  config->filter_cap = 0;
+  config->filters = NULL;
+  config->rel_types = NULL;
+}
+
+static void destroy_rel_property_filter_config(rel_property_filter_config_t *config, struct mgp_memory *memory) {
+  if (!config || !memory) {
+    return;
+  }
+  for (size_t i = 0; i < config->filter_count; i++) {
+    destroy_property_filter(&config->filters[i], memory);
+    if (config->rel_types && config->rel_types[i]) {
+      mgp_free(memory, config->rel_types[i]);
+    }
+  }
+  if (config->filters) {
+    mgp_free(memory, config->filters);
+  }
+  if (config->rel_types) {
+    mgp_free(memory, config->rel_types);
+  }
+  init_rel_property_filter_config(config);
+}
+
 static void init_filter_config(filter_config_t *config) {
   init_node_property_filter_config(&config->node_config);
   init_rel_property_filter_config(&config->rel_config);
@@ -390,167 +478,199 @@ static void init_filter_config(filter_config_t *config) {
   config->has_rel_config = false;
 }
 
-// Parse node property filter config from map
-static void parse_node_property_filter_config(node_property_filter_config_t *config, struct mgp_map *nodes_map,
-                                              struct mgp_memory *memory) {
-  init_node_property_filter_config(config);
-
-  if (!nodes_map) {
+static void destroy_filter_config(filter_config_t *config, struct mgp_memory *memory) {
+  if (!config || !memory) {
     return;
   }
-
-  struct mgp_map_items_iterator *iter = NULL;
-  if (mgp_map_iter_items(nodes_map, memory, &iter) != MGP_ERROR_NO_ERROR || iter == NULL) {
-    return;
-  }
-
-  struct mgp_map_item *item;
-  if (mgp_map_items_iterator_get(iter, &item) == MGP_ERROR_NO_ERROR && item != NULL) {
-    do {
-      const char *key_str;
-      if (mgp_map_item_key(item, &key_str) != MGP_ERROR_NO_ERROR || key_str == NULL) {
-        continue;
-      }
-
-      struct mgp_value *value;
-      if (mgp_map_item_value(item, &value) != MGP_ERROR_NO_ERROR || value == NULL) {
-        continue;
-      }
-
-      enum mgp_value_type value_type;
-      if (mgp_value_get_type(value, &value_type) != MGP_ERROR_NO_ERROR || value_type != MGP_VALUE_TYPE_LIST) {
-        continue;
-      }
-
-      struct mgp_list *props_list;
-      if (mgp_value_get_list(value, &props_list) != MGP_ERROR_NO_ERROR) {
-        continue;
-      }
-
-      if (config->filter_count < MAX_PROPERTIES) {
-        if (safe_strcpy_truncate(config->labels[config->filter_count], key_str, MAX_STRING_LENGTH)) {
-          parse_property_filter(&config->filters[config->filter_count], props_list);
-          config->filter_count++;
-        }
-      }
-    } while (mgp_map_items_iterator_next(iter, &item) == MGP_ERROR_NO_ERROR && item != NULL);
-  }
-  mgp_map_items_iterator_destroy(iter);
+  destroy_node_property_filter_config(&config->node_config, memory);
+  destroy_rel_property_filter_config(&config->rel_config, memory);
+  config->has_node_config = false;
+  config->has_rel_config = false;
 }
 
-// Parse relationship property filter config from map
-static void parse_rel_property_filter_config(rel_property_filter_config_t *config, struct mgp_map *rels_map,
-                                             struct mgp_memory *memory) {
-  init_rel_property_filter_config(config);
-
-  if (!rels_map) {
-    return;
+static bool ensure_filter_table_capacity(size_t count, size_t *cap, property_filter_t **filters, char ***names,
+                                         struct mgp_memory *memory) {
+  if (count < *cap) {
+    return true;
   }
-
-  struct mgp_map_items_iterator *iter = NULL;
-  if (mgp_map_iter_items(rels_map, memory, &iter) != MGP_ERROR_NO_ERROR || iter == NULL) {
-    return;
+  size_t next_cap = (*cap == 0) ? INITIAL_CAPACITY : (*cap * 2);
+  if (next_cap < *cap || next_cap > SIZE_MAX / sizeof(property_filter_t) || next_cap > SIZE_MAX / sizeof(char *)) {
+    return false;
   }
-
-  struct mgp_map_item *item;
-  if (mgp_map_items_iterator_get(iter, &item) == MGP_ERROR_NO_ERROR && item != NULL) {
-    do {
-      const char *key_str;
-      if (mgp_map_item_key(item, &key_str) != MGP_ERROR_NO_ERROR || key_str == NULL) {
-        continue;
-      }
-
-      struct mgp_value *value;
-      if (mgp_map_item_value(item, &value) != MGP_ERROR_NO_ERROR || value == NULL) {
-        continue;
-      }
-
-      enum mgp_value_type value_type;
-      if (mgp_value_get_type(value, &value_type) != MGP_ERROR_NO_ERROR || value_type != MGP_VALUE_TYPE_LIST) {
-        continue;
-      }
-
-      struct mgp_list *props_list;
-      if (mgp_value_get_list(value, &props_list) != MGP_ERROR_NO_ERROR) {
-        continue;
-      }
-
-      if (config->filter_count < MAX_PROPERTIES) {
-        if (safe_strcpy_truncate(config->rel_types[config->filter_count], key_str, MAX_STRING_LENGTH)) {
-          parse_property_filter(&config->filters[config->filter_count], props_list);
-          config->filter_count++;
-        }
-      }
-    } while (mgp_map_items_iterator_next(iter, &item) == MGP_ERROR_NO_ERROR && item != NULL);
+  void *new_filters = NULL;
+  void *new_names = NULL;
+  if (!alloc_bytes(memory, next_cap * sizeof(property_filter_t), &new_filters)) {
+    return false;
   }
-  mgp_map_items_iterator_destroy(iter);
+  if (!alloc_bytes(memory, next_cap * sizeof(char *), &new_names)) {
+    mgp_free(memory, new_filters);
+    return false;
+  }
+  if (*filters) {
+    memcpy(new_filters, *filters, count * sizeof(property_filter_t));
+    mgp_free(memory, *filters);
+  }
+  if (*names) {
+    memcpy(new_names, *names, count * sizeof(char *));
+    mgp_free(memory, *names);
+  }
+  *filters = (property_filter_t *)new_filters;
+  *names = (char **)new_names;
+  *cap = next_cap;
+  return true;
 }
 
-// Parse entire filter config once
-static void parse_filter_config(filter_config_t *filter_config, struct mgp_map *config, struct mgp_memory *memory) {
-  init_filter_config(filter_config);
-
-  if (!config) {
-    return;
+static bool parse_named_filter_map(struct mgp_map *filter_map, size_t *out_count, size_t *out_cap,
+                                   property_filter_t **out_filters, char ***out_names, struct mgp_memory *memory) {
+  if (!filter_map) {
+    return true;
   }
-
-  // Parse node filters
-  struct mgp_value *nodes_value = NULL;
-  if (mgp_map_at(config, "nodes", &nodes_value) == MGP_ERROR_NO_ERROR && nodes_value != NULL) {
-    enum mgp_value_type nodes_type = MGP_VALUE_TYPE_NULL;
-    if (mgp_value_get_type(nodes_value, &nodes_type) == MGP_ERROR_NO_ERROR && nodes_type == MGP_VALUE_TYPE_MAP) {
-      struct mgp_map *nodes_map = NULL;
-      if (mgp_value_get_map(nodes_value, &nodes_map) == MGP_ERROR_NO_ERROR && nodes_map != NULL) {
-        parse_node_property_filter_config(&filter_config->node_config, nodes_map, memory);
-        filter_config->has_node_config = true;
-      }
-    }
+  size_t map_sz = 0;
+  if (mgp_map_size(filter_map, &map_sz) != MGP_ERROR_NO_ERROR) {
+    return false;
   }
-
-  // Parse relationship filters
-  struct mgp_value *rels_value = NULL;
-  if (mgp_map_at(config, "rels", &rels_value) == MGP_ERROR_NO_ERROR && rels_value != NULL) {
-    enum mgp_value_type rels_type = MGP_VALUE_TYPE_NULL;
-    if (mgp_value_get_type(rels_value, &rels_type) == MGP_ERROR_NO_ERROR && rels_type == MGP_VALUE_TYPE_MAP) {
-      struct mgp_map *rels_map = NULL;
-      if (mgp_value_get_map(rels_value, &rels_map) == MGP_ERROR_NO_ERROR && rels_map != NULL) {
-        parse_rel_property_filter_config(&filter_config->rel_config, rels_map, memory);
-        filter_config->has_rel_config = true;
-      }
-    }
-  }
-}
-
-// Get relationship property filter for a given relationship type
-static const property_filter_t *get_rel_property_filter(const rel_property_filter_config_t *config,
-                                                        const char *rel_type) {
-  if (!config) {
-    return NULL;
-  }
-
-  for (size_t i = 0; i < config->filter_count; i++) {
-    if (strcmp(config->rel_types[i], rel_type) == 0) {
-      return &config->filters[i];
-    }
-  }
-
-  // Return NULL if no filter found for this relationship type
-  return NULL;
-}
-
-// Check if relationship property should be included
-static bool should_include_rel_property(const char *prop_name, const filter_config_t *filter_config,
-                                        const char *rel_type) {
-  if (!filter_config || !filter_config->has_rel_config) {
-    return true;  // No filtering config: include all properties
-  }
-
-  const property_filter_t *filter = get_rel_property_filter(&filter_config->rel_config, rel_type);
-
-  if (!filter) {
+  if (map_sz == 0) {
     return true;
   }
 
+  struct mgp_map_items_iterator *iter = NULL;
+  if (mgp_map_iter_items(filter_map, memory, &iter) != MGP_ERROR_NO_ERROR || iter == NULL) {
+    return false;
+  }
+
+  struct mgp_map_item *item = NULL;
+  enum mgp_error iter_err = mgp_map_items_iterator_get(iter, &item);
+  while (iter_err == MGP_ERROR_NO_ERROR && item != NULL) {
+    const char *key_str = NULL;
+    if (mgp_map_item_key(item, &key_str) != MGP_ERROR_NO_ERROR || key_str == NULL) {
+      mgp_map_items_iterator_destroy(iter);
+      return false;
+    }
+
+    struct mgp_value *value = NULL;
+    if (mgp_map_item_value(item, &value) != MGP_ERROR_NO_ERROR || value == NULL) {
+      mgp_map_items_iterator_destroy(iter);
+      return false;
+    }
+
+    enum mgp_value_type value_type = MGP_VALUE_TYPE_NULL;
+    if (mgp_value_get_type(value, &value_type) != MGP_ERROR_NO_ERROR) {
+      mgp_map_items_iterator_destroy(iter);
+      return false;
+    }
+
+    if (value_type == MGP_VALUE_TYPE_LIST) {
+      struct mgp_list *props_list = NULL;
+      if (mgp_value_get_list(value, &props_list) != MGP_ERROR_NO_ERROR || props_list == NULL) {
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+      if (!ensure_filter_table_capacity(*out_count, out_cap, out_filters, out_names, memory)) {
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+      char *copied_key = dup_cstr(key_str, memory);
+      if (!copied_key) {
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+      if (!parse_property_filter(&(*out_filters)[*out_count], props_list, memory)) {
+        mgp_free(memory, copied_key);
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+      (*out_names)[*out_count] = copied_key;
+      (*out_count)++;
+    }
+
+    iter_err = mgp_map_items_iterator_next(iter, &item);
+  }
+  mgp_map_items_iterator_destroy(iter);
+  return iter_err == MGP_ERROR_NO_ERROR;
+}
+
+static bool parse_filter_config(filter_config_t *filter_config, struct mgp_map *config, struct mgp_memory *memory) {
+  init_filter_config(filter_config);
+  if (!config) {
+    return true;
+  }
+
+  struct mgp_value *nodes_value = NULL;
+  if (mgp_map_at(config, "nodes", &nodes_value) != MGP_ERROR_NO_ERROR) {
+    return false;
+  }
+  if (nodes_value != NULL) {
+    enum mgp_value_type nodes_type = MGP_VALUE_TYPE_NULL;
+    if (mgp_value_get_type(nodes_value, &nodes_type) != MGP_ERROR_NO_ERROR) {
+      return false;
+    }
+    if (nodes_type == MGP_VALUE_TYPE_MAP) {
+      struct mgp_map *nodes_map = NULL;
+      if (mgp_value_get_map(nodes_value, &nodes_map) != MGP_ERROR_NO_ERROR || nodes_map == NULL) {
+        return false;
+      }
+      if (!parse_named_filter_map(nodes_map, &filter_config->node_config.filter_count,
+                                  &filter_config->node_config.filter_cap, &filter_config->node_config.filters,
+                                  &filter_config->node_config.labels, memory)) {
+        destroy_filter_config(filter_config, memory);
+        return false;
+      }
+      filter_config->has_node_config = true;
+    }
+  }
+
+  struct mgp_value *rels_value = NULL;
+  if (mgp_map_at(config, "rels", &rels_value) != MGP_ERROR_NO_ERROR) {
+    destroy_filter_config(filter_config, memory);
+    return false;
+  }
+  if (rels_value != NULL) {
+    enum mgp_value_type rels_type = MGP_VALUE_TYPE_NULL;
+    if (mgp_value_get_type(rels_value, &rels_type) != MGP_ERROR_NO_ERROR) {
+      destroy_filter_config(filter_config, memory);
+      return false;
+    }
+    if (rels_type == MGP_VALUE_TYPE_MAP) {
+      struct mgp_map *rels_map = NULL;
+      if (mgp_value_get_map(rels_value, &rels_map) != MGP_ERROR_NO_ERROR || rels_map == NULL) {
+        destroy_filter_config(filter_config, memory);
+        return false;
+      }
+      if (!parse_named_filter_map(rels_map, &filter_config->rel_config.filter_count,
+                                  &filter_config->rel_config.filter_cap, &filter_config->rel_config.filters,
+                                  &filter_config->rel_config.rel_types, memory)) {
+        destroy_filter_config(filter_config, memory);
+        return false;
+      }
+      filter_config->has_rel_config = true;
+    }
+  }
+
+  return true;
+}
+
+static const property_filter_t *get_rel_property_filter(const rel_property_filter_config_t *config,
+                                                        const char *rel_type) {
+  if (!config || !rel_type) {
+    return NULL;
+  }
+  for (size_t i = 0; i < config->filter_count; i++) {
+    if (config->rel_types[i] && strcmp(config->rel_types[i], rel_type) == 0) {
+      return &config->filters[i];
+    }
+  }
+  return NULL;
+}
+
+static bool should_include_rel_property(const char *prop_name, const filter_config_t *filter_config,
+                                        const char *rel_type) {
+  if (!filter_config || !filter_config->has_rel_config) {
+    return true;
+  }
+  const property_filter_t *filter = get_rel_property_filter(&filter_config->rel_config, rel_type);
+  if (!filter) {
+    return true;
+  }
   switch (filter->mode) {
     case FILTER_MODE_WILDCARD:
       return true;
@@ -563,295 +683,352 @@ static bool should_include_rel_property(const char *prop_name, const filter_conf
   }
 }
 
-// Forward declarations
-static void merge_list_into_list_hashed(struct mgp_list *existing_list, struct mgp_list *new_list,
-                                        struct mgp_memory *memory);
+static bool merge_trees(struct mgp_map *target, struct mgp_map *source, struct mgp_memory *memory);
 
-static void merge_trees(struct mgp_map *target, struct mgp_map *source, struct mgp_memory *memory);
-
-typedef struct {
-  int64_t id;
-  uint64_t type_hash;
-  bool valid;
-} merge_identity_t;
-
-/* Extracts (_id:int, _type:string) from a node/edge map item.
-   Returns .valid=false if anything is missing or types mismatch. */
-static inline merge_identity_t extract_identity(struct mgp_map *map) {
-  merge_identity_t out = {.id = 0, .type_hash = 0, .valid = false};
-  if (!map) return out;
-
-  struct mgp_value *id_v = NULL, *type_v = NULL;
-  if (mgp_map_at(map, "_id", &id_v) != MGP_ERROR_NO_ERROR || id_v == NULL) return out;
-  if (mgp_map_at(map, "_type", &type_v) != MGP_ERROR_NO_ERROR || type_v == NULL) return out;
-
-  enum mgp_value_type t_id = MGP_VALUE_TYPE_NULL, t_type = MGP_VALUE_TYPE_NULL;
-  if (mgp_value_get_type(id_v, &t_id) != MGP_ERROR_NO_ERROR || t_id != MGP_VALUE_TYPE_INT) return out;
-  if (mgp_value_get_type(type_v, &t_type) != MGP_ERROR_NO_ERROR) return out;
-
-  int64_t id;
-  uint64_t type_hash = 0;
-  if (mgp_value_get_int(id_v, &id) != MGP_ERROR_NO_ERROR) return out;
-
-  if (t_type == MGP_VALUE_TYPE_STRING) {
-    const char *type_s = NULL;
-    if (mgp_value_get_string(type_v, &type_s) != MGP_ERROR_NO_ERROR || !type_s) return out;
-    type_hash = 14695981039346656037ULL;
-    for (const char *p = type_s; *p; p++) {
-      type_hash ^= (unsigned char)*p;
-      type_hash *= 1099511628211ULL;
-    }
-  } else if (t_type == MGP_VALUE_TYPE_LIST) {
-    struct mgp_list *type_list = NULL;
-    if (mgp_value_get_list(type_v, &type_list) != MGP_ERROR_NO_ERROR || !type_list) return out;
-    size_t list_size = 0;
-    if (mgp_list_size(type_list, &list_size) != MGP_ERROR_NO_ERROR || list_size == 0) return out;
-
-    type_hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < list_size; i++) {
-      struct mgp_value *label_val = NULL;
-      if (mgp_list_at(type_list, i, &label_val) != MGP_ERROR_NO_ERROR || !label_val) return out;
-      const char *label_str = NULL;
-      if (mgp_value_get_string(label_val, &label_str) != MGP_ERROR_NO_ERROR || !label_str) return out;
-
-      for (const char *p = label_str; *p; p++) {
-        type_hash ^= (unsigned char)*p;
-        type_hash *= 1099511628211ULL;
-      }
-
-      // Concatenate strings using `:` as a delimiter, as we know that can't
-      // appear in the labels.
-      if (i < list_size - 1) {
-        type_hash ^= ':';
-        type_hash *= 1099511628211ULL;
-      }
-    }
-  } else {
+static inline merge_identity_t extract_child_identity(struct mgp_map *map, const char *rel_id_key) {
+  merge_identity_t out = {.node_id = 0, .edge_id = 0, .valid = false};
+  if (!map || !rel_id_key) {
     return out;
   }
 
-  out.id = id;
-  out.type_hash = type_hash;
+  struct mgp_value *id_v = NULL;
+  struct mgp_value *edge_id_v = NULL;
+  if (mgp_map_at(map, "_id", &id_v) != MGP_ERROR_NO_ERROR || id_v == NULL) {
+    return out;
+  }
+  if (mgp_map_at(map, rel_id_key, &edge_id_v) != MGP_ERROR_NO_ERROR || edge_id_v == NULL) {
+    return out;
+  }
+
+  enum mgp_value_type t_id = MGP_VALUE_TYPE_NULL;
+  enum mgp_value_type t_edge = MGP_VALUE_TYPE_NULL;
+  if (mgp_value_get_type(id_v, &t_id) != MGP_ERROR_NO_ERROR || t_id != MGP_VALUE_TYPE_INT) {
+    return out;
+  }
+  if (mgp_value_get_type(edge_id_v, &t_edge) != MGP_ERROR_NO_ERROR || t_edge != MGP_VALUE_TYPE_INT) {
+    return out;
+  }
+
+  int64_t node_id = 0;
+  int64_t edge_id = 0;
+  if (mgp_value_get_int(id_v, &node_id) != MGP_ERROR_NO_ERROR) {
+    return out;
+  }
+  if (mgp_value_get_int(edge_id_v, &edge_id) != MGP_ERROR_NO_ERROR) {
+    return out;
+  }
+
+  out.node_id = node_id;
+  out.edge_id = edge_id;
   out.valid = true;
   return out;
 }
 
-/* Build a hash table over existing_list's map items keyed by (_id,_type). cap is power-of-two. */
-static bool index_existing_children(struct mgp_list *existing_list, bucket_t *tbl, size_t cap) {
-  size_t n = 0;
-  if (mgp_list_size(existing_list, &n) != MGP_ERROR_NO_ERROR) return false;
-  for (size_t i = 0; i < n; ++i) {
-    struct mgp_value *item_v = NULL;
-    if (mgp_list_at(existing_list, i, &item_v) != MGP_ERROR_NO_ERROR || !item_v) continue;
-    enum mgp_value_type t = MGP_VALUE_TYPE_NULL;
-    if (mgp_value_get_type(item_v, &t) != MGP_ERROR_NO_ERROR || t != MGP_VALUE_TYPE_MAP) continue;
-    struct mgp_map *m = NULL;
-    if (mgp_value_get_map(item_v, &m) != MGP_ERROR_NO_ERROR || !m) continue;
-
-    merge_identity_t id = extract_identity(m);
-    if (!id.valid) continue;
-
-    /* Use optimized hash function */
-    uint64_t h = optimized_hash(id.type_hash, id.id);
-
-    ssize_t pos = optimized_probe(tbl, cap, id.id, id.type_hash, h);
-    if (pos < 0) return false;
-    if (!tbl[pos].used) {
-      tbl[pos].used = true;
-      tbl[pos].id = id.id;
-      tbl[pos].type_hash = id.type_hash;
-      tbl[pos].map = m;
+/* Returns true iff `val` is a non-empty list of child subtrees for relationship `rel_key`. */
+static bool is_rel_child_list_value(struct mgp_value *val, const char *rel_id_key, bool *out_ok) {
+  *out_ok = true;
+  if (!val || !rel_id_key) {
+    return false;
+  }
+  enum mgp_value_type vt = MGP_VALUE_TYPE_NULL;
+  if (mgp_value_get_type(val, &vt) != MGP_ERROR_NO_ERROR) {
+    *out_ok = false;
+    return false;
+  }
+  if (vt != MGP_VALUE_TYPE_LIST) {
+    return false;
+  }
+  struct mgp_list *lst = NULL;
+  if (mgp_value_get_list(val, &lst) != MGP_ERROR_NO_ERROR || !lst) {
+    *out_ok = false;
+    return false;
+  }
+  size_t sz = 0;
+  if (mgp_list_size(lst, &sz) != MGP_ERROR_NO_ERROR) {
+    *out_ok = false;
+    return false;
+  }
+  if (sz == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < sz; ++i) {
+    struct mgp_value *elem = NULL;
+    if (mgp_list_at(lst, i, &elem) != MGP_ERROR_NO_ERROR || !elem) {
+      *out_ok = false;
+      return false;
     }
-    /* if it already existed, we ignore duplicates in existing_list */
+    enum mgp_value_type et = MGP_VALUE_TYPE_NULL;
+    if (mgp_value_get_type(elem, &et) != MGP_ERROR_NO_ERROR) {
+      *out_ok = false;
+      return false;
+    }
+    if (et != MGP_VALUE_TYPE_MAP) {
+      return false;
+    }
+    struct mgp_map *em = NULL;
+    if (mgp_value_get_map(elem, &em) != MGP_ERROR_NO_ERROR || !em) {
+      *out_ok = false;
+      return false;
+    }
+    merge_identity_t cid = extract_child_identity(em, rel_id_key);
+    if (!cid.valid) {
+      return false;
+    }
   }
   return true;
 }
 
-/* Optimized merge for small lists using stack-allocated hash table */
-static void merge_list_into_list_small(struct mgp_list *existing_list, struct mgp_list *new_list,
-                                       struct mgp_memory *memory) {
-  size_t exist_n = 0, new_n = 0;
-  if (mgp_list_size(existing_list, &exist_n) != MGP_ERROR_NO_ERROR) return;
-  if (mgp_list_size(new_list, &new_n) != MGP_ERROR_NO_ERROR) return;
-  if (new_n == 0) return;
-
-  // Use stack-allocated hash table for small merges
-  bucket_t small_table[SMALL_MERGE_THRESHOLD];
-  memset(small_table, 0, sizeof(small_table));
-
-  // Index existing children using small table
-  if (!index_existing_children(existing_list, small_table, SMALL_MERGE_THRESHOLD)) {
-    return;
+static bool index_existing_children(struct mgp_list *existing_list, const char *rel_id_key, bucket_t *tbl, size_t cap) {
+  size_t n = 0;
+  if (mgp_list_size(existing_list, &n) != MGP_ERROR_NO_ERROR) {
+    return false;
   }
-
-  // Process new items
-  for (size_t i = 0; i < new_n; ++i) {
-    struct mgp_value *new_item = NULL;
-    if (mgp_list_at(new_list, i, &new_item) != MGP_ERROR_NO_ERROR || !new_item) continue;
-
-    enum mgp_value_type tnew = MGP_VALUE_TYPE_NULL;
-    if (mgp_value_get_type(new_item, &tnew) != MGP_ERROR_NO_ERROR) continue;
-
-    if (tnew == MGP_VALUE_TYPE_MAP) {
-      struct mgp_map *new_map = NULL;
-      if (mgp_value_get_map(new_item, &new_map) != MGP_ERROR_NO_ERROR || !new_map) {
-        mgp_list_append_move(existing_list, new_item);
-        continue;
-      }
-
-      merge_identity_t nid = extract_identity(new_map);
-      if (!nid.valid) {
-        mgp_list_append_move(existing_list, new_item);
-        continue;
-      }
-
-      uint64_t h = optimized_hash(nid.type_hash, nid.id);
-      ssize_t pos = optimized_probe(small_table, SMALL_MERGE_THRESHOLD, nid.id, nid.type_hash, h);
-
-      if (pos >= 0 && small_table[pos].used) {
-        /* Merge into existing */
-        merge_trees(small_table[pos].map, new_map, memory);
-      } else {
-        /* Append and index */
-        mgp_list_append_move(existing_list, new_item);
-        if (pos >= 0) {
-          small_table[pos].used = true;
-          small_table[pos].id = nid.id;
-          small_table[pos].type_hash = nid.type_hash;
-          small_table[pos].map = new_map;
-        }
-      }
-    } else {
-      /* Non-map items: just append, as before. */
-      mgp_list_append_move(existing_list, new_item);
+  for (size_t i = 0; i < n; ++i) {
+    struct mgp_value *item_v = NULL;
+    if (mgp_list_at(existing_list, i, &item_v) != MGP_ERROR_NO_ERROR || !item_v) {
+      return false;
+    }
+    struct mgp_map *m = NULL;
+    if (mgp_value_get_map(item_v, &m) != MGP_ERROR_NO_ERROR || !m) {
+      return false;
+    }
+    merge_identity_t id = extract_child_identity(m, rel_id_key);
+    if (!id.valid) {
+      continue;
+    }
+    uint64_t h = hash_child_identity(id.node_id, id.edge_id);
+    ssize_t pos = probe_child_bucket(tbl, cap, id.node_id, id.edge_id, h);
+    if (pos < 0) {
+      return false;
+    }
+    if (!tbl[pos].used) {
+      tbl[pos].used = true;
+      tbl[pos].node_id = id.node_id;
+      tbl[pos].edge_id = id.edge_id;
+      tbl[pos].map = m;
     }
   }
+  return true;
 }
 
-/* Merges new_list into existing_list by hashing existing_list.
-   Average O(n) with low constants; preserves old behavior. */
-static void merge_list_into_list_hashed(struct mgp_list *existing_list, struct mgp_list *new_list,
-                                        struct mgp_memory *memory) {
-  size_t exist_n = 0, new_n = 0;
-  if (mgp_list_size(existing_list, &exist_n) != MGP_ERROR_NO_ERROR) return;
-  if (mgp_list_size(new_list, &new_n) != MGP_ERROR_NO_ERROR) return;
-  if (new_n == 0) return;
-
-  // Use optimized small merge for small lists
-  if (exist_n < SMALL_MERGE_THRESHOLD) {
-    merge_list_into_list_small(existing_list, new_list, memory);
-    return;
+static bool merge_child_lists_hashed(struct mgp_list *existing_list, struct mgp_list *new_list, const char *rel_id_key,
+                                     struct mgp_memory *memory) {
+  size_t exist_n = 0;
+  size_t new_n = 0;
+  if (mgp_list_size(existing_list, &exist_n) != MGP_ERROR_NO_ERROR) {
+    return false;
+  }
+  if (mgp_list_size(new_list, &new_n) != MGP_ERROR_NO_ERROR) {
+    return false;
+  }
+  if (new_n == 0) {
+    return true;
+  }
+  if (exist_n > SIZE_MAX - new_n) {
+    return false;
+  }
+  size_t total_possible = exist_n + new_n;
+  if (mgp_list_reserve(existing_list, total_possible) != MGP_ERROR_NO_ERROR) {
+    return false;
   }
 
-  /* Capacity: next power of two >= 2*exist_n (at least 8). */
   size_t cap = HASH_TABLE_MIN_CAPACITY;
-  while (cap < (exist_n << 1)) cap <<= 1;
+  if (total_possible > (SIZE_MAX >> 2)) {
+    return false;
+  }
+  while (cap < (total_possible << 1)) {
+    cap <<= 1;
+  }
 
+  bucket_t stack_tbl[SMALL_MERGE_BUCKETS];
   bucket_t *tbl = NULL;
-  size_t bytes = cap * sizeof(bucket_t);
-  void *ptr = NULL;
-  if (mgp_alloc(memory, bytes, &ptr) != MGP_ERROR_NO_ERROR || !ptr) {
-    /* Fallback to optimized small merge instead of O(n²) */
-    merge_list_into_list_small(existing_list, new_list, memory);
-    return;
+  bool heap_tbl = false;
+  if (cap <= SMALL_MERGE_BUCKETS) {
+    cap = SMALL_MERGE_BUCKETS;
+    memset(stack_tbl, 0, sizeof(stack_tbl));
+    tbl = stack_tbl;
+  } else {
+    if (cap > SIZE_MAX / sizeof(bucket_t)) {
+      return false;
+    }
+    void *ptr = NULL;
+    if (!alloc_bytes(memory, cap * sizeof(bucket_t), &ptr)) {
+      return false;
+    }
+    tbl = (bucket_t *)ptr;
+    memset(tbl, 0, cap * sizeof(bucket_t));
+    heap_tbl = true;
   }
 
-  tbl = (bucket_t *)ptr;
-  memset(tbl, 0, bytes);
-  if (!index_existing_children(existing_list, tbl, cap)) {
-    mgp_free(memory, tbl);
-    return;
+  if (!index_existing_children(existing_list, rel_id_key, tbl, cap)) {
+    if (heap_tbl) {
+      mgp_free(memory, tbl);
+    }
+    return false;
   }
 
-  /* For each new child: merge or append, updating the index when appending. */
   for (size_t i = 0; i < new_n; ++i) {
     struct mgp_value *new_item = NULL;
-    if (mgp_list_at(new_list, i, &new_item) != MGP_ERROR_NO_ERROR || !new_item) continue;
-
-    enum mgp_value_type tnew = MGP_VALUE_TYPE_NULL;
-    if (mgp_value_get_type(new_item, &tnew) != MGP_ERROR_NO_ERROR) continue;
-
-    if (tnew == MGP_VALUE_TYPE_MAP) {
-      struct mgp_map *new_map = NULL;
-      if (mgp_value_get_map(new_item, &new_map) != MGP_ERROR_NO_ERROR || !new_map) {
-        mgp_list_append_move(existing_list, new_item);
-        continue;
+    if (mgp_list_at(new_list, i, &new_item) != MGP_ERROR_NO_ERROR || !new_item) {
+      if (heap_tbl) {
+        mgp_free(memory, tbl);
       }
-
-      merge_identity_t nid = extract_identity(new_map);
-      if (!nid.valid) {
-        mgp_list_append_move(existing_list, new_item);
-        continue;
+      return false;
+    }
+    struct mgp_map *new_map = NULL;
+    if (mgp_value_get_map(new_item, &new_map) != MGP_ERROR_NO_ERROR || !new_map) {
+      if (heap_tbl) {
+        mgp_free(memory, tbl);
       }
+      return false;
+    }
+    merge_identity_t nid = extract_child_identity(new_map, rel_id_key);
+    if (!nid.valid) {
+      if (heap_tbl) {
+        mgp_free(memory, tbl);
+      }
+      return false;
+    }
 
-      uint64_t h = optimized_hash(nid.type_hash, nid.id);
-      ssize_t pos = optimized_probe(tbl, cap, nid.id, nid.type_hash, h);
+    uint64_t h = hash_child_identity(nid.node_id, nid.edge_id);
+    ssize_t pos = probe_child_bucket(tbl, cap, nid.node_id, nid.edge_id, h);
+    if (pos < 0) {
+      if (heap_tbl) {
+        mgp_free(memory, tbl);
+      }
+      return false;
+    }
 
-      if (pos >= 0 && tbl[pos].used) {
-        /* Merge into existing */
-        merge_trees(tbl[pos].map, new_map, memory);
-      } else {
-        /* Append and index */
-        /* NOTE: we need the map pointer after append, so keep it now. */
-        mgp_list_append_move(existing_list, new_item);
-        if (pos >= 0) {
-          tbl[pos].used = true;
-          tbl[pos].id = nid.id;
-          tbl[pos].type_hash = nid.type_hash;
-          tbl[pos].map = new_map;
+    if (tbl[pos].used) {
+      if (!merge_trees(tbl[pos].map, new_map, memory)) {
+        if (heap_tbl) {
+          mgp_free(memory, tbl);
         }
+        return false;
       }
     } else {
-      /* Non-map items: just append, as before. */
-      mgp_list_append_move(existing_list, new_item);
+      if (mgp_list_append_move(existing_list, new_item) != MGP_ERROR_NO_ERROR) {
+        if (heap_tbl) {
+          mgp_free(memory, tbl);
+        }
+        return false;
+      }
+      size_t cur_sz = 0;
+      struct mgp_value *appended_val = NULL;
+      struct mgp_map *appended_map = NULL;
+      if (mgp_list_size(existing_list, &cur_sz) != MGP_ERROR_NO_ERROR || cur_sz == 0 ||
+          mgp_list_at(existing_list, cur_sz - 1, &appended_val) != MGP_ERROR_NO_ERROR || !appended_val ||
+          mgp_value_get_map(appended_val, &appended_map) != MGP_ERROR_NO_ERROR || !appended_map) {
+        if (heap_tbl) {
+          mgp_free(memory, tbl);
+        }
+        return false;
+      }
+      tbl[pos].used = true;
+      tbl[pos].node_id = nid.node_id;
+      tbl[pos].edge_id = nid.edge_id;
+      tbl[pos].map = appended_map;
     }
   }
 
-  mgp_free(memory, tbl);
-}
-
-static void merge_trees(struct mgp_map *target, struct mgp_map *source, struct mgp_memory *memory) {
-  struct mgp_map_items_iterator *iter;
-  if (mgp_map_iter_items(source, memory, &iter) != MGP_ERROR_NO_ERROR || !iter) return;
-
-  struct mgp_map_item *item;
-  if (mgp_map_items_iterator_get(iter, &item) == MGP_ERROR_NO_ERROR && item) {
-    do {
-      const char *key_str = NULL;
-      if (mgp_map_item_key(item, &key_str) != MGP_ERROR_NO_ERROR || !key_str) continue;
-
-      /* Skip metadata keys */
-      if (key_str[0] == '_' && (strcmp(key_str, "_type") == 0 || strcmp(key_str, "_id") == 0)) continue;
-
-      struct mgp_value *src_val = NULL;
-      if (mgp_map_item_value(item, &src_val) != MGP_ERROR_NO_ERROR || !src_val) continue;
-
-      struct mgp_value *dst_val = NULL;
-      if (mgp_map_at(target, key_str, &dst_val) == MGP_ERROR_NO_ERROR && dst_val) {
-        enum mgp_value_type td = MGP_VALUE_TYPE_NULL, ts = MGP_VALUE_TYPE_NULL;
-        if (mgp_value_get_type(dst_val, &td) == MGP_ERROR_NO_ERROR &&
-            mgp_value_get_type(src_val, &ts) == MGP_ERROR_NO_ERROR && td == MGP_VALUE_TYPE_LIST &&
-            ts == MGP_VALUE_TYPE_LIST) {
-          struct mgp_list *dst_list = NULL, *src_list = NULL;
-          if (mgp_value_get_list(dst_val, &dst_list) == MGP_ERROR_NO_ERROR &&
-              mgp_value_get_list(src_val, &src_list) == MGP_ERROR_NO_ERROR && dst_list && src_list) {
-            /* Optimized merge: hash-based */
-            merge_list_into_list_hashed(dst_list, src_list, memory);
-          }
-        } else {
-          /* If types mismatch or not lists, last one wins (keep old behavior: overwrite by insert_move?) */
-          /* We mimic original intent: when key exists and both are lists, we merge; otherwise ignore. */
-        }
-      } else {
-        /* Direct move insert when key doesn't exist */
-        mgp_map_insert_move(target, key_str, src_val);
-      }
-    } while (mgp_map_items_iterator_next(iter, &item) == MGP_ERROR_NO_ERROR && item);
+  if (heap_tbl) {
+    mgp_free(memory, tbl);
   }
-  mgp_map_items_iterator_destroy(iter);
+  return true;
 }
 
-// Helper function to create a complete node map with properties and labels
+static bool merge_trees(struct mgp_map *target, struct mgp_map *source, struct mgp_memory *memory) {
+  if (!target || !source || !memory) {
+    return false;
+  }
+  size_t source_sz = 0;
+  if (mgp_map_size(source, &source_sz) != MGP_ERROR_NO_ERROR) {
+    return false;
+  }
+  if (source_sz == 0) {
+    return true;
+  }
+
+  struct mgp_map_items_iterator *iter = NULL;
+  if (mgp_map_iter_items(source, memory, &iter) != MGP_ERROR_NO_ERROR || !iter) {
+    return false;
+  }
+
+  struct mgp_map_item *item = NULL;
+  enum mgp_error iter_err = mgp_map_items_iterator_get(iter, &item);
+  while (iter_err == MGP_ERROR_NO_ERROR && item != NULL) {
+    const char *key_str = NULL;
+    if (mgp_map_item_key(item, &key_str) != MGP_ERROR_NO_ERROR || !key_str) {
+      mgp_map_items_iterator_destroy(iter);
+      return false;
+    }
+
+    if (strcmp(key_str, "_type") == 0 || strcmp(key_str, "_id") == 0) {
+      iter_err = mgp_map_items_iterator_next(iter, &item);
+      continue;
+    }
+
+    struct mgp_value *src_val = NULL;
+    if (mgp_map_item_value(item, &src_val) != MGP_ERROR_NO_ERROR || !src_val) {
+      mgp_map_items_iterator_destroy(iter);
+      return false;
+    }
+
+    struct mgp_value *dst_val = NULL;
+    if (mgp_map_at(target, key_str, &dst_val) != MGP_ERROR_NO_ERROR) {
+      mgp_map_items_iterator_destroy(iter);
+      return false;
+    }
+
+    if (dst_val != NULL) {
+      char *rel_id_key = join_strings(key_str, ".", "_id", memory);
+      if (!rel_id_key) {
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+      bool ok_dst = true;
+      bool ok_src = true;
+      bool dst_is_rel = is_rel_child_list_value(dst_val, rel_id_key, &ok_dst);
+      bool src_is_rel = is_rel_child_list_value(src_val, rel_id_key, &ok_src);
+      if (!ok_dst || !ok_src) {
+        mgp_free(memory, rel_id_key);
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+
+      if (dst_is_rel && src_is_rel) {
+        struct mgp_list *dst_list = NULL;
+        struct mgp_list *src_list = NULL;
+        if (mgp_value_get_list(dst_val, &dst_list) != MGP_ERROR_NO_ERROR ||
+            mgp_value_get_list(src_val, &src_list) != MGP_ERROR_NO_ERROR || !dst_list || !src_list ||
+            !merge_child_lists_hashed(dst_list, src_list, rel_id_key, memory)) {
+          mgp_free(memory, rel_id_key);
+          mgp_map_items_iterator_destroy(iter);
+          return false;
+        }
+      } else if (!dst_is_rel && src_is_rel) {
+        /* Relationship child list takes precedence over a colliding scalar/list node property. */
+        if (!map_put_move_borrowed(target, key_str, src_val)) {
+          mgp_free(memory, rel_id_key);
+          mgp_map_items_iterator_destroy(iter);
+          return false;
+        }
+      }
+      mgp_free(memory, rel_id_key);
+    } else {
+      if (mgp_map_insert_move(target, key_str, src_val) != MGP_ERROR_NO_ERROR) {
+        mgp_map_items_iterator_destroy(iter);
+        return false;
+      }
+    }
+
+    iter_err = mgp_map_items_iterator_next(iter, &item);
+  }
+
+  mgp_map_items_iterator_destroy(iter);
+  return iter_err == MGP_ERROR_NO_ERROR;
+}
+
 static struct mgp_map *create_complete_node_map(struct mgp_vertex *node, const filter_config_t *filter_config,
                                                 struct mgp_memory *memory) {
   if (!node || !memory) {
@@ -863,67 +1040,119 @@ static struct mgp_map *create_complete_node_map(struct mgp_vertex *node, const f
     return NULL;
   }
 
-  // Add node properties with filtering
   struct mgp_properties_iterator *iter = NULL;
-  enum mgp_error error = mgp_vertex_iter_properties(node, memory, &iter);
-  if (error == MGP_ERROR_NO_ERROR && iter) {
-    struct mgp_property *prop = NULL;
-    if (mgp_properties_iterator_get(iter, &prop) == MGP_ERROR_NO_ERROR && prop != NULL) {
-      do {
-        // Check if property should be included based on filtering
-        if (should_include_node_property(prop->name, filter_config, node)) {
-          mgp_map_insert_move(node_map, prop->name, prop->value);  // inputs are copied, so should be okay to move
-        }
-      } while (mgp_properties_iterator_next(iter, &prop) == MGP_ERROR_NO_ERROR && prop != NULL);
+  if (mgp_vertex_iter_properties(node, memory, &iter) != MGP_ERROR_NO_ERROR || !iter) {
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+
+  struct mgp_property *prop = NULL;
+  enum mgp_error prop_err = mgp_properties_iterator_get(iter, &prop);
+  while (prop_err == MGP_ERROR_NO_ERROR && prop != NULL) {
+    if (!prop->name || !prop->value) {
+      mgp_properties_iterator_destroy(iter);
+      mgp_map_destroy(node_map);
+      return NULL;
     }
-    mgp_properties_iterator_destroy(iter);
+    if (strcmp(prop->name, "_id") != 0 && strcmp(prop->name, "_type") != 0) {
+      bool filter_ok = true;
+      bool include_prop = should_include_node_property(prop->name, filter_config, node, &filter_ok);
+      if (!filter_ok) {
+        mgp_properties_iterator_destroy(iter);
+        mgp_map_destroy(node_map);
+        return NULL;
+      }
+      if (include_prop) {
+        if (!map_put_move_borrowed(node_map, prop->name, prop->value)) {
+          mgp_properties_iterator_destroy(iter);
+          mgp_map_destroy(node_map);
+          return NULL;
+        }
+      }
+    }
+    prop_err = mgp_properties_iterator_next(iter, &prop);
+  }
+  mgp_properties_iterator_destroy(iter);
+  if (prop_err != MGP_ERROR_NO_ERROR) {
+    mgp_map_destroy(node_map);
+    return NULL;
   }
 
   size_t label_count = 0;
-  if (mgp_vertex_labels_count(node, &label_count) == MGP_ERROR_NO_ERROR && label_count > 0) {
-    if (label_count == 1) {
-      // Single label
+  if (mgp_vertex_labels_count(node, &label_count) != MGP_ERROR_NO_ERROR) {
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+  if (label_count == 1) {
+    struct mgp_label label = {.name = NULL};
+    if (mgp_vertex_label_at(node, 0, &label) != MGP_ERROR_NO_ERROR || !label.name) {
+      mgp_map_destroy(node_map);
+      return NULL;
+    }
+    struct mgp_value *type_value = NULL;
+    if (mgp_value_make_string(label.name, memory, &type_value) != MGP_ERROR_NO_ERROR || type_value == NULL) {
+      mgp_map_destroy(node_map);
+      return NULL;
+    }
+    if (!map_put_move_owned(node_map, "_type", type_value)) {
+      mgp_map_destroy(node_map);
+      return NULL;
+    }
+  } else if (label_count > 1) {
+    struct mgp_list *label_list = NULL;
+    if (mgp_list_make_empty(label_count, memory, &label_list) != MGP_ERROR_NO_ERROR || label_list == NULL) {
+      mgp_map_destroy(node_map);
+      return NULL;
+    }
+    for (size_t i = 0; i < label_count; i++) {
       struct mgp_label label = {.name = NULL};
-      if (mgp_vertex_label_at(node, 0, &label) == MGP_ERROR_NO_ERROR && label.name) {
-        struct mgp_value *type_value = NULL;
-        if (mgp_value_make_string(label.name, memory, &type_value) == MGP_ERROR_NO_ERROR && type_value != NULL) {
-          mgp_map_insert_move(node_map, "_type", type_value);
-        }
+      if (mgp_vertex_label_at(node, i, &label) != MGP_ERROR_NO_ERROR || !label.name) {
+        mgp_list_destroy(label_list);
+        mgp_map_destroy(node_map);
+        return NULL;
       }
-    } else {
-      // Multiple labels - create a list
-      struct mgp_list *label_list = NULL;
-      if (mgp_list_make_empty(label_count, memory, &label_list) == MGP_ERROR_NO_ERROR && label_list != NULL) {
-        for (size_t i = 0; i < label_count; i++) {
-          struct mgp_label label = {.name = NULL};
-          if (mgp_vertex_label_at(node, i, &label) == MGP_ERROR_NO_ERROR && label.name) {
-            struct mgp_value *label_value = NULL;
-            if (mgp_value_make_string(label.name, memory, &label_value) == MGP_ERROR_NO_ERROR && label_value != NULL) {
-              mgp_list_append_move(label_list, label_value);
-            }
-          }
-        }
-        struct mgp_value *type_value = NULL;
-        if (mgp_value_make_list(label_list, &type_value) == MGP_ERROR_NO_ERROR && type_value != NULL) {
-          mgp_map_insert_move(node_map, "_type", type_value);
-        }
+      struct mgp_value *label_value = NULL;
+      if (mgp_value_make_string(label.name, memory, &label_value) != MGP_ERROR_NO_ERROR || label_value == NULL) {
+        mgp_list_destroy(label_list);
+        mgp_map_destroy(node_map);
+        return NULL;
       }
+      if (!list_append_move_owned(label_list, label_value)) {
+        mgp_list_destroy(label_list);
+        mgp_map_destroy(node_map);
+        return NULL;
+      }
+    }
+    struct mgp_value *type_value = NULL;
+    if (mgp_value_make_list(label_list, &type_value) != MGP_ERROR_NO_ERROR || type_value == NULL) {
+      mgp_list_destroy(label_list);
+      mgp_map_destroy(node_map);
+      return NULL;
+    }
+    if (!map_put_move_owned(node_map, "_type", type_value)) {
+      mgp_map_destroy(node_map);
+      return NULL;
     }
   }
 
-  // Add node ID
   struct mgp_vertex_id id;
-  if (mgp_vertex_get_id(node, &id) == MGP_ERROR_NO_ERROR) {
-    struct mgp_value *id_value = NULL;
-    if (mgp_value_make_int(id.as_int, memory, &id_value) == MGP_ERROR_NO_ERROR && id_value != NULL) {
-      mgp_map_insert_move(node_map, "_id", id_value);
-    }
+  if (mgp_vertex_get_id(node, &id) != MGP_ERROR_NO_ERROR) {
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+  struct mgp_value *id_value = NULL;
+  if (mgp_value_make_int(id.as_int, memory, &id_value) != MGP_ERROR_NO_ERROR || id_value == NULL) {
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+  if (!map_put_move_owned(node_map, "_id", id_value)) {
+    mgp_map_destroy(node_map);
+    return NULL;
   }
 
   return node_map;
 }
 
-// Helper function to build tree from a single path recursively
 static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, size_t start_index, bool lower_case_rels,
                                                         const filter_config_t *filter_config,
                                                         struct mgp_memory *memory) {
@@ -931,13 +1160,11 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     return NULL;
   }
 
-  // Get current node
   struct mgp_vertex *current_node = NULL;
   if (mgp_path_vertex_at(path, start_index, &current_node) != MGP_ERROR_NO_ERROR || current_node == NULL) {
     return NULL;
   }
 
-  // Create node map with properties and labels
   struct mgp_map *node_map = create_complete_node_map(current_node, filter_config, memory);
   if (!node_map) {
     return NULL;
@@ -949,7 +1176,6 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     return NULL;
   }
 
-  // If this is the last node in the path, return just the node
   if (start_index >= path_size) {
     struct mgp_value *result = NULL;
     if (mgp_value_make_map(node_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
@@ -959,14 +1185,12 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     return result;
   }
 
-  // Get the relationship
   struct mgp_edge *edge = NULL;
   if (mgp_path_edge_at(path, start_index, &edge) != MGP_ERROR_NO_ERROR || edge == NULL) {
     mgp_map_destroy(node_map);
     return NULL;
   }
 
-  // Get relationship type
   struct mgp_edge_type edge_type = {.name = NULL};
   if (mgp_edge_get_type(edge, &edge_type) != MGP_ERROR_NO_ERROR || edge_type.name == NULL) {
     mgp_map_destroy(node_map);
@@ -974,12 +1198,6 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
   }
 
   const char *rel_type_str = edge_type.name;
-  if (!rel_type_str) {
-    mgp_map_destroy(node_map);
-    return NULL;
-  }
-
-  // Process relationship type (lowercase if requested)
   char *rel_type_processed = (char *)rel_type_str;
   if (lower_case_rels) {
     rel_type_processed = to_lowercase(rel_type_str, memory);
@@ -989,7 +1207,6 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     }
   }
 
-  // Recursively build the subtree for the next part of the path
   struct mgp_value *subtree_value =
       build_tree_from_path_recursive(path, start_index + 1, lower_case_rels, filter_config, memory);
   if (!subtree_value) {
@@ -1000,48 +1217,112 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     return NULL;
   }
 
-  // Add relationship ID to the subtree
-  struct mgp_edge_id edge_id;
-  if (mgp_edge_get_id(edge, &edge_id) == MGP_ERROR_NO_ERROR) {
-    char *id_key = concatenate_strings(rel_type_processed, "._id", memory);
-    if (id_key) {
-      struct mgp_value *id_value = NULL;
-      if (mgp_value_make_int(edge_id.as_int, memory, &id_value) == MGP_ERROR_NO_ERROR && id_value != NULL) {
-        // Get the subtree map to add the ID
-        struct mgp_map *subtree_map = NULL;
-        if (mgp_value_get_map(subtree_value, &subtree_map) == MGP_ERROR_NO_ERROR && subtree_map != NULL) {
-          mgp_map_insert_move(subtree_map, id_key, id_value);
-          // mgp_value_destroy(id_value);
-        }
-      }
-      mgp_free(memory, id_key);
+  struct mgp_map *subtree_map = NULL;
+  if (mgp_value_get_map(subtree_value, &subtree_map) != MGP_ERROR_NO_ERROR || subtree_map == NULL) {
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
     }
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
   }
 
-  // Add relationship properties to the subtree with filtering
   struct mgp_properties_iterator *iter = NULL;
-  enum mgp_error error = mgp_edge_iter_properties(edge, memory, &iter);
-  if (error == MGP_ERROR_NO_ERROR && iter) {
-    struct mgp_property *prop = NULL;
-    if (mgp_properties_iterator_get(iter, &prop) == MGP_ERROR_NO_ERROR && prop) {
-      do {
-        if (should_include_rel_property(prop->name, filter_config, rel_type_processed)) {
-          /* Build key "<rel>.<prop>" without heap allocs */
-          char keybuf[(MAX_STRING_LENGTH * 2) + 2];
-          int nw = snprintf(keybuf, sizeof(keybuf), "%s.%s", rel_type_processed, prop->name);
-          if (nw > 0 && (size_t)nw < sizeof(keybuf)) {
-            struct mgp_map *subtree_map = NULL;
-            if (mgp_value_get_map(subtree_value, &subtree_map) == MGP_ERROR_NO_ERROR && subtree_map) {
-              mgp_map_insert_move(subtree_map, keybuf, prop->value);
-            }
-          }
-        }
-      } while (mgp_properties_iterator_next(iter, &prop) == MGP_ERROR_NO_ERROR && prop);
+  if (mgp_edge_iter_properties(edge, memory, &iter) != MGP_ERROR_NO_ERROR || !iter) {
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
     }
-    mgp_properties_iterator_destroy(iter);
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
   }
 
-  // Create list for this relationship type
+  struct mgp_property *prop = NULL;
+  enum mgp_error prop_err = mgp_properties_iterator_get(iter, &prop);
+  while (prop_err == MGP_ERROR_NO_ERROR && prop != NULL) {
+    if (!prop->name || !prop->value) {
+      mgp_properties_iterator_destroy(iter);
+      if (lower_case_rels && rel_type_processed != rel_type_str) {
+        mgp_free(memory, rel_type_processed);
+      }
+      mgp_value_destroy(subtree_value);
+      mgp_map_destroy(node_map);
+      return NULL;
+    }
+    if (strcmp(prop->name, "_id") != 0 && should_include_rel_property(prop->name, filter_config, rel_type_processed)) {
+      char *qual_key = join_strings(rel_type_processed, ".", prop->name, memory);
+      if (!qual_key) {
+        mgp_properties_iterator_destroy(iter);
+        if (lower_case_rels && rel_type_processed != rel_type_str) {
+          mgp_free(memory, rel_type_processed);
+        }
+        mgp_value_destroy(subtree_value);
+        mgp_map_destroy(node_map);
+        return NULL;
+      }
+      bool put_ok = map_put_move_borrowed(subtree_map, qual_key, prop->value);
+      mgp_free(memory, qual_key);
+      if (!put_ok) {
+        mgp_properties_iterator_destroy(iter);
+        if (lower_case_rels && rel_type_processed != rel_type_str) {
+          mgp_free(memory, rel_type_processed);
+        }
+        mgp_value_destroy(subtree_value);
+        mgp_map_destroy(node_map);
+        return NULL;
+      }
+    }
+    prop_err = mgp_properties_iterator_next(iter, &prop);
+  }
+  mgp_properties_iterator_destroy(iter);
+  if (prop_err != MGP_ERROR_NO_ERROR) {
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
+    }
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+
+  struct mgp_edge_id edge_id;
+  if (mgp_edge_get_id(edge, &edge_id) != MGP_ERROR_NO_ERROR) {
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
+    }
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+  char *id_key = join_strings(rel_type_processed, ".", "_id", memory);
+  if (!id_key) {
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
+    }
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+  struct mgp_value *id_value = NULL;
+  if (mgp_value_make_int(edge_id.as_int, memory, &id_value) != MGP_ERROR_NO_ERROR || id_value == NULL) {
+    mgp_free(memory, id_key);
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
+    }
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+  bool id_put_ok = map_put_move_owned(subtree_map, id_key, id_value);
+  mgp_free(memory, id_key);
+  if (!id_put_ok) {
+    if (lower_case_rels && rel_type_processed != rel_type_str) {
+      mgp_free(memory, rel_type_processed);
+    }
+    mgp_value_destroy(subtree_value);
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
+
   struct mgp_list *rel_list = NULL;
   if (mgp_list_make_empty(1, memory, &rel_list) != MGP_ERROR_NO_ERROR || rel_list == NULL) {
     if (lower_case_rels && rel_type_processed != rel_type_str) {
@@ -1052,19 +1333,15 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     return NULL;
   }
 
-  // Add the subtree to the relationship list
-  if (mgp_list_append_move(rel_list, subtree_value) != MGP_ERROR_NO_ERROR) {
+  if (!list_append_move_owned(rel_list, subtree_value)) {
     if (lower_case_rels && rel_type_processed != rel_type_str) {
       mgp_free(memory, rel_type_processed);
     }
     mgp_list_destroy(rel_list);
-    mgp_value_destroy(subtree_value);
     mgp_map_destroy(node_map);
     return NULL;
   }
-  // Don't destroy subtree_value - it was moved
 
-  // Add relationship list to node map
   struct mgp_value *rel_list_value = NULL;
   if (mgp_value_make_list(rel_list, &rel_list_value) != MGP_ERROR_NO_ERROR || rel_list_value == NULL) {
     if (lower_case_rels && rel_type_processed != rel_type_str) {
@@ -1075,14 +1352,15 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
     return NULL;
   }
 
-  mgp_map_insert_move(node_map, rel_type_processed, rel_list_value);
-  // Don't destroy rel_list_value - it was moved
-
+  bool rel_put_ok = map_put_move_owned(node_map, rel_type_processed, rel_list_value);
   if (lower_case_rels && rel_type_processed != rel_type_str) {
     mgp_free(memory, rel_type_processed);
   }
+  if (!rel_put_ok) {
+    mgp_map_destroy(node_map);
+    return NULL;
+  }
 
-  // Convert node map to value
   struct mgp_value *result = NULL;
   if (mgp_value_make_map(node_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
     mgp_map_destroy(node_map);
@@ -1092,117 +1370,134 @@ static struct mgp_value *build_tree_from_path_recursive(struct mgp_path *path, s
   return result;
 }
 
-// Helper function to build tree from a single path (wrapper for backward compatibility)
 static struct mgp_value *build_simple_tree_from_path(struct mgp_path *path, bool lower_case_rels,
                                                      const filter_config_t *filter_config, struct mgp_memory *memory) {
   return build_tree_from_path_recursive(path, 0, lower_case_rels, filter_config, memory);
 }
 
-// Main tree conversion function
+static struct mgp_value *make_empty_map_value(struct mgp_memory *memory) {
+  struct mgp_map *empty_map = NULL;
+  if (mgp_unordered_map_make_empty(memory, &empty_map) != MGP_ERROR_NO_ERROR || empty_map == NULL) {
+    return NULL;
+  }
+  struct mgp_value *result = NULL;
+  if (mgp_value_make_map(empty_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
+    mgp_map_destroy(empty_map);
+    return NULL;
+  }
+  return result;
+}
+
+static void destroy_root_groups(struct mgp_value **root_groups, int64_t *root_ids, size_t count,
+                                struct mgp_memory *memory) {
+  if (root_groups) {
+    for (size_t i = 0; i < count; i++) {
+      if (root_groups[i]) {
+        mgp_value_destroy(root_groups[i]);
+      }
+    }
+    mgp_free(memory, root_groups);
+  }
+  if (root_ids) {
+    mgp_free(memory, root_ids);
+  }
+}
+
 static struct mgp_value *convert_to_tree_impl(struct mgp_value *value, bool lower_case_rels, struct mgp_map *config,
                                               struct mgp_memory *memory) {
-  // Parse filter config once at the start
   filter_config_t filter_config;
-  parse_filter_config(&filter_config, config, memory);
+  if (!parse_filter_config(&filter_config, config, memory)) {
+    return NULL;
+  }
+
   if (!value) {
-    // Null input: return empty map
-    struct mgp_map *empty_map = NULL;
-    if (mgp_unordered_map_make_empty(memory, &empty_map) != MGP_ERROR_NO_ERROR || empty_map == NULL) {
-      return NULL;
-    }
-    struct mgp_value *result = NULL;
-    if (mgp_value_make_map(empty_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
-      mgp_map_destroy(empty_map);
-      return NULL;
-    }
-    return result;
+    destroy_filter_config(&filter_config, memory);
+    return make_empty_map_value(memory);
   }
 
   enum mgp_value_type value_type = MGP_VALUE_TYPE_NULL;
   if (mgp_value_get_type(value, &value_type) != MGP_ERROR_NO_ERROR) {
+    destroy_filter_config(&filter_config, memory);
     return NULL;
   }
 
   if (value_type == MGP_VALUE_TYPE_NULL) {
-    // Null input: return empty map
-    struct mgp_map *empty_map = NULL;
-    if (mgp_unordered_map_make_empty(memory, &empty_map) != MGP_ERROR_NO_ERROR || empty_map == NULL) {
-      return NULL;
-    }
-    struct mgp_value *result = NULL;
-    if (mgp_value_make_map(empty_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
-      mgp_map_destroy(empty_map);
-      return NULL;
-    }
-    return result;
+    destroy_filter_config(&filter_config, memory);
+    return make_empty_map_value(memory);
   }
 
-  // Handle different input types
   if (value_type == MGP_VALUE_TYPE_PATH) {
-    // Convert single path to tree
     struct mgp_path *path = NULL;
     if (mgp_value_get_path(value, &path) != MGP_ERROR_NO_ERROR || path == NULL) {
+      destroy_filter_config(&filter_config, memory);
       return NULL;
     }
-    return build_simple_tree_from_path(path, lower_case_rels, &filter_config, memory);
+    struct mgp_value *single_res = build_simple_tree_from_path(path, lower_case_rels, &filter_config, memory);
+    destroy_filter_config(&filter_config, memory);
+    return single_res;
   }
 
   if (value_type == MGP_VALUE_TYPE_LIST) {
-    // Convert list of paths to tree
     struct mgp_list *paths = NULL;
     if (mgp_value_get_list(value, &paths) != MGP_ERROR_NO_ERROR || paths == NULL) {
+      destroy_filter_config(&filter_config, memory);
       return NULL;
     }
 
     size_t paths_size = 0;
     if (mgp_list_size(paths, &paths_size) != MGP_ERROR_NO_ERROR) {
+      destroy_filter_config(&filter_config, memory);
       return NULL;
     }
 
     if (paths_size == 0) {
-      // Empty list: return empty map
-      struct mgp_map *empty_map = NULL;
-      if (mgp_unordered_map_make_empty(memory, &empty_map) != MGP_ERROR_NO_ERROR || empty_map == NULL) {
-        return NULL;
-      }
-      struct mgp_value *result = NULL;
-      if (mgp_value_make_map(empty_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
-        mgp_map_destroy(empty_map);
-        return NULL;
-      }
-      return result;
+      destroy_filter_config(&filter_config, memory);
+      return make_empty_map_value(memory);
     }
 
-    // Group paths by root node ID to build separate trees
-    struct mgp_map *root_groups[MAX_PROPERTIES];  // Map from root_id to tree
+    struct mgp_value **root_groups = NULL;
+    int64_t *root_ids = NULL;
     size_t root_group_count = 0;
-    int64_t root_ids[MAX_PROPERTIES];
+    size_t root_group_cap = 0;
 
     for (size_t i = 0; i < paths_size; i++) {
       struct mgp_value *path_value = NULL;
       if (mgp_list_at(paths, i, &path_value) != MGP_ERROR_NO_ERROR || path_value == NULL) {
-        continue;
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        destroy_filter_config(&filter_config, memory);
+        return NULL;
+      }
+
+      enum mgp_value_type elem_type = MGP_VALUE_TYPE_NULL;
+      if (mgp_value_get_type(path_value, &elem_type) != MGP_ERROR_NO_ERROR || elem_type != MGP_VALUE_TYPE_PATH) {
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        destroy_filter_config(&filter_config, memory);
+        return NULL;
       }
 
       struct mgp_path *path = NULL;
       if (mgp_value_get_path(path_value, &path) != MGP_ERROR_NO_ERROR || path == NULL) {
-        continue;
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        destroy_filter_config(&filter_config, memory);
+        return NULL;
       }
 
-      // Get root node ID
       struct mgp_vertex *root_node = NULL;
       if (mgp_path_vertex_at(path, 0, &root_node) != MGP_ERROR_NO_ERROR || root_node == NULL) {
-        continue;
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        destroy_filter_config(&filter_config, memory);
+        return NULL;
       }
 
       struct mgp_vertex_id root_id;
       if (mgp_vertex_get_id(root_node, &root_id) != MGP_ERROR_NO_ERROR) {
-        continue;
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        destroy_filter_config(&filter_config, memory);
+        return NULL;
       }
 
-      // Find existing root group or create new one
       size_t group_index = SIZE_MAX;
-      for (size_t j = 0; j < root_group_count && j < MAX_PROPERTIES; j++) {
+      for (size_t j = 0; j < root_group_count; j++) {
         if (root_ids[j] == root_id.as_int) {
           group_index = j;
           break;
@@ -1210,9 +1505,38 @@ static struct mgp_value *convert_to_tree_impl(struct mgp_value *value, bool lowe
       }
 
       if (group_index == SIZE_MAX) {
-        // New root group
-        if (root_group_count >= MAX_PROPERTIES) {
-          continue;  // Too many root groups
+        if (root_group_count >= root_group_cap) {
+          size_t next_cap = root_group_cap == 0 ? INITIAL_CAPACITY : root_group_cap * 2;
+          if (next_cap < root_group_cap || next_cap > SIZE_MAX / sizeof(struct mgp_value *) ||
+              next_cap > SIZE_MAX / sizeof(int64_t)) {
+            destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+            destroy_filter_config(&filter_config, memory);
+            return NULL;
+          }
+          void *new_groups = NULL;
+          void *new_ids = NULL;
+          if (!alloc_bytes(memory, next_cap * sizeof(struct mgp_value *), &new_groups)) {
+            destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+            destroy_filter_config(&filter_config, memory);
+            return NULL;
+          }
+          if (!alloc_bytes(memory, next_cap * sizeof(int64_t), &new_ids)) {
+            mgp_free(memory, new_groups);
+            destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+            destroy_filter_config(&filter_config, memory);
+            return NULL;
+          }
+          if (root_groups) {
+            memcpy(new_groups, root_groups, root_group_count * sizeof(struct mgp_value *));
+            mgp_free(memory, root_groups);
+          }
+          if (root_ids) {
+            memcpy(new_ids, root_ids, root_group_count * sizeof(int64_t));
+            mgp_free(memory, root_ids);
+          }
+          root_groups = (struct mgp_value **)new_groups;
+          root_ids = (int64_t *)new_ids;
+          root_group_cap = next_cap;
         }
         group_index = root_group_count;
         root_ids[group_index] = root_id.as_int;
@@ -1220,86 +1544,60 @@ static struct mgp_value *convert_to_tree_impl(struct mgp_value *value, bool lowe
         root_group_count++;
       }
 
-      // Convert this path to a tree
       struct mgp_value *tree_value = build_simple_tree_from_path(path, lower_case_rels, &filter_config, memory);
       if (!tree_value) {
-        continue;
-      }
-
-      // Get the tree map
-      struct mgp_map *tree_map = NULL;
-      if (mgp_value_get_map(tree_value, &tree_map) != MGP_ERROR_NO_ERROR || tree_map == NULL) {
-        mgp_value_destroy(tree_value);
-        continue;
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        destroy_filter_config(&filter_config, memory);
+        return NULL;
       }
 
       if (root_groups[group_index] == NULL) {
-        // First tree for this root, use it as the base
-        root_groups[group_index] = tree_map;
-        // Don't destroy tree_value here since we're keeping the map
+        root_groups[group_index] = tree_value;
       } else {
-        // Merge with existing tree for this root
-        merge_trees(root_groups[group_index], tree_map, memory);
+        struct mgp_map *existing_map = NULL;
+        struct mgp_map *tree_map = NULL;
+        if (mgp_value_get_map(root_groups[group_index], &existing_map) != MGP_ERROR_NO_ERROR || !existing_map ||
+            mgp_value_get_map(tree_value, &tree_map) != MGP_ERROR_NO_ERROR || !tree_map ||
+            !merge_trees(existing_map, tree_map, memory)) {
+          mgp_value_destroy(tree_value);
+          destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+          destroy_filter_config(&filter_config, memory);
+          return NULL;
+        }
         mgp_value_destroy(tree_value);
       }
     }
 
+    destroy_filter_config(&filter_config, memory);
+
     if (root_group_count == 0) {
-      // No valid paths found, return empty map
-      struct mgp_map *empty_map = NULL;
-      if (mgp_unordered_map_make_empty(memory, &empty_map) != MGP_ERROR_NO_ERROR || empty_map == NULL) {
-        return NULL;
-      }
-      struct mgp_value *result = NULL;
-      if (mgp_value_make_map(empty_map, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
-        mgp_map_destroy(empty_map);
-        return NULL;
-      }
-      return result;
+      destroy_root_groups(root_groups, root_ids, 0, memory);
+      return make_empty_map_value(memory);
     }
 
     if (root_group_count == 1) {
-      if (root_groups[0] == NULL) {
-        return NULL;
-      }
-      // Single root: return the tree directly
-      struct mgp_value *result = NULL;
-      if (mgp_value_make_map(root_groups[0], &result) != MGP_ERROR_NO_ERROR || result == NULL) {
-        mgp_map_destroy(root_groups[0]);
-        return NULL;
-      }
-      return result;
+      struct mgp_value *single_root = root_groups[0];
+      root_groups[0] = NULL;
+      destroy_root_groups(root_groups, root_ids, 1, memory);
+      return single_root;
     }
 
-    // Multiple roots: return a list of all root trees
     struct mgp_list *tree_list = NULL;
     if (mgp_list_make_empty(root_group_count, memory, &tree_list) != MGP_ERROR_NO_ERROR || tree_list == NULL) {
-      // Clean up on error
-      for (size_t i = 0; i < root_group_count && i < MAX_PROPERTIES; i++) {
-        if (root_groups[i]) {
-          mgp_map_destroy(root_groups[i]);
-        }
-      }
+      destroy_root_groups(root_groups, root_ids, root_group_count, memory);
       return NULL;
     }
 
-    for (size_t i = 0; i < root_group_count && i < MAX_PROPERTIES; i++) {
-      if (root_groups[i]) {
-        struct mgp_value *tree_value = NULL;
-        if (mgp_value_make_map(root_groups[i], &tree_value) != MGP_ERROR_NO_ERROR || tree_value == NULL) {
-          mgp_list_destroy(tree_list);
-          // Clean up remaining trees
-          for (size_t j = i; j < root_group_count && j < MAX_PROPERTIES; j++) {
-            if (root_groups[j]) {
-              mgp_map_destroy(root_groups[j]);
-            }
-          }
-          return NULL;
-        }
-        mgp_list_append_move(tree_list, tree_value);
-        // Don't destroy tree_value - it was moved
+    for (size_t i = 0; i < root_group_count; i++) {
+      struct mgp_value *root_val = root_groups[i];
+      root_groups[i] = NULL;
+      if (!list_append_move_owned(tree_list, root_val)) {
+        mgp_list_destroy(tree_list);
+        destroy_root_groups(root_groups, root_ids, root_group_count, memory);
+        return NULL;
       }
     }
+    destroy_root_groups(root_groups, root_ids, root_group_count, memory);
 
     struct mgp_value *result = NULL;
     if (mgp_value_make_list(tree_list, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
@@ -1309,7 +1607,8 @@ static struct mgp_value *convert_to_tree_impl(struct mgp_value *value, bool lowe
     return result;
   }
 
-  // For other types, return as-is
+  destroy_filter_config(&filter_config, memory);
+
   struct mgp_value *result = NULL;
   if (mgp_value_copy(value, memory, &result) != MGP_ERROR_NO_ERROR || result == NULL) {
     return NULL;
@@ -1317,9 +1616,9 @@ static struct mgp_value *convert_to_tree_impl(struct mgp_value *value, bool lowe
   return result;
 }
 
-// Main to_tree procedure implementation
 static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_result *result,
                     struct mgp_memory *memory) {
+  (void)graph;
   size_t args_size = 0;
   if (mgp_list_size(args, &args_size) != MGP_ERROR_NO_ERROR) {
     mgp_result_set_error_msg(result, "Failed to get arguments size");
@@ -1331,14 +1630,12 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
     return;
   }
 
-  // Get the input argument
   struct mgp_value *input = NULL;
   if (mgp_list_at(args, 0, &input) != MGP_ERROR_NO_ERROR || input == NULL) {
     mgp_result_set_error_msg(result, "Failed to get input argument");
     return;
   }
 
-  // Get lowerCaseRels parameter (default to true)
   bool lower_case_rels = true;
   if (args_size > 1) {
     struct mgp_value *lower_case_arg = NULL;
@@ -1353,7 +1650,6 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
     }
   }
 
-  // Get config parameter (default to empty map)
   struct mgp_map *config = NULL;
   if (args_size > 2) {
     struct mgp_value *config_arg = NULL;
@@ -1366,21 +1662,18 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
         }
         size_t size = 0;
         if (mgp_map_size(config, &size) == MGP_ERROR_NO_ERROR && size == 0) {
-          // Config map is empty, set to NULL
           config = NULL;
         }
       }
     }
   }
 
-  // Convert the input value to tree structure
   struct mgp_value *result_value = convert_to_tree_impl(input, lower_case_rels, config, memory);
   if (!result_value) {
     mgp_result_set_error_msg(result, "Failed to convert input to tree");
     return;
   }
 
-  // Handle multiple results (APOC behavior for multiple roots)
   enum mgp_value_type result_type = MGP_VALUE_TYPE_NULL;
   if (mgp_value_get_type(result_value, &result_type) != MGP_ERROR_NO_ERROR) {
     mgp_value_destroy(result_value);
@@ -1389,7 +1682,6 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
   }
 
   if (result_type == MGP_VALUE_TYPE_LIST) {
-    // Multiple roots: yield one record per root
     struct mgp_list *result_list = NULL;
     if (mgp_value_get_list(result_value, &result_list) != MGP_ERROR_NO_ERROR || result_list == NULL) {
       mgp_value_destroy(result_value);
@@ -1407,7 +1699,9 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
     for (size_t i = 0; i < list_size; i++) {
       struct mgp_value *tree_value = NULL;
       if (mgp_list_at(result_list, i, &tree_value) != MGP_ERROR_NO_ERROR || tree_value == NULL) {
-        continue;
+        mgp_value_destroy(result_value);
+        mgp_result_set_error_msg(result, "Failed to get result tree entry");
+        return;
       }
 
       struct mgp_result_record *record = NULL;
@@ -1425,7 +1719,6 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
     }
     mgp_value_destroy(result_value);
   } else {
-    // Single root: yield one record
     struct mgp_result_record *record = NULL;
     if (mgp_result_new_record(result, &record) != MGP_ERROR_NO_ERROR || record == NULL) {
       mgp_value_destroy(result_value);
@@ -1442,15 +1735,12 @@ static void to_tree(struct mgp_list *args, struct mgp_graph *graph, struct mgp_r
   }
 }
 
-// Module initialization
 int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
-  // Add the to_tree procedure
   struct mgp_proc *proc = NULL;
   if (mgp_module_add_read_procedure(module, kProcedureToTree, to_tree, &proc) != MGP_ERROR_NO_ERROR || proc == NULL) {
     return 1;
   }
 
-  // Add parameters
   struct mgp_type *any_type = NULL;
   if (mgp_type_any(&any_type) != MGP_ERROR_NO_ERROR || any_type == NULL) {
     return 1;
@@ -1497,15 +1787,13 @@ int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
     return 1;
   }
 
-  if (mgp_proc_add_opt_arg(proc, kParameterConfig, map_type, empty_map_value) != MGP_ERROR_NO_ERROR ||
-      empty_map_value == NULL) {
+  if (mgp_proc_add_opt_arg(proc, kParameterConfig, map_type, empty_map_value) != MGP_ERROR_NO_ERROR) {
     mgp_value_destroy(empty_map_value);
     return 1;
   }
   mgp_value_destroy(empty_map_value);
 
-  // Add return value
-  if (mgp_proc_add_result(proc, kReturnValue, map_type) != MGP_ERROR_NO_ERROR || map_type == NULL) {
+  if (mgp_proc_add_result(proc, kReturnValue, map_type) != MGP_ERROR_NO_ERROR) {
     return 1;
   }
 

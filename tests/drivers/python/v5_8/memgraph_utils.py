@@ -13,8 +13,8 @@
 # licenses/APL.txt.
 
 import os
-import re
 from pathlib import Path
+import re
 
 
 def config_to_dict(configs):

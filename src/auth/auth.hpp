@@ -20,6 +20,7 @@
 #include "auth/ops.hpp"
 #include "auth/profiles/user_profiles.hpp"
 #include "auth/repository.hpp"
+#include "auth/rules.hpp"
 #include "glue/auth_global.hpp"
 #include "kvstore/kvstore.hpp"
 #include "license/license.hpp"
@@ -227,6 +228,8 @@ class Auth final {
    */
   std::vector<User> AllUsers() const;
 
+  std::vector<User> AllUsersStrict() const;
+
   /**
    * @brief
    *
@@ -379,6 +382,10 @@ class Auth final {
 
   std::vector<std::string> AllUsernamesForRole(const std::string &rolename) const;
 
+  rules::RoleMembersListing ListUsersForRole(const std::string &rolename) const;
+
+  rules::RoleMemberNamesListing ListUsernamesForRole(const std::string &rolename) const;
+
 #ifdef MG_ENTERPRISE
   /**
    * @brief Grant access to individual database for a user.
@@ -426,6 +433,10 @@ class Auth final {
    * @throw AuthException if unable to read data
    */
   void DeleteDatabase(const std::string &db, system::Transaction *system_tx = nullptr);
+
+  std::map<std::string, std::vector<std::string>> PendingDatabaseCleanups() const { return pending_db_cleanups_; }
+
+  void RetryPendingDatabaseCleanups(system::Transaction *system_tx = nullptr);
 
   /**
    * @brief Set main database for an individual user.
@@ -535,6 +546,12 @@ class Auth final {
 #ifdef MG_ENTERPRISE
   std::vector<std::string> *&dropped_users() { return dropped_users_; }
 
+  UserProfiles::MemorySnapshot CaptureProfileMemorySnapshot() const { return user_profiles_.CaptureMemorySnapshot(); }
+  void RestoreProfileMemorySnapshot(UserProfiles::MemorySnapshot snapshot) {
+    user_profiles_.RestoreMemorySnapshot(std::move(snapshot));
+  }
+  void RefreshAllUserProfileResources();
+
   // Releases the live limits a dropped user was holding. Deferred to COMMIT, because ResourceMonitoring is shared
   // with every session and has no rollback of its own.
   void ReleaseUserResources(std::string const &username) {
@@ -609,6 +626,7 @@ class Auth final {
 #ifdef MG_ENTERPRISE
   UserProfiles user_profiles_{storage_};
   utils::ResourceMonitoring *user_resources_;
+  std::map<std::string, std::vector<std::string>> pending_db_cleanups_;
 #endif
   std::unordered_map<std::string, auth::Module> modules_;
   Config config_;

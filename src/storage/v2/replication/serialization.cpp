@@ -67,15 +67,18 @@ void Encoder::WriteFileBuffer(const uint8_t *buffer, const size_t buffer_size) {
   builder_->SaveFileBuffer(buffer, buffer_size);
 }
 
-void Encoder::WriteFileData(utils::InputFile *file) {
+bool Encoder::WriteFileData(utils::InputFile *file) {
   auto file_size = file->GetSize();
   uint8_t buffer[utils::kFileBufferSize];
   while (file_size > 0) {
     const auto chunk_size = std::min(file_size, utils::kFileBufferSize);
-    file->Read(buffer, chunk_size);
+    if (!file->Read(buffer, chunk_size)) {
+      return false;
+    }
     WriteFileBuffer(buffer, chunk_size);
     file_size -= chunk_size;
   }
+  return true;
 }
 
 bool Encoder::WriteFile(const std::filesystem::path &path, std::filesystem::path const &path_to_write,
@@ -93,7 +96,10 @@ bool Encoder::WriteFile(const std::filesystem::path &path, std::filesystem::path
   WriteString(path_to_write.string());
   auto const file_size = file.GetSize();
   WriteUint(file_size);
-  WriteFileData(&file);
+  if (!WriteFileData(&file)) {
+    spdlog::error("Failed to read file {} during replication transfer.", path);
+    return false;
+  }
   // The read is done and left the file's pages clean, which is the only state they can be evicted
   // in. The bytes are already in the stream's buffers, so nothing here waits on the replica.
   if (page_cache == utils::PageCachePolicy::kDrop) file.DropCachedPages();

@@ -1,7 +1,6 @@
-from typing import List
+"""Utilities for message aggregator."""
 
-import torch
-import torch.nn as nn
+from torch import Tensor as torch_Tensor, cat as torch_cat, mean as torch_mean, nn
 
 
 class MessageAggregator(nn.Module):
@@ -12,8 +11,8 @@ class MessageAggregator(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, data: List[torch.Tensor]) -> torch.Tensor:
-        raise Exception("Not implemented")
+    def forward(self, data: list[torch_Tensor]) -> torch_Tensor:
+        raise NotImplementedError("MessageAggregator subclasses must implement forward")
 
 
 class MeanMessageAggregator(MessageAggregator):
@@ -23,17 +22,17 @@ class MeanMessageAggregator(MessageAggregator):
     as mean of features received
     """
 
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, data: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, data: list[torch_Tensor]) -> torch_Tensor:
+        if not data:
+            raise ValueError("MeanMessageAggregator requires at least one message")
         # here we will 2D tensor
         # shape = (len(data), num_features)
-        data_torch = torch.cat(data)
+        data_torch = torch_cat(data)
         # mean across rows
-        mean = torch.mean(data_torch, dim=0)
+        mean = torch_mean(data_torch, dim=0)
         # return shape = (1, num_features)
-        return mean.reshape((1, -1))
+        computed_return_value = mean.reshape((1, -1))
+        return computed_return_value
 
 
 class LastMessageAggregator(MessageAggregator):
@@ -42,8 +41,8 @@ class LastMessageAggregator(MessageAggregator):
     From messages received as List of torch.Tensor, it returns last message
     """
 
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, data: List[torch.Tensor]) -> torch.Tensor:
-        return data[-1]
+    def forward(self, data: list[torch_Tensor]) -> torch_Tensor:
+        if not data:
+            raise ValueError("LastMessageAggregator requires at least one message")
+        computed_return_value = data[-1]
+        return computed_return_value

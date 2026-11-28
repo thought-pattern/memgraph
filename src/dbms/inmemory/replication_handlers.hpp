@@ -103,7 +103,8 @@ class InMemoryReplicationHandlers {
       uint64_t request_version, slk::Reader *req_reader, slk::Builder *res_builder);
 
   static LoadWalStatus LoadWal(std::filesystem::path const &wal_path, storage::InMemoryStorage *storage,
-                               rpc::ProgressHeartbeat &heartbeat);
+                               rpc::ProgressHeartbeat &heartbeat,
+                               std::optional<utils::UUID> expected_uuid = std::nullopt);
 
   static auto TakeSnapshotLock(auto &snapshot_guard, storage::InMemoryStorage *storage) -> bool;
 

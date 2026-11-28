@@ -11,6 +11,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <limits>
+
 #include "system/state.hpp"
 #include "system/transaction.hpp"
 
@@ -34,7 +37,12 @@ struct System {
     if (!system_unique.try_lock_for(try_time)) {
       return std::nullopt;
     }
-    return Transaction{state_, std::move(system_unique), ++timestamp_};
+    const auto base = std::max(timestamp_, state_.LastCommittedSystemTimestamp());
+    if (base == std::numeric_limits<std::uint64_t>::max()) {
+      throw kvstore::KVStoreError("System transaction timestamp exhausted");
+    }
+    timestamp_ = base + 1;
+    return Transaction{state_, std::move(system_unique), timestamp_};
   }
 
   // TODO: this and LastCommittedSystemTimestamp maybe not needed

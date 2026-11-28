@@ -75,6 +75,7 @@ class ExistenceConstraints {
   struct IndividualConstraint {
     ConstraintStatus status{};
     metrics::ScopedGauge gauge_{};
+    std::shared_ptr<IndividualConstraint> fallback_on_abort{};
     ~IndividualConstraint();
   };
 
@@ -122,10 +123,14 @@ class ExistenceConstraints {
   /// existed for {label, property}.
   [[nodiscard]] IndividualConstraintPtr DropConstraint(LabelId label, PropertyId property);
 
-  /// Reinstalls a previously-evicted IndividualConstraint. No-op if the slot
-  /// has been reclaimed by a concurrent CREATE (constraint DDL runs under
-  /// READ_ONLY/UNIQUE, which does not serialize peers).
+  /// Reinstalls a previously-evicted IndividualConstraint. If an uncommitted
+  /// concurrent CREATE currently occupies the slot, attaches `evicted` as its
+  /// abort fallback so aborting the CREATE restores the committed rule.
   void RestoreConstraint(LabelId label, PropertyId property, IndividualConstraintPtr evicted);
+
+  /// Rolls back an unpublished POPULATING constraint, restoring any committed
+  /// constraint whose overlapping DROP aborted while this CREATE owned the slot.
+  void AbortUnpublishedConstraint(LabelId label, PropertyId property);
 
   /*
    * VALIDATION
@@ -157,7 +162,8 @@ class ExistenceConstraints {
   bool InstallConstraint_(LabelId label, PropertyId property, IndividualConstraintPtr ptr);
 
   metrics::GaugeHandle gauge_{};
-  utils::Synchronized<ContainerPtr, utils::WritePrioritizedRWLock> constraints_{std::make_shared<Container const>()};
+  mutable utils::Synchronized<ContainerPtr, utils::WritePrioritizedRWLock> constraints_{
+      std::make_shared<Container const>()};
 };
 
 }  // namespace memgraph::storage

@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_to_set_unduplicates_values(memgraph):

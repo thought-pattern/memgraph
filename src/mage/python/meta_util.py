@@ -2,6 +2,7 @@ from collections import defaultdict
 from typing import Dict, Iterator, Tuple, Union
 
 import mgp
+
 from mage.meta_util.parameters import Parameter
 
 NodeKeyType = Tuple[str, ...]

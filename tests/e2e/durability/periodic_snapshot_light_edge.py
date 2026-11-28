@@ -17,10 +17,10 @@
 import os
 import sys
 
+from common import get_data_path, get_logs_path
 import interactive_mg_runner
 import periodic_snapshot as base
 import pytest
-from common import get_data_path, get_logs_path
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

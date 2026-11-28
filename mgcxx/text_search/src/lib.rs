@@ -126,6 +126,11 @@ mod ffi {
         // threads (the C++ side does exactly this, without a lock). Mutating ops (add/delete/commit/
         // rollback) keep `&mut Context` and are serialized by the C++ write_mutex.
         fn aggregate(context: &Context, input: &SearchInput) -> Result<DocumentOutput>;
+        fn aggregate_pinned(
+            context: &Context,
+            searcher: &SearcherContext,
+            input: &SearchInput,
+        ) -> Result<DocumentOutput>;
         fn acquire_searcher(context: &Context) -> Result<Box<SearcherContext>>;
         fn search_gids_pinned(
             context: &Context,
@@ -972,11 +977,9 @@ fn search_get_fields(
 }
 
 // Adaptive candidate paging for fuzzy_phrase_search. The post-filter discards candidates, so the first page
-// over-fetches the effective limit by FUZZY_PHRASE_OVERFETCH_FACTOR and doubles each round when starved.
-// FUZZY_PHRASE_MAX_CANDIDATES caps how many score-ranked candidates one query will ever scan.
-// (Future scalability lever: a str/bytes fast field + columnar collector would filter without the store.)
+// over-fetches the effective limit by FUZZY_PHRASE_OVERFETCH_FACTOR and doubles each round when starved
+// until the requested limit is satisfied or the Tantivy candidate stream is exhausted.
 const FUZZY_PHRASE_OVERFETCH_FACTOR: usize = 8;
-const FUZZY_PHRASE_MAX_CANDIDATES: usize = 50_000;
 
 // Parses `data.<property>:<terms>` into (property, terms); the field side is trimmed. fuzzy_phrase_search
 // is single-property only, so any other form (no colon, non-`data` prefix, or blank property) is rejected.
@@ -1169,10 +1172,19 @@ const REGEX_CACHE_CAPACITY: usize = 256;
 // autocomplete reuses patterns heavily. On a miss we compile off-lock and only hold the lock for
 // the small get/put. The automaton is independent of index/searcher, so caching by pattern is exact.
 fn compiled_regex(context: &ffi::Context, pattern: &str) -> Result<Arc<Regex>, std::io::Error> {
-    if let Some(regex) = context.tantivyContext.regex_cache.lock().unwrap_or_else(|p| p.into_inner()).get(pattern) {
+    // Indexed tokens in `all` are lowercased by Tantivy's default analyzer, so wrap in `(?i:...)` to fold
+    // letter case inside the regex engine without altering uppercase escape classes like `\D`, `\S`, or `\W`.
+    let case_insensitive_pattern = format!("(?i:{})", pattern);
+    if let Some(regex) = context
+        .tantivyContext
+        .regex_cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&case_insensitive_pattern)
+    {
         return Ok(regex.clone());
     }
-    let regex = Arc::new(Regex::new(pattern).map_err(|e| {
+    let regex = Arc::new(Regex::new(&case_insensitive_pattern).map_err(|e| {
         Error::new(
             ErrorKind::Other,
             format!(
@@ -1186,7 +1198,7 @@ fn compiled_regex(context: &ffi::Context, pattern: &str) -> Result<Arc<Regex>, s
         .regex_cache
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .put(pattern.to_string(), regex.clone());
+        .put(case_insensitive_pattern, regex.clone());
     Ok(regex)
 }
 
@@ -1204,7 +1216,13 @@ fn regex_search_gids_pinned(
     let index_path = &context.tantivyContext.index_path;
     let schema = &context.tantivyContext.schema;
 
-    let search_field = search_get_fields(&input.search_fields, schema, index_path)?[0];
+    let search_fields = search_get_fields(&input.search_fields, schema, index_path)?;
+    let search_field = search_fields.first().copied().ok_or_else(|| {
+        Error::new(
+            ErrorKind::Other,
+            format!("regex_search requires at least one search field inside {:?} text search index", index_path),
+        )
+    })?;
     let regex = compiled_regex(context, &input.search_query)?;
 
     let limit = input.effective_limit();
@@ -1365,13 +1383,24 @@ fn fuzzy_phrase_matched_docs(
 
     // Page through score-ranked candidates, post-filtering each page, until we've collected
     // `result_limit` matches or the candidate stream runs out. Selective queries fill the first page;
-    // we widen only when the post-filter is starved, capped at FUZZY_PHRASE_MAX_CANDIDATES.
+    // we widen only when the post-filter is starved, without silently truncating before exhaustion.
     let result_limit = input.effective_limit();
+    if result_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let total_docs = searcher_ctx.searcher.num_docs() as usize;
+    if total_docs == 0 {
+        return Ok(Vec::new());
+    }
     let mut matched: Vec<(f32, TantivyDocument)> = Vec::new();
     let mut scanned = 0usize;
-    let mut page = result_limit.saturating_mul(FUZZY_PHRASE_OVERFETCH_FACTOR).min(FUZZY_PHRASE_MAX_CANDIDATES);
-    while matched.len() < result_limit && scanned < FUZZY_PHRASE_MAX_CANDIDATES {
-        let page_limit = page.min(FUZZY_PHRASE_MAX_CANDIDATES - scanned);
+    let mut page = result_limit
+        .saturating_mul(FUZZY_PHRASE_OVERFETCH_FACTOR)
+        .max(1)
+        .min(total_docs);
+    while matched.len() < result_limit && scanned < total_docs {
+        let remaining_docs = total_docs - scanned;
+        let page_limit = page.min(remaining_docs).max(1);
         let top_docs = searcher_ctx
             .searcher
             .search(&query, &TopDocs::with_limit(page_limit).and_offset(scanned))
@@ -1399,13 +1428,6 @@ fn fuzzy_phrase_matched_docs(
             break; // candidate stream exhausted -- no more docs to page into
         }
         page = page.saturating_mul(2);
-    }
-    if matched.len() < result_limit && scanned >= FUZZY_PHRASE_MAX_CANDIDATES {
-        log::warn!(
-            "fuzzy_phrase_search hit the {} candidate scan cap in {:?}; results may be truncated",
-            FUZZY_PHRASE_MAX_CANDIDATES,
-            index_path
-        );
     }
     Ok(matched)
 }
@@ -1467,7 +1489,13 @@ fn regex_search_edge_gids_pinned(
     let index_path = &context.tantivyContext.index_path;
     let schema = &context.tantivyContext.schema;
 
-    let search_field = search_get_fields(&input.search_fields, schema, index_path)?[0];
+    let search_fields = search_get_fields(&input.search_fields, schema, index_path)?;
+    let search_field = search_fields.first().copied().ok_or_else(|| {
+        Error::new(
+            ErrorKind::Other,
+            format!("regex_search requires at least one search field inside {:?} text search index", index_path),
+        )
+    })?;
     let regex = compiled_regex(context, &input.search_query)?;
 
     let limit = input.effective_limit();
@@ -1523,14 +1551,14 @@ fn regex_search_edge_gids_pinned(
     Ok(ffi::EdgeGidScoreOutput { docs })
 }
 
-fn aggregate(
+fn aggregate_with_searcher(
     context: &ffi::Context,
+    searcher: &tantivy::Searcher,
     input: &ffi::SearchInput,
 ) -> Result<ffi::DocumentOutput, std::io::Error> {
     let index_path = &context.tantivyContext.index_path;
     let index = &context.tantivyContext.index;
     let schema = &context.tantivyContext.schema;
-    let reader = &context.tantivyContext.index_reader;
 
     let search_fields = search_get_fields(&input.search_fields, schema, index_path)?;
     let query_parser = QueryParser::for_index(index, search_fields);
@@ -1543,7 +1571,6 @@ fn aggregate(
             ));
         }
     };
-    let searcher = reader.searcher();
     let agg_req: Aggregations = serde_json::from_str(&input.aggregation_query)?;
     let collector = AggregationCollector::from_aggs(agg_req, Default::default());
     let agg_res: AggregationResults = match searcher.search(&query, &collector) {
@@ -1563,6 +1590,22 @@ fn aggregate(
         data: res.to_string(),
         score: 0.0, // Aggregation results don't have individual document scores
     })
+}
+
+fn aggregate(
+    context: &ffi::Context,
+    input: &ffi::SearchInput,
+) -> Result<ffi::DocumentOutput, std::io::Error> {
+    let searcher = context.tantivyContext.index_reader.searcher();
+    aggregate_with_searcher(context, &searcher, input)
+}
+
+fn aggregate_pinned(
+    context: &ffi::Context,
+    searcher_ctx: &SearcherContext,
+    input: &ffi::SearchInput,
+) -> Result<ffi::DocumentOutput, std::io::Error> {
+    aggregate_with_searcher(context, &searcher_ctx.searcher, input)
 }
 
 fn get_num_docs(context: &ffi::Context) -> Result<u64, std::io::Error> {

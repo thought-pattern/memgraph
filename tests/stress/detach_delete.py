@@ -16,14 +16,14 @@
 Large bipartite graph stress test.
 """
 
+from argparse import Namespace as Args
 import atexit
+from dataclasses import dataclass
+from functools import wraps
 import logging
 import multiprocessing
 import random
 import time
-from argparse import Namespace as Args
-from dataclasses import dataclass
-from functools import wraps
 from typing import Any, Callable, Tuple
 
 from common import (

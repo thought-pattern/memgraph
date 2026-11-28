@@ -3,11 +3,11 @@ line-length = 120
 include = '\.pyi?$'
 extend-exclude = '''
 /(
-    | .git
-    | .__pycache__
-    | build
-    | libs
-    | .cache
+    \.git
+  | __pycache__
+  | build
+  | libs
+  | \.cache
 )/
 '''
 

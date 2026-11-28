@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import *
+import pytest
 
 set_vertex_property_query = "MATCH (n:update_label) CALL update.set_property(n) RETURN n.prop;"
 set_edge_property_query = (

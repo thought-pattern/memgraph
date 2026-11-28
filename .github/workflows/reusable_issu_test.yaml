@@ -86,14 +86,21 @@ jobs:
       - name: Load Next Image (URL)
         if: ${{ env.NEXT_TYPE == 'url' }}
         run: |
-          curl -L ${{ env.NEXT_IMAGE }} > next.tar.gz
+          curl -L "${{ env.NEXT_IMAGE }}" > next.tar.gz
           load_output=$(docker load -i next.tar.gz)
 
-          # grab each repo:tag, drop the ":latest" one, pick the first real tag
+          # Prefer a non-:latest tag when multiple tags are loaded; fall back to the first loaded tag
           repo_tag=$(echo "$load_output" \
             | awk -F': ' '/Loaded image:/ {print $2}' \
-            | grep -v ':latest$' \
+            | { grep -v ':latest$' || true; } \
             | head -n1)
+          if [[ -z "$repo_tag" ]]; then
+            repo_tag=$(echo "$load_output" | awk -F': ' '/Loaded image:/ {print $2}' | head -n1)
+          fi
+          if [[ -z "$repo_tag" ]]; then
+            echo "::error::Failed to extract loaded Docker image reference from next.tar.gz"
+            exit 1
+          fi
 
           echo "MEMGRAPH_NEXT_DOCKERHUB_IMAGE=${repo_tag}" >> $GITHUB_ENV
 
@@ -106,14 +113,21 @@ jobs:
       - name: Load Last Image (URL)
         if: ${{ env.LAST_TYPE == 'url' }}
         run: |
-          curl -L ${{ env.LAST_IMAGE }} > last.tar.gz
+          curl -L "${{ env.LAST_IMAGE }}" > last.tar.gz
           load_output=$(docker load -i last.tar.gz)
 
-          # grab each repo:tag, drop the ":latest" one, pick the first real tag
+          # Prefer a non-:latest tag when multiple tags are loaded; fall back to the first loaded tag
           repo_tag=$(echo "$load_output" \
             | awk -F': ' '/Loaded image:/ {print $2}' \
-            | grep -v ':latest$' \
+            | { grep -v ':latest$' || true; } \
             | head -n1)
+          if [[ -z "$repo_tag" ]]; then
+            repo_tag=$(echo "$load_output" | awk -F': ' '/Loaded image:/ {print $2}' | head -n1)
+          fi
+          if [[ -z "$repo_tag" ]]; then
+            echo "::error::Failed to extract loaded Docker image reference from last.tar.gz"
+            exit 1
+          fi
 
           echo "MEMGRAPH_LAST_DOCKERHUB_IMAGE=${repo_tag}" >> $GITHUB_ENV
 
@@ -130,7 +144,7 @@ jobs:
           HELM_CHARTS_BRANCH: ${{ inputs.helm_charts_branch }}
         run: |
           cd tests/issu
-          ./test_upgrade.sh ${{ env.MEMGRAPH_LAST_TAG }} ${{ env.MEMGRAPH_NEXT_TAG }} --test-routing=false --debug=false
+          ./test_upgrade.sh "${{ env.MEMGRAPH_LAST_DOCKERHUB_IMAGE }}" "${{ env.MEMGRAPH_NEXT_DOCKERHUB_IMAGE }}" --test-routing=false --debug=false
 
       - name: Upload ISSU logs
         if: always()

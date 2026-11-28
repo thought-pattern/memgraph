@@ -70,6 +70,9 @@ float GetRandFloat() {
 void NormalizeRank(std::vector<std::pair<std::uint64_t, double>> &rank) {
   const double sum =
       std::accumulate(rank.begin(), rank.end(), 0.0, [](auto sum, const auto &p) { return sum + p.second; });
+  if (sum <= 0.0) {
+    return;
+  }
   for (auto &[node_id, value] : rank) {
     value /= sum;
   }
@@ -157,8 +160,7 @@ void UpdateCreate(const mg_graph::GraphView<> &graph, const std::pair<std::uint6
     walk.erase(std::find(walk.begin(), walk.end(), from) + 1, walk.end());
 
     auto current_id = from;
-    auto half_eps = pagerank_online_alg::global_epsilon / 2.0;
-    CreateRoute(graph, graph.GetInnerNodeId(current_id), walk, walk_index, half_eps);
+    CreateRoute(graph, graph.GetInnerNodeId(current_id), walk, walk_index, pagerank_online_alg::global_epsilon);
   }
 }
 
@@ -222,18 +224,51 @@ void UpdateDelete(const mg_graph::GraphView<> &graph, const std::pair<std::uint6
       continue;
     }
 
-    auto half_eps = pagerank_online_alg::global_epsilon / 2.0;
-    CreateRoute(graph, graph.GetInnerNodeId(current_id), walk, walk_index, half_eps);
+    CreateRoute(graph, graph.GetInnerNodeId(current_id), walk, walk_index, pagerank_online_alg::global_epsilon);
   }
 }
 
 ///
-///@brief Deletes vertex from context. This is trivial because we are sure that no edge exists around that node.
+///@brief Deletes vertex from context and repairs or clears walks that visited it.
 ///
 ///@param graph Graph for updating
 ///@param removed_vertex Removed vertex
 ///
 void UpdateDelete(const mg_graph::GraphView<> &graph, std::uint64_t removed_vertex) {
+  auto table_it = pagerank_online_alg::context.walks_table.find(removed_vertex);
+  if (table_it != pagerank_online_alg::context.walks_table.end()) {
+    std::unordered_set<std::uint64_t> walk_table_copy(table_it->second);
+    for (auto walk_index : walk_table_copy) {
+      auto &walk = pagerank_online_alg::context.walks[walk_index];
+      auto pos = std::find(walk.begin(), walk.end(), removed_vertex);
+      if (pos == walk.end()) {
+        continue;
+      }
+      if (pos == walk.begin()) {
+        for (auto it = walk.begin(); it != walk.end(); ++it) {
+          pagerank_online_alg::context.walks_table[*it].erase(walk_index);
+          auto cnt_it = pagerank_online_alg::context.walks_counter.find(*it);
+          if (cnt_it != pagerank_online_alg::context.walks_counter.end() && cnt_it->second > 0) {
+            cnt_it->second--;
+          }
+        }
+        walk.clear();
+      } else {
+        auto prev_vertex = *(pos - 1);
+        for (auto it = pos; it != walk.end(); ++it) {
+          pagerank_online_alg::context.walks_table[*it].erase(walk_index);
+          auto cnt_it = pagerank_online_alg::context.walks_counter.find(*it);
+          if (cnt_it != pagerank_online_alg::context.walks_counter.end() && cnt_it->second > 0) {
+            cnt_it->second--;
+          }
+        }
+        walk.erase(pos, walk.end());
+        if (graph.NodeExists(prev_vertex)) {
+          CreateRoute(graph, graph.GetInnerNodeId(prev_vertex), walk, walk_index, pagerank_online_alg::global_epsilon);
+        }
+      }
+    }
+  }
   pagerank_online_alg::context.walks_table.erase(removed_vertex);
   pagerank_online_alg::context.walks_counter.erase(removed_vertex);
 }
@@ -243,6 +278,11 @@ bool IsIncosistent(const mg_graph::GraphView<> &graph) {
     auto external_id = graph.GetMemgraphNodeId(node_id);
     if (pagerank_online_alg::context.walks_counter.find(external_id) ==
         pagerank_online_alg::context.walks_counter.end()) {
+      return true;
+    }
+  }
+  for (auto const &[node_id, _] : pagerank_online_alg::context.walks_counter) {
+    if (!graph.NodeExists(node_id)) {
       return true;
     }
   }

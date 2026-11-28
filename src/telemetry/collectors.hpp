@@ -11,10 +11,21 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <nlohmann/json_fwd.hpp>
 
 namespace memgraph::telemetry {
+
+/**
+ * Parse a single Linux `/proc/[pid]/stat` or `/proc/[pid]/task/[tid]/stat` record,
+ * returning `(comm_name, utime + stime + cutime + cstime ticks)` or `std::nullopt` if malformed.
+ */
+std::optional<std::pair<std::string, uint64_t>> ParseProcStatCpuTicks(std::string_view raw_stat);
 
 /**
  * This function returs a dictionary containing resource usage information

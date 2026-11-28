@@ -109,13 +109,24 @@ class InMemoryEdgeTypeIndex : public storage::EdgeTypeIndex {
 
     class Iterator {
      public:
-      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator index_iterator)
+      struct EndTag {};
+
+      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator index_iterator,
+               utils::SkipListDb<Entry>::ChunkedIterator chunk_end)
           : self_(self),
             index_iterator_(index_iterator),
+            chunk_end_(chunk_end),
             current_edge_accessor_(EdgeRef{nullptr}, EdgeTypeId{}, nullptr, nullptr, self_->storage_,
                                    self_->transaction_) {
         AdvanceUntilValid();
       }
+
+      Iterator(ChunkedIterable *self, utils::SkipListDb<Entry>::ChunkedIterator chunk_end, EndTag)
+          : self_(self),
+            index_iterator_(chunk_end),
+            chunk_end_(chunk_end),
+            current_edge_accessor_(EdgeRef{nullptr}, EdgeTypeId{}, nullptr, nullptr, self_->storage_,
+                                   self_->transaction_) {}
 
       EdgeAccessor const &operator*() const { return current_edge_accessor_; }
 
@@ -134,6 +145,7 @@ class InMemoryEdgeTypeIndex : public storage::EdgeTypeIndex {
 
       ChunkedIterable *self_;
       utils::SkipListDb<Entry>::ChunkedIterator index_iterator_;
+      utils::SkipListDb<Entry>::ChunkedIterator chunk_end_;
       EdgeAccessor current_edge_accessor_;
       EdgeRef current_edge_{nullptr};
     };
@@ -144,7 +156,7 @@ class InMemoryEdgeTypeIndex : public storage::EdgeTypeIndex {
 
      public:
       Chunk(ChunkedIterable *self, utils::SkipListDb<Entry>::Chunk &chunk)
-          : begin_{self, chunk.begin()}, end_{self, chunk.end()} {}
+          : begin_{self, chunk.begin(), chunk.end()}, end_{self, chunk.end(), Iterator::EndTag{}} {}
 
       Iterator begin() { return begin_; }
 

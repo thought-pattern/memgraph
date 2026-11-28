@@ -46,9 +46,15 @@ void Save(const storage::Point2d &point2d_val, slk::Builder *builder) {
 }
 
 void Load(storage::Point2d *point2d_val, slk::Reader *reader) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  storage::CoordinateReferenceSystem crs;
-  slk::Load(&crs, reader);
+  std::underlying_type_t<storage::CoordinateReferenceSystem> crs_raw{};
+  slk::Load(&crs_raw, reader);
+  if (crs_raw > std::to_underlying(storage::CoordinateReferenceSystem::Cartesian_3d)) {
+    throw slk::SlkDecodeException("Trying to load Point2d with unknown coordinate reference system!");
+  }
+  auto const crs = static_cast<storage::CoordinateReferenceSystem>(crs_raw);
+  if (!storage::valid2d(crs)) {
+    throw slk::SlkDecodeException("Trying to load Point2d with non-2D coordinate reference system!");
+  }
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   double x;
   slk::Load(&x, reader);
@@ -66,9 +72,15 @@ void Save(const storage::Point3d &point3d_val, slk::Builder *builder) {
 }
 
 void Load(storage::Point3d *point3d_val, slk::Reader *reader) {
-  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
-  storage::CoordinateReferenceSystem crs;
-  slk::Load(&crs, reader);
+  std::underlying_type_t<storage::CoordinateReferenceSystem> crs_raw{};
+  slk::Load(&crs_raw, reader);
+  if (crs_raw > std::to_underlying(storage::CoordinateReferenceSystem::Cartesian_3d)) {
+    throw slk::SlkDecodeException("Trying to load Point3d with unknown coordinate reference system!");
+  }
+  auto const crs = static_cast<storage::CoordinateReferenceSystem>(crs_raw);
+  if (!storage::valid3d(crs)) {
+    throw slk::SlkDecodeException("Trying to load Point3d with non-3D coordinate reference system!");
+  }
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   double x;
   slk::Load(&x, reader);
@@ -122,7 +134,7 @@ void Save(const storage::ExternalPropertyValue &value, slk::Builder *builder) {
     case storage::ExternalPropertyValue::Type::List: {
       slk::Save(wire_format::TagOf(storage::ExternalPropertyValue::Type::List), builder);
       const auto &values = value.ValueList();
-      const auto size = values.size();
+      const uint64_t size = values.size();
       slk::Save(size, builder);
       for (const auto &v : values) {
         slk::Save(v, builder);
@@ -132,7 +144,7 @@ void Save(const storage::ExternalPropertyValue &value, slk::Builder *builder) {
     case storage::ExternalPropertyValue::Type::IntList: {
       slk::Save(wire_format::TagOf(storage::ExternalPropertyValue::Type::IntList), builder);
       const auto &values = value.ValueIntList();
-      const auto size = values.size();
+      const uint64_t size = values.size();
       slk::Save(size, builder);
       for (const auto &v : values) {
         slk::Save(v, builder);
@@ -142,7 +154,7 @@ void Save(const storage::ExternalPropertyValue &value, slk::Builder *builder) {
     case storage::ExternalPropertyValue::Type::DoubleList: {
       slk::Save(wire_format::TagOf(storage::ExternalPropertyValue::Type::DoubleList), builder);
       const auto &values = value.ValueDoubleList();
-      const auto size = values.size();
+      const uint64_t size = values.size();
       slk::Save(size, builder);
       for (const auto &v : values) {
         slk::Save(v, builder);
@@ -152,7 +164,7 @@ void Save(const storage::ExternalPropertyValue &value, slk::Builder *builder) {
     case storage::ExternalPropertyValue::Type::NumericList: {
       slk::Save(wire_format::TagOf(storage::ExternalPropertyValue::Type::NumericList), builder);
       const auto &values = value.ValueNumericList();
-      const auto size = values.size();
+      const uint64_t size = values.size();
       slk::Save(size, builder);
       for (const auto &v : values) {
         if (std::holds_alternative<int>(v)) {
@@ -168,7 +180,7 @@ void Save(const storage::ExternalPropertyValue &value, slk::Builder *builder) {
     case storage::ExternalPropertyValue::Type::Map: {
       slk::Save(wire_format::TagOf(storage::ExternalPropertyValue::Type::Map), builder);
       const auto &map = value.ValueMap();
-      const auto size = map.size();
+      const uint64_t size = map.size();
       slk::Save(size, builder);
       for (const auto &kv : map) {
         slk::Save(kv, builder);
@@ -252,48 +264,65 @@ void Load(storage::ExternalPropertyValue *value, slk::Reader *reader) {
       return;
     }
     case storage::ExternalPropertyValue::Type::List: {
-      size_t size = 0;
+      uint64_t size = 0;
       slk::Load(&size, reader);
-      std::vector<storage::ExternalPropertyValue> list(size);
-      for (size_t i = 0UZ; i < size; ++i) {
-        slk::Load(&list[i], reader);
+      if (size > reader->RemainingPayloadBytes()) {
+        throw slk::SlkDecodeException("Declared List size exceeds remaining SLK payload!");
+      }
+      std::vector<storage::ExternalPropertyValue> list;
+      for (uint64_t i = 0; i < size; ++i) {
+        storage::ExternalPropertyValue elem;
+        slk::Load(&elem, reader);
+        list.push_back(std::move(elem));
       }
       *value = storage::ExternalPropertyValue(std::move(list));
       return;
     }
     case storage::ExternalPropertyValue::Type::IntList: {
-      size_t size = 0;
+      uint64_t size = 0;
       slk::Load(&size, reader);
-      storage::ExternalPropertyValue::int_list_t list(size);
-      for (size_t i = 0UZ; i < size; ++i) {
-        slk::Load(&list[i], reader);
+      if (size > reader->RemainingPayloadBytes() / sizeof(int)) {
+        throw slk::SlkDecodeException("Declared IntList size exceeds remaining SLK payload!");
+      }
+      storage::ExternalPropertyValue::int_list_t list;
+      for (uint64_t i = 0; i < size; ++i) {
+        int elem = 0;
+        slk::Load(&elem, reader);
+        list.push_back(elem);
       }
       *value = storage::ExternalPropertyValue(std::move(list));
       return;
     }
     case storage::ExternalPropertyValue::Type::DoubleList: {
-      size_t size = 0;
+      uint64_t size = 0;
       slk::Load(&size, reader);
-      storage::ExternalPropertyValue::double_list_t list(size);
-      for (size_t i = 0UZ; i < size; ++i) {
-        slk::Load(&list[i], reader);
+      if (size > reader->RemainingPayloadBytes() / sizeof(double)) {
+        throw slk::SlkDecodeException("Declared DoubleList size exceeds remaining SLK payload!");
+      }
+      storage::ExternalPropertyValue::double_list_t list;
+      for (uint64_t i = 0; i < size; ++i) {
+        double elem = 0.0;
+        slk::Load(&elem, reader);
+        list.push_back(elem);
       }
       *value = storage::ExternalPropertyValue(std::move(list));
       return;
     }
     case storage::ExternalPropertyValue::Type::NumericList: {
-      size_t size = 0;
+      uint64_t size = 0;
       slk::Load(&size, reader);
+      if (size > reader->RemainingPayloadBytes() / (sizeof(wire_format::PropertyTag) + sizeof(int))) {
+        throw slk::SlkDecodeException("Declared NumericList size exceeds remaining SLK payload!");
+      }
       storage::ExternalPropertyValue::numeric_list_t list;
-      list.reserve(size);
-      for (size_t i = 0UZ; i < size; ++i) {
-        storage::ExternalPropertyValue::Type type{};
-        slk::Load(&type, reader);
-        if (type == storage::ExternalPropertyValue::Type::Int) {
+      for (uint64_t i = 0; i < size; ++i) {
+        storage::ExternalPropertyValue::Type elem_type{};
+        slk::Load(&elem_type, reader);
+        if (elem_type == storage::ExternalPropertyValue::Type::Int) {
           int v = 0;
           slk::Load(&v, reader);
           list.emplace_back(v);
-        } else if (type == storage::ExternalPropertyValue::Type::Double) {
+        } else if (elem_type == storage::ExternalPropertyValue::Type::Double) {
           double v = NAN;
           slk::Load(&v, reader);
           list.emplace_back(v);
@@ -305,29 +334,41 @@ void Load(storage::ExternalPropertyValue *value, slk::Reader *reader) {
       return;
     }
     case storage::ExternalPropertyValue::Type::Map: {
-      size_t size = 0;
+      uint64_t size = 0;
       slk::Load(&size, reader);
+      if (size > reader->RemainingPayloadBytes() / (sizeof(uint64_t) + sizeof(wire_format::PropertyTag))) {
+        throw slk::SlkDecodeException("Declared Map size exceeds remaining SLK payload!");
+      }
       auto map = storage::ExternalPropertyValue::map_t{};
-      do_reserve(map, size);
-      for (size_t i = 0UZ; i < size; ++i) {
+      for (uint64_t i = 0; i < size; ++i) {
         std::pair<std::string, storage::ExternalPropertyValue> kv;
         slk::Load(&kv, reader);
-        map.insert(kv);
+        if (!map.insert(std::move(kv)).second) {
+          throw slk::SlkDecodeException("Trying to load Map with duplicate key!");
+        }
       }
       *value = storage::ExternalPropertyValue(std::move(map));
       return;
     }
     case storage::ExternalPropertyValue::Type::TemporalData: {
-      storage::TemporalType temporal_type{};
-      slk::Load(&temporal_type, reader);
+      std::underlying_type_t<storage::TemporalType> raw_type{};
+      slk::Load(&raw_type, reader);
+      if (raw_type > std::to_underlying(storage::TemporalType::Duration)) {
+        throw slk::SlkDecodeException("Trying to load TemporalData with invalid temporal subtype!");
+      }
+      auto const temporal_type = static_cast<storage::TemporalType>(raw_type);
       int64_t microseconds{0};
       slk::Load(&microseconds, reader);
       *value = storage::ExternalPropertyValue(storage::TemporalData{temporal_type, microseconds});
       return;
     }
     case storage::ExternalPropertyValue::Type::ZonedTemporalData: {
-      storage::ZonedTemporalType temporal_type{};
-      slk::Load(&temporal_type, reader);
+      std::underlying_type_t<storage::ZonedTemporalType> raw_type{};
+      slk::Load(&raw_type, reader);
+      if (raw_type > std::to_underlying(storage::ZonedTemporalType::ZonedDateTime)) {
+        throw slk::SlkDecodeException("Trying to load ZonedTemporalData with invalid temporal subtype!");
+      }
+      auto const temporal_type = static_cast<storage::ZonedTemporalType>(raw_type);
       int64_t microseconds{0};
       slk::Load(&microseconds, reader);
       storage::ExternalPropertyValue::Type timezone_representation_type{};

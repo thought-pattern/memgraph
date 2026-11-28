@@ -20,7 +20,7 @@ public class Transactions {
       using (var tx = session.BeginTransaction(txConfig => txConfig.WithMetadata(txMetadata))) {
         tx.Run("MATCH (n) RETURN n LIMIT 1").Consume();
         // Check transaction info from another thread
-        Thread show_tx = new Thread(() => ShowTx(ref driver));
+        Thread show_tx = new Thread(() => ShowTx(ref driver, "transaction", "oho", 456));
         show_tx.Start();
         show_tx.Join();
         // End current transaction
@@ -32,7 +32,11 @@ public class Transactions {
       Console.WriteLine("Checking implicit transaction metadata...");
       var txMetadata =
           new Dictionary<string, object> { { "ver", "session" }, { "str", "aha" }, { "num", 123 } };
-      CheckMD(session.Run("SHOW TRANSACTIONS", txConfig => txConfig.WithMetadata(txMetadata)));
+      CheckMD(
+          session.Run("SHOW TRANSACTIONS", txConfig => txConfig.WithMetadata(txMetadata)),
+          "session",
+          "aha",
+          123);
     }
 
     Console.WriteLine("All ok!");
@@ -42,13 +46,13 @@ public class Transactions {
     using (var session = driver.Session()) session.Run("MATCH (n) DETACH DELETE n").Consume();
   }
 
-  public static void ShowTx(ref IDriver driver) {
+  public static void ShowTx(ref IDriver driver, string expectedVer, string expectedStr, int expectedNum) {
     using (var session = driver.Session()) {
-      CheckMD(session.Run("SHOW TRANSACTIONS"));
+      CheckMD(session.Run("SHOW TRANSACTIONS"), expectedVer, expectedStr, expectedNum);
     }
   }
 
-  public static void CheckMD(IResult tx_md) {
+  public static void CheckMD(IResult tx_md, string expectedVer, string expectedStr, int expectedNum) {
     int n = 0;
     try {
       foreach (var res in tx_md) {
@@ -56,11 +60,8 @@ public class Transactions {
         // Background-task rows (GC, snapshot) also appear in SHOW TRANSACTIONS with
         // their own metadata keys; skip any row missing the keys we care about.
         if (md.ContainsKey("ver") && md.ContainsKey("str") && md.ContainsKey("num")) {
-          if (md["ver"].As<string>() == "transaction" && md["str"].As<string>() == "oho" &&
-              md["num"].As<int>() == 456) {
-            n = n + 1;
-          } else if (md["ver"].As<string>() == "session" && md["str"].As<string>() == "aha" &&
-                     md["num"].As<int>() == 123) {
+          if (md["ver"].As<string>() == expectedVer && md["str"].As<string>() == expectedStr &&
+              md["num"].As<int>() == expectedNum) {
             n = n + 1;
           }
         }

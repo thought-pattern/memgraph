@@ -18,6 +18,7 @@
 #include "storage/v2/disk/durable_metadata.hpp"
 #include "storage/v2/disk/edge_import_mode_cache.hpp"
 #include "storage/v2/disk/rocksdb_storage.hpp"
+#include "storage/v2/disk/unique_constraints.hpp"
 #include "storage/v2/edge_import_mode.hpp"
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indices/label_property_index.hpp"
@@ -412,7 +413,7 @@ class DiskStorage final : public Storage {
 
     utils::small_vector<uint64_t> GetVectorIndexIdsForVertex(Vertex *vertex, PropertyId property) override;
 
-    utils::small_vector<float> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const override;
+    utils::small_vector<double> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const override;
     std::expected<void, storage::StorageIndexDefinitionError> CreateVectorEdgeIndex(
         VectorEdgeIndexSpec spec, ProgressCallback const &on_progress) override;
 
@@ -456,61 +457,97 @@ class DiskStorage final : public Storage {
 
 #ifdef MG_ENTERPRISE
     // TTL management methods
-    void StartTtl(TTLReplicationArgs /*repl_args*/ = {}) override {
-      storage_->ttl_.Resume();
+    void StartTtl(TTLReplicationArgs repl_args = {}) override {
+      if (!storage_->ttl_.Config()) throw ttl::TtlException("TTL not configured!");
+      auto *ttl_ptr = &storage_->ttl_;
+      bool const prev_wanted = ttl_ptr->Wanted();
+      ttl_ptr->SetWanted(true);
+      utils::OnScopeExit rollback{[ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); });
+      transaction_.commit_callbacks_.Add([ttl_ptr, is_main = repl_args.is_main](uint64_t /*commit_ts*/) {
+        if (is_main) {
+          ttl_ptr->Resume();
+        } else {
+          ttl_ptr->SetWanted(true);
+        }
+      });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::ENABLE, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
-    void DisableTtl(TTLReplicationArgs /*repl_args*/ = {}) override {
+    void DisableTtl(TTLReplicationArgs repl_args = {}) override {
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
+      auto &ttl = storage_->ttl_;
+      auto const prev_state = ttl.CaptureState();
 
-      // Drop indices
-      auto index_result = DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-      if (!index_result) {
-        // Silently fail if vertex index already dropped
-      }
-
-      // Check if edge TTL was enabled and drop edge index if needed
-      if (storage_->ttl_.Config().should_run_edge_ttl) {
-        auto edge_index_result = DropGlobalEdgeIndex(ttl_property);
-        if (!edge_index_result) {
-          // Silently fail if edge index already dropped
+      if (repl_args.is_main) {
+        if (ttl.OwnsLabelPropertyIndex()) {
+          (void)DropIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
+        }
+        if (ttl.Config().should_run_edge_ttl && ttl.OwnsEdgePropertyIndex()) {
+          (void)DropGlobalEdgeIndex(ttl_property);
         }
       }
 
-      storage_->ttl_.Disable();
+      ttl.StageMetadata({}, false, false, false);
+      ttl.SetWanted(false);
+      auto *ttl_ptr = &ttl;
+      utils::OnScopeExit rollback{[ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); });
+      transaction_.commit_callbacks_.Add(
+          [this, ttl_ptr](uint64_t /*commit_ts*/) { this->DeferThreadJoinAfterUnlock(ttl_ptr->DisableAsync()); });
 
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::DISABLE, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
     void StopTtl() override {
-      storage_->ttl_.Pause();
+      auto *ttl_ptr = &storage_->ttl_;
+      bool const prev_wanted = ttl_ptr->Wanted();
+      ttl_ptr->SetWanted(false);
+      utils::OnScopeExit rollback{[ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_wanted]() noexcept { ttl_ptr->SetWanted(prev_wanted); });
+      transaction_.commit_callbacks_.Add([ttl_ptr](uint64_t /*commit_ts*/) { ttl_ptr->Pause(); });
       transaction_.md_deltas.emplace_back(
           MetadataDelta::ttl_operation, durability::TtlOperationType::STOP, std::nullopt, std::nullopt, false);
+      rollback.Disable();
     }
 
-    void ConfigureTtl(const storage::ttl::TtlInfo &ttl_info, TTLReplicationArgs /*repl_args*/ = {}) override {
+    void ConfigureTtl(const storage::ttl::TtlInfo &ttl_info, TTLReplicationArgs repl_args = {}) override {
+      auto const validated_period = storage::ttl::TTL::ValidateInterval(ttl_info.period);
       auto ttl_label = NameToLabel("TTL");
       auto ttl_property = NameToProperty("ttl");
+      auto const ttl_path = std::vector<storage::PropertyPath>{{ttl_property}};
+      auto &ttl = storage_->ttl_;
+      auto const prev_state = ttl.CaptureState();
+      bool owns_lp = prev_state.owns_label_property_index;
 
-      // If TTL is not enabled, create required indices and enable TTL
-      if (!storage_->ttl_.Enabled()) {
-        // Create label+property index for TTL
-        (void)CreateIndex(ttl_label, std::vector<storage::PropertyPath>{{ttl_property}});
-        storage_->ttl_.Enable();
+      if (!ttl.Enabled() && repl_args.is_main) {
+        bool const label_index_existed =
+            storage_->indices_.label_property_index_->GetActiveIndices()->IndexExists(ttl_label, ttl_path);
+        if (!label_index_existed) {
+          (void)CreateIndex(ttl_label, ttl_path);
+        }
+        owns_lp = !label_index_existed;
       }
 
-      // Configure TTL
-      if (!storage_->ttl_.Running()) storage_->ttl_.Configure(ttl_info.should_run_edge_ttl);
-      storage_->ttl_.SetInterval(ttl_info.period, ttl_info.start_time);
-      transaction_.md_deltas.emplace_back(MetadataDelta::ttl_operation,
-                                          durability::TtlOperationType::CONFIGURE,
-                                          ttl_info.period,
-                                          ttl_info.start_time,
-                                          ttl_info.should_run_edge_ttl);
+      ttl.StageMetadata(storage::ttl::TtlInfo{validated_period, ttl_info.start_time, false}, true, owns_lp, false);
+      auto *ttl_ptr = &ttl;
+      utils::OnScopeExit rollback{[ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); }};
+      transaction_.abort_callbacks_.Add([ttl_ptr, prev_state]() noexcept { ttl_ptr->RestoreState(prev_state); });
+      auto const start_time = ttl_info.start_time;
+      transaction_.commit_callbacks_.Add([ttl_ptr, validated_period, start_time](uint64_t /*commit_ts*/) {
+        if (!ttl_ptr->Running()) {
+          ttl_ptr->Configure(false);
+        }
+        ttl_ptr->SetInterval(validated_period, start_time);
+      });
+      transaction_.md_deltas.emplace_back(
+          MetadataDelta::ttl_operation, durability::TtlOperationType::CONFIGURE, validated_period, ttl_info.start_time, false);
+      rollback.Disable();
     }
 
     storage::ttl::TtlInfo GetTtlConfig() const override { return storage_->ttl_.Config(); }
@@ -537,23 +574,36 @@ class DiskStorage final : public Storage {
   std::unique_ptr<Accessor> ReadOnlyAccess(std::optional<IsolationLevel> override_isolation_level,
                                            std::optional<std::chrono::milliseconds> timeout) override;
 
+  struct AuxiliaryTransactions {
+    std::unique_ptr<rocksdb::Transaction> unique_tx;
+    std::unique_ptr<rocksdb::Transaction> label_tx;
+    std::unique_ptr<rocksdb::Transaction> label_prop_tx;
+  };
+
   /// Flushing methods
-  [[nodiscard]] std::expected<void, StorageManipulationError> FlushIndexCache(Transaction *transaction);
+  [[nodiscard]] std::expected<void, StorageManipulationError> FlushIndexCache(
+      Transaction *transaction, DiskUniqueConstraints::SeenUniqueValues &unique_storage,
+      const std::unordered_set<Gid> &superseded_gids, AuxiliaryTransactions &aux_txs);
 
   [[nodiscard]] std::expected<void, StorageManipulationError> FlushVertices(
-      Transaction *transaction, const auto &vertex_acc, std::vector<std::vector<PropertyValue>> &unique_storage);
+      Transaction *transaction, const auto &vertex_acc, DiskUniqueConstraints::SeenUniqueValues &unique_storage,
+      const std::unordered_set<Gid> &superseded_gids, AuxiliaryTransactions &aux_txs);
 
   [[nodiscard]] std::expected<void, StorageManipulationError> CheckVertexConstraintsBeforeCommit(
-      const Vertex &vertex, std::vector<std::vector<PropertyValue>> &unique_storage) const;
+      const Vertex &vertex, DiskUniqueConstraints::SeenUniqueValues &unique_storage,
+      const std::unordered_set<Gid> &superseded_gids) const;
 
-  [[nodiscard]] std::expected<void, StorageManipulationError> FlushDeletedVertices(Transaction *transaction);
+  [[nodiscard]] std::expected<void, StorageManipulationError> FlushDeletedVertices(Transaction *transaction,
+                                                                                   AuxiliaryTransactions &aux_txs);
   [[nodiscard]] std::expected<void, StorageManipulationError> FlushDeletedEdges(Transaction *transaction);
   [[nodiscard]] std::expected<void, StorageManipulationError> FlushModifiedEdges(Transaction *transaction,
                                                                                  const auto &edges_acc);
-  [[nodiscard]] std::expected<void, StorageManipulationError> ClearDanglingVertices(Transaction *transaction);
+  [[nodiscard]] std::expected<void, StorageManipulationError> ClearDanglingVertices(Transaction *transaction,
+                                                                                    AuxiliaryTransactions &aux_txs);
 
   /// Writing methods
   bool WriteVertexToVertexColumnFamily(Transaction *transaction, const Vertex &vertex);
+  bool DeleteOldVertexEntryFromDisk(Transaction *transaction, std::string_view old_vertex_key);
   bool WriteEdgeToEdgeColumnFamily(Transaction *transaction, std::string_view serialized_edge_key,
                                    std::string_view serialized_edge_value);
   bool WriteEdgeToConnectivityIndex(Transaction *transaction, std::string_view vertex_gid, std::string_view edge_gid,
@@ -648,19 +698,22 @@ class DiskStorage final : public Storage {
 
  private:
   void LoadPersistingMetadataInfo();
+  void ReconcileRecoveredStateFromGraph();
 
   uint64_t GetDiskSpaceUsage() const;
 
   [[nodiscard]] std::expected<void, ConstraintViolation> CheckExistingVerticesBeforeCreatingExistenceConstraint(
-      LabelId label, PropertyId property) const;
+      LabelId label, PropertyId property, CheckCancelFunction const &cancel_check = neverCancel) const;
 
   [[nodiscard]] std::expected<std::vector<std::pair<std::string, std::string>>, ConstraintViolation>
-  CheckExistingVerticesBeforeCreatingUniqueConstraint(LabelId label, const std::set<PropertyId> &properties) const;
+  CheckExistingVerticesBeforeCreatingUniqueConstraint(LabelId label, const std::set<PropertyId> &properties,
+                                                      CheckCancelFunction const &cancel_check = neverCancel) const;
 
-  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelIndex(LabelId label);
+  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelIndex(
+      LabelId label, CheckCancelFunction const &cancel_check = neverCancel);
 
-  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelPropertyIndex(LabelId label,
-                                                                                          PropertyId property);
+  std::vector<std::pair<std::string, std::string>> SerializeVerticesForLabelPropertyIndex(
+      LabelId label, PropertyId property, CheckCancelFunction const &cancel_check = neverCancel);
 
   StorageInfo GetBaseInfo() override;
   StorageInfo GetInfo() override;

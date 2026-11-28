@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -179,6 +180,14 @@ class Word2Vec {
       index2token_.clear();
       counts_.clear();
       vocab_size_ = 0;
+      total_words_ = 0;
+      keep_prob_.clear();
+      syn0_.clear();
+      syn1neg_.clear();
+      syn1_.clear();
+      hs_codes_.clear();
+      hs_points_.clear();
+      cum_table_.clear();
     }
 
     // Assign vocabulary indices in a deterministic order: descending count, then
@@ -347,6 +356,16 @@ class Word2Vec {
     }
   }
 
+  static constexpr size_t kLockStripes = 256;
+  static constexpr uint64_t kSyn0LockTag = 1u;
+  static constexpr uint64_t kSyn1LockTag = 2u;
+  static constexpr uint64_t kSyn1NegLockTag = 3u;
+
+  static inline std::mutex &StripeMutex(std::vector<std::mutex> &locks, uint64_t tag, int row_idx) {
+    uint64_t h = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) * 1315423911ULL) ^ (tag * 0x9E3779B97F4A7C15ULL);
+    return locks[static_cast<size_t>(h & (kLockStripes - 1))];
+  }
+
   void TrainEpochs(const std::vector<std::vector<Token>> &sentences, int epochs) {
     // Convert tokens to vocabulary indices once, dropping out-of-vocab tokens.
     std::vector<std::vector<int>> coded;
@@ -369,11 +388,13 @@ class Word2Vec {
 
     int64_t total_train_words = total_tokens * static_cast<int64_t>(epochs);
     std::atomic<int64_t> words_done{0};
+    std::vector<std::mutex> stripe_locks(workers > 1 ? kLockStripes : 0);
+    std::vector<std::mutex> *locks_ptr = workers > 1 ? &stripe_locks : nullptr;
 
     for (int epoch = 0; epoch < epochs; ++epoch) {
       if (workers <= 1) {
-        TrainRange(
-            coded, 0, coded.size(), words_done, total_train_words, seed_ + static_cast<uint64_t>(epoch) * 7919u + 1u);
+        TrainRange(coded, 0, coded.size(), words_done, total_train_words,
+                   seed_ + static_cast<uint64_t>(epoch) * 7919u + 1u, nullptr);
       } else {
         std::vector<std::thread> pool;
         size_t chunk = (coded.size() + workers - 1) / workers;
@@ -382,8 +403,9 @@ class Word2Vec {
           if (begin >= coded.size()) break;
           size_t end = std::min(begin + chunk, coded.size());
           uint64_t rng_seed = seed_ + static_cast<uint64_t>(epoch) * 7919u + static_cast<uint64_t>(w) * 104729u + 1u;
-          pool.emplace_back(
-              [&, begin, end, rng_seed]() { TrainRange(coded, begin, end, words_done, total_train_words, rng_seed); });
+          pool.emplace_back([&, begin, end, rng_seed, locks_ptr]() {
+            TrainRange(coded, begin, end, words_done, total_train_words, rng_seed, locks_ptr);
+          });
         }
         for (auto &th : pool) th.join();
       }
@@ -392,10 +414,11 @@ class Word2Vec {
 
   // Trains over coded[begin, end).
   void TrainRange(const std::vector<std::vector<int>> &coded, size_t begin, size_t end,
-                  std::atomic<int64_t> &words_done, int64_t total_train_words, uint64_t rng_seed) {
-    std::mt19937_64 rng(rng_seed);         // NOSONAR
-    std::vector<float> neu1(dim_, 0.0f);   // CBOW hidden layer
-    std::vector<float> neu1e(dim_, 0.0f);  // accumulated gradient
+                  std::atomic<int64_t> &words_done, int64_t total_train_words, uint64_t rng_seed,
+                  std::vector<std::mutex> *locks) {
+    std::mt19937_64 rng(rng_seed);           // NOSONAR
+    std::vector<float> neu1(dim_, 0.0f);     // CBOW hidden layer / SG context snapshot
+    std::vector<float> neu1e(dim_, 0.0f);    // accumulated gradient
 
     double start_alpha = p_.alpha;
     double end_alpha = p_.min_alpha;
@@ -413,7 +436,14 @@ class Word2Vec {
         if (keep_prob_[idx] >= 1.0 || keep_dist(rng) <= keep_prob_[idx]) sentence.push_back(idx);
       }
       const int len = static_cast<int>(sentence.size());
-      if (len == 0) continue;
+      if (len == 0) {
+        local_processed += static_cast<int64_t>(raw.size());
+        if (local_processed >= 10000) {
+          words_done.fetch_add(local_processed, std::memory_order_relaxed);
+          local_processed = 0;
+        }
+        continue;
+      }
 
       // Refresh the learning rate roughly once per sentence.
       int64_t seen = words_done.load(std::memory_order_relaxed) + local_processed;
@@ -425,11 +455,15 @@ class Word2Vec {
       for (int i = 0; i < len; ++i) {
         int b = static_cast<int>(rng() % static_cast<uint64_t>(p_.window));  // reduced window in [0, window)
         if (p_.sg)
-          TrainSGWord(sentence, i, b, alpha, neu1e, rng);
+          TrainSGWord(sentence, i, b, alpha, neu1, neu1e, rng, locks);
         else
-          TrainCBOWWord(sentence, i, b, alpha, neu1, neu1e, rng);
+          TrainCBOWWord(sentence, i, b, alpha, neu1, neu1e, rng, locks);
       }
       local_processed += static_cast<int64_t>(raw.size());
+      if (local_processed >= 10000) {
+        words_done.fetch_add(local_processed, std::memory_order_relaxed);
+        local_processed = 0;
+      }
     }
     words_done.fetch_add(local_processed, std::memory_order_relaxed);
   }
@@ -440,8 +474,9 @@ class Word2Vec {
   //   i     - position of the center word in the sentence
   //   b     - random window shrink for this center word (word2vec's dynamic window)
   //   neu1e - reusable per-call gradient accumulator (caller-owned scratch)
-  void TrainSGWord(const std::vector<int> &sentence, int i, int b, float alpha, std::vector<float> &neu1e,
-                   std::mt19937_64 &rng) {  // NOSONAR
+  void TrainSGWord(const std::vector<int> &sentence, int i, int b, float alpha, std::vector<float> &l1_snap,
+                   std::vector<float> &neu1e, std::mt19937_64 &rng,
+                   std::vector<std::mutex> *locks) {  // NOSONAR
     const int len = static_cast<int>(sentence.size());
     const int center = sentence[i];  // the word being predicted (output/target)
     // `a` scans the window [-window+b, +window-b] around i; a == window is the
@@ -452,8 +487,20 @@ class Word2Vec {
       int context = sentence[c];
       float *l1 = &syn0_[static_cast<size_t>(context) * dim_];  // context word's vector = the hidden layer
       std::fill(neu1e.begin(), neu1e.end(), 0.0f);              // reset gradient accumulator for l1
-      TrainPair(center, l1, alpha, neu1e.data(), rng);
-      for (int d = 0; d < dim_; ++d) l1[d] += neu1e[d];  // apply the accumulated gradient to the context vector
+      if (locks == nullptr) {
+        TrainPair(center, l1, alpha, neu1e.data(), rng, nullptr);
+        for (int d = 0; d < dim_; ++d) l1[d] += neu1e[d];
+      } else {
+        {
+          std::lock_guard<std::mutex> lk(StripeMutex(*locks, kSyn0LockTag, context));
+          std::copy_n(l1, dim_, l1_snap.data());
+        }
+        TrainPair(center, l1_snap.data(), alpha, neu1e.data(), rng, locks);
+        {
+          std::lock_guard<std::mutex> lk(StripeMutex(*locks, kSyn0LockTag, context));
+          for (int d = 0; d < dim_; ++d) l1[d] += neu1e[d];
+        }
+      }
     }
   }
 
@@ -463,7 +510,8 @@ class Word2Vec {
   //   neu1  - reusable scratch for the averaged context (the hidden layer)
   //   neu1e - reusable scratch for the gradient shared by all context words
   void TrainCBOWWord(const std::vector<int> &sentence, int i, int b, float alpha, std::vector<float> &neu1,
-                     std::vector<float> &neu1e, std::mt19937_64 &rng) {  // NOSONAR
+                     std::vector<float> &neu1e, std::mt19937_64 &rng,
+                     std::vector<std::mutex> *locks) {  // NOSONAR
     const int len = static_cast<int>(sentence.size());
     const int center = sentence[i];  // the word being predicted (output/target)
     std::fill(neu1.begin(), neu1.end(), 0.0f);
@@ -475,21 +523,33 @@ class Word2Vec {
     for (int a = b; a < 2 * p_.window + 1 - b; ++a) {
       int c = i - p_.window + a;
       if (a == p_.window || c < 0 || c >= len) continue;
-      const float *row = &syn0_[static_cast<size_t>(sentence[c]) * dim_];
-      for (int d = 0; d < dim_; ++d) neu1[d] += row[d];
+      int ctx = sentence[c];
+      const float *row = &syn0_[static_cast<size_t>(ctx) * dim_];
+      if (locks == nullptr) {
+        for (int d = 0; d < dim_; ++d) neu1[d] += row[d];
+      } else {
+        std::lock_guard<std::mutex> lk(StripeMutex(*locks, kSyn0LockTag, ctx));
+        for (int d = 0; d < dim_; ++d) neu1[d] += row[d];
+      }
       ++cw;
     }
     if (cw == 0) return;                           // no context words -> nothing to train
     for (int d = 0; d < dim_; ++d) neu1[d] /= cw;  // mean of the context vectors (cbow_mean = 1)
 
-    TrainPair(center, neu1.data(), alpha, neu1e.data(), rng);
+    TrainPair(center, neu1.data(), alpha, neu1e.data(), rng, locks);
 
     // Back-propagate the same gradient to every context word's input vector.
     for (int a = b; a < 2 * p_.window + 1 - b; ++a) {
       int c = i - p_.window + a;
       if (a == p_.window || c < 0 || c >= len) continue;
-      float *row = &syn0_[static_cast<size_t>(sentence[c]) * dim_];
-      for (int d = 0; d < dim_; ++d) row[d] += neu1e[d];
+      int ctx = sentence[c];
+      float *row = &syn0_[static_cast<size_t>(ctx) * dim_];
+      if (locks == nullptr) {
+        for (int d = 0; d < dim_; ++d) row[d] += neu1e[d];
+      } else {
+        std::lock_guard<std::mutex> lk(StripeMutex(*locks, kSyn0LockTag, ctx));
+        for (int d = 0; d < dim_; ++d) row[d] += neu1e[d];
+      }
     }
   }
 
@@ -509,7 +569,8 @@ class Word2Vec {
   // Trains the output layer to predict `target` from the hidden vector `l1`,
   // accumulating the input-side gradient into `neu1e`. Uses hierarchical softmax
   // and/or negative sampling depending on parameters.
-  void TrainPair(int target, const float *l1, float alpha, float *neu1e, std::mt19937_64 &rng) {  // NOSONAR
+  void TrainPair(int target, const float *l1, float alpha, float *neu1e, std::mt19937_64 &rng,
+                 std::vector<std::mutex> *locks) {  // NOSONAR
     // Hierarchical softmax: one binary decision per internal node on `target`'s
     // Huffman path. code[j] is the bit toward `target`, so the target label for
     // the "1" branch is (1 - code[j]).
@@ -517,8 +578,14 @@ class Word2Vec {
       const std::vector<uint8_t> &code = hs_codes_[target];
       const std::vector<int> &point = hs_points_[target];
       for (size_t j = 0; j < code.size(); ++j) {
-        float *l2 = &syn1_[static_cast<size_t>(point[j]) * dim_];
-        UpdateOutput(l2, 1.0f - static_cast<float>(code[j]), l1, alpha, neu1e);
+        int row_idx = point[j];
+        float *l2 = &syn1_[static_cast<size_t>(row_idx) * dim_];
+        if (locks == nullptr) {
+          UpdateOutput(l2, 1.0f - static_cast<float>(code[j]), l1, alpha, neu1e);
+        } else {
+          std::lock_guard<std::mutex> lk(StripeMutex(*locks, kSyn1LockTag, row_idx));
+          UpdateOutput(l2, 1.0f - static_cast<float>(code[j]), l1, alpha, neu1e);
+        }
       }
     }
 
@@ -533,7 +600,13 @@ class Word2Vec {
           if (sample == target) continue;  // never train the target as its own negative
           label = 0.0f;
         }
-        UpdateOutput(&syn1neg_[static_cast<size_t>(sample) * dim_], label, l1, alpha, neu1e);
+        float *l2 = &syn1neg_[static_cast<size_t>(sample) * dim_];
+        if (locks == nullptr) {
+          UpdateOutput(l2, label, l1, alpha, neu1e);
+        } else {
+          std::lock_guard<std::mutex> lk(StripeMutex(*locks, kSyn1NegLockTag, sample));
+          UpdateOutput(l2, label, l1, alpha, neu1e);
+        }
       }
     }
   }

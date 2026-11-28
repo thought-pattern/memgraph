@@ -1,8 +1,8 @@
 import sys
 from textwrap import dedent
 
-import pytest
 from graphql_server import *
+import pytest
 
 
 @pytest.fixture
@@ -11,7 +11,8 @@ def query_server() -> GraphQLServer:
 
 
 def test_mutation_in__property(query_server):
-    query_server.send_query("mutation { setup }")
+    setup_result = query_server.send_query("mutation { setup }")
+    assert server_returned_expected('{"data": {"setup": true}}', setup_result)
 
     query = dedent(
         """\
@@ -52,7 +53,8 @@ def test_mutation_in__property(query_server):
 
 
 def test_mutation_in_relationship_property(query_server):
-    query_server.send_query("mutation { setup }")
+    setup_result = query_server.send_query("mutation { setup }")
+    assert server_returned_expected('{"data": {"setup": true}}', setup_result)
 
     query = dedent(
         """\

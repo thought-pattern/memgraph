@@ -178,6 +178,16 @@ class ResourceMonitoring {
     }
   }
 
+  std::shared_ptr<const UserResources> FindUser(const std::string &name) const {
+    const auto key = ToLowerCase(name);
+    auto lock = std::shared_lock(mtx_);
+    auto it = per_user_resources.find(key);
+    if (it != per_user_resources.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
   void RemoveUser(const std::string &name) {
     // Resource is passed as a shared_ptr; anything using it should be safe
     auto lock = std::unique_lock(mtx_);

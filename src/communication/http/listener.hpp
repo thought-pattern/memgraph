@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <exception>
 #include <list>
 #include <memory>
 
@@ -55,7 +57,7 @@ class Listener final : public std::enable_shared_from_this<Listener<TRequestHand
   // Start accepting incoming connections
   void Run() { DoAccept(); }
 
-  bool HasErrorHappened() const { return error_happened_; }
+  bool HasErrorHappened() const { return error_happened_.load(std::memory_order_acquire); }
 
   std::optional<tcp::endpoint> GetEndpoint() const {
     try {
@@ -76,7 +78,7 @@ class Listener final : public std::enable_shared_from_this<Listener<TRequestHand
     acceptor_.open(endpoint.protocol(), ec);
     if (ec) {
       LogErrorListener(ec, "open");
-      error_happened_ = true;
+      error_happened_.store(true, std::memory_order_release);
       return;
     }
 
@@ -84,7 +86,7 @@ class Listener final : public std::enable_shared_from_this<Listener<TRequestHand
     acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec);
     if (ec) {
       LogErrorListener(ec, "set_option");
-      error_happened_ = true;
+      error_happened_.store(true, std::memory_order_release);
       return;
     }
 
@@ -92,14 +94,14 @@ class Listener final : public std::enable_shared_from_this<Listener<TRequestHand
     acceptor_.bind(endpoint, ec);
     if (ec) {
       LogErrorListener(ec, "bind");
-      error_happened_ = true;
+      error_happened_.store(true, std::memory_order_release);
       return;
     }
 
     acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec);
     if (ec) {
       LogErrorListener(ec, "listen");
-      error_happened_ = true;
+      error_happened_.store(true, std::memory_order_release);
       return;
     }
 
@@ -119,14 +121,22 @@ class Listener final : public std::enable_shared_from_this<Listener<TRequestHand
         RetryAcceptLater(retry_timer_, [shared_this = shared_from_this()] { shared_this->DoAccept(); });
         return;
       }
-      error_happened_ = true;
-      LogErrorListener(ec, "accept");
+      if (ec != boost::asio::error::operation_aborted) {
+        error_happened_.store(true, std::memory_order_release);
+        LogErrorListener(ec, "accept");
+      }
       return;
     }
 
-    SessionHandler::Create(std::move(socket), session_context_, *context_)->Run();
+    try {
+      SessionHandler::Create(std::move(socket), session_context_, *context_)->Run();
+    } catch (const std::exception &e) {
+      spdlog::warn("HTTP listener failed to initialize accepted session: {}", e.what());
+    }
 
-    DoAccept();
+    if (acceptor_.is_open()) {
+      DoAccept();
+    }
   }
 
   boost::asio::io_context &ioc_;
@@ -135,6 +145,6 @@ class Listener final : public std::enable_shared_from_this<Listener<TRequestHand
   tcp::acceptor acceptor_;
   boost::asio::steady_timer retry_timer_;
   AcceptRetryLogThrottle accept_log_throttle_;
-  bool error_happened_{false};
+  std::atomic<bool> error_happened_{false};
 };
 }  // namespace memgraph::communication::http

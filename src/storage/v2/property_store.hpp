@@ -184,6 +184,9 @@ class PropertyStore {
   /// Sets buffer
   void SetBuffer(std::string_view buffer);
 
+  static bool NeedsPrecisionNormalization() noexcept;
+  static PropertyValue NormalizeForStorage(const PropertyValue &value);
+
   auto PropertiesMatchTypes(TypeConstraintsValidator const &constraint) const
       -> std::optional<PropertyStoreConstraintViolation>;
 

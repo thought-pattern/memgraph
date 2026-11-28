@@ -20,7 +20,10 @@ mg_add_stamped_custom_target(mage_python_modules ALL
             -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
             -DDST=${MG_MAGE_DIST_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/copy_python_modules.cmake
-    DEPENDS ${MG_MAGE_PY_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/copy_python_modules.cmake
+    DEPENDS
+        ${MG_MAGE_PY_SOURCES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/requirements-gpu.txt
+        ${CMAKE_CURRENT_SOURCE_DIR}/copy_python_modules.cmake
     COMMENT "Copying MAGE Python modules into dist")
 
 # Keep the exclude list in sync with copy_python_modules.cmake.

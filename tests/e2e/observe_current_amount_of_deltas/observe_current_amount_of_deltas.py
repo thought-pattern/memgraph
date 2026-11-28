@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, connect_with_autocommit, execute_and_fetch_all
+import pytest
 
 
 def get_current_amount_of_deltas():

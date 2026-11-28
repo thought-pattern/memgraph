@@ -12,9 +12,9 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from neo4j import GraphDatabase
 

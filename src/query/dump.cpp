@@ -78,6 +78,109 @@ std::string EscapeName(const std::string_view value) {
   return out;
 }
 
+std::string SelectUnusedInternalLabel(query::DbAccessor *dba) {
+  auto mapper = dba->GetStorageAccessor()->GetNameIdMapper();
+  std::string candidate = kInternalVertexLabel;
+  for (uint64_t suffix = 0; mapper->NameToIdIfExists(candidate).has_value(); ++suffix) {
+    candidate = fmt::format("__mg_vertex_{}__", suffix);
+  }
+  return candidate;
+}
+
+std::string SelectUnusedInternalProperty(query::DbAccessor *dba) {
+  auto mapper = dba->GetStorageAccessor()->GetNameIdMapper();
+  std::string candidate = kInternalPropertyId;
+  for (uint64_t suffix = 0; mapper->NameToIdIfExists(candidate).has_value(); ++suffix) {
+    candidate = fmt::format("__mg_id_{}__", suffix);
+  }
+  return candidate;
+}
+
+std::string SanitizeTriggerStatementForSingleLine(std::string_view stmt) {
+  std::string out;
+  out.reserve(stmt.size() + 8);
+  for (size_t i = 0; i < stmt.size();) {
+    const char c = stmt[i];
+    if (c == '\'' || c == '"') {
+      const char quote = c;
+      out.push_back(quote);
+      ++i;
+      while (i < stmt.size()) {
+        const char ch = stmt[i++];
+        if (ch == '\\' && i < stmt.size()) {
+          out.push_back('\\');
+          out.push_back(stmt[i++]);
+        } else if (ch == '\n') {
+          out.append("\\n");
+        } else if (ch == '\r') {
+          out.append("\\r");
+        } else {
+          out.push_back(ch);
+          if (ch == quote) break;
+        }
+      }
+    } else if (c == '`') {
+      out.push_back('`');
+      ++i;
+      while (i < stmt.size()) {
+        const char ch = stmt[i++];
+        if (ch == '`' && i < stmt.size() && stmt[i] == '`') {
+          out.append("``");
+          ++i;
+        } else if (ch == '\r' || ch == '\n') {
+          out.push_back(' ');
+        } else {
+          out.push_back(ch);
+          if (ch == '`') break;
+        }
+      }
+    } else if (c == '/' && i + 1 < stmt.size() && stmt[i + 1] == '*') {
+      out.append("/*");
+      i += 2;
+      while (i < stmt.size()) {
+        if (stmt[i] == '*' && i + 1 < stmt.size() && stmt[i + 1] == '/') {
+          out.append("*/");
+          i += 2;
+          break;
+        }
+        const char ch = stmt[i++];
+        out.push_back((ch == '\r' || ch == '\n') ? ' ' : ch);
+      }
+    } else if (c == '/' && i + 1 < stmt.size() && stmt[i + 1] == '/') {
+      i += 2;
+      out.append("/*");
+      while (i < stmt.size() && stmt[i] != '\n' && stmt[i] != '\r') {
+        if (stmt[i] == '*' && i + 1 < stmt.size() && stmt[i + 1] == '/') {
+          out.append("* /");
+          i += 2;
+        } else {
+          out.push_back(stmt[i++]);
+        }
+      }
+      out.append("*/");
+      if (i < stmt.size()) {
+        if (stmt[i] == '\r' && i + 1 < stmt.size() && stmt[i + 1] == '\n') {
+          i += 2;
+        } else {
+          ++i;
+        }
+        out.push_back(' ');
+      }
+    } else if (c == '\r' || c == '\n') {
+      if (c == '\r' && i + 1 < stmt.size() && stmt[i + 1] == '\n') {
+        i += 2;
+      } else {
+        ++i;
+      }
+      out.push_back(' ');
+    } else {
+      out.push_back(c);
+      ++i;
+    }
+  }
+  return out;
+}
+
 void DumpPreciseDouble(std::ostream *os, double value) { *os << CypherNumericLiteral(value); }
 
 namespace {
@@ -102,9 +205,11 @@ void DumpDuration(std::ostream &os, const storage::TemporalData &value) {
 }
 
 void DumpEnum(std::ostream &os, const storage::Enum &value, query::DbAccessor *dba) {
-  auto const opt_str = dba->EnumToName(value);
-  if (!opt_str) throw query::QueryRuntimeException("Unexpected error when getting enum.");
-  os << *opt_str;
+  auto const &enum_store = dba->GetStorageAccessor()->GetEnumStoreShared();
+  auto const type_name = enum_store.ToTypeString(value.type_id());
+  auto const val_name = enum_store.ToValueString(value.type_id(), value.value_id());
+  if (!type_name || !val_name) throw query::QueryRuntimeException("Unexpected error when getting enum.");
+  os << EscapeName(*type_name) << "::" << EscapeName(*val_name);
 }
 
 void DumpTemporalData(std::ostream &os, const storage::TemporalData &value) {
@@ -247,10 +352,11 @@ void DumpPropertyValue(std::ostream *os, const storage::ExternalPropertyValue &v
 
 void DumpProperties(std::ostream *os, query::DbAccessor *dba,
                     const std::map<storage::PropertyId, storage::PropertyValue> &store,
-                    std::optional<int64_t> property_id = std::nullopt) {
+                    std::optional<int64_t> property_id = std::nullopt,
+                    std::string_view internal_property_id = kInternalPropertyId) {
   *os << "{";
   if (property_id) {
-    *os << kInternalPropertyId << ": " << *property_id;
+    *os << EscapeName(internal_property_id) << ": " << *property_id;
     if (!store.empty()) *os << ", ";
   }
   utils::PrintIterable(*os, store, ", ", [&dba](auto &os, const auto &kv) {
@@ -264,9 +370,10 @@ void DumpProperties(std::ostream *os, query::DbAccessor *dba,
 }
 
 void DumpVertex(std::ostream *os, query::DbAccessor *dba, const query::VertexAccessor &vertex,
-                FineGrainedAuthChecker const *auth_checker) {
+                FineGrainedAuthChecker const *auth_checker, std::string_view internal_vertex_label = kInternalVertexLabel,
+                std::string_view internal_property_id = kInternalPropertyId) {
   *os << "CREATE (";
-  *os << ":" << kInternalVertexLabel;
+  *os << ":" << EscapeName(internal_vertex_label);
   auto maybe_labels = vertex.Labels(storage::View::OLD);
   if (!maybe_labels) ThrowVertexLabelsReadFailure(maybe_labels.error());
   for (const auto &label : *maybe_labels) {
@@ -287,12 +394,15 @@ void DumpVertex(std::ostream *os, query::DbAccessor *dba, const query::VertexAcc
     }
   }
 
-  // For VectorIndexId properties, fetch the actual vector from the index
+  // vertex.Properties(View::OLD) already populates ValueVectorIndexList() from the transaction's snapshot;
+  // only consult the live index if a compact handle arrived without decoded coordinates.
   for (auto &prop_value :
        *maybe_props | std::views::values | std::views::filter([](const auto &pv) { return pv.IsVectorIndexId(); })) {
-    auto index_name = dba->GetStorageAccessor()->GetNameIdMapper()->IdToName(prop_value.ValueVectorIndexIds()[0]);
-    auto vector = dba->GetStorageAccessor()->GetVectorFromVectorIndex(vertex.impl_.vertex_, index_name);
-    prop_value.ValueVectorIndexList() = std::move(vector);
+    if (prop_value.ValueVectorIndexList().empty() && !prop_value.ValueVectorIndexIds().empty()) {
+      auto index_name = dba->GetStorageAccessor()->GetNameIdMapper()->IdToName(prop_value.ValueVectorIndexIds()[0]);
+      auto vector = dba->GetStorageAccessor()->GetVectorFromVectorIndex(vertex.impl_.vertex_, index_name);
+      prop_value.ValueVectorIndexList() = std::move(vector);
+    }
   }
 
   if (auth_checker) {
@@ -301,19 +411,20 @@ void DumpVertex(std::ostream *os, query::DbAccessor *dba, const query::VertexAcc
     });
   }
 
-  DumpProperties(os, dba, *maybe_props, vertex.CypherId());
+  DumpProperties(os, dba, *maybe_props, vertex.CypherId(), internal_property_id);
   *os << ");";
 }
 
 void DumpEdge(std::ostream *os, query::DbAccessor *dba, const query::EdgeAccessor &edge,
-              FineGrainedAuthChecker const *auth_checker) {
+              FineGrainedAuthChecker const *auth_checker, std::string_view internal_vertex_label = kInternalVertexLabel,
+              std::string_view internal_property_id = kInternalPropertyId) {
   *os << "MATCH ";
-  *os << "(u:" << kInternalVertexLabel << "), ";
-  *os << "(v:" << kInternalVertexLabel << ")";
+  *os << "(u:" << EscapeName(internal_vertex_label) << "), ";
+  *os << "(v:" << EscapeName(internal_vertex_label) << ")";
   *os << " WHERE ";
-  *os << "u." << kInternalPropertyId << " = " << edge.From().CypherId();
+  *os << "u." << EscapeName(internal_property_id) << " = " << edge.From().CypherId();
   *os << " AND ";
-  *os << "v." << kInternalPropertyId << " = " << edge.To().CypherId() << " ";
+  *os << "v." << EscapeName(internal_property_id) << " = " << edge.To().CypherId() << " ";
   *os << "CREATE (u)-[";
   *os << ":" << EscapeName(dba->EdgeTypeToName(edge.EdgeType()));
   auto maybe_props = edge.Properties(storage::View::OLD);
@@ -475,6 +586,8 @@ PullPlanDump::PullPlanDump(DbAccessor *dba, dbms::DatabaseAccess db_acc, FineGra
       auth_checker_(auth_checker),
       db_acc_(std::move(db_acc)),
       vertices_iterable_(dba->Vertices(storage::View::OLD)),
+      internal_vertex_label_(SelectUnusedInternalLabel(dba)),
+      internal_property_id_(SelectUnusedInternalProperty(dba)),
       pull_chunks_{/*
                     * IMPORTANT: the order here must reflex the order in `src/storage/v2/durability/snapshot.cpp`
                     * this is so that we have a stable order
@@ -570,9 +683,11 @@ bool PullPlanDump::Pull(AnyStream *stream, std::optional<int> n) {
 PullPlanDump::PullChunk PullPlanDump::CreateEnumsPullChunk() {
   auto enums = dba_->ShowEnums();
   auto to_create = [](auto &&p) {
-    // rv::c_str is required! https://github.com/ericniebler/range-v3/issues/1699
-    return fmt::format(
-        "CREATE ENUM {} VALUES {{ {} }};", p.first, p.second | rv::join(rv::c_str(", ")) | r::to<std::string>);
+    std::ostringstream os;
+    os << "CREATE ENUM " << EscapeName(p.first) << " VALUES { ";
+    utils::PrintIterable(os, p.second, ", ", [](auto &s, auto const &val) { s << EscapeName(val); });
+    os << " };";
+    return os.str();
   };
   auto results = enums | rv::transform(to_create) | r::to_vector;
 
@@ -1006,7 +1121,8 @@ PullPlanDump::PullChunk PullPlanDump::CreateInternalIndexPullChunk() {
   return [this](AnyStream *stream, std::optional<int>) mutable -> std::optional<size_t> {
     if (vertices_iterable_.begin() != vertices_iterable_.end()) {
       std::ostringstream os;
-      os << "CREATE INDEX ON :" << kInternalVertexLabel << "(" << kInternalPropertyId << ");";
+      os << "CREATE INDEX ON :" << EscapeName(internal_vertex_label_) << "(" << EscapeName(internal_property_id_)
+         << ");";
       stream->Result({TypedValue(os.str())});
       internal_index_created_ = true;
       return 1;
@@ -1031,7 +1147,7 @@ PullPlanDump::PullChunk PullPlanDump::CreateVertexPullChunk() {
     size_t local_counter = 0;
     while (current_iter != vertices_iterable_.end() && (!n || local_counter < *n)) {
       std::ostringstream os;
-      DumpVertex(&os, dba_, *current_iter, auth_checker_);
+      DumpVertex(&os, dba_, *current_iter, auth_checker_, internal_vertex_label_, internal_property_id_);
       stream->Result({TypedValue(os.str())});
       ++local_counter;
       ++current_iter;
@@ -1074,7 +1190,7 @@ PullPlanDump::PullChunk PullPlanDump::CreateEdgePullChunk() {
       auto current_edge_iter = maybe_current_edge_iter ? *maybe_current_edge_iter : maybe_edges->edges.begin();
       for (; current_edge_iter != maybe_edges->edges.end() && (!n || local_counter < *n); ++current_edge_iter) {
         std::ostringstream os;
-        DumpEdge(&os, dba_, *current_edge_iter, auth_checker_);
+        DumpEdge(&os, dba_, *current_edge_iter, auth_checker_, internal_vertex_label_, internal_property_id_);
         stream->Result({TypedValue(os.str())});
 
         ++local_counter;
@@ -1101,7 +1217,7 @@ PullPlanDump::PullChunk PullPlanDump::CreateDropInternalIndexPullChunk() {
   return [this](AnyStream *stream, std::optional<int>) {
     if (internal_index_created_) {
       std::ostringstream os;
-      os << "DROP INDEX ON :" << kInternalVertexLabel << "(" << kInternalPropertyId << ");";
+      os << "DROP INDEX ON :" << EscapeName(internal_vertex_label_) << "(" << EscapeName(internal_property_id_) << ");";
       stream->Result({TypedValue(os.str())});
       return 1;
     }
@@ -1113,7 +1229,8 @@ PullPlanDump::PullChunk PullPlanDump::CreateInternalIndexCleanupPullChunk() {
   return [this](AnyStream *stream, std::optional<int>) {
     if (internal_index_created_) {
       std::ostringstream os;
-      os << "MATCH (u) REMOVE u:" << kInternalVertexLabel << ", u." << kInternalPropertyId << ";";
+      os << "MATCH (u) REMOVE u:" << EscapeName(internal_vertex_label_) << ", u." << EscapeName(internal_property_id_)
+         << ";";
       stream->Result({TypedValue(os.str())});
       return 1;
     }
@@ -1122,25 +1239,41 @@ PullPlanDump::PullChunk PullPlanDump::CreateInternalIndexCleanupPullChunk() {
 }
 
 PullPlanDump::PullChunk PullPlanDump::CreateTriggersPullChunk() {
-  return [this](AnyStream *stream, std::optional<int>) {
-    auto triggers = db_acc_->trigger_store()->GetTriggerInfo();
-    for (const auto &trigger : triggers) {
-      std::ostringstream os;
-      auto trigger_statement_copy = trigger.statement;
-      std::ranges::replace(trigger_statement_copy, '\n', ' ');
-      os << "CREATE TRIGGER " << trigger.name;
-      if (trigger.privilege_context == TriggerPrivilegeContext::INVOKER) {
-        os << " SECURITY INVOKER";
-      } else {
-        os << " SECURITY DEFINER";
+  return [this, maybe_results = std::optional<std::vector<std::string>>{}, global_index = 0UZ](
+             AnyStream *stream, std::optional<int> n) mutable -> std::optional<size_t> {
+    if (!maybe_results) {
+      auto triggers = db_acc_->trigger_store()->GetTriggerInfo();
+      std::vector<std::string> formatted;
+      formatted.reserve(triggers.size());
+      for (const auto &trigger : triggers) {
+        std::ostringstream os;
+        auto const sanitized_statement = SanitizeTriggerStatementForSingleLine(trigger.statement);
+        os << "CREATE TRIGGER " << EscapeName(trigger.name);
+        if (trigger.privilege_context == TriggerPrivilegeContext::INVOKER) {
+          os << " SECURITY INVOKER";
+        } else {
+          os << " SECURITY DEFINER";
+        }
+        if (trigger.event_type != TriggerEventType::ANY) {
+          os << " ON " << memgraph::query::TriggerEventTypeToString(trigger.event_type);
+        }
+        os << " " << triggerPhaseToString(trigger.phase) << " " << sanitized_statement << ";";
+        formatted.push_back(os.str());
       }
-      if (trigger.event_type != TriggerEventType::ANY) {
-        os << " ON " << memgraph::query::TriggerEventTypeToString(trigger.event_type);
-      }
-      os << " " << triggerPhaseToString(trigger.phase) << " " << trigger_statement_copy << ";";
-      stream->Result({TypedValue(os.str())});
+      maybe_results.emplace(std::move(formatted));
     }
-    return 0;
+
+    auto const &results = *maybe_results;
+    size_t local_counter = 0;
+    while (global_index < results.size() && (!n || std::cmp_less(local_counter, *n))) {
+      stream->Result({TypedValue(results[global_index])});
+      ++global_index;
+      ++local_counter;
+    }
+    if (global_index == results.size()) {
+      return local_counter;
+    }
+    return std::nullopt;
   };
 }
 

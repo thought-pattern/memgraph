@@ -11,6 +11,8 @@
 
 #include "communication/bolt/v1/value.hpp"
 
+#include <limits>
+
 #include "query/string_helpers.hpp"
 #include "utils/algorithm.hpp"
 #include "utils/string.hpp"
@@ -61,131 +63,83 @@ DEF_GETTER_BY_REF(Point3d, Point3d, point_3d_v);
 
 #undef DEF_GETTER_BY_REF
 
-Value::Value(const Value &other) : type_(other.type_) {
+bool Path::HasValidStructure() const noexcept {
+  if (vertices.empty()) return false;
+  if ((indices.size() % 2U) != 0U) return false;
+  for (size_t i = 0; i < indices.size(); i += 2) {
+    const int64_t edge_ind = indices[i];
+    const int64_t vertex_ind = indices[i + 1];
+    if (edge_ind == 0 || edge_ind == std::numeric_limits<int64_t>::min()) return false;
+    const uint64_t abs_edge =
+        edge_ind > 0 ? static_cast<uint64_t>(edge_ind) : static_cast<uint64_t>(-(edge_ind + 1)) + 1ULL;
+    if (abs_edge - 1ULL >= edges.size()) return false;
+    if (vertex_ind < 0 || static_cast<uint64_t>(vertex_ind) >= vertices.size()) return false;
+  }
+  return true;
+}
+
+void Value::CopyConstructFrom(const Value &other) {
+  type_ = Type::Null;
   switch (other.type_) {
     case Type::Null:
-      return;
+      break;
     case Type::Bool:
       this->bool_v = other.bool_v;
-      return;
+      break;
     case Type::Int:
       this->int_v = other.int_v;
-      return;
+      break;
     case Type::Double:
       this->double_v = other.double_v;
-      return;
+      break;
     case Type::String:
       new (&string_v) std::string(other.string_v);
-      return;
+      break;
     case Type::List:
       new (&list_v) std::vector<Value>(other.list_v);
-      return;
+      break;
     case Type::Map:
       new (&map_v) map_t(other.map_v);
-      return;
+      break;
     case Type::Vertex:
       new (&vertex_v) Vertex(other.vertex_v);
-      return;
+      break;
     case Type::Edge:
       new (&edge_v) Edge(other.edge_v);
-      return;
+      break;
     case Type::UnboundedEdge:
       new (&unbounded_edge_v) UnboundedEdge(other.unbounded_edge_v);
-      return;
+      break;
     case Type::Path:
       new (&path_v) Path(other.path_v);
-      return;
+      break;
     case Type::Date:
       new (&date_v) utils::Date(other.date_v);
-      return;
+      break;
     case Type::LocalTime:
       new (&local_time_v) utils::LocalTime(other.local_time_v);
-      return;
+      break;
     case Type::LocalDateTime:
       new (&local_date_time_v) utils::LocalDateTime(other.local_date_time_v);
-      return;
+      break;
     case Type::Duration:
       new (&duration_v) utils::Duration(other.duration_v);
-      return;
+      break;
     case Type::ZonedDateTime:
       new (&zoned_date_time_v) utils::ZonedDateTime(other.zoned_date_time_v);
-      return;
+      break;
     case Type::Point2d:
       new (&point_2d_v) Point2d(other.point_2d_v);
-      return;
+      break;
     case Type::Point3d:
       new (&point_3d_v) Point3d(other.point_3d_v);
-      return;
+      break;
   }
+  type_ = other.type_;
 }
 
-Value &Value::operator=(const Value &other) {
-  if (this != &other) {
-    this->~Value();
-    // Leave *this as a valid Null if placement-new copy construction below throws.
-    type_ = Type::Null;
-
-    switch (other.type_) {
-      case Type::Null:
-        return *this;
-      case Type::Bool:
-        this->bool_v = other.bool_v;
-        break;
-      case Type::Int:
-        this->int_v = other.int_v;
-        break;
-      case Type::Double:
-        this->double_v = other.double_v;
-        break;
-      case Type::String:
-        new (&string_v) std::string(other.string_v);
-        break;
-      case Type::List:
-        new (&list_v) std::vector<Value>(other.list_v);
-        break;
-      case Type::Map:
-        new (&map_v) map_t(other.map_v);
-        break;
-      case Type::Vertex:
-        new (&vertex_v) Vertex(other.vertex_v);
-        break;
-      case Type::Edge:
-        new (&edge_v) Edge(other.edge_v);
-        break;
-      case Type::UnboundedEdge:
-        new (&unbounded_edge_v) UnboundedEdge(other.unbounded_edge_v);
-        break;
-      case Type::Path:
-        new (&path_v) Path(other.path_v);
-        break;
-      case Type::Date:
-        new (&date_v) utils::Date(other.date_v);
-        break;
-      case Type::LocalTime:
-        new (&local_time_v) utils::LocalTime(other.local_time_v);
-        break;
-      case Type::LocalDateTime:
-        new (&local_date_time_v) utils::LocalDateTime(other.local_date_time_v);
-        break;
-      case Type::Duration:
-        new (&duration_v) utils::Duration(other.duration_v);
-        break;
-      case Type::ZonedDateTime:
-        new (&zoned_date_time_v) utils::ZonedDateTime(other.zoned_date_time_v);
-        break;
-      case Type::Point2d:
-        new (&point_2d_v) Point2d(other.point_2d_v);
-        break;
-      case Type::Point3d:
-        new (&point_3d_v) Point3d(other.point_3d_v);
-        break;
-    }
-    type_ = other.type_;
-  }
-  return *this;
-}
-
-Value::Value(Value &&other) noexcept : type_(other.type_) {
+void Value::MoveConstructFrom(Value &&other) noexcept {
+  type_ = other.type_;
   switch (other.type_) {
     case Type::Null:
       break;
@@ -241,106 +195,32 @@ Value::Value(Value &&other) noexcept : type_(other.type_) {
       new (&point_3d_v) Point3d(other.point_3d_v);
       break;
   }
-
-  // reset the type of other
-  other.~Value();
-  other.type_ = Type::Null;
 }
 
-Value &Value::operator=(Value &&other) noexcept {
-  if (this != &other) {
-    this->~Value();
-    // set the type of this
-    type_ = other.type_;
-
-    switch (other.type_) {
-      case Type::Null:
-        break;
-      case Type::Bool:
-        this->bool_v = other.bool_v;
-        break;
-      case Type::Int:
-        this->int_v = other.int_v;
-        break;
-      case Type::Double:
-        this->double_v = other.double_v;
-        break;
-      case Type::String:
-        new (&string_v) std::string(std::move(other.string_v));
-        break;
-      case Type::List:
-        new (&list_v) std::vector<Value>(std::move(other.list_v));
-        break;
-      case Type::Map:
-        new (&map_v) map_t(std::move(other.map_v));
-        break;
-      case Type::Vertex:
-        new (&vertex_v) Vertex(std::move(other.vertex_v));
-        break;
-      case Type::Edge:
-        new (&edge_v) Edge(std::move(other.edge_v));
-        break;
-      case Type::UnboundedEdge:
-        new (&unbounded_edge_v) UnboundedEdge(std::move(other.unbounded_edge_v));
-        break;
-      case Type::Path:
-        new (&path_v) Path(std::move(other.path_v));
-        break;
-      case Type::Date:
-        new (&date_v) utils::Date(other.date_v);
-        break;
-      case Type::LocalTime:
-        new (&local_time_v) utils::LocalTime(other.local_time_v);
-        break;
-      case Type::LocalDateTime:
-        new (&local_date_time_v) utils::LocalDateTime(other.local_date_time_v);
-        break;
-      case Type::Duration:
-        new (&duration_v) utils::Duration(other.duration_v);
-        break;
-      case Type::ZonedDateTime:
-        new (&zoned_date_time_v) utils::ZonedDateTime(other.zoned_date_time_v);
-        break;
-      case Type::Point2d:
-        new (&point_2d_v) Point2d(other.point_2d_v);
-        break;
-      case Type::Point3d:
-        new (&point_3d_v) Point3d(other.point_3d_v);
-        break;
-    }
-
-    // reset the type of other
-    other.~Value();
-    other.type_ = Type::Null;
-  }
-  return *this;
-}
-
-Value::~Value() {
-  switch (type_) {
-    // destructor for primitive types does nothing
+void Value::DestroyActiveMember() noexcept {
+  const Type prev_type = type_;
+  type_ = Type::Null;
+  switch (prev_type) {
     case Type::Null:
     case Type::Bool:
     case Type::Int:
     case Type::Double:
       return;
-
-    // we need to call destructors for non primitive types since we used
-    // placement new
-    case Type::String:
-      // Clang fails to compile ~std::string. It seems it is a bug in some
-      // versions of clang. using namespace std statement solves the issue.
+    case Type::String: {
       using namespace std;
       string_v.~string();
       return;
-    case Type::List:
+    }
+    case Type::List: {
       using namespace std;
       list_v.~vector<Value>();
       return;
-    case Type::Map:
+    }
+    case Type::Map: {
       using namespace std;
       map_v.~map_t();
       return;
+    }
     case Type::Vertex:
       vertex_v.~Vertex();
       return;
@@ -376,6 +256,35 @@ Value::~Value() {
       return;
   }
 }
+
+Value::Value(const Value &other) : type_(Type::Null) { CopyConstructFrom(other); }
+
+Value &Value::operator=(const Value &other) {
+  if (this != &other) {
+    Value copy(other);
+    DestroyActiveMember();
+    MoveConstructFrom(std::move(copy));
+    copy.DestroyActiveMember();
+  }
+  return *this;
+}
+
+Value::Value(Value &&other) noexcept : type_(Type::Null) {
+  MoveConstructFrom(std::move(other));
+  other.DestroyActiveMember();
+}
+
+Value &Value::operator=(Value &&other) noexcept {
+  if (this != &other) {
+    Value moved(std::move(other));
+    DestroyActiveMember();
+    MoveConstructFrom(std::move(moved));
+    moved.DestroyActiveMember();
+  }
+  return *this;
+}
+
+Value::~Value() { DestroyActiveMember(); }
 
 std::ostream &operator<<(std::ostream &os, const Vertex &vertex) {
   os << "(";
@@ -424,23 +333,38 @@ std::ostream &operator<<(std::ostream &os, const UnboundedEdge &edge) {
 }
 
 std::ostream &operator<<(std::ostream &os, const Path &path) {
+  if (!path.HasValidStructure()) {
+    return os << "<invalid path>";
+  }
   os << path.vertices[0];
-  for (auto it = path.indices.begin(); it != path.indices.end();) {
-    auto edge_ind = *it++;
-    auto vertex_ind = *it++;
-    bool arrow_to_right = true;
-    if (edge_ind < 0) {
-      arrow_to_right = false;
-      edge_ind = -edge_ind;
-    }
+  for (size_t i = 0; i < path.indices.size(); i += 2) {
+    const int64_t edge_ind = path.indices[i];
+    const auto vertex_ind = static_cast<size_t>(path.indices[i + 1]);
+    const bool arrow_to_right = edge_ind > 0;
+    const uint64_t abs_edge =
+        arrow_to_right ? static_cast<uint64_t>(edge_ind) : static_cast<uint64_t>(-(edge_ind + 1)) + 1ULL;
 
     if (!arrow_to_right) os << "<";
-    os << "-" << path.edges[edge_ind - 1] << "-";
+    os << "-" << path.edges[static_cast<size_t>(abs_edge - 1ULL)] << "-";
     if (arrow_to_right) os << ">";
     os << path.vertices[vertex_ind];
   }
 
   return os;
+}
+
+std::ostream &operator<<(std::ostream &os, const std::vector<Value> &values) {
+  os << "[";
+  utils::PrintIterable(os, values);
+  return os << "]";
+}
+
+std::ostream &operator<<(std::ostream &os, const map_t &values) {
+  os << "{";
+  utils::PrintIterable(os, values, ", ", [](auto &stream, const auto &pair) {
+    stream << pair.first << ": " << pair.second;
+  });
+  return os << "}";
 }
 
 std::ostream &operator<<(std::ostream &os, const Value &value) {
@@ -456,15 +380,9 @@ std::ostream &operator<<(std::ostream &os, const Value &value) {
     case Value::Type::String:
       return os << utils::Escape(value.ValueString());
     case Value::Type::List:
-      os << "[";
-      utils::PrintIterable(os, value.ValueList());
-      return os << "]";
+      return os << value.ValueList();
     case Value::Type::Map:
-      os << "{";
-      utils::PrintIterable(os, value.ValueMap(), ", ", [](auto &stream, const auto &pair) {
-        stream << pair.first << ": " << pair.second;
-      });
-      return os << "}";
+      return os << value.ValueMap();
     case Value::Type::Vertex:
       return os << value.ValueVertex();
     case Value::Type::Edge:

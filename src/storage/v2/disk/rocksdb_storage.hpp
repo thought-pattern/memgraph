@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include <rocksdb/comparator.h>
 #include <rocksdb/db.h>
 #include <rocksdb/iterator.h>
@@ -39,15 +41,45 @@ struct RocksDBStorage {
   RocksDBStorage(RocksDBStorage &&) = delete;
   RocksDBStorage &operator=(RocksDBStorage &&) = delete;
 
-  ~RocksDBStorage() {
-    delete db_;
-    db_ = nullptr;
-    delete options_.comparator;
+  ~RocksDBStorage() { Close(); }
+
+  void InstallComparator(std::unique_ptr<rocksdb::Comparator> comparator) {
+    owned_comparator_ = std::move(comparator);
+    options_.comparator = owned_comparator_.get();
+  }
+
+  void Close() {
+    if (db_ != nullptr) {
+      if (vertex_chandle != nullptr) {
+        logging::AssertRocksDBStatus(db_->DestroyColumnFamilyHandle(vertex_chandle));
+        vertex_chandle = nullptr;
+      }
+      if (edge_chandle != nullptr) {
+        logging::AssertRocksDBStatus(db_->DestroyColumnFamilyHandle(edge_chandle));
+        edge_chandle = nullptr;
+      }
+      if (out_edges_chandle != nullptr) {
+        logging::AssertRocksDBStatus(db_->DestroyColumnFamilyHandle(out_edges_chandle));
+        out_edges_chandle = nullptr;
+      }
+      if (in_edges_chandle != nullptr) {
+        logging::AssertRocksDBStatus(db_->DestroyColumnFamilyHandle(in_edges_chandle));
+        in_edges_chandle = nullptr;
+      }
+      if (default_chandle != nullptr) {
+        logging::AssertRocksDBStatus(db_->DestroyColumnFamilyHandle(default_chandle));
+        default_chandle = nullptr;
+      }
+      delete db_;
+      db_ = nullptr;
+    }
     options_.comparator = nullptr;
+    owned_comparator_.reset();
   }
 
   rocksdb::Options options_;
-  rocksdb::TransactionDB *db_;
+  rocksdb::TransactionDB *db_{nullptr};
+  std::unique_ptr<rocksdb::Comparator> owned_comparator_{nullptr};
   /// TODO: (andi) Refactor this
   rocksdb::ColumnFamilyHandle *vertex_chandle = nullptr;
   rocksdb::ColumnFamilyHandle *edge_chandle = nullptr;

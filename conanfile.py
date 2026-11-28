@@ -47,6 +47,44 @@ class Memgraph(ConanFile):
         "import/*",
     )
 
+    def export_sources(self):
+        import re
+        import subprocess
+        import sys
+
+        meta = {"version": "0.0.0", "distance": 0, "shorthash": ""}
+        base_ver_match = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+)", str(self.version or ""))
+        if base_ver_match:
+            meta["version"] = base_ver_match.group(1)
+
+        version_script = os.path.join(self.recipe_folder, "release", "get_version.py")
+        if os.path.isfile(version_script):
+            env = dict(os.environ)
+            env["MEMGRAPH__GET_VERSION__LOCAL_ONLY"] = "1"
+            proc = subprocess.run(
+                [sys.executable, version_script, "", "", "--memgraph-root-dir", self.recipe_folder],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            if proc.returncode == 0:
+                raw = proc.stdout.strip()
+                dev_m = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)~([0-9a-fA-F]+)", raw)
+                rel_m = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+)", raw)
+                if dev_m:
+                    meta = {
+                        "version": dev_m.group(1),
+                        "distance": int(dev_m.group(2)),
+                        "shorthash": dev_m.group(3),
+                    }
+                elif rel_m:
+                    meta = {"version": rel_m.group(1), "distance": 0, "shorthash": ""}
+
+        exported_path = os.path.join(self.export_sources_folder, "MEMGRAPH_EXPORTED_VERSION")
+        with open(exported_path, "w", encoding="utf-8") as vf:
+            json.dump(meta, vf)
+
     default_options = {
         "mage_only": False,
         "bundled_toolchain": True,
@@ -126,10 +164,8 @@ class Memgraph(ConanFile):
         self.requires("librdkafka/2.14.2")
         self.requires("librdtsc/0.3-memgraph")
         if self.settings.os == "Linux":
-            # seccomp is a Linux kernel interface and its recipe only supports Linux, so the
-            # dependency cannot be resolved elsewhere. src/auth still calls into it
-            # unconditionally, so a non-Linux build gets as far as compiling and then fails
-            # there; making that optional is separate work.
+            # seccomp is a Linux kernel interface; src/auth/CMakeLists.txt and
+            # src/auth/module.cpp gate seccomp integration to Linux builds.
             self.requires("libseccomp/2.6.0", options={"shared": True})
         self.requires("mgclient/1.8.0")
         self.requires("nuraft/2.1.0-memgraph")
@@ -210,14 +246,10 @@ class Memgraph(ConanFile):
         tc = CMakeToolchain(self)
 
         # Automatically set sanitizer CMake flags based on compiler settings
-        if self.settings.get_safe("compiler.asan"):
-            tc.cache_variables["ASAN"] = "ON"
-
-        if self.settings.get_safe("compiler.ubsan"):
-            tc.cache_variables["UBSAN"] = "ON"
-
-        if self.settings.get_safe("compiler.tsan"):
-            tc.cache_variables["TSAN"] = "ON"
+        tc.cache_variables["ASAN"] = "ON" if self.settings.get_safe("compiler.asan") else "OFF"
+        tc.cache_variables["UBSAN"] = "ON" if self.settings.get_safe("compiler.ubsan") else "OFF"
+        tc.cache_variables["TSAN"] = "ON" if self.settings.get_safe("compiler.tsan") else "OFF"
+        tc.cache_variables["MG_CAN_RUN_TARGET"] = "ON" if can_run(self) else "OFF"
 
         if self.options.mage_only:
             tc.cache_variables["MG_BUILD_MEMGRAPH"] = "OFF"
@@ -246,9 +278,6 @@ class Memgraph(ConanFile):
             cmake.ctest(cli_args=["-R", "memgraph__unit", "--output-on-failure"])
 
     def package(self):
-        # NOTE we still can't package because ATM we exports_sources which means:
-        # - we are not a git repo
-        # - releases/get_version.py will fail
         cmake = CMake(self)
         cmake.install()
 

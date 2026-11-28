@@ -14,6 +14,7 @@
 namespace memgraph::communication::bolt {
 
 auto BoltMapToMgTypeInfo(map_t const &value) -> std::optional<mg_type_info> {
+  if (value.size() != 2) return std::nullopt;
   auto type_selector = value.find(kMgTypeType);
   if (type_selector == value.cend()) return std::nullopt;
   auto value_selector = value.find(kMgTypeValue);

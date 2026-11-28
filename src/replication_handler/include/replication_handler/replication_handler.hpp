@@ -18,8 +18,10 @@
 
 #include "dbms/dbms_handler.hpp"
 #include "flags/experimental.hpp"
+#include "license/license.hpp"
 #include "metrics/scoped_histogram_timer.hpp"
 #include "parameters/parameters.hpp"
+#include "query/replication_query_handler.hpp"
 #include "replication/include/replication/state.hpp"
 #include "replication_coordination_glue/common.hpp"
 #include "replication_coordination_glue/handler.hpp"
@@ -33,10 +35,12 @@ inline std::optional<query::RegisterReplicaError> HandleRegisterReplicaStatus(
 
 #ifdef MG_ENTERPRISE
 void StartReplicaClient(ReplicationClient &client, system::System &system, dbms::DbmsHandler &dbms_handler,
-                        utils::UUID main_uuid, auth::SynchedAuth &auth, parameters::Parameters &parameters);
+                        utils::UUID main_uuid, auth::SynchedAuth &auth, parameters::Parameters &parameters,
+                        utils::Synchronized<ReplicationState, utils::RWSpinLock> *repl_state = nullptr);
 #else
 void StartReplicaClient(replication::ReplicationClient &client, system::System &system, dbms::DbmsHandler &dbms_handler,
-                        utils::UUID main_uuid, parameters::Parameters &parameters);
+                        utils::UUID main_uuid, parameters::Parameters &parameters,
+                        utils::Synchronized<ReplicationState, utils::RWSpinLock> *repl_state = nullptr);
 #endif
 
 // TODO: Split into 2 functions: dbms and auth
@@ -62,6 +66,13 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
       })) {
     return;
   }
+
+  bool recovery_completed = false;
+  utils::OnScopeExit restore_behind_on_failure{[&client, &recovery_completed]() noexcept {
+    if (!recovery_completed) {
+      client.state_.WithLock([](auto &state) { state = ReplicationClient::State::BEHIND; });
+    }
+  }};
 
   // We still need to system replicate.
   // NB: DbInfo is a local, in-process aggregate only — NOT a wire type, so it needs no versioning of
@@ -113,13 +124,15 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
     std::vector<auth::User> auth_users;
     std::vector<auth::Role> auth_roles;
     std::vector<auth::UserProfiles::Profile> auth_profiles;
+    std::vector<dbms::TenantProfiles::Profile> tenant_profiles;
     if (is_enterprise) {
       auth.WithReadLock([&](const auto &locked_auth) {
         auth_config = locked_auth.GetConfig();
-        auth_users = locked_auth.AllUsers();
+        auth_users = locked_auth.AllUsersStrict();
         auth_roles = locked_auth.AllRoles();
         auth_profiles = locked_auth.AllProfiles();
       });
+      tenant_profiles = dbms_handler.GetAllTenantProfilesStrict();
     }
 #endif
     auto stream = std::invoke([&]() {
@@ -134,7 +147,9 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
                                                             std::vector<auth::UserProfiles::Profile>{},
                                                             params_snapshot,
                                                             std::vector<storage::ColdTenantRecovery>{},
-                                                            /*includes_auth_and_databases=*/false);
+                                                            /*includes_auth_and_databases=*/false,
+                                                            std::vector<dbms::TenantProfiles::Profile>{},
+                                                            /*includes_tenant_profiles=*/false);
       }
       return client.rpc_client_.Stream<SystemRecoveryRpc>(main_uuid,
                                                           db_info.last_committed_timestamp,
@@ -145,7 +160,9 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
                                                           std::move(auth_profiles),
                                                           params_snapshot,
                                                           std::move(db_info.cold_databases),
-                                                          /*includes_auth_and_databases=*/true);
+                                                          /*includes_auth_and_databases=*/true,
+                                                          std::move(tenant_profiles),
+                                                          /*includes_tenant_profiles=*/true);
 #else
       return client.rpc_client_.Stream<SystemRecoveryRpc>(main_uuid,
                                                           db_info.last_committed_timestamp,
@@ -156,7 +173,9 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
                                                           std::vector<auth::UserProfiles::Profile>{},
                                                           params_snapshot,
                                                           std::vector<storage::ColdTenantRecovery>{},
-                                                          /*includes_auth_and_databases=*/false);
+                                                          /*includes_auth_and_databases=*/false,
+                                                          std::vector<dbms::TenantProfiles::Profile>{},
+                                                          /*includes_tenant_profiles=*/false);
 #endif
     });
     guard.reset();
@@ -164,15 +183,21 @@ void SystemRestore(ReplicationClient &client, system::System &system, dbms::Dbms
     if (response.result == SystemRecoveryRes::Result::FAILURE) {
       // System recovery failed; do not record confirmations so the reset is re-advertised on the next
       // SystemRestore.
-      client.state_.WithLock([](auto &state) { state = ReplicationClient::State::BEHIND; });
       return;
     }
   } catch (rpc::RpcFailedException const &) {  // intentionally RpcFailedException and not Generic because we want to
                                                // handle both Generic and timeout type of errors
-    client.state_.WithLock([](auto &state) { state = ReplicationClient::State::BEHIND; });
+    return;
+  } catch (utils::BasicException const &e) {
+    spdlog::warn("System recovery decoding failed for replica {}: {}", client.name_, e.what());
+    return;
+  } catch (std::exception const &e) {
+    spdlog::error("System recovery failed unexpectedly for replica {}: {}", client.name_, e.what());
     return;
   }
   // Successfully recovered
+  client.RecordConfirmedSystemTimestamp(db_info.last_committed_timestamp);
+  recovery_completed = true;
   client.state_.WithLock([](auto &state) { state = memgraph::replication::ReplicationClient::State::READY; });
 }
 
@@ -316,6 +341,7 @@ struct ReplicationHandler : public query::ReplicationQueryHandler {
     auto const main_uuid = std::get<RoleMainData>(locked_repl_state->ReplicationData()).uuid_;
     if constexpr (SendSwapUUID) {
       if (!replication_coordination_glue::SendSwapMainUUIDRpc((*maybe_client)->rpc_client_, main_uuid)) {
+        (void)UnregisterReplicaLocked_(locked_repl_state, config.name);
         return std::unexpected{RegisterReplicaError::ERROR_ACCEPTING_MAIN};
       }
     }
@@ -419,9 +445,9 @@ struct ReplicationHandler : public query::ReplicationQueryHandler {
     }
 
 #ifdef MG_ENTERPRISE
-    StartReplicaClient(*instance_client_ptr, system_, dbms_handler_, main_uuid, auth_, parameters_);
+    StartReplicaClient(*instance_client_ptr, system_, dbms_handler_, main_uuid, auth_, parameters_, &repl_state_);
 #else
-    StartReplicaClient(*instance_client_ptr, system_, dbms_handler_, main_uuid, parameters_);
+    StartReplicaClient(*instance_client_ptr, system_, dbms_handler_, main_uuid, parameters_, &repl_state_);
 #endif
     return {};
   }
@@ -433,52 +459,83 @@ struct ReplicationHandler : public query::ReplicationQueryHandler {
       if constexpr (!AllowIdempotency) {
         return false;
       }
-      // We don't want to restart the server if we're already a REPLICA with correct config
       auto &replica_data = std::get<RoleReplicaData>(locked_repl_state->ReplicationData());
       if (replica_data.config == config) {
-        return true;
+        if (maybe_main_uuid.has_value() && replica_data.uuid_ != *maybe_main_uuid) {
+          if (!locked_repl_state->TryPersistRoleReplica(
+                  replica_data.config, *maybe_main_uuid, /*clear_registered_replicas=*/false)) {
+            return false;
+          }
+          replica_data.uuid_ = *maybe_main_uuid;
+        }
+        if (replica_data.server != nullptr && replica_data.server->IsRunning()) {
+          return true;
+        }
+        try {
+          replica_data.server = std::make_unique<ReplicationServer>(config);
+        } catch (utils::BasicException const &e) {
+          spdlog::warn(e.what());
+          return false;
+        }
+#ifdef MG_ENTERPRISE
+        return StartRpcServer(dbms_handler_, repl_state_, replica_data, auth_, system_, parameters_);
+#else
+        return StartRpcServer(dbms_handler_, repl_state_, replica_data, system_, parameters_);
+#endif
       }
       if (!locked_repl_state->SetReplicationRoleReplica(config, maybe_main_uuid)) {
         return false;
       }
+      auto &updated_replica_data = std::get<RoleReplicaData>(locked_repl_state->ReplicationData());
 #ifdef MG_ENTERPRISE
-      return StartRpcServer(dbms_handler_, repl_state_, replica_data, auth_, system_, parameters_);
+      return StartRpcServer(dbms_handler_, repl_state_, updated_replica_data, auth_, system_, parameters_);
 #else
-      return StartRpcServer(dbms_handler_, repl_state_, replica_data, system_, parameters_);
+      return StartRpcServer(dbms_handler_, repl_state_, updated_replica_data, system_, parameters_);
 #endif
     }
 
-    // Shutdown any clients we might have had
-    ClientsShutdown(locked_repl_state);
-    // Creates the server
-    if (!locked_repl_state->SetReplicationRoleReplica(config, maybe_main_uuid)) {
+    const auto resolved_main_uuid = maybe_main_uuid.value_or(utils::UUID{});
+    std::unique_ptr<ReplicationServer> candidate_server;
+    try {
+      candidate_server = std::make_unique<ReplicationServer>(config);
+    } catch (utils::BasicException const &e) {
+      spdlog::warn(e.what());
       return false;
     }
-    spdlog::info("Role set to replica, instance-level clients destroyed.");
 
-    // Start
-    const auto success = std::visit(
-        utils::Overloaded{[](RoleMainData &) {
-                            // ASSERT
-                            return false;
-                          },
-                          [this](RoleReplicaData &data) {
+    // Preserve MAIN's live replica clients and TTL until both the new replica listener is running and the role
+    // transition (including atomic removal of old replica registrations) is durably persisted.
+    RoleMainData saved_main = std::move(std::get<RoleMainData>(locked_repl_state->ReplicationData()));
+    locked_repl_state->ReplicationData() =
+        RoleReplicaData{.config = config, .server = std::move(candidate_server), .uuid_ = resolved_main_uuid};
+
+    auto &new_replica_data = std::get<RoleReplicaData>(locked_repl_state->ReplicationData());
 #ifdef MG_ENTERPRISE
-                            return StartRpcServer(dbms_handler_, repl_state_, data, auth_, system_, parameters_);
+    const bool server_started = StartRpcServer(dbms_handler_, repl_state_, new_replica_data, auth_, system_, parameters_);
 #else
-                            return StartRpcServer(dbms_handler_, repl_state_, data, system_, parameters_);
+    const bool server_started = StartRpcServer(dbms_handler_, repl_state_, new_replica_data, system_, parameters_);
 #endif
-                          }},
-        locked_repl_state->ReplicationData());
+    if (!server_started) {
+      locked_repl_state->ReplicationData() = std::move(saved_main);
+      return false;
+    }
 
-    // Pause TTL
+    if (!locked_repl_state->TryPersistRoleReplica(config, resolved_main_uuid, /*clear_registered_replicas=*/true)) {
+      new_replica_data.server->Shutdown();
+      locked_repl_state->ReplicationData() = std::move(saved_main);
+      return false;
+    }
+
+    for (auto &client : saved_main.registered_replicas_) {
+      client.Shutdown();
+    }
     dbms_handler_.ForEach([&](dbms::DatabaseAccess db_acc) {
-      auto &ttl = db_acc->ttl();
-      ttl.Suspend();
+      auto *storage = db_acc->storage();
+      storage->repl_storage_state_.replication_storage_clients_.WithLock([](auto &clients) { clients.clear(); });
+      db_acc->ttl().Suspend();
     });
-
-    // TODO Handle error (restore to main?)
-    return success;
+    spdlog::info("Role set to replica, instance-level clients destroyed.");
+    return true;
   }
 
   utils::Synchronized<ReplicationState, utils::RWSpinLock> &repl_state_;

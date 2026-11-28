@@ -3,11 +3,11 @@ set -Eeuo pipefail
 
 # Function to display usage
 usage() {
-  echo "Usage: $0 <last_tag> <next_tag> [options]"
+  echo "Usage: $0 <last_image_or_tag> <next_image_or_tag> [options]"
   echo ""
   echo "Arguments:"
-  echo "  last_tag    The previous version tag (e.g., 2.3.3)"
-  echo "  next_tag    The new version tag (e.g., 2.3.4)"
+  echo "  last_image_or_tag    The previous Docker image (repo:tag) or version tag (e.g., memgraph/memgraph:2.3.3 or 2.3.3)"
+  echo "  next_image_or_tag    The new Docker image (repo:tag) or version tag (e.g., memgraph/memgraph:2.3.4 or 2.3.4)"
   echo ""
   echo "Options:"
   echo "  --test-routing, --test-routing=true         Enable routing tests"
@@ -16,19 +16,63 @@ usage() {
   echo ""
   echo "Example:"
   echo "  $0 2.3.3 2.3.4"
-  echo "  $0 2.3.3 2.3.4 --test-routing --debug=true"
+  echo "  $0 custom.registry/org/memgraph:2.3.3 custom.registry/org/memgraph:2.3.4 --test-routing --debug=true"
   exit 1
 }
 
+parse_image_ref() {
+  local raw="$1"
+  local repo tag
+  if [[ "$raw" == */* ]]; then
+    local last_seg="${raw##*/}"
+    if [[ "$last_seg" == *:* ]]; then
+      repo="${raw%:*}"
+      tag="${last_seg#*:}"
+    else
+      repo="$raw"
+      tag="latest"
+    fi
+  elif [[ "$raw" == *:* ]]; then
+    repo="${raw%:*}"
+    tag="${raw#*:}"
+  else
+    repo="memgraph/memgraph"
+    tag="$raw"
+  fi
+  printf '%s\n%s\n' "$repo" "$tag"
+}
+
+normalize_helm_repo() {
+  local repo="$1"
+  if [[ "$repo" != */* ]]; then
+    echo "docker.io/library/$repo"
+    return
+  fi
+  local first_seg="${repo%%/*}"
+  if [[ "$first_seg" == *.* || "$first_seg" == *:* || "$first_seg" == "localhost" ]]; then
+    echo "$repo"
+  else
+    echo "docker.io/$repo"
+  fi
+}
+
 # --- Validate args ---
-if [ $# -lt 2 ]; then
+if [ $# -lt 2 ] || [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
   echo "Error: Missing required arguments"
   usage
 fi
 
 # --- Required args ---
-LAST_TAG="$1"
-NEXT_TAG="$2"
+parsed_last="$(parse_image_ref "$1")"
+LAST_REPO="${parsed_last%%$'\n'*}"
+LAST_TAG="${parsed_last#*$'\n'}"
+parsed_next="$(parse_image_ref "$2")"
+NEXT_REPO="${parsed_next%%$'\n'*}"
+NEXT_TAG="${parsed_next#*$'\n'}"
+LAST_IMAGE="${LAST_REPO}:${LAST_TAG}"
+NEXT_IMAGE="${NEXT_REPO}:${NEXT_TAG}"
+LAST_HELM_REPO="$(normalize_helm_repo "$LAST_REPO")"
+NEXT_HELM_REPO="$(normalize_helm_repo "$NEXT_REPO")"
 shift 2
 
 # --- Config ---
@@ -45,13 +89,13 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; NC='\033[0m'
 # --- save images as tarballs ---
 # save each image as tarball in the current directory because
 # `minikube load image` is very flaky with loading images directly from Docker.
-LAST_TARBALL="memgraph-${LAST_TAG}.tar"
-NEXT_TARBALL="memgraph-${NEXT_TAG}.tar"
-echo -e "${GREEN}Saving ${LAST_TAG} as ${LAST_TARBALL}"
-docker save memgraph/memgraph:${LAST_TAG} -o ${LAST_TARBALL}
-echo -e "${GREEN}Saving ${NEXT_TAG} as ${NEXT_TARBALL}"
-docker save memgraph/memgraph:${NEXT_TAG} -o ${NEXT_TARBALL}
-echo -e "${GREEN}Saved ${LAST_TAG} as ${LAST_TARBALL} and ${NEXT_TAG} as ${NEXT_TARBALL}"
+LAST_TARBALL="last-$(tr '/:@' '___' <<<"${LAST_IMAGE}").tar"
+NEXT_TARBALL="next-$(tr '/:@' '___' <<<"${NEXT_IMAGE}").tar"
+echo -e "${GREEN}Saving ${LAST_IMAGE} as ${LAST_TARBALL}"
+docker save "${LAST_IMAGE}" -o "${LAST_TARBALL}"
+echo -e "${GREEN}Saving ${NEXT_IMAGE} as ${NEXT_TARBALL}"
+docker save "${NEXT_IMAGE}" -o "${NEXT_TARBALL}"
+echo -e "${GREEN}Saved ${LAST_IMAGE} as ${LAST_TARBALL} and ${NEXT_IMAGE} as ${NEXT_TARBALL}"
 
 # Defaults for flags/env overrides
 TEST_ROUTING=${TEST_ROUTING:-false}
@@ -63,8 +107,12 @@ if [[ "$(arch)" == "aarch64" ]]; then
 else
   ARCH="amd64"
 fi
-echo "Clearing minikube image cache for ${ARCH} in ${HOME}/.minikube/cache/images/${ARCH}/memgraph"
-rm -rfv "${HOME}/.minikube/cache/images/${ARCH}/memgraph"
+for cache_prefix in "${LAST_REPO%%/*}" "${NEXT_REPO%%/*}"; do
+  if [[ -n "${cache_prefix}" ]]; then
+    echo "Clearing minikube image cache for ${ARCH} in ${HOME}/.minikube/cache/images/${ARCH}/${cache_prefix}"
+    rm -rfv "${HOME}/.minikube/cache/images/${ARCH}/${cache_prefix}"
+  fi
+done
 
 # --- Parse flags ---
 while [ "$#" -gt 0 ]; do
@@ -89,7 +137,7 @@ extract_commit_from_tag() {
   # Heuristic: last underscore-separated field looks like a hex SHA (>=7 chars)
   local last_field="${tag##*_}"
   if [[ "$last_field" =~ ^[0-9a-fA-F]{7,}$ ]]; then
-    echo "${last_field,,}"   # normalize to lowercase
+    printf '%s\n' "$last_field" | tr '[:upper:]' '[:lower:]'
   else
     echo ""
   fi
@@ -225,8 +273,8 @@ fi
 
 # --- Banner ---
 echo -e "${GREEN}Starting ISSU test:${NC}"
-echo -e "${GREEN}  Last tag: ${LAST_TAG}${NC}"
-echo -e "${GREEN}  Next tag: ${NEXT_TAG}${NC}"
+echo -e "${GREEN}  Last image: ${LAST_IMAGE}${NC}"
+echo -e "${GREEN}  Next image: ${NEXT_IMAGE}${NC}"
 echo -e "${GREEN}  Debug cleanup (extra): ${DEBUG}${NC}"
 
 # --- Generate values files ---
@@ -239,13 +287,15 @@ fi
 ENTERPRISE_LICENSE=${MEMGRAPH_ENTERPRISE_LICENSE:-""}
 ORGANIZATION_NAME=${MEMGRAPH_ORGANIZATION_NAME:-""}
 
-sed -e "s/{{VERSION_TAG}}/${LAST_TAG}/g" \
+sed -e "s|{{IMAGE_REPOSITORY}}|${LAST_HELM_REPO}|g" \
+    -e "s|{{VERSION_TAG}}|${LAST_TAG}|g" \
     values_template.yaml > old_values.yaml
-echo -e "${GREEN}Generated old_values.yaml with tag: ${LAST_TAG}${NC}"
+echo -e "${GREEN}Generated old_values.yaml with image: ${LAST_HELM_REPO}:${LAST_TAG}${NC}"
 
-sed -e "s/{{VERSION_TAG}}/${NEXT_TAG}/g" \
+sed -e "s|{{IMAGE_REPOSITORY}}|${NEXT_HELM_REPO}|g" \
+    -e "s|{{VERSION_TAG}}|${NEXT_TAG}|g" \
     values_template.yaml > new_values.yaml
-echo -e "${GREEN}Generated new_values.yaml with tag: ${NEXT_TAG}${NC}"
+echo -e "${GREEN}Generated new_values.yaml with image: ${NEXT_HELM_REPO}:${NEXT_TAG}${NC}"
 
 echo -e "${YELLOW}Debug: Checking generated values files...${NC}"
 echo "old_values.yaml image tag:"; grep "tag:" old_values.yaml || echo "No tag found in old_values.yaml"
@@ -522,7 +572,7 @@ kubectl wait --for=condition=ready node --all --timeout=300s
 
 minikube_has_image() {
   local image="$1"
-  if minikube image ls | grep -q "${image}"; then
+  if minikube image ls | grep -Fq "${image}"; then
     return 0
   else
     return 1
@@ -567,8 +617,8 @@ load_into_minikube_if_missing() {
 }
 
 echo -e "${GREEN}Ensuring images exist in Minikube...${NC}"
-load_into_minikube_if_missing "memgraph/memgraph:${LAST_TAG}" "${LAST_TARBALL}"
-load_into_minikube_if_missing "memgraph/memgraph:${NEXT_TAG}" "${NEXT_TARBALL}"
+load_into_minikube_if_missing "${LAST_IMAGE}" "${LAST_TARBALL}"
+load_into_minikube_if_missing "${NEXT_IMAGE}" "${NEXT_TARBALL}"
 
 kubectl apply -f sc.yaml
 echo "Created $SC_NAME storage class"

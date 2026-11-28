@@ -32,7 +32,21 @@ on:
         default: ''
 
 jobs:
+  validate_inputs:
+    name: Validate ISSU Inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate check_flakiness count
+        shell: bash
+        run: |
+          CHECK_FLAKINESS="${{ inputs.check_flakiness }}"
+          if ! [[ "$CHECK_FLAKINESS" =~ ^[0-9]+$ ]] || [ "$CHECK_FLAKINESS" -lt 1 ] || [ "$CHECK_FLAKINESS" -gt 20 ]; then
+            echo "Error: 'check_flakiness' must be an integer between 1 and 20 (inclusive), but got '$CHECK_FLAKINESS'." >&2
+            exit 1
+          fi
+
   single_test:
+    needs: validate_inputs
     if: ${{ inputs.check_flakiness == 1 }}
     name: ISSU Test
     uses: ./.github/workflows/reusable_issu_test.yaml
@@ -44,6 +58,7 @@ jobs:
     secrets: inherit
 
   prepare_flakiness_matrix:
+    needs: validate_inputs
     if: ${{ inputs.check_flakiness > 1 }}
     name: Prepare Flakiness Matrix
     runs-on: ubuntu-latest

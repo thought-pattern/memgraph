@@ -13,8 +13,8 @@ import datetime
 import sys
 import zoneinfo
 
-import pytest
 from common import connect, execute_and_fetch_all
+import pytest
 
 
 def test_pymodule_taking_zoneddatetime_with_UTC():

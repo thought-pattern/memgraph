@@ -39,9 +39,16 @@ inline auto MakeSnapshotName(uint64_t const last_durable_ts) -> std::string {
 }
 
 // Generates the name for a WAL file in a well-defined sortable format.
+inline auto MakeWalNameForDate(std::string_view const date_str, uint64_t const collision_index = 0) -> std::string {
+  if (collision_index == 0) {
+    return fmt::format("{}_current", date_str);
+  }
+  return fmt::format("{}_seq_{:06d}_current", date_str, collision_index);
+}
+
 inline auto MakeWalName() -> std::string {
   auto const date_str = utils::Timestamp::Now().ToString(kTimestampFormat);
-  return fmt::format("{}_current", date_str);
+  return MakeWalNameForDate(date_str);
 }
 
 // Generates the path for a WAL file in a well-defined sortable format with the

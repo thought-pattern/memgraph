@@ -134,7 +134,14 @@ class Reader {
   ~Reader() = default;
 
   struct ParseError {
-    enum class ErrorCode : uint8_t { BAD_HEADER, NO_CLOSING_QUOTE, UNEXPECTED_TOKEN, BAD_NUM_OF_COLUMNS, NULL_BYTE };
+    enum class ErrorCode : uint8_t {
+      BAD_HEADER,
+      NO_CLOSING_QUOTE,
+      UNEXPECTED_TOKEN,
+      BAD_NUM_OF_COLUMNS,
+      NULL_BYTE,
+      IO_ERROR
+    };
 
     ParseError(ErrorCode code, std::string message) : code(code), message(std::move(message)) {}
 

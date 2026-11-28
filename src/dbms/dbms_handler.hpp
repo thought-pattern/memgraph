@@ -116,6 +116,7 @@ class DbmsHandler {
     NOT_IN_MEMORY,          //!< on-disk storage mode is not suspendable
     DURABILITY_INCOMPLETE,  //!< durability mode is not {periodic snapshot + WAL}
     ACTIVE_CONNECTIONS,     //!< another accessor is live; could not reach sole-accessor state
+    DURABILITY_FAILED,      //!< failed to persist the cold catalog marker
   };
   using SuspendResult = std::expected<void, SuspendError>;
 
@@ -189,7 +190,7 @@ class DbmsHandler {
   NewResultT Update(const storage::SalientConfig &config) {
     auto wr = std::lock_guard{lock_};
     const auto name_view = config.name.str_view();
-    auto new_db = New_(*name_view, config.uuid);
+    auto new_db = NewFromSalient_(config);
     if (new_db || new_db.error() != NewError::EXISTS) {
       // NOTE: If db already exists we retry below
       return new_db;
@@ -203,6 +204,7 @@ class DbmsHandler {
                   std::string(db->uuid()),
                   std::string(config.uuid));
     if (db->uuid() == config.uuid) {  // Same db
+      db->storage()->config_.salient = config;
       return db;
     }
 
@@ -225,19 +227,23 @@ class DbmsHandler {
         spdlog::debug("Default storage is not clean, cannot update UUID...");
         return std::unexpected{NewError::GENERIC};
       }
-      auto const old_uuid = storage->config_.salient.uuid;
-      storage->config_.salient.uuid = config.uuid;
+      auto const old_salient = storage->config_.salient;
+      storage->config_.salient = config;
       try {
-        UpdateDurability(storage->config_, ".");
+        if (!UpdateDurability(storage->config_, ".")) {
+          storage->config_.salient = old_salient;
+          return std::unexpected{NewError::GENERIC};
+        }
       } catch (...) {
-        storage->config_.salient.uuid = old_uuid;
+        storage->config_.salient = old_salient;
         throw;
       }
       if (storage->config_.register_metrics) {
         // Only the presented uuid changes; the metric objects and every handle into them stay put.
         metrics::Metrics().RebindDefaultDatabaseUUID(config.uuid);
       }
-      NotifyUuidRetired_(old_uuid, kDefaultDB);
+      NotifyUuidRetired_(old_salient.uuid, kDefaultDB);
+      db->streams()->BindStorageUuid(config.uuid);
       spdlog::debug("Updated default db's UUID");
 
       return db;
@@ -248,12 +254,14 @@ class DbmsHandler {
                   std::string(db->uuid()),
                   std::string(config.uuid));
     // Defer drop
-    (void)Delete_(db->name());
+    if (const auto del = Delete_(db->name()); !del && del.error() != DeleteError::NON_EXISTENT) {
+      return std::unexpected{NewError::GENERIC};
+    }
     // Second attempt
-    return New_(*name_view, config.uuid);
+    return NewFromSalient_(config);
   }
 
-  void UpdateDurability(const storage::Config &config, std::optional<std::filesystem::path> rel_dir = {});
+  [[nodiscard]] bool UpdateDurability(const storage::Config &config, std::optional<std::filesystem::path> rel_dir = {});
 
   /**
    * @brief Get the context associated with the "name" database
@@ -335,7 +343,11 @@ class DbmsHandler {
    * @param txn system transaction for replication
    * @return RenameResult error on failure
    */
+  enum class ReplicaRenameOutcome : uint8_t { SUCCESS, NO_NEED, FAILURE };
+
   RenameResult Rename(std::string_view old_name, std::string_view new_name, system::Transaction *txn = nullptr);
+  ReplicaRenameOutcome RenameForReplication(const utils::UUID &expected_uuid, std::string_view old_name,
+                                            std::string_view new_name);
 
   /**
    * @brief Suspend (move HOT -> COLD) the named tenant, tearing down its in-memory storage.
@@ -700,8 +712,9 @@ class DbmsHandler {
         stats.streams += info.streams;
         ++stats.num_databases;
         stats.indices += storage_info.label_indices + storage_info.label_property_indices + storage_info.text_indices +
-                         storage_info.vector_indices;
-        stats.constraints += storage_info.existence_constraints + storage_info.unique_constraints;
+                         storage_info.vector_indices + storage_info.vector_edge_indices;
+        stats.constraints +=
+            storage_info.existence_constraints + storage_info.unique_constraints + storage_info.type_constraints;
         ++stats.storage_modes[(int)storage_info.storage_mode];
         ++stats.isolation_levels[(int)storage_info.isolation_level];
         stats.snapshot_enabled += storage_info.durability_snapshot_enabled;
@@ -716,6 +729,7 @@ class DbmsHandler {
 
         constexpr size_t kMaxHistogramBucket = 6;
         for (auto &&[label, count] : label_counts) {
+          if (count == 0) continue;
           std::size_t const bucket = std::min(kMaxHistogramBucket, static_cast<std::size_t>(std::log10(count)));
           ++stats.label_node_count_histogram[bucket];
         }
@@ -878,6 +892,12 @@ class DbmsHandler {
     return tenant_profiles_ ? tenant_profiles_->GetAll() : std::vector<TenantProfiles::Profile>{};
   }
 
+  std::vector<TenantProfiles::Profile> GetAllTenantProfilesStrict() const {
+    return tenant_profiles_ ? tenant_profiles_->GetAllStrict() : std::vector<TenantProfiles::Profile>{};
+  }
+
+  [[nodiscard]] bool ReconcileTenantProfilesForRecovery(const std::vector<TenantProfiles::Profile> &incoming);
+
   std::optional<TenantProfiles::Profile> GetTenantProfile(std::string_view name) const {
     return tenant_profiles_ ? tenant_profiles_->Get(name) : std::nullopt;
   }
@@ -920,6 +940,12 @@ class DbmsHandler {
     storage::SalientConfig salient;   //!< salient config to recreate the storage
     std::filesystem::path rel_dir;    //!< durability dir relative to the instance root
     storage::StorageInfo cold_stats;  //!< last-hot stats snapshot (cold SHOW STORAGE INFO display cache)
+    bool stats_dirty{false};          //!< true when cold_stats updated in memory after a failed durability write
+  };
+
+  struct UnreadableProfileEntry {
+    storage::SalientConfig salient;
+    std::filesystem::path rel_dir;
   };
 
   /// @brief Implementation of Suspend. See Suspend() for semantics.
@@ -963,10 +989,13 @@ class DbmsHandler {
    * @return NewResultT context on success, error on failure
    */
   NewResultT New_(std::string_view name, utils::UUID uuid, system::Transaction *txn = nullptr,
-                  std::optional<std::filesystem::path> rel_dir = {}) {
+                  std::optional<std::filesystem::path> rel_dir = {},
+                  std::optional<int64_t> tenant_memory_limit = std::nullopt,
+                  bool persist_durability = true) {
     auto config_copy = default_config_;
     config_copy.salient.name = name;
     config_copy.salient.uuid = uuid;
+    config_copy.tenant_memory_limit = tenant_memory_limit;
     spdlog::debug("Creating database '{}' - '{}'", name, std::string{uuid});
     if (rel_dir) {
       storage::UpdatePaths(config_copy, default_config_.durability.storage_directory / *rel_dir);
@@ -974,7 +1003,20 @@ class DbmsHandler {
       storage::UpdatePaths(config_copy,
                            default_config_.durability.storage_directory / kMultiTenantDir / std::string{uuid});
     }
-    return New_(std::move(config_copy), txn);
+    return New_(std::move(config_copy), txn, persist_durability);
+  }
+
+  NewResultT NewFromSalient_(const storage::SalientConfig &salient) {
+    auto config_copy = default_config_;
+    config_copy.salient = salient;
+    const auto name_view = salient.name.str_view();
+    if (*name_view == kDefaultDB) {
+      storage::UpdatePaths(config_copy, default_config_.durability.storage_directory);
+    } else {
+      storage::UpdatePaths(
+          config_copy, default_config_.durability.storage_directory / kMultiTenantDir / std::string{salient.uuid});
+    }
+    return New_(std::move(config_copy), /*txn=*/nullptr, /*persist_durability=*/true);
   }
 
   /**
@@ -983,7 +1025,13 @@ class DbmsHandler {
    * @param storage_config storage configuration
    * @return NewResultT context on success, error on failure
    */
-  DbmsHandler::NewResultT New_(storage::Config storage_config, system::Transaction *txn = nullptr);
+  DbmsHandler::NewResultT New_(storage::Config storage_config, system::Transaction *txn = nullptr,
+                               bool persist_durability = true);
+
+  [[nodiscard]] static bool IsExpectedTenantRelDir_(std::string_view name, const utils::UUID &uuid,
+                                                    const std::filesystem::path &rel_dir);
+
+  bool TryReconcileUnreadableProfileDb_(std::string_view name);
 
   // TODO: new overload of Delete_ with DatabaseAccess
   DeleteResult Delete_(std::string db_name);
@@ -1003,7 +1051,7 @@ class DbmsHandler {
   // Retire the tenant's own durability key together with its profile detach in one atomic kvstore batch
   // when a profile is attached; otherwise delete the key on its own. Safe (no-op on the key) when the
   // database has no attached profile. Caller must hold lock_.
-  void DetachProfileAndRetireDurabilityKey_(std::string_view db_name);
+  [[nodiscard]] bool DetachProfileAndRetireDurabilityKey_(std::string_view db_name);
 
   // Cold-tenant fast path shared by every Delete/TryDelete overload: if `name` is currently in
   // suspended_, drop it via DeleteCold_ (bypassing the HOT gatekeeper path, which would otherwise
@@ -1153,15 +1201,13 @@ class DbmsHandler {
    * @throw UnknownDatabaseException if database not found
    */
   DatabaseAccess Get_(const utils::UUID &uuid) {
-    // A COLD (suspended) tenant keeps an in-map gatekeeper, but access() returns nullopt (it is not
-    // HOT), so FindHotByUuid_ skips it: a COLD tenant is correctly "not found by UUID" here, and a
-    // data delta for it raises UnknownDatabaseException so the replica fails that delta for MAIN to
-    // recover (it is NOT reheated inline — see GetDatabaseAccessor).
-    auto it = FindHotByUuid_(uuid);  // TODO Speed up (linear scan)
-    if (it == db_handler_.end()) {
-      throw UnknownDatabaseException("Tried to retrieve an unknown database with UUID \"{}\".", std::string{uuid});
+    for (auto &kv : db_handler_) {
+      auto acc = kv.second.access();
+      if (acc && acc->get()->uuid() == uuid) {
+        return std::move(*acc);
+      }
     }
-    return std::move(*it->second.access());
+    throw UnknownDatabaseException("Tried to retrieve an unknown database with UUID \"{}\".", std::string{uuid});
   }
 #endif
 
@@ -1176,6 +1222,7 @@ class DbmsHandler {
   // throw. Do NOT change this to std::less<std::string> — find(string_view) would then construct a
   // std::string key and could throw bad_alloc inside the noexcept window.
   std::map<std::string, SuspendedEntry, std::less<>> suspended_;
+  std::map<std::string, UnreadableProfileEntry, std::less<>> unreadable_profile_dbs_;
   // TODO: move to be common
   std::unique_ptr<kvstore::KVStore> durability_;     //!< list of active dbs (pointer so we can postpone its creation)
   std::unique_ptr<TenantProfiles> tenant_profiles_;  //!< per-DB resource profiles (created after durability_)

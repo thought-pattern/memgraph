@@ -13,6 +13,7 @@
 
 #include <fmt/format.h>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -70,23 +71,152 @@ template <typename Fun>
 [[nodiscard]] bool InsertResultOrSetError(mgp_result *result, mgp_result_record *record, const char *result_name,
                                           mgp_value *value);
 
-// Extracts the `data.<property>` fields a specified-property text query references. Boolean structure is
-// ignored on purpose: a hit can be produced by any referenced field, so all must be readable —
-// over-extraction only over-restricts, whereas missing a field would leak. Empty for a fieldless/blob
-// query (search_all/regex), on which the caller falls back to the index's full property set.
-inline std::vector<std::string_view> ReferencedTextQueryFields(std::string_view query) {
+// Extracts the `data.<property>` fields a specified-property text query references when every clause in the
+// query is explicitly scoped to a `data.<property>` field. Quoted literals and regex literals are skipped so
+// field-like text inside search values is ignored, and any unqualified clause, wildcard/non-`data.` field, or
+// malformed group/quote returns `std::nullopt` so the caller falls back to the index's full property set.
+inline std::optional<std::vector<std::string_view>> TryExtractCompleteTextQueryFields(std::string_view query) {
   constexpr std::string_view kFieldPrefix = "data.";
+  const auto is_ws = [](const char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
   const auto is_ident = [](const char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
   };
+  const auto is_boundary = [&](const size_t idx) {
+    if (idx >= query.size()) return true;
+    const char c = query[idx];
+    return is_ws(c) || c == '(' || c == ')';
+  };
+  const auto skip_quoted_or_delim = [&](size_t &pos, const char closer) -> bool {
+    ++pos;  // skip opening delimiter
+    while (pos < query.size()) {
+      if (query[pos] == '\\') {
+        pos += 2;
+        continue;
+      }
+      if (query[pos] == closer) {
+        ++pos;
+        return true;
+      }
+      ++pos;
+    }
+    return false;
+  };
+  const auto skip_term_modifiers = [&](size_t &pos) {
+    while (pos < query.size() && (query[pos] == '~' || query[pos] == '^')) {
+      ++pos;
+      while (pos < query.size() && !is_ws(query[pos]) && query[pos] != '(' && query[pos] != ')') {
+        ++pos;
+      }
+    }
+  };
+  const auto consume_atom_value = [&](size_t &pos) -> bool {
+    if (pos >= query.size()) return false;
+    const char ch = query[pos];
+    if (ch == '"' || ch == '\'' || ch == '/') {
+      if (!skip_quoted_or_delim(pos, ch)) return false;
+      skip_term_modifiers(pos);
+      return true;
+    }
+    if (ch == '[' || ch == '{') {
+      const char closer = (ch == '[') ? ']' : '}';
+      if (!skip_quoted_or_delim(pos, closer)) return false;
+      skip_term_modifiers(pos);
+      return true;
+    }
+    if (ch == ')' || is_ws(ch)) return false;
+    while (pos < query.size() && !is_ws(query[pos]) && query[pos] != '(' && query[pos] != ')') {
+      if (query[pos] == '\\') {
+        pos += 2;
+        continue;
+      }
+      if (query[pos] == '"' || query[pos] == '\'' || query[pos] == '/') {
+        const char q = query[pos];
+        if (!skip_quoted_or_delim(pos, q)) return false;
+        continue;
+      }
+      ++pos;
+    }
+    return true;
+  };
+
   std::vector<std::string_view> fields;
-  for (auto pos = query.find(kFieldPrefix); pos != std::string_view::npos; pos = query.find(kFieldPrefix, pos)) {
-    const auto name_start = pos + kFieldPrefix.size();
-    auto name_end = name_start;
-    while (name_end < query.size() && is_ident(query[name_end])) ++name_end;
-    pos = name_end;
-    if (name_end == name_start || name_end >= query.size() || query[name_end] != ':') continue;
-    fields.push_back(query.substr(name_start, name_end - name_start));
+  std::vector<bool> group_qualified_stack;
+  bool inherited_qualified = false;
+  size_t pos = 0;
+
+  while (pos < query.size()) {
+    while (pos < query.size() && is_ws(query[pos])) ++pos;
+    if (pos >= query.size()) break;
+
+    if (query[pos] == ')') {
+      if (group_qualified_stack.empty()) return std::nullopt;
+      inherited_qualified = group_qualified_stack.back();
+      group_qualified_stack.pop_back();
+      ++pos;
+      skip_term_modifiers(pos);
+      continue;
+    }
+
+    while (pos < query.size() && (query[pos] == '+' || query[pos] == '-')) {
+      ++pos;
+      if (pos >= query.size() || is_ws(query[pos])) return std::nullopt;
+    }
+
+    if ((query.substr(pos).starts_with("AND") && is_boundary(pos + 3)) ||
+        (query.substr(pos).starts_with("NOT") && is_boundary(pos + 3))) {
+      pos += 3;
+      continue;
+    }
+    if (query.substr(pos).starts_with("OR") && is_boundary(pos + 2)) {
+      pos += 2;
+      continue;
+    }
+
+    if (query[pos] == '(') {
+      group_qualified_stack.push_back(inherited_qualified);
+      ++pos;
+      continue;
+    }
+
+    // Check whether this atom begins with an unescaped `<field>:` prefix.
+    size_t scan = pos;
+    while (scan < query.size() && (is_ident(query[scan]) || query[scan] == '.' || query[scan] == '*')) {
+      ++scan;
+    }
+    if (scan > pos && scan < query.size() && query[scan] == ':') {
+      const auto field_spec = query.substr(pos, scan - pos);
+      if (!field_spec.starts_with(kFieldPrefix)) return std::nullopt;
+      const auto prop_name = field_spec.substr(kFieldPrefix.size());
+      if (prop_name.empty()) return std::nullopt;
+      for (const char c : prop_name) {
+        if (!is_ident(c)) return std::nullopt;
+      }
+      fields.push_back(prop_name);
+      pos = scan + 1;
+      while (pos < query.size() && is_ws(query[pos])) ++pos;
+      if (pos >= query.size()) return std::nullopt;
+      while (pos < query.size() && (query[pos] == '+' || query[pos] == '-')) {
+        ++pos;
+        if (pos >= query.size() || is_ws(query[pos])) return std::nullopt;
+      }
+      if (query[pos] == '(') {
+        group_qualified_stack.push_back(inherited_qualified);
+        inherited_qualified = true;
+        ++pos;
+        continue;
+      }
+      if (!consume_atom_value(pos)) return std::nullopt;
+      continue;
+    }
+
+    if (!inherited_qualified) {
+      return std::nullopt;
+    }
+    if (!consume_atom_value(pos)) return std::nullopt;
+  }
+
+  if (!group_qualified_stack.empty() || fields.empty()) {
+    return std::nullopt;
   }
   return fields;
 }

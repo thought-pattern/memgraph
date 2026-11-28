@@ -43,7 +43,7 @@ bool HoldsANaNBelowTheTop(PropertyValue const &value, bool at_top = true) {
         return as_double != nullptr && std::isnan(*as_double);
       });
     case PropertyValueType::VectorIndexId:
-      return std::ranges::any_of(value.ValueVectorIndexList(), [](float element) { return std::isnan(element); });
+      return std::ranges::any_of(value.ValueVectorIndexList(), [](double element) { return std::isnan(element); });
     case PropertyValueType::Point2d:
       return std::isnan(value.ValuePoint2d().x()) || std::isnan(value.ValuePoint2d().y());
     case PropertyValueType::Point3d:

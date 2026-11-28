@@ -28,6 +28,7 @@ class ReplicationServer {
   ~ReplicationServer();
 
   bool Start();
+  bool IsRunning() const;
   // const because at the shutdown time (main thread) we need to take ReadLock() on repl state which requires constness
   // of functions being invoked
   bool Shutdown() const;

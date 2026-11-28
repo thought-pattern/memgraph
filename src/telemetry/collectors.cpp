@@ -14,10 +14,13 @@
 #include <fmt/format.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <charconv>
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -27,37 +30,80 @@
 
 namespace memgraph::telemetry {
 
-const std::pair<const std::string, const double> GetCpuUsage(pid_t pid, pid_t tid = 0) {
-  std::string name;
-  double cpu = 0;
-  std::string path = "";
-  if (tid == 0) {
-    path = fmt::format("/proc/{}/stat", pid);
-  } else {
-    path = fmt::format("/proc/{}/task/{}/stat", pid, tid);
+std::optional<std::pair<std::string, uint64_t>> ParseProcStatCpuTicks(std::string_view raw_stat) {
+  const auto open_paren = raw_stat.find('(');
+  const auto close_paren = raw_stat.rfind(')');
+  if (open_paren == std::string_view::npos || close_paren == std::string_view::npos || close_paren <= open_paren) {
+    return std::nullopt;
   }
-  auto stat_data = utils::ReadLines(path);
-  if (stat_data.size() >= 1) {
-    auto split = utils::Split(stat_data[0]);
-    if (split.size() >= 20) {
-      int off = 0;
-      for (int i = 1; i < split.size(); ++i) {
-        if (utils::EndsWith(split[i], ")")) {
-          off = i - 1;
-          break;
-        }
-      }
-      // These fields are: utime, stime, cutime, cstime.
-      // Their description can be found in `man proc` under `/proc/[pid]/stat`.
-      for (int i = 14; i <= 17; ++i) {
-        cpu += std::stoull(split[i - 1 + off]);
-      }
-      name = utils::Trim(utils::Join(std::vector<std::string>(split.begin() + 1, split.begin() + 2 + off), " "), "()");
+
+  std::string name{raw_stat.substr(open_paren + 1, close_paren - open_paren - 1)};
+  std::string_view rest = raw_stat.substr(close_paren + 1);
+
+  std::vector<std::string_view> fields;
+  fields.reserve(24);
+  size_t pos = 0;
+  while (pos < rest.size()) {
+    while (pos < rest.size() && (rest[pos] == ' ' || rest[pos] == '\t' || rest[pos] == '\n' || rest[pos] == '\r')) {
+      ++pos;
+    }
+    if (pos >= rest.size()) {
+      break;
+    }
+    const size_t start = pos;
+    while (pos < rest.size() && rest[pos] != ' ' && rest[pos] != '\t' && rest[pos] != '\n' && rest[pos] != '\r') {
+      ++pos;
+    }
+    fields.push_back(rest.substr(start, pos - start));
+  }
+
+  // Fields after `(comm)` start at field 3 (`state`); field 20 (`num_threads`) is index 17,
+  // and `utime`, `stime`, `cutime`, `cstime` (fields 14..17) sit at indices 11..14.
+  if (fields.size() < 18) {
+    return std::nullopt;
+  }
+
+  uint64_t total_ticks = 0;
+  for (size_t idx = 11; idx <= 12; ++idx) {
+    uint64_t val = 0;
+    const auto [ptr, ec] = std::from_chars(fields[idx].data(), fields[idx].data() + fields[idx].size(), val);
+    if (ec != std::errc{} || ptr != fields[idx].data() + fields[idx].size()) {
+      return std::nullopt;
+    }
+    total_ticks += val;
+  }
+  for (size_t idx = 13; idx <= 14; ++idx) {
+    int64_t signed_val = 0;
+    const auto [ptr, ec] =
+        std::from_chars(fields[idx].data(), fields[idx].data() + fields[idx].size(), signed_val);
+    if (ec != std::errc{} || ptr != fields[idx].data() + fields[idx].size()) {
+      return std::nullopt;
+    }
+    if (signed_val > 0) {
+      total_ticks += static_cast<uint64_t>(signed_val);
     }
   }
-  cpu /= sysconf(_SC_CLK_TCK);
-  return {name, cpu};
+
+  return std::make_pair(std::move(name), total_ticks);
 }
+
+namespace {
+std::optional<std::pair<std::string, double>> GetCpuUsage(pid_t pid, pid_t tid = 0) {
+  const std::string path =
+      tid == 0 ? fmt::format("/proc/{}/stat", pid) : fmt::format("/proc/{}/task/{}/stat", pid, tid);
+  const auto stat_data = utils::ReadLines(path);
+  if (stat_data.empty()) {
+    return std::nullopt;
+  }
+  const auto parsed = ParseProcStatCpuTicks(stat_data[0]);
+  if (!parsed) {
+    return std::nullopt;
+  }
+  const long clk_tck = sysconf(_SC_CLK_TCK);
+  const double cpu = clk_tck > 0 ? static_cast<double>(parsed->second) / static_cast<double>(clk_tck) : 0.0;
+  return std::make_pair(parsed->first, cpu);
+}
+}  // namespace
 
 const nlohmann::json GetResourceUsage(std::filesystem::path root_directory) {
   // Get PID of entire process.
@@ -68,19 +114,24 @@ const nlohmann::json GetResourceUsage(std::filesystem::path root_directory) {
   cpu["threads"] = nlohmann::json::array();
 
   // Find all threads.
+  std::error_code ec;
   std::string task_file = fmt::format("/proc/{}/task", pid);
-  if (!std::filesystem::exists(task_file)) {
+  if (!std::filesystem::exists(task_file, ec) || ec) {
     return nlohmann::json::object();
   }
-  for (auto &file : std::filesystem::directory_iterator(task_file)) {
-    auto split = utils::Split(file.path().string(), "/");
-    if (split.size() < 1) continue;
-    pid_t tid = std::stoi(split[split.size() - 1]);
-    auto cpu_usage = GetCpuUsage(pid, tid);
-    cpu["threads"].push_back({{"name", cpu_usage.first}, {"usage", cpu_usage.second}});
+  for (std::filesystem::directory_iterator it(task_file, ec), end; !ec && it != end; it.increment(ec)) {
+    const std::string tid_str = it->path().filename().string();
+    pid_t tid = 0;
+    const auto [ptr, parse_ec] = std::from_chars(tid_str.data(), tid_str.data() + tid_str.size(), tid);
+    if (parse_ec != std::errc{} || ptr != tid_str.data() + tid_str.size() || tid <= 0) {
+      continue;
+    }
+    if (const auto cpu_usage = GetCpuUsage(pid, tid)) {
+      cpu["threads"].push_back({{"name", cpu_usage->first}, {"usage", cpu_usage->second}});
+    }
   }
-  auto cpu_total = GetCpuUsage(pid);
-  cpu["usage"] = cpu_total.second;
+  const auto cpu_total = GetCpuUsage(pid);
+  cpu["usage"] = cpu_total ? cpu_total->second : 0.0;
   const auto vm_max_map_count = utils::GetVmMaxMapCount();
   return {{"cpu", cpu},
           {"memory", utils::GetMemoryRES()},

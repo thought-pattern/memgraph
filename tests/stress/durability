@@ -9,13 +9,13 @@ Durability Stress Test
 
 import atexit
 import multiprocessing
+from multiprocessing import Manager, Pool
 import os
 import random
 import shutil
 import subprocess
 import threading
 import time
-from multiprocessing import Manager, Pool
 
 from common import SessionCache, connection_argument_parser
 

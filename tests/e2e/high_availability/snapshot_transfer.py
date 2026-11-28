@@ -16,16 +16,16 @@
 # files with ENOSPC while its trigger file exists): the replica must survive them, and the main's retry must
 # succeed once there is space again.
 
+from functools import partial
 import glob
 import os
 import shutil
 import sys
-from functools import partial
 
-import interactive_mg_runner
-import pytest
 from common import connect, execute_and_fetch_all, get_data_path, get_logs_path, show_instances
+import interactive_mg_runner
 from mg_utils import mg_sleep_and_assert
+import pytest
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

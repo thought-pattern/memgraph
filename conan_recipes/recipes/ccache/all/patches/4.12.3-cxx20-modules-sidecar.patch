@@ -183,7 +183,7 @@ index 1466c041..87a426df 100644
    return true;
  }
  
-@@ -2154,6 +2173,48 @@ hash_argument(const Context& ctx,
+@@ -2154,6 +2173,52 @@ hash_argument(const Context& ctx,
      return {};
    }
  
@@ -224,6 +224,10 @@ index 1466c041..87a426df 100644
 +        return tl::unexpected(Statistic::could_not_use_module_sidecar);
 +      }
 +      hash.hash_delimiter("module_file");
++      if (eq_pos != std::string_view::npos) {
++        hash.hash(val.substr(0, eq_pos));
++        hash.hash_delimiter("=");
++      }
 +      hash.hash(sidecar->result_key);
 +      return {};
 +    }
@@ -232,7 +236,7 @@ index 1466c041..87a426df 100644
    if (util::starts_with(args[i], "-fplugin=")) {
      DirEntry dir_entry(&args[i][9], DirEntry::LogOnError::yes);
      if (dir_entry.is_regular_file()) {
-@@ -2523,6 +2584,13 @@ from_cache(Context& ctx, FromCacheCallMode mode, const Hash::Digest& result_key)
+@@ -2523,6 +2588,13 @@ from_cache(Context& ctx, FromCacheCallMode mode, const Hash::Digest& result_key)
      return false;
    }
  
@@ -394,9 +398,9 @@ index 00000000..6a79ea5c
 +  }
 +  for (size_t i = 0; i < out.size(); ++i) {
 +    uint8_t byte = 0;
-+    auto [_, ec] =
-+      std::from_chars(hex.data() + 2 * i, hex.data() + 2 * i + 2, byte, 16);
-+    if (ec != std::errc{}) {
++    const char* pair_end = hex.data() + 2 * i + 2;
++    auto [ptr, ec] = std::from_chars(hex.data() + 2 * i, pair_end, byte, 16);
++    if (ec != std::errc{} || ptr != pair_end) {
 +      return false;
 +    }
 +    out[i] = byte;
@@ -459,17 +463,17 @@ index 00000000..6a79ea5c
 +      }
 +      saw_key = true;
 +    } else if (key == "pcm_size") {
-+      auto [_, ec] =
-+        std::from_chars(val.data(), val.data() + val.size(), out.pcm_size);
-+      if (ec != std::errc{}) {
++      const char* val_end = val.data() + val.size();
++      auto [ptr, ec] = std::from_chars(val.data(), val_end, out.pcm_size);
++      if (ec != std::errc{} || ptr != val_end || val.empty()) {
 +        LOG("Module sidecar at {} has malformed pcm_size", path);
 +        return std::nullopt;
 +      }
 +      saw_size = true;
 +    } else if (key == "pcm_mtime_ns") {
-+      auto [_, ec] =
-+        std::from_chars(val.data(), val.data() + val.size(), out.pcm_mtime_ns);
-+      if (ec != std::errc{}) {
++      const char* val_end = val.data() + val.size();
++      auto [ptr, ec] = std::from_chars(val.data(), val_end, out.pcm_mtime_ns);
++      if (ec != std::errc{} || ptr != val_end || val.empty()) {
 +        LOG("Module sidecar at {} has malformed pcm_mtime_ns", path);
 +        return std::nullopt;
 +      }

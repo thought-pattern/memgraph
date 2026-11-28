@@ -426,26 +426,45 @@ TEST_F(PatternVM_Compiler, Validation_DuplicateSymbolBindingAcrossPatterns) {
 }
 
 TEST(PatternVM_Compiler_Validation, SymbolTableOverflowThrows) {
-  // The VM encodes symbol indices as uint8_t; the compiler's symbol table is
-  // therefore capped at 256 distinct Symbol values. Exceeding this must throw
-  // rather than silently wrap the index. Uses a uint16_t-keyed pattern to
-  // produce enough distinct symbols (the Op enum used by the main fixture has
-  // far fewer than 256 values).
+  // The VM encodes symbol indices as uint8_t; the compiler's symbol table holds
+  // up to 256 distinct Symbol values (indices 0..255). Joining unary patterns on
+  // a shared variable uses only 2 e-class registers and 1 e-node register per
+  // pattern, allowing all 256 symbol slots to succeed before a 257th root-symbol
+  // pattern triggers symbol-table overflow prior to register allocation.
   using OverflowCompiler = pattern::vm::PatternsCompiler<uint16_t>;
   using OverflowPattern = pattern::Pattern<uint16_t>;
 
-  auto builder = OverflowPattern::Builder{};
-  constexpr auto kVar = pattern::PatternVar{0};
-  auto cur = builder.var(kVar);
-  // 256 nested unary symbols, each distinct. The compiler's symbols_ vector
-  // will grow past uint8_t::max() while emitting CheckSymbol opcodes.
-  for (uint16_t i = 0; i < 256; ++i) {
-    cur = builder.sym(i, {cur});
+  constexpr auto kSharedVar = pattern::PatternVar{0};
+  constexpr auto kExtraVar = pattern::PatternVar{1};
+
+  std::vector<OverflowPattern> max_valid_patterns;
+  max_valid_patterns.reserve(256);
+  for (uint16_t sym = 0; sym < 256; ++sym) {
+    auto b = OverflowPattern::Builder{};
+    auto v = b.var(kSharedVar);
+    (void)b.sym(sym, {v});
+    max_valid_patterns.push_back(std::move(b).build());
   }
-  auto pattern = std::move(builder).build();
+
+  OverflowCompiler compiler_ok;
+  auto compiled_256 = compiler_ok.compile(max_valid_patterns);
+  EXPECT_EQ(compiled_256.symbols().size(), 256u);
+
+  auto overflow_patterns = max_valid_patterns;
+  {
+    auto b = OverflowPattern::Builder{};
+    auto v = b.var(kExtraVar);
+    (void)b.sym(uint16_t{256}, {v});
+    overflow_patterns.push_back(std::move(b).build());
+  }
 
   OverflowCompiler overflow_compiler;
-  EXPECT_THROW(overflow_compiler.compile(pattern), std::overflow_error);
+  try {
+    (void)overflow_compiler.compile(overflow_patterns);
+    FAIL() << "Expected std::overflow_error on 257th distinct symbol";
+  } catch (std::overflow_error const &ex) {
+    EXPECT_NE(std::string_view{ex.what()}.find("symbol table limit exceeded"), std::string_view::npos) << ex.what();
+  }
 }
 
 }  // namespace memgraph::planner::core

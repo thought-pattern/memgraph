@@ -48,7 +48,9 @@ void ResumeDatabaseHandler(memgraph::system::ReplicaHandlerAccessToState &system
 // Converges {HOT ∪ COLD} to match MAIN. If this replica is unlicensed or includes_all_databases is false,
 // only the default DB is updated and nothing is dropped. Returns false on a non-transient failure.
 bool SystemRecoveryHandler(DbmsHandler &dbms_handler, const std::vector<storage::SalientConfig> &database_configs,
-                           const std::vector<storage::ColdTenantRecovery> &cold_databases, bool includes_all_databases);
+                           const std::vector<storage::ColdTenantRecovery> &cold_databases, bool includes_all_databases,
+                           const std::vector<TenantProfiles::Profile> &tenant_profiles = {},
+                           bool includes_tenant_profiles = false);
 
 // RPC registration
 void Register(replication::RoleReplicaData const &data, system::ReplicaHandlerAccessToState &system_state_access,

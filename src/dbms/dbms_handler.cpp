@@ -159,6 +159,8 @@ struct Durability {
     return json.dump();
   }
 
+  static constexpr std::string_view kV0MigrationJournalPrefix = "v0_migration:";
+
   static void Migrate(kvstore::KVStore *durability, const std::filesystem::path &root) {
     const auto ver_val = durability->Get("version");
     const auto ver = VersionCheck(ver_val);
@@ -168,35 +170,60 @@ struct Durability {
 
     // Update from V0 to V1
     if (ver == DurabilityVersion::V0) {
+      std::vector<std::string> v0_keys;
       for (const auto &[key, _] : *durability) {
-        if (key == "version") continue;  // Reserved key
-        // Generate a UUID
-        auto const uuid = utils::UUID();
-        // New json values
-        auto new_key = GenKey(key);
-        auto path = root;
-        if (key != kDefaultDB) {  // Special case for non-default DBs
-          // Move directory to new UUID dir
-          path = root / kMultiTenantDir / std::string{uuid};
-          std::filesystem::path old_dir(root / kMultiTenantDir / key);
-          std::error_code ec;
-          std::filesystem::rename(old_dir, path, ec);
-          MG_ASSERT(!ec, "Failed to upgrade durability: cannot move default directory.");
+        if (key == "version" || key.starts_with(kV0MigrationJournalPrefix) || key.starts_with(kDBPrefix)) {
+          continue;
         }
-        // Generate json and update value
-        auto new_data = GenVal(uuid, std::filesystem::relative(path, root));
-        to_put.emplace(std::move(new_key), std::move(new_data));
+        v0_keys.push_back(key);
+      }
+
+      for (const auto &key : v0_keys) {
+        const std::string journal_key = std::string{kV0MigrationJournalPrefix} + key;
+        utils::UUID uuid;
+        std::filesystem::path rel_dir;
+
+        if (const auto existing_journal = durability->GetStrict(journal_key); existing_journal.has_value()) {
+          try {
+            const auto j = nlohmann::json::parse(*existing_journal);
+            uuid = j.at(kUuidKey).get<utils::UUID>();
+            rel_dir = j.at(kRelDirKey).get<std::filesystem::path>();
+          } catch (const std::exception &) {
+            throw MigrationException();
+          }
+        } else if (existing_journal.error() == kvstore::KVStore::GetError::kNotFound) {
+          const auto target_path = (key == kDefaultDB) ? root : (root / kMultiTenantDir / std::string{uuid});
+          rel_dir = std::filesystem::relative(target_path, root);
+          const auto planned_val = GenVal(uuid, rel_dir);
+          // Persist the planned target directory BEFORE renaming on disk so an interrupted upgrade recovers it.
+          if (!durability->Put(journal_key, planned_val)) {
+            throw MigrationException();
+          }
+        } else {
+          throw MigrationException();
+        }
+
+        if (key != kDefaultDB) {
+          const std::filesystem::path target_path = root / rel_dir;
+          const std::filesystem::path old_dir = root / kMultiTenantDir / key;
+          std::error_code ec;
+          if (std::filesystem::exists(old_dir, ec)) {
+            std::filesystem::rename(old_dir, target_path, ec);
+            if (ec) {
+              throw MigrationException();
+            }
+          } else if (!std::filesystem::exists(target_path, ec)) {
+            throw MigrationException();
+          }
+        }
+
+        to_put.emplace(GenKey(key), GenVal(uuid, rel_dir));
         to_delete.emplace_back(key);
+        to_delete.emplace_back(journal_key);
       }
     }
 
-    // V1 -> V2 is purely additive: V1 entries are all HOT ({uuid, rel_dir}) and remain valid as-is;
-    // V2 only ADDS optional COLD entries (written by SUSPEND). Reads default `cold` to false and
-    // `cold_stats` to zeros, so an unmigrated V1 entry is read correctly with no data movement.
-
-    // Bump the version inside the SAME atomic batch as the key rewrite: a crash must never leave
-    // version=V2 persisted while the V0->V1 key rewrite is missing (that would permanently skip
-    // migration on the next boot and orphan the un-rewritten keys). Version advances iff the batch lands.
+    // Bump the version inside the SAME atomic batch as the key rewrite.
     to_put.emplace("version", "V2");
     if (!durability->PutAndDeleteMultiple(to_put, to_delete)) {
       throw MigrationException();
@@ -204,33 +231,38 @@ struct Durability {
   }
 };
 
+bool DbmsHandler::IsExpectedTenantRelDir_(std::string_view name, const utils::UUID &uuid,
+                                          const std::filesystem::path &rel_dir) {
+  if (rel_dir.empty() || rel_dir.is_absolute()) {
+    return false;
+  }
+  for (const auto &part : rel_dir) {
+    if (part == "..") {
+      return false;
+    }
+  }
+  const auto normalized = rel_dir.lexically_normal();
+  if (name == kDefaultDB) {
+    return normalized == std::filesystem::path{"."};
+  }
+  const auto expected = (std::filesystem::path{kMultiTenantDir} / std::string{uuid}).lexically_normal();
+  return normalized == expected;
+}
+
 DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_policy)
     : default_config_{std::move(config)}, resume_retry_policy_{resume_retry_policy} {
-  // TODO: Decouple storage config from dbms config
-  // TODO: Save individual db configs inside the kvstore and restore from there
-
-  /*
-   * FILESYSTEM MANIPULATION
-   */
   const auto &root = default_config_.durability.storage_directory;
   storage::UpdatePaths(default_config_, root);
   const auto &db_dir = default_config_.durability.storage_directory / kMultiTenantDir;
-  // TODO: Unify durability and wal
   const auto durability_dir = db_dir / ".durability";
   utils::EnsureDirOrDie(db_dir);
   utils::EnsureDirOrDie(durability_dir);
   durability_ = std::make_unique<kvstore::KVStore>(durability_dir);
 
-  /*
-   * DURABILITY
-   */
-  // Migrate durability
   Durability::Migrate(durability_.get(), root);
+  tenant_profiles_ = std::make_unique<TenantProfiles>(*durability_);
   auto directories = std::set{std::string{kDefaultDB}};
 
-  // Reconstruct a COLD tenant's rebuild metadata from a durable entry. The salient is rebuilt from
-  // the instance defaults (per-tenant salient persistence is out of scope for now) with the durable
-  // name + uuid overlaid — identical to how New_(name, uuid, ...) builds it for a HOT tenant.
   auto make_cold_entry =
       [&](std::string_view nm, utils::UUID id, std::filesystem::path rel_dir, const nlohmann::json &json) {
         SuspendedEntry entry;
@@ -242,32 +274,24 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
         return entry;
       };
 
-  // Restore databases. A tenant is restored HOT (storage built + recovered) unless its durable entry
-  // carries `cold:true`, in which case only a no-value COLD shell + suspended_ metadata is restored
-  // (no storage build). A HOT recovery that fails ABORTS the process (fail loud, like master) — a HOT
-  // database is never silently demoted to COLD at boot.
-  // If a durable entry fails to parse we cannot learn its data directory, so we must NOT run the
-  // cleanup pass below (it would delete every dir not in the keep-set, including the one this corrupt
-  // entry owned). Track that the durable view is incomplete and skip cleanup for this boot.
   bool durability_view_incomplete = false;
   auto it = durability_->begin(std::string(kDBPrefix));
   auto end = durability_->end(std::string(kDBPrefix));
   for (; it != end; ++it) {
     const auto &[key, config_json] = *it;
     const auto name = key.substr(kDBPrefix.size());
-    // Parse defensively. A corrupt/truncated entry must leave the instance starting DEGRADED
-    // (skip the entry, keep the data on disk) rather than throwing out of the ctor and bricking boot.
     nlohmann::json json;
     utils::UUID uuid;
     std::filesystem::path rel_dir;
+    bool is_cold = false;
     try {
       json = nlohmann::json::parse(config_json);
       uuid = json.at(kUuidKey).get<utils::UUID>();
       rel_dir = json.at(kRelDirKey).get<std::filesystem::path>();
+      if (json.contains("cold")) {
+        is_cold = json.at("cold").get<bool>();
+      }
     } catch (const nlohmann::json::exception &e) {
-      // Catch ONLY JSON parse/type/missing-key errors (genuine corruption). A non-JSON exception
-      // (e.g. std::bad_alloc under boot memory pressure) must propagate, not be mislabeled corruption
-      // and silently skip a valid tenant — mirrors the OOM-aware classification of the HOT path below.
       durability_view_incomplete = true;
       spdlog::error(
           "Corrupt durable database entry '{}' ({}); skipping it. Its on-disk data is left untouched and "
@@ -276,18 +300,21 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
           e.what());
       continue;
     }
-    // The on-disk directory must survive the cleanup pass below for BOTH hot and cold tenants — a
-    // COLD shell's data dir is exactly what a later resume rebuilds from.
+
+    if (!IsExpectedTenantRelDir_(name, uuid, rel_dir)) {
+      durability_view_incomplete = true;
+      spdlog::error(
+          "Durable database entry '{}' points to unexpected relative directory '{}' for UUID '{}'; refusing to open "
+          "it and skipping directory cleanup this boot.",
+          key,
+          rel_dir.string(),
+          std::string{uuid});
+      continue;
+    }
+
     directories.emplace(rel_dir.filename());
 
-    const bool is_cold = json.value("cold", false);
     if (is_cold) {
-      // COLD: metadata-only shell, no storage build.
-      // make_cold_entry reads the optional cold_stats field via j.value() / j.at(). nlohmann's j.value() throws
-      // nlohmann::json::type_error (302) when a key is PRESENT BUT WRONG-TYPED (the default only
-      // covers MISSING keys). Guard here with the same degradation pattern as the parse guard above:
-      // a wrong-typed sub-field must leave the instance booting DEGRADED, not abort it. We catch
-      // only nlohmann::json::exception so std::bad_alloc / OOM keep their existing propagation.
       spdlog::info("Restoring suspended (cold) database {} at {}.", name, rel_dir);
       try {
         db_handler_.EmplaceColdShell(name);
@@ -305,20 +332,31 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
       continue;
     }
 
-    // HOT: build + recover the storage. A recovery failure here is FATAL — the instance aborts, exactly
-    // as on master and on a single-tenant instance. A HOT database that cannot be brought up at boot is
-    // NEVER silently demoted to COLD: failing loud surfaces the problem (corruption / OOM / bad config)
-    // and refuses to serve a tenant that has silently lost data. (A user-initiated RESUME, by contrast,
-    // is recoverable — it fails + returns an error and leaves the tenant COLD/retriable; see Resume_.)
-    // A genuinely suspended tenant never reaches here: it is restored as a COLD shell above (cold:true).
-    // Recovery can fail two ways: New_ returns an `unexpected` (the assert below) OR it throws
-    // (on-disk corruption, bad_alloc, OutOfMemoryException). Both are fatal; the catch turns a throw into
-    // the same clean fatal log instead of an opaque uncaught-exception terminate out of the ctor.
+    const auto limit_lookup = tenant_profiles_->ResolveDatabaseLimit(name);
+    if (!limit_lookup.has_value()) {
+      durability_view_incomplete = true;
+      spdlog::error(
+          "Failed to resolve tenant profile memory limit for database '{}'; bringing it up in broken/unavailable "
+          "state without loading its graph until its profile assignment and limit can be read.",
+          name);
+      auto placeholder_cfg = default_config_;
+      placeholder_cfg.salient.name = name;
+      placeholder_cfg.salient.uuid = uuid;
+      placeholder_cfg.durability.recover_on_startup = false;
+      placeholder_cfg.durability.snapshot_on_exit = false;
+      placeholder_cfg.durability.snapshot_wal_mode = storage::Config::Durability::SnapshotWalMode::DISABLED;
+      storage::UpdatePaths(placeholder_cfg, default_config_.durability.storage_directory / rel_dir);
+      auto broken_db = New_(std::move(placeholder_cfg), /*txn=*/nullptr, /*persist_durability=*/false);
+      MG_ASSERT(broken_db.has_value(), "Failed while materializing broken placeholder for database {}.", name);
+      (*broken_db)->storage()->SetBroken(true);
+      unreadable_profile_dbs_.insert_or_assign(
+          std::string{name}, UnreadableProfileEntry{.salient = (*broken_db)->config().salient, .rel_dir = rel_dir});
+      continue;
+    }
+
     spdlog::info("Restoring database {} at {}.", name, rel_dir);
     try {
-      // New_ registers the database as a side effect; the returned handle is intentionally dropped and
-      // only its success is checked here (do not "fix" the unused value by storing it).
-      auto new_db = New_(name, uuid, nullptr, rel_dir);
+      auto new_db = New_(name, uuid, nullptr, rel_dir, *limit_lookup, /*persist_durability=*/false);
       MG_ASSERT(new_db.has_value(),
                 "Failed while recovering database {} (error {}); aborting.",
                 name,
@@ -328,17 +366,15 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
     }
     spdlog::info("Database {} restored.", name);
   }
-  // Set the cold-tenant gauge ONCE after the restore loop (a per-iteration Set would be repeatedly
-  // overwritten; no scrape endpoint is live during construction anyway). Counts the cold-shell tenants
-  // restored above (a failed HOT recovery aborts, so it never contributes a COLD entry here).
+  if (it.HasError()) {
+    durability_view_incomplete = true;
+    spdlog::error(
+        "Database catalog scan ended with a storage read error ({}); skipping unused-directory cleanup and profile "
+        "pruning so live tenant directories are preserved.",
+        it.ErrorMessage());
+  }
   UpdateColdGauge_();
 
-  /*
-   * DATABASES CLEAN UP
-   */
-  // Clean the unused directories. If any durable entry failed to parse, the keep-set is
-  // incomplete — skip cleanup entirely so we never delete the data dir of a tenant we could not read.
-  // The orphan dirs are merely disk overhead and get reclaimed on the next clean boot.
   if (durability_view_incomplete) {
     spdlog::warn(
         "Skipping unused-directory cleanup: a durable database entry failed to parse, so the set of live "
@@ -358,33 +394,66 @@ DbmsHandler::DbmsHandler(storage::Config config, ResumeRetryPolicy resume_retry_
     }
   }
 
-  /*
-   * DEFAULT DB SETUP
-   */
-  // Setup the default DB
   SetupDefault_();
 
-  /*
-   * TENANT PROFILES
-   */
-  tenant_profiles_ = std::make_unique<TenantProfiles>(*durability_);
-
   {
-    // Built from the durable key prefix, not Get_: Get_ is HOT-gated, so a suspended (COLD) tenant
-    // would look absent and have its attachment pruned. A key also survives a value that failed to parse.
     std::set<std::string> live{std::string{kDefaultDB}};
-    for (auto pit = durability_->begin(std::string(kDBPrefix)), pend = durability_->end(std::string(kDBPrefix));
-         pit != pend;
-         ++pit) {
+    auto pit = durability_->begin(std::string(kDBPrefix));
+    const auto pend = durability_->end(std::string(kDBPrefix));
+    for (; pit != pend; ++pit) {
       live.insert(pit->first.substr(kDBPrefix.size()));
     }
-    const auto pruned = tenant_profiles_->PruneDatabases(live);
-    if (pruned != 0) {
-      spdlog::warn("Pruned {} tenant profile attachment(s) whose database no longer exists.", pruned);
+    if (pit.HasError() || durability_view_incomplete) {
+      spdlog::warn("Skipping tenant profile attachment pruning because the durable database catalog scan was incomplete.");
+    } else {
+      const auto pruned = tenant_profiles_->PruneDatabases(live);
+      if (pruned != 0) {
+        spdlog::warn("Pruned {} tenant profile attachment(s) whose database no longer exists.", pruned);
+      }
     }
   }
 
   RestoreTenantProfiles_();
+}
+
+bool DbmsHandler::TryReconcileUnreadableProfileDb_(std::string_view name) {
+  if (!tenant_profiles_) return false;
+  const auto limit_lookup = tenant_profiles_->ResolveDatabaseLimit(name);
+  if (!limit_lookup.has_value()) {
+    return false;
+  }
+  storage::SalientConfig salient;
+  std::filesystem::path rel_dir;
+  {
+    auto wr = std::lock_guard{lock_};
+    auto it = unreadable_profile_dbs_.find(name);
+    if (it == unreadable_profile_dbs_.end()) {
+      return true;
+    }
+    salient = it->second.salient;
+    rel_dir = it->second.rel_dir;
+    auto *gk = db_handler_.GetGatekeeper(name);
+    if (!gk) {
+      return false;
+    }
+    storage::Config cfg = default_config_;
+    cfg.salient = salient;
+    cfg.tenant_memory_limit = *limit_lookup;
+    storage::UpdatePaths(cfg, default_config_.durability.storage_directory / rel_dir);
+    // Stop background tasks and drop broken placeholder first so metrics registration for the same UUID does not collide.
+    if (auto placeholder_acc = gk->access()) {
+      placeholder_acc->get()->StopAllBackgroundTasks();
+    }
+    if (!db_handler_.TryDelete(name)) {
+      return false;
+    }
+    auto recovered = New_(std::move(cfg), /*txn=*/nullptr, /*persist_durability=*/false);
+    if (!recovered.has_value()) {
+      return false;
+    }
+    unreadable_profile_dbs_.erase(it);
+  }
+  return true;
 }
 
 struct DropDatabase : memgraph::system::ISystemAction {
@@ -411,8 +480,8 @@ struct DropDatabase : memgraph::system::ISystemAction {
 };
 
 struct RenameDatabase : memgraph::system::ISystemAction {
-  explicit RenameDatabase(std::string old_name, std::string new_name)
-      : old_name_{std::move(old_name)}, new_name_{std::move(new_name)} {}
+  explicit RenameDatabase(utils::UUID uuid, std::string old_name, std::string new_name)
+      : old_name_{std::move(old_name)}, new_name_{std::move(new_name)}, uuid_{uuid} {}
 
   void DoDurability() override { /* Done during DBMS execution */ }
 
@@ -474,45 +543,51 @@ void DbmsHandler::NotifyUuidRetired_(utils::UUID const &uuid, std::string_view n
 DbmsHandler::DeleteResult DbmsHandler::TryDelete(std::string db_name, system::Transaction *transaction) {
   auto wr = std::lock_guard{lock_};
   if (db_name == kDefaultDB) {
-    // MSG cannot delete the default db
     return std::unexpected{DeleteError::DEFAULT_DB};
   }
 
-  // Cold-tenant fast path: drop a COLD (suspended) tenant directly without going through the HOT
-  // gatekeeper path (which returns NON_EXISTENT for a no-value shell).
   if (auto cold_res = TryDeleteColdFastPath_(db_name, transaction)) {
     return *cold_res;
   }
 
-  // Get DB config for the UUID and disk clean up
   const auto conf = db_handler_.GetConfig(db_name);
   if (!conf) return std::unexpected{NotLiveDeleteError_(db_name)};
-  const auto &storage_path = conf->durability.storage_directory;
-  const auto &uuid = conf->salient.uuid;
+  const auto storage_path = conf->durability.storage_directory;
+  const auto uuid = conf->salient.uuid;
+  const auto rel_dir = std::filesystem::relative(storage_path, default_config_.durability.storage_directory);
 
-  // Check if db exists
-  try {
-    // Low level handlers
-    if (!db_handler_.TryDelete(db_name)) {
-      return std::unexpected{DeleteError::USING};
-    }
-  } catch (utils::BasicException &) {
-    return std::unexpected{DeleteError::NON_EXISTENT};
+  auto *gk = db_handler_.GetGatekeeper(db_name);
+  if (!gk) return std::unexpected{DeleteError::NON_EXISTENT};
+  auto db_acc = gk->access();
+  if (!db_acc || !gk->try_begin_suspend()) {
+    return std::unexpected{DeleteError::USING};
   }
 
-  DetachProfileAndRetireDurabilityKey_(db_name);
+  // Confirm durable catalog and profile retirement BEFORE destroying the database or removing its directory.
+  if (!DetachProfileAndRetireDurabilityKey_(db_name)) {
+    gk->abort_suspend();
+    return std::unexpected{DeleteError::DISK_FAIL};
+  }
 
-  // Delete disk storage
-  std::error_code ec;
-  (void)std::filesystem::remove_all(storage_path, ec);
-  if (ec) {
-    spdlog::error(R"(Failed to clean disk while deleting database "{}" stored in {})", db_name, storage_path);
+  db_acc->get()->StopAllBackgroundTasks();
+  db_acc->get()->streams()->DropAll();
+  db_acc.reset();
+  gk->finish_suspend();
+  db_handler_.EraseColdShell(db_name);
+  unreadable_profile_dbs_.erase(db_name);
+
+  if (IsExpectedTenantRelDir_(db_name, uuid, rel_dir)) {
+    std::error_code ec;
+    (void)std::filesystem::remove_all(storage_path, ec);
+    if (ec) {
+      spdlog::error(R"(Failed to clean disk while deleting database "{}" stored in {})", db_name, storage_path);
+    }
+  } else {
+    spdlog::error(R"(Refusing to delete unexpected directory {} while dropping database "{}")", storage_path, db_name);
   }
 
   NotifyUuidRetired_(uuid, db_name);
 
-  // Success
-  // Save delta
   if (transaction) {
     transaction->AddAction<DropDatabase>(uuid);
   }
@@ -599,65 +674,160 @@ DbmsHandler::RenameResult DbmsHandler::Rename(std::string_view old_name, std::st
     return std::unexpected{RenameError::USING};
   }
 
-  // Perform the rename operation in the handler
+  std::optional<std::string> old_durable_val;
+  std::string old_key;
+  std::string new_key;
+  if (durability_) {
+    old_key = Durability::GenKey(old_name);
+    new_key = Durability::GenKey(new_name);
+    auto fetched = durability_->GetStrict(old_key);
+    if (!fetched.has_value()) {
+      spdlog::error("Failed to read durable catalog entry '{}' before renaming database to '{}'.", old_key, new_name);
+      return std::unexpected{fetched.error() == kvstore::KVStore::GetError::kNotFound ? RenameError::NON_EXISTENT
+                                                                                      : RenameError::FAIL};
+    }
+    old_durable_val = std::move(*fetched);
+  }
+
+  // Pre-allocate rollback name so reversing an in-memory rename on durability failure cannot fail.
+  std::string rollback_old_name{old_name};
+
   if (auto rename_result = db_handler_.Rename(old_name, new_name); !rename_result.has_value()) {
     return std::unexpected{rename_result.error()};
   }
 
-  // Update current db config
   auto new_db = db_handler_.Get(new_name);
   MG_ASSERT(new_db, "Database {} not found after rename.", new_name);
+  const auto db_uuid = (*new_db)->uuid();
   (*new_db)->Rename(new_name);
 
-  // Update durability metadata
   if (durability_) {
-    const auto old_key = Durability::GenKey(old_name);
-    const auto new_key = Durability::GenKey(new_name);
-    auto old_val = durability_->Get(old_key);
-
-    if (old_val) {
-      // The stored value is name-independent (only "uuid"/"rel_dir"/cold fields; the name lives in
-      // the key), so move it verbatim instead of parsing and rewriting it.
-      const std::map<std::string, std::string> to_put{{new_key, std::move(*old_val)}};
-      const std::vector<std::string> to_delete{old_key};
-      // Atomic batch: a separate Put-then-Delete could leave the tenant durably recorded under BOTH
-      // names if the process died mid-way, and the restore loop would then restore the same uuid twice.
-      if (!durability_->PutAndDeleteMultiple(to_put, to_delete)) {
-        // The batch is atomic, so on failure old_name still stands alone durably -- but the in-memory
-        // rename above has already taken effect. Roll it back and fail the operation rather than
-        // replicate a rename MAIN never durably committed: otherwise a crash leaves MAIN recovering
-        // old_name while the replica has new_name, and any later DDL on the phantom new_name compounds
-        // the divergence (its durable key was never written, so the durability update silently no-ops).
-        spdlog::error(
-            "Failed to persist rename of database {} to {}; rolling back in-memory rename.", old_name, new_name);
-        // Intentional reverse rename -- the DB is currently named new_name, so rename it back to
-        // old_name to undo the in-memory rename above (arg/param names legitimately mismatch).
-        // NOLINTNEXTLINE(readability-suspicious-call-argument)
-        [[maybe_unused]] auto rolled_back = db_handler_.Rename(new_name, old_name);
-        (*new_db)->Rename(old_name);
-        return std::unexpected{RenameError::FAIL};
-      }
+    const std::map<std::string, std::string> extra_puts{{new_key, *old_durable_val}};
+    const std::vector<std::string> extra_deletes{old_key};
+    bool committed = false;
+    if (tenant_profiles_) {
+      const auto renamed = tenant_profiles_->RenameDatabase(old_name, new_name, extra_puts, extra_deletes);
+      committed = renamed.has_value();
+    } else {
+      committed = durability_->PutAndDeleteMultiple(extra_puts, extra_deletes);
     }
-  }
-
-  // Update tenant profile membership (no-op if database had no profile attached). Reached only after the
-  // tenant durability record has durably moved (the failure branch above returned), so this profile
-  // rewrite is the sole remaining durable write.
-  if (tenant_profiles_) {
-    // A profile-membership failure here must NOT skip the AddAction<RenameDatabase> below: the rename is
-    // already durable, so refusing to replicate it is exactly what would diverge MAIN and its replicas.
-    auto renamed = tenant_profiles_->RenameDatabase(old_name, new_name);
+    if (!committed) {
+      spdlog::error("Failed to atomically persist rename of database {} to {}; rolling back in-memory rename.",
+                    old_name,
+                    new_name);
+      // NOLINTNEXTLINE(readability-suspicious-call-argument)
+      [[maybe_unused]] auto rolled_back = db_handler_.Rename(new_name, rollback_old_name);
+      (*new_db)->Rename(rollback_old_name);
+      return std::unexpected{RenameError::FAIL};
+    }
+  } else if (tenant_profiles_) {
+    const auto renamed = tenant_profiles_->RenameDatabase(old_name, new_name);
     if (!renamed.has_value() && renamed.error() == TenantProfiles::RenameError::DURABILITY_ERROR) {
-      spdlog::warn("Failed to persist tenant profile membership rename for database {} (was {}).", new_name, old_name);
+      // NOLINTNEXTLINE(readability-suspicious-call-argument)
+      [[maybe_unused]] auto rolled_back = db_handler_.Rename(new_name, rollback_old_name);
+      (*new_db)->Rename(rollback_old_name);
+      return std::unexpected{RenameError::FAIL};
     }
   }
 
-  // Add system action for replication
+  if (auto up_it = unreadable_profile_dbs_.find(old_name); up_it != unreadable_profile_dbs_.end()) {
+    auto moved_entry = std::move(up_it->second);
+    moved_entry.salient.name = new_name;
+    unreadable_profile_dbs_.erase(up_it);
+    unreadable_profile_dbs_.insert_or_assign(std::string{new_name}, std::move(moved_entry));
+  }
+
   if (txn) {
-    txn->AddAction<RenameDatabase>(std::string{old_name}, std::string{new_name});
+    txn->AddAction<RenameDatabase>(db_uuid, std::string{old_name}, std::string{new_name});
   }
 
   return {};  // Success
+}
+
+DbmsHandler::ReplicaRenameOutcome DbmsHandler::RenameForReplication(const utils::UUID &expected_uuid,
+                                                                    std::string_view old_name,
+                                                                    std::string_view new_name) {
+  auto wr = std::lock_guard{lock_};
+  if (old_name == kDefaultDB || old_name == new_name) {
+    return ReplicaRenameOutcome::FAILURE;
+  }
+  if (suspended_.contains(old_name)) {
+    return ReplicaRenameOutcome::FAILURE;
+  }
+
+  if (auto old_acc = db_handler_.Get(old_name)) {
+    if ((*old_acc)->uuid() != expected_uuid) {
+      spdlog::warn("RenameForReplication: database '{}' has UUID '{}', expected '{}'; rejecting.",
+                   old_name,
+                   std::string{(*old_acc)->uuid()},
+                   std::string{expected_uuid});
+      return ReplicaRenameOutcome::FAILURE;
+    }
+    old_acc->reset();
+    if (auto *gk = db_handler_.GetGatekeeper(old_name); !gk || gk->state() != utils::GatekeeperState::HOT) {
+      return ReplicaRenameOutcome::FAILURE;
+    }
+
+    std::optional<std::string> old_durable_val;
+    std::string old_key;
+    std::string new_key;
+    if (durability_) {
+      old_key = Durability::GenKey(old_name);
+      new_key = Durability::GenKey(new_name);
+      auto fetched = durability_->GetStrict(old_key);
+      if (!fetched.has_value()) {
+        return ReplicaRenameOutcome::FAILURE;
+      }
+      old_durable_val = std::move(*fetched);
+    }
+
+    std::string rollback_old_name{old_name};
+    if (!db_handler_.Rename(old_name, new_name).has_value()) {
+      return ReplicaRenameOutcome::FAILURE;
+    }
+    auto new_db = db_handler_.Get(new_name);
+    MG_ASSERT(new_db, "Database {} not found after replicated rename.", new_name);
+    (*new_db)->Rename(new_name);
+
+    if (durability_) {
+      const std::map<std::string, std::string> extra_puts{{new_key, *old_durable_val}};
+      const std::vector<std::string> extra_deletes{old_key};
+      const bool committed = tenant_profiles_
+                                 ? tenant_profiles_->RenameDatabase(old_name, new_name, extra_puts, extra_deletes)
+                                       .has_value()
+                                 : durability_->PutAndDeleteMultiple(extra_puts, extra_deletes);
+      if (!committed) {
+        // NOLINTNEXTLINE(readability-suspicious-call-argument)
+        [[maybe_unused]] auto rolled_back = db_handler_.Rename(new_name, rollback_old_name);
+        (*new_db)->Rename(rollback_old_name);
+        return ReplicaRenameOutcome::FAILURE;
+      }
+    } else if (tenant_profiles_) {
+      const auto renamed = tenant_profiles_->RenameDatabase(old_name, new_name);
+      if (!renamed.has_value() && renamed.error() == TenantProfiles::RenameError::DURABILITY_ERROR) {
+        // NOLINTNEXTLINE(readability-suspicious-call-argument)
+        [[maybe_unused]] auto rolled_back = db_handler_.Rename(new_name, rollback_old_name);
+        (*new_db)->Rename(rollback_old_name);
+        return ReplicaRenameOutcome::FAILURE;
+      }
+    }
+
+    if (auto up_it = unreadable_profile_dbs_.find(old_name); up_it != unreadable_profile_dbs_.end()) {
+      auto moved_entry = std::move(up_it->second);
+      moved_entry.salient.name = new_name;
+      unreadable_profile_dbs_.erase(up_it);
+      unreadable_profile_dbs_.insert_or_assign(std::string{new_name}, std::move(moved_entry));
+    }
+    return ReplicaRenameOutcome::SUCCESS;
+  }
+
+  if (auto *gk = db_handler_.GetGatekeeper(old_name); gk != nullptr) {
+    return ReplicaRenameOutcome::FAILURE;
+  }
+  if (auto new_acc = db_handler_.Get(new_name); new_acc && (*new_acc)->uuid() == expected_uuid) {
+    return ReplicaRenameOutcome::NO_NEED;
+  }
+  return ReplicaRenameOutcome::FAILURE;
 }
 
 struct CreateDatabase : memgraph::system::ISystemAction {
@@ -742,12 +912,13 @@ std::expected<void, TenantProfiles::AlterError> DbmsHandler::AlterTenantProfile(
   auto result = tenant_profiles_->Alter(name, memory_limit);
   if (!result) return std::unexpected{result.error()};
   for (const auto &db_name : *result) {
+    (void)TryReconcileUnreadableProfileDb_(db_name);
     try {
       auto db_acc = Get(db_name);
       db_acc.get()->SetTenantMemoryLimit(memory_limit);
+    } catch (const SuspendedDatabaseException &) {
+      spdlog::info("AlterTenantProfile: database '{}' is suspended — updated limit will apply on resume", db_name);
     } catch (const UnknownDatabaseException &) {
-      // DB was dropped concurrently — the profile change is already durable and will not
-      // be re-applied on restart (the DB no longer exists). Skip gracefully.
       spdlog::warn("AlterTenantProfile: database '{}' not found while applying profile '{}' — skipping", db_name, name);
     }
   }
@@ -770,10 +941,22 @@ std::expected<void, TenantProfiles::DropError> DbmsHandler::DropTenantProfile(st
 std::expected<void, TenantProfiles::AttachError> DbmsHandler::SetTenantProfileOnDatabase(std::string_view profile_name,
                                                                                          std::string_view db_name,
                                                                                          system::Transaction *sys_txn) {
-  auto db_acc = Get(db_name);
+  {
+    auto rd = std::shared_lock{lock_};
+    if (!db_handler_.Has(db_name) && !suspended_.contains(db_name)) {
+      throw UnknownDatabaseException("Tried to retrieve an unknown database \"{}\".", db_name);
+    }
+  }
   auto result = tenant_profiles_->AttachToDatabase(profile_name, db_name);
   if (!result) return std::unexpected{result.error()};
-  db_acc.get()->SetTenantMemoryLimit(*result);
+  (void)TryReconcileUnreadableProfileDb_(db_name);
+  try {
+    auto db_acc = Get(db_name);
+    db_acc.get()->SetTenantMemoryLimit(*result);
+  } catch (const SuspendedDatabaseException &) {
+    // Suspended tenant: Resume_ resolves and installs the attached profile's memory limit before recovery.
+  } catch (const UnknownDatabaseException &) {
+  }
   if (sys_txn) {
     sys_txn->AddAction<TenantProfileAction>(
         TenantProfileAction::Action::SET_ON_DATABASE, profile_name, db_name, *result);
@@ -783,10 +966,22 @@ std::expected<void, TenantProfiles::AttachError> DbmsHandler::SetTenantProfileOn
 
 std::expected<void, TenantProfiles::DetachError> DbmsHandler::RemoveTenantProfileFromDatabase(
     std::string_view db_name, system::Transaction *sys_txn) {
+  {
+    auto rd = std::shared_lock{lock_};
+    if (!db_handler_.Has(db_name) && !suspended_.contains(db_name)) {
+      throw UnknownDatabaseException("Tried to retrieve an unknown database \"{}\".", db_name);
+    }
+  }
   auto result = tenant_profiles_->DetachFromDatabase(db_name);
   if (!result) return std::unexpected{result.error()};
-  auto db_acc = Get(db_name);
-  db_acc.get()->SetTenantMemoryLimit(0);
+  (void)TryReconcileUnreadableProfileDb_(db_name);
+  try {
+    auto db_acc = Get(db_name);
+    db_acc.get()->SetTenantMemoryLimit(0);
+  } catch (const SuspendedDatabaseException &) {
+    // Suspended tenant: durable detachment succeeded; Resume_ will observe no attached profile on resume.
+  } catch (const UnknownDatabaseException &) {
+  }
   if (sys_txn) {
     sys_txn->AddAction<TenantProfileAction>(
         TenantProfileAction::Action::REMOVE_FROM_DATABASE, "", db_name, kUnusedMemoryLimit);
@@ -794,13 +989,61 @@ std::expected<void, TenantProfiles::DetachError> DbmsHandler::RemoveTenantProfil
   return {};
 }
 
-DbmsHandler::NewResultT DbmsHandler::New_(storage::Config storage_config, system::Transaction *txn) {
+bool DbmsHandler::ReconcileTenantProfilesForRecovery(const std::vector<TenantProfiles::Profile> &incoming) {
+  if (!tenant_profiles_) return true;
+  if (!tenant_profiles_->ReconcileForRecovery(incoming)) {
+    return false;
+  }
+
+  std::unordered_map<std::string, int64_t> desired_limits;
+  for (const auto &profile : incoming) {
+    for (const auto &db_name : profile.databases) {
+      desired_limits[db_name] = profile.memory_limit;
+    }
+  }
+
+  std::vector<std::string> unreadable_names;
+  {
+    auto rd = std::shared_lock{lock_};
+    for (const auto &[name, _] : unreadable_profile_dbs_) {
+      unreadable_names.push_back(name);
+    }
+  }
+  for (const auto &name : unreadable_names) {
+    (void)TryReconcileUnreadableProfileDb_(name);
+  }
+
+  auto rd = std::shared_lock{lock_};
+  ForEachLocked_([&](DatabaseAccess db_acc) {
+    const auto it = desired_limits.find(db_acc->name());
+    db_acc->SetTenantMemoryLimit(it != desired_limits.end() ? it->second : 0);
+  });
+  return true;
+}
+
+DbmsHandler::NewResultT DbmsHandler::New_(storage::Config storage_config, system::Transaction *txn,
+                                          bool persist_durability) {
+  const std::string created_name{*storage_config.salient.name.str_view()};
+  const auto created_dir = storage_config.durability.storage_directory;
   auto new_db = db_handler_.New(storage_config);
 
-  if (new_db) {  // Success
+  if (new_db) {
+    if (persist_durability && !UpdateDurability(storage_config)) {
+      spdlog::error("Failed to persist catalog entry for newly created database '{}'; rolling back creation.",
+                    created_name);
+      (*new_db)->StopAllBackgroundTasks();
+      new_db->reset();
+      (void)db_handler_.TryDelete(created_name);
+      if (created_name != kDefaultDB) {
+        const auto rel_dir = std::filesystem::relative(created_dir, default_config_.durability.storage_directory);
+        if (IsExpectedTenantRelDir_(created_name, storage_config.salient.uuid, rel_dir)) {
+          std::error_code ec;
+          (void)std::filesystem::remove_all(created_dir, ec);
+        }
+      }
+      return std::unexpected{NewError::GENERIC};
+    }
     if (ttl_user_check_) (*new_db)->storage()->ttl_.SetUserCheck(ttl_user_check_);
-    // Save delta
-    UpdateDurability(storage_config);
     if (txn) {
       txn->AddAction<CreateDatabase>(storage_config.salient, new_db.value());
     }
@@ -812,32 +1055,34 @@ std::expected<utils::UUID, DeleteError> DbmsHandler::DeleteCold_(std::string_vie
   auto it = suspended_.find(name);
   if (it == suspended_.end()) return std::unexpected{DeleteError::NON_EXISTENT};
 
-  // A DROP may only proceed when the tenant is strictly COLD. If it is mid-transition
-  // (RESUMING or SUSPENDING) a concurrent operation holds or has handed off the gatekeeper;
-  // erasing now would block ~Gatekeeper waiting for a terminal state while the caller holds
-  // lock_ -> permanent deadlock. Reject as retriable (USING): the in-flight transition will
-  // finish (RESUMING -> HOT, SUSPENDING -> COLD or HOT) and the DROP can be retried.
-  //
-  // This is the load-bearing enforcement of the invariant the Resume_ comment at Phase A
-  // (~1300-1304) previously only claimed: "a concurrent DROP sees RESUMING and refuses to erase."
-  // That invariant is NOW enforced here under the same exclusive lock_ the DROP path holds.
   auto *gk = db_handler_.GetGatekeeper(name);
   if (!gk || gk->state() != utils::GatekeeperState::COLD) {
     return std::unexpected{DeleteError::USING};
   }
 
   const auto uuid = it->second.salient.uuid;
-  const auto data_dir = default_config_.durability.storage_directory / it->second.rel_dir;
-  // `name` may be a view into it->first (the Delete(uuid) path passes the map key directly). Own it
-  // before erase() frees the node, or the reads below dangle (heap-UAF).
+  const auto rel_dir = it->second.rel_dir;
+  const auto data_dir = default_config_.durability.storage_directory / rel_dir;
   const std::string name_copy{name};
+
+  if (!DetachProfileAndRetireDurabilityKey_(name_copy)) {
+    return std::unexpected{DeleteError::DISK_FAIL};
+  }
+
   suspended_.erase(it);
-  db_handler_.EraseColdShell(name_copy);  // guaranteed to succeed: we just verified state==COLD above
-  DetachProfileAndRetireDurabilityKey_(name_copy);
-  std::error_code ec;
-  (void)std::filesystem::remove_all(data_dir, ec);
-  if (ec) {
-    spdlog::error(R"(Failed to clean disk while dropping suspended database "{}" at {})", name_copy, data_dir.string());
+  unreadable_profile_dbs_.erase(name_copy);
+  db_handler_.EraseColdShell(name_copy);
+  if (IsExpectedTenantRelDir_(name_copy, uuid, rel_dir)) {
+    std::error_code ec;
+    (void)std::filesystem::remove_all(data_dir, ec);
+    if (ec) {
+      spdlog::error(
+          R"(Failed to clean disk while dropping suspended database "{}" at {})", name_copy, data_dir.string());
+    }
+  } else {
+    spdlog::error(R"(Refusing to delete unexpected directory {} while dropping suspended database "{}")",
+                  data_dir.string(),
+                  name_copy);
   }
   NotifyUuidRetired_(uuid, name_copy);
   UpdateColdGauge_();
@@ -846,88 +1091,92 @@ std::expected<utils::UUID, DeleteError> DbmsHandler::DeleteCold_(std::string_vie
 
 DbmsHandler::DeleteResult DbmsHandler::Delete_(std::string db_name) {
   if (db_name == kDefaultDB) {
-    // MSG cannot delete the default db
     return std::unexpected{DeleteError::DEFAULT_DB};
   }
 
   const auto storage_path = StorageDir_(db_name);
   if (!storage_path) return std::unexpected{DeleteError::NON_EXISTENT};
 
-  // Capture the tenant's UUID inside the accessor scope (before the accessor is released).
-  // Database::uuid() is const and does not re-acquire lock_ — safe to call while lock_ is held.
-  // Reused below both to announce the retired uuid (uuid-keyed stores) and to key the dropping_ row.
   std::optional<utils::UUID> db_uuid;
   {
     auto db = db_handler_.Get(db_name);
     if (!db) {
-      // Get() is HOT-gated, so a tenant caught mid-SUSPEND (state SUSPENDING, not yet in `suspended_`)
-      // lands here too. Mirrors the Rename guard: report USING for any non-HOT gatekeeper instead of
-      // misreporting NON_EXISTENT for a tenant that in fact exists.
       auto *gk = db_handler_.GetGatekeeper(db_name);
       if (gk && gk->state() != utils::GatekeeperState::HOT) return std::unexpected{DeleteError::USING};
       return std::unexpected{DeleteError::NON_EXISTENT};
     }
     db_uuid = db->get()->uuid();
-    // No early seal here (late-seal model). The seal happens after all fallible work has succeeded so
-    // that an exception leaves the gatekeeper fully HOT in items_ — the tenant is intact and no
-    // rollback of any kind is ever needed.
-  }  // release our accessor so the worker can reach sole access
+  }
 
-  // Fallible, point-of-no-return. If it throws, nothing is sealed and the gatekeeper is still HOT in
-  // items_ — the tenant is fully intact; because the seal has not happened yet, no rollback is needed.
-  DetachProfileAndRetireDurabilityKey_(db_name);
+  const auto rel_dir = std::filesystem::relative(*storage_path, default_config_.durability.storage_directory);
+  const bool valid_rel_dir = IsExpectedTenantRelDir_(db_name, *db_uuid, rel_dir);
 
-  // Build the deferred-worker arguments BEFORE the advisory seal so the post-seal suffix is genuinely
-  // non-throwing: an allocation failure while building them leaves the tenant HOT and unsealed
-  // (retriable), never sealed-but-still-in-items_.
+  // Allocate all deferred-handoff objects BEFORE retiring the durable catalog entry so an allocation
+  // failure leaves the tenant HOT, unsealed, and durably registered.
   auto husk_id = std::string{*db_uuid};
   std::move_only_function<void(Database &)> stop_step = [](Database &db) {
     db.StopAllBackgroundTasks();
     db.streams()->DropAll();
   };
-  std::move_only_function<void()> post_delete_step = [storage_path = *storage_path, db_name = db_name]() {
-    std::error_code ec;
-    (void)std::filesystem::remove_all(storage_path, ec);
-    if (ec) {
-      spdlog::error(R"(Failed to clean disk while deleting database "{}" stored in {})", db_name, storage_path);
-    }
-  };
-  // Build the owned name copy BEFORE the seal so the post-seal suffix contains no allocations:
-  // a bad_alloc here leaves the tenant HOT and unsealed (retriable), never sealed-but-stranded.
+  std::move_only_function<void()> post_delete_step =
+      [storage_path = *storage_path, db_name = db_name, valid_rel_dir]() {
+        if (!valid_rel_dir) {
+          spdlog::error(R"(Refusing to delete unexpected directory {} while deleting database "{}")",
+                        storage_path,
+                        db_name);
+          return;
+        }
+        std::error_code ec;
+        (void)std::filesystem::remove_all(storage_path, ec);
+        if (ec) {
+          spdlog::error(R"(Failed to clean disk while deleting database "{}" stored in {})", db_name, storage_path);
+        }
+      };
   auto husk_name = db_name;
-  // Advisory seal — the last step before the nothrow handoff. Every argument to DeferDelete is
-  // already an owned value (std::string by value, move_only_function by move — all noexcept moves),
-  // so no allocation or copy occurs after this point.
+
+  if (!DetachProfileAndRetireDurabilityKey_(db_name)) {
+    return std::unexpected{DeleteError::DISK_FAIL};
+  }
+  unreadable_profile_dbs_.erase(db_name);
+
   auto *gk = db_handler_.GetGatekeeper(db_name);
   MG_ASSERT(gk, "Delete_: gatekeeper for '{}' vanished under lock_", db_name);
   gk->seal();
   db_handler_.DeferDelete(std::move(husk_name), std::move(husk_id), std::move(stop_step), std::move(post_delete_step));
 
-  // Announce the retired uuid. Placed after the point of no return (seal + DeferDelete): any earlier
-  // failure leaves the tenant HOT and unsealed, so a not-actually-dropped tenant never loses its rows.
   NotifyUuidRetired_(*db_uuid, db_name);
 
   return {};  // Success
 }
 
-void DbmsHandler::DetachProfileAndRetireDurabilityKey_(std::string_view db_name) {
-  bool retired_with_detach = false;
+bool DbmsHandler::DetachProfileAndRetireDurabilityKey_(std::string_view db_name) {
   if (tenant_profiles_) {
-    retired_with_detach = tenant_profiles_->DetachFromDatabase(db_name, {Durability::GenKey(db_name)}).has_value();
+    const auto detach_res = tenant_profiles_->DetachFromDatabase(db_name, {Durability::GenKey(db_name)});
+    if (detach_res.has_value()) {
+      return true;
+    }
+    if (detach_res.error() != TenantProfiles::DetachError::NOT_ATTACHED) {
+      spdlog::error("Failed to detach tenant profile and retire catalog entry for database '{}'.", db_name);
+      return false;
+    }
   }
-  if (!retired_with_detach && durability_) durability_->Delete(Durability::GenKey(db_name));
+  if (!durability_) return true;
+  if (!durability_->Delete(Durability::GenKey(db_name))) {
+    spdlog::error("Failed to delete durable catalog entry for database '{}'.", db_name);
+    return false;
+  }
+  return true;
 }
 
-void DbmsHandler::UpdateDurability(const storage::Config &config, std::optional<std::filesystem::path> rel_dir) {
-  if (!durability_) return;
-  // Save database in a list of active databases
+bool DbmsHandler::UpdateDurability(const storage::Config &config, std::optional<std::filesystem::path> rel_dir) {
+  if (!durability_) return true;
   const auto &key = Durability::GenKey(*config.salient.name.str_view());
   if (rel_dir == std::nullopt) {
     rel_dir =
         std::filesystem::relative(config.durability.storage_directory, default_config_.durability.storage_directory);
   }
   const auto &val = Durability::GenVal(config.salient.uuid, *rel_dir);
-  durability_->Put(key, val);
+  return durability_->Put(key, val);
 }
 
 #endif
@@ -1221,62 +1470,43 @@ DbmsHandler::SuspendResult DbmsHandler::Suspend_(std::string_view name, system::
   }
 
   // PHASE C — record metadata (lock_), then heavy teardown OUTSIDE lock_.
-  const auto tenant_uuid = entry.salient.uuid;  // capture before `entry` is moved into suspended_
-  // Serialize the durable COLD marker (key + value) from `entry` BEFORE it is moved into suspended_ and
-  // BEFORE the point of no return. GenKey (fmt::format) allocates, so computing it here — while the
-  // rollback guard can still cleanly restore HOT — keeps the only throwing durability work out of the
-  // post-commit region (HC-2: a throw must not leave a stale suspended_ entry behind).
+  const auto tenant_uuid = entry.salient.uuid;
   std::string cold_key;
   std::string cold_val;
   if (durability_) {
     cold_key = Durability::GenKey(name);
     cold_val = Durability::GenColdVal(entry.salient.uuid, entry.rel_dir, entry.cold_stats);
   }
-  // Capture a raw Database* for the pre-finish_suspend() background-task teardown below (see the
-  // StopAllBackgroundTasks() call after rollback.Disable()). Valid until finish_suspend() destroys
-  // value_: during SUSPENDING no other path can access() the value (returns nullopt) or destroy it,
-  // and this thread is the sole driver of the transition.
+  // Pre-allocate the suspended_ map node BEFORE committing the durable COLD marker so no allocation can
+  // throw after durability_->Put succeeds.
+  std::map<std::string, SuspendedEntry, std::less<>> staged_suspended;
+  staged_suspended.emplace(std::string{name}, std::move(entry));
+  auto staged_node = staged_suspended.extract(staged_suspended.begin());
+
   auto *db_for_teardown = acc->get();
   acc.reset();  // drop our accessor -> count == 0 (state still SUSPENDING)
   {
     auto wr = std::lock_guard{lock_};
-    // Persist the durable COLD marker FIRST, before the in-memory commit below. Both run under the SAME
-    // lock_ so a concurrent Resume_ cannot observe a half state (order within the lock is invisible to
-    // observers, who cannot acquire lock_ until we release it). The marker is best-effort: a Put failure
-    // — whether it returns false OR throws (KVStore::Put is not noexcept; bad_alloc under memory pressure)
-    // — is caught locally right below and degrades to a warning; it never reaches the outer rollback
-    // guard (`rollback` above, which calls gk->abort_suspend()) and never rolls back the suspend. The
-    // throwing durability work that the rollback guard actually protects is the PRE-LOCK GenKey/
-    // GenColdVal serialization above (before acc.reset()/this lock_ scope) — that is what must not run
-    // after suspended_ is populated. Keeping suspended_.insert_or_assign AFTER this Put attempt is
-    // defense-in-depth: it means even a hypothetical future change that let a Put-throw escape this
-    // try/catch still could not leave suspended_ populated for a tenant that stayed HOT. A missing
-    // marker only makes the tenant recover HOT on restart; MAIN's data stays durable on disk regardless.
     if (durability_) {
       bool marker_persisted = false;
-      std::string put_error;  // populated only on a thrown Put(); empty on a clean `false` return
       try {
         marker_persisted = durability_->Put(cold_key, cold_val);
-      } catch (const std::exception &e) {  // best-effort marker; fall through to the warning below
+      } catch (const std::exception &e) {
+        spdlog::error("hot/cold suspend: failed to persist cold durability marker for '{}': {}", name, e.what());
         marker_persisted = false;
-        put_error = e.what();
-      } catch (...) {  // NOLINT(bugprone-empty-catch) — non-std throw; still best-effort
+      } catch (...) {
+        spdlog::error("hot/cold suspend: failed to persist cold durability marker for '{}'.", name);
         marker_persisted = false;
       }
       if (!marker_persisted) {
-        spdlog::warn(
-            "hot/cold suspend: failed to persist the cold durability marker for '{}'{}{}; the database is "
-            "suspended in memory but will recover HOT on restart.",
-            name,
-            put_error.empty() ? "" : ": ",
-            put_error);
+        spdlog::error("hot/cold suspend: aborting suspend of '{}' because the cold marker was not persisted.", name);
+        return std::unexpected{SuspendError::DURABILITY_FAILED};
       }
     }
-    // In-memory commit — the tenant is now COLD. Counts every successful Suspend_ (user SUSPEND, replica
-    // RPC apply, and recovery force-suspend all funnel through here); the gauge tracks the live cold-set
-    // size. insert_or_assign / Increment / UpdateColdGauge_ are all noexcept, so once we reach here the
-    // suspend cannot throw-and-roll-back with a stale suspended_ entry.
-    suspended_.insert_or_assign(std::string{name}, std::move(entry));
+    if (auto existing = suspended_.find(name); existing != suspended_.end()) {
+      suspended_.erase(existing);
+    }
+    suspended_.insert(std::move(staged_node));
     metrics::Metrics().global.database_suspends->Increment();
     UpdateColdGauge_();
   }
@@ -1304,7 +1534,9 @@ DbmsHandler::SuspendResult DbmsHandler::Suspend_(std::string_view name, system::
 
   // The database teardown frees its own arena, but many allocations remain in shared jemalloc arenas.
   // Force a global purge so SUSPEND returns only after the tenant's memory has been reclaimed.
-  memory::PurgeUnusedMemory();
+  if (!memory::PurgeUnusedMemory()) {
+    spdlog::warn("Failed to purge unused allocator memory after suspending database.");
+  }
 
   // The suspend is committed (tenant is COLD, in-memory storage and stream consumers dropped;
   // durable stream metadata persists for resume). Keep the streams stopped — do NOT run the undo guard.
@@ -1469,74 +1701,77 @@ DbmsHandler::ResumeResult DbmsHandler::Resume_(std::string_view name, system::Tr
     // `fresh` destructs: ~Gatekeeper waits for count == 0, so an outstanding `acc` would self-deadlock
     // the fresh gatekeeper's destruction.
     try {
+      if (!IsExpectedTenantRelDir_(name, salient.uuid, rel_dir)) {
+        spdlog::error("hot/cold resume: unexpected relative directory '{}' for database '{}' (UUID '{}').",
+                      rel_dir.string(),
+                      name,
+                      std::string{salient.uuid});
+        if (gk->state() == utils::GatekeeperState::RESUMING) gk->abort_resume();
+        return std::unexpected{ResumeError::RECOVERY_FAILED};
+      }
+      std::optional<int64_t> resolved_limit;
+      if (tenant_profiles_) {
+        const auto limit_lookup = tenant_profiles_->ResolveDatabaseLimit(name);
+        if (!limit_lookup.has_value()) {
+          spdlog::error(
+              "hot/cold resume: refusing to resume database '{}' because its tenant profile limit could not be read.",
+              name);
+          if (gk->state() == utils::GatekeeperState::RESUMING) gk->abort_resume();
+          return std::unexpected{ResumeError::RECOVERY_FAILED};
+        }
+        resolved_limit = *limit_lookup;
+      }
+
       storage::Config cfg = default_config_;
       cfg.salient = salient;
+      cfg.tenant_memory_limit = resolved_limit;
       cfg.durability.recover_on_startup = true;
       storage::UpdatePaths(cfg, default_config_.durability.storage_directory / rel_dir);
-      auto fresh = db_handler_.BuildDetached(std::move(cfg));  // Database ctor recovers from disk
+      auto fresh = db_handler_.BuildDetached(std::move(cfg));  // Database ctor recovers from disk with limit applied
       DatabaseAccess acc = fresh.access().value();             // fresh gk is HOT => has_value
-      // Roll a failed pre-publish rebuild back to COLD (retriable). CRITICAL ORDERING: fully tear down
-      // `fresh` (its InMemoryStorage closes WAL/snapshot fds; ~Database -> RemoveDatabase deregisters the
-      // uuid-keyed prometheus metrics) BEFORE abort_resume() releases the single-flight RESUMING token.
-      // Releasing the token first would let the next winner BuildDetached a same-uuid Database that
-      // pointer-aliases `fresh`'s not-yet-freed metrics (heap-UAF), or let DeleteCold_ remove_all() the
-      // data dir while `fresh` still holds it open.
       auto rollback_to_cold = [&] {
-        acc.reset();  // drop our accessor
-        // ~Gatekeeper<Database> runs now: it seals `fresh`, so its background workers
-        // mint no new protectors, waits for the ones they hold to drain, then ~Database ->
-        // RemoveDatabase(uuid) + storage teardown complete.
+        acc.reset();
         {
           auto dying = std::move(fresh);
         }
-        gk->abort_resume();  // RESUMING -> COLD; suspended_ untouched => retriable
+        gk->abort_resume();
       };
       try {
-        if (on_resume_) on_resume_(acc);  // PRE-PUBLISH arm (triggers/streams re-arm)
+        std::string hot_key;
+        std::string hot_val;
+        if (durability_) {
+          hot_key = Durability::GenKey(name);
+          hot_val = Durability::GenVal(salient.uuid, rel_dir);
+        }
+        if (on_resume_) on_resume_(acc);
+        if (ttl_user_check_) acc->storage()->ttl_.SetUserCheck(ttl_user_check_);
         {
-          // PUBLISH — move-assign the fresh HOT gatekeeper over the RESUMING shell, under lock_.
-          // `acc` survives the move (it points at fresh's pimpl, which the unique_ptr move transfers
-          // into the shell). The shell is RESUMING (access() refuses) and we hold lock_, so no
-          // concurrent accessor observes the half-moved state. The erase uses a transparent find +
-          // erase(iterator) — both nothrow — so the publish block cannot throw after the noexcept
-          // move commits the gatekeeper to HOT.
           auto wr = std::unique_lock{lock_};
-          // The resumed tenant runs its own on-disk epoch+history (recovered by BuildDetached) — the
-          // cold entry carries no epoch to restore (cold-tenant epoch machinery was intentionally removed).
-          auto it = suspended_.find(name);  // valid across the move below (it touches db_handler_, not suspended_)
-          // Overwriting the RESUMING shell here is deadlock-free because Gatekeeper's move-assign tears
-          // the old state down via ~GKInternals (which never waits), NOT the count-waiting ~Gatekeeper — see
-          // the load-bearing note on Gatekeeper::operator=(Gatekeeper&&) in utils/gatekeeper.hpp.
+          if (durability_ && !durability_->Put(hot_key, hot_val)) {
+            wr.unlock();
+            spdlog::error("hot/cold resume: failed to persist hot durability marker for '{}'; rolling back to COLD.",
+                          name);
+            rollback_to_cold();
+            return std::unexpected{ResumeError::RECOVERY_FAILED};
+          }
+          auto it = suspended_.find(name);
           *gk = std::move(fresh);
           if (it != suspended_.end()) suspended_.erase(it);
-          // The tenant is now HOT. Counter increment + gauge set are atomic/non-throwing, so they
-          // do not break the publish block's no-throw guarantee; done under lock_ so the gauge reads a
-          // consistent suspended_ size.
           metrics::Metrics().global.database_resumes->Increment();
           UpdateColdGauge_();
         }
       } catch (const std::exception &e) {
-        // PRE-PUBLISH failure: on_resume_ threw and the publish has NOT happened — `fresh` is still
-        // local and HOT. rollback_to_cold() releases `acc` and fully tears `fresh` down BEFORE
-        // releasing the single-flight RESUMING token (see the load-bearing comment on the lambda).
         spdlog::warn(
-            "hot/cold resume: the pre-publish on_resume_ arm for '{}' threw ({}); rolling back to COLD "
-            "(retriable).",
+            "hot/cold resume: the pre-publish resume arm for '{}' threw ({}); rolling back to COLD (retriable).",
             name,
             e.what());
         rollback_to_cold();
         return std::unexpected{ResumeError::RECOVERY_FAILED};
       } catch (...) {
-        // Same as above, for a non-std::exception throw.
         rollback_to_cold();
         return std::unexpected{ResumeError::RECOVERY_FAILED};
       }
-      // Publish committed: the tenant is HOT and queryable. Everything below is best-effort
-      // bookkeeping — the gatekeeper is already HOT, so a throw escaping any of these arms must NEVER
-      // reach the outer catch(...): that catch calls abort_resume() on the gatekeeper, and abort_resume()
-      // asserts state == RESUMING, so it would terminate on a HOT gatekeeper instead of degrading
-      // gracefully. `best_effort` wraps each arm in its own try/catch so a failure here only logs — the
-      // database stays live (HOT) and data is intact regardless of whether the bookkeeping succeeds.
+
       auto best_effort = [&](std::string_view what, auto &&fn) {
         try {
           fn();
@@ -1547,58 +1782,15 @@ DbmsHandler::ResumeResult DbmsHandler::Resume_(std::string_view name, system::Tr
         }
       };
 
-      // Record resume latency (recovery + publish) before the rest of the best-effort post-publish
-      // bookkeeping so that work is excluded from the metric. Histogram::Observe takes a std::mutex
-      // lock, whose lock() may throw std::system_error under OS resource exhaustion.
       best_effort("recording resume latency", [&] {
         metrics::Metrics().global.database_resume_latency_seconds->Observe(
             std::chrono::duration<double>(std::chrono::steady_clock::now() - resume_start).count());
       });
 
-      // A resumed tenant is a freshly built Database with a default (uncapped) tracker, so the
-      // attached profile's memory cap has to be re-applied.
-      best_effort("re-applying tenant profile memory limit", [&] {
-        if (tenant_profiles_) {
-          if (auto profile_name = tenant_profiles_->GetProfileForDatabase(name)) {
-            if (auto profile = tenant_profiles_->Get(*profile_name); profile && profile->memory_limit > 0) {
-              acc.get()->SetTenantMemoryLimit(profile->memory_limit);
-            }
-          }
-        }
-      });
-
-      // Flip the durable entry back to HOT (drop the cold marker) so a restart recovers it HOT.
-      // Done in a SEPARATE short lock_ scope AFTER the publish. The write is guarded by
-      // !suspended_.contains: if a SUSPEND raced in after our publish-erase and re-suspended the tenant,
-      // its under-lock COLD marker must stand. GenKey/GenVal allocate (fmt/nlohmann) and can throw
-      // bad_alloc. A failure (bool or throw) degrades to a warning: the tenant is live HOT regardless;
-      // on the next restart a stale cold marker only makes it recover COLD, and it is resumable again.
-      best_effort("clearing the cold durability marker (recoverable as COLD on restart)", [&] {
-        if (durability_) {
-          auto wr = std::lock_guard{lock_};
-          if (!suspended_.contains(name)) {
-            if (!durability_->Put(Durability::GenKey(name), Durability::GenVal(salient.uuid, rel_dir))) {
-              spdlog::warn(
-                  "hot/cold resume: failed to clear the cold durability marker for '{}'; the database is live "
-                  "(HOT) but may recover COLD on restart (resumable).",
-                  name);
-            }
-          }
-        }
-      });
-
-      // Record the system action so the resume is ordered + replicated like CREATE/DROP DATABASE.
-      // DoReplication sends ResumeDatabaseRpc to each replica; PostReplication then re-wires the
-      // MAIN's outbound replication clients for this tenant (RecoverStorageReplication). This order
-      // ensures the replica has resumed its copy BEFORE the MAIN tries to connect to it.
       best_effort("recording the resume system action (may not replicate until the next system sync)", [&] {
         if (txn) txn->AddAction<ResumeDatabase>(salient.uuid, acc);
         spdlog::info("hot/cold: database '{}' resumed (COLD -> HOT)", name);
       });
-      best_effort("applying the TTL user check", [&] {
-        if (ttl_user_check_) acc->storage()->ttl_.SetUserCheck(ttl_user_check_);
-      });
-      // Winner's own successful publish: a real COLD -> HOT rebuild, so already_hot is false.
       if (already_hot) *already_hot = false;
       return acc;
     } catch (const std::exception &e) {
@@ -1651,24 +1843,17 @@ void DbmsHandler::ApplyColdRecoveryMeta(std::string_view name, const storage::Co
   auto wr = std::lock_guard{lock_};
   auto it = suspended_.find(name);
   if (it == suspended_.end()) return;
-  // Nothing changed (the common steady-state on a re-sync) -> skip the in-memory mutation and the
-  // durable Put below (fmt key alloc + JSON serialize + disk write).
-  if (it->second.cold_stats == meta.stats) return;
-  // StorageInfo is a trivially-copyable flat POD, so this assignment allocates nothing and cannot
-  // throw — it->second is never left partially updated.
+  if (it->second.cold_stats == meta.stats && !it->second.stats_dirty) return;
   it->second.cold_stats = meta.stats;
 
-  // Persist the refreshed COLD marker so MAIN's authoritative stats survive a restart. The Put runs
-  // UNDER lock_: releasing the lock between the in-memory mutation and the durable write would let a
-  // concurrent DROP erase the tenant in the gap, after which this trailing Put would resurrect a
-  // durable COLD entry for a tenant that no longer exists. Best-effort: the in-memory entry already
-  // carries MAIN's stats (display is correct in this process); only a restart-before-persist would
-  // recover the stale stats, which then self-heal on the next SystemRecovery round.
   if (durability_) {
     const auto &entry = it->second;
-    if (!durability_->Put(Durability::GenKey(name),
-                          Durability::GenColdVal(entry.salient.uuid, entry.rel_dir, entry.cold_stats))) {
-      spdlog::warn("hot/cold recovery: failed to persist cold stats for database '{}'.", name);
+    if (durability_->Put(Durability::GenKey(name),
+                         Durability::GenColdVal(entry.salient.uuid, entry.rel_dir, entry.cold_stats))) {
+      it->second.stats_dirty = false;
+    } else {
+      it->second.stats_dirty = true;
+      spdlog::warn("hot/cold recovery: failed to persist cold stats for database '{}'; marked dirty for retry.", name);
     }
   }
 }

@@ -522,7 +522,7 @@ TEST(PropertyStore, AVectorIndexIdKeepsItsIdsAndNotItsCoordinates) {
 
   PropertyStore store;
   ASSERT_TRUE(store.SetProperty(
-      prop, PropertyValue(Data{.ids = ids, .vector = memgraph::utils::small_vector<float>{1.0F, 2.0F}})));
+      prop, PropertyValue(Data{.ids = ids, .vector = memgraph::utils::small_vector<double>{1.0, 2.0}})));
 
   auto const read = store.GetProperty(prop);
   ASSERT_TRUE(read.IsVectorIndexId());
@@ -530,7 +530,7 @@ TEST(PropertyStore, AVectorIndexIdKeepsItsIdsAndNotItsCoordinates) {
   EXPECT_TRUE(read.ValueVectorIndexList().empty());
 
   auto const other_coordinates =
-      PropertyValue(Data{.ids = ids, .vector = memgraph::utils::small_vector<float>{3.0F, 4.0F}});
+      PropertyValue(Data{.ids = ids, .vector = memgraph::utils::small_vector<double>{3.0, 4.0}});
   EXPECT_TRUE(store.IsPropertyEqual(prop, other_coordinates));
   EXPECT_NE(read, other_coordinates);
 }

@@ -24,6 +24,7 @@ void to_json(nlohmann::json &data, SalientConfig::Items const &items) {
       {"enable_label_index_auto_creation", items.enable_label_index_auto_creation},
       {"enable_edge_type_index_auto_creation", items.enable_edge_type_index_auto_creation},
       {"storage_light_edge", items.storage_light_edge},
+      {"delta_on_identical_property_update", items.delta_on_identical_property_update},
       {"property_store_compression_enabled", items.property_store_compression_enabled},
   };
 }
@@ -39,16 +40,20 @@ void from_json(const nlohmann::json &data, SalientConfig::Items &items) {
   if (auto it = data.find("storage_light_edge"); it != data.end()) {
     it->get_to(items.storage_light_edge);
   }
+  if (auto it = data.find("delta_on_identical_property_update"); it != data.end()) {
+    it->get_to(items.delta_on_identical_property_update);
+  }
   data.at("property_store_compression_enabled").get_to(items.property_store_compression_enabled);
 }
 
 void to_json(nlohmann::json &data, SalientConfig const &config) {
-  data = nlohmann::json{{"items", config.items},
-                        {"name", config.name},
-                        {"uuid", config.uuid},
-                        {"storage_mode", config.storage_mode},
-                        "property_store_compression_level",
-                        config.property_store_compression_level};
+  data = nlohmann::json{
+      {"items", config.items},
+      {"name", config.name},
+      {"uuid", config.uuid},
+      {"storage_mode", config.storage_mode},
+      {"property_store_compression_level", config.property_store_compression_level},
+  };
 }
 
 void from_json(const nlohmann::json &data, SalientConfig &config) {

@@ -1,8 +1,8 @@
-import sys
 from enum import Enum, auto
+import sys
 
-import pytest
 from common import *
+import pytest
 
 
 class TargetBranch(Enum):

@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -39,24 +40,52 @@
 
 namespace {
 constexpr std::string_view delimiter = ":";
+
+std::string NormalizeHostAddress(std::string_view raw) {
+  if (raw.size() >= 2 && raw.front() == '[' && raw.back() == ']') {
+    return std::string{raw.substr(1, raw.size() - 2)};
+  }
+  return std::string{raw};
+}
+
+std::string FormatHostPort(std::string_view host, uint16_t port) {
+  if (host.contains(':')) {
+    return fmt::format("[{}]:{}", host, port);
+  }
+  return fmt::format("{}{}{}", host, delimiter, port);
+}
+
+bool IsValidBareIpv6Literal(std::string_view candidate) {
+  if (candidate.empty() || !candidate.contains(':')) {
+    return false;
+  }
+  const auto zone_sep = candidate.find('%');
+  const std::string addr_only{zone_sep == std::string_view::npos ? candidate : candidate.substr(0, zone_sep)};
+  if (zone_sep != std::string_view::npos && zone_sep + 1 >= candidate.size()) {
+    return false;
+  }
+  in6_addr parsed_v6{};
+  return inet_pton(AF_INET6, addr_only.c_str(), &parsed_v6) == 1;
+}
 }  // namespace
 
 namespace memgraph::io::network {
 
-Endpoint::Endpoint(std::string address, uint16_t port) : address_(std::move(address)), port_(port) {}
+Endpoint::Endpoint(std::string address, uint16_t port)
+    : address_(NormalizeHostAddress(address)), port_(port) {}
 
-auto Endpoint::SocketAddress() const -> std::string { return fmt::format("{}{}{}", address_, delimiter, port_); }
+auto Endpoint::SocketAddress() const -> std::string { return FormatHostPort(address_, port_); }
 
 auto Endpoint::GetResolvedSocketAddress() const -> std::string {
   auto const result = TryResolveAddress(address_, port_);
   if (!result) {
-    throw NetworkError("Couldn't resolve {}:{}.", address_, port_);
+    throw NetworkError("Couldn't resolve {}.", FormatHostPort(address_, port_));
   }
 
   auto resolved_address = std::get<0>(*result);
   auto resolved_port = std::get<1>(*result);
 
-  return fmt::format("{}{}{}", resolved_address, delimiter, resolved_port);
+  return FormatHostPort(resolved_address, resolved_port);
 }
 
 auto Endpoint::GetResolvedIPAddress() const -> std::string {
@@ -152,54 +181,95 @@ std::optional<Endpoint::RetValue> Endpoint::TryResolveAddress(std::string_view a
 
 std::optional<Endpoint> Endpoint::ParseAndCreateSocketOrAddress(std::string_view address,
                                                                 std::optional<uint16_t> default_port) {
-  auto const parts = utils::SplitView(address, delimiter);
-
-  if (parts.size() > 2) {
+  if (address.empty()) {
     return std::nullopt;
   }
 
-  auto const port = [default_port, &parts]() -> std::optional<uint16_t> {
-    if (parts.size() == 2) {
-      return static_cast<uint16_t>(utils::ParseInt(parts[1]));
+  if (address.front() == '[') {
+    const auto close_bracket = address.find(']');
+    if (close_bracket == std::string_view::npos || close_bracket <= 1) {
+      return std::nullopt;
     }
-    return default_port;
-  }();
+    const auto host_part = address.substr(1, close_bracket - 1);
+    if (!IsValidBareIpv6Literal(host_part)) {
+      return std::nullopt;
+    }
+    const auto remainder = address.substr(close_bracket + 1);
+    if (remainder.empty()) {
+      if (!default_port) {
+        return std::nullopt;
+      }
+      return Endpoint{std::string{host_part}, *default_port};
+    }
+    if (!remainder.starts_with(delimiter)) {
+      return std::nullopt;
+    }
+    const auto parsed_port = ParseValidatedPort(remainder.substr(delimiter.size()));
+    if (!parsed_port) {
+      return std::nullopt;
+    }
+    return Endpoint{std::string{host_part}, *parsed_port};
+  }
 
-  if (!ValidatePort(port)) {
+  const auto first_colon = address.find(':');
+  if (first_colon == std::string_view::npos) {
+    if (!default_port) {
+      return std::nullopt;
+    }
+    return Endpoint{std::string{address}, *default_port};
+  }
+
+  const auto last_colon = address.rfind(':');
+  if (first_colon != last_colon) {
+    // Multiple colons without brackets: valid only as a bare IPv6 literal when default_port is supplied.
+    if (default_port && IsValidBareIpv6Literal(address)) {
+      return Endpoint{std::string{address}, *default_port};
+    }
     return std::nullopt;
   }
 
-  auto const addr = [address, &parts]() {
-    if (parts.size() == 2) {
-      return parts[0];
-    }
-    return address;
-  }();
-
-  return Endpoint{std::string(addr), *port};  // NOLINT
+  const auto host_part = address.substr(0, first_colon);
+  const auto port_part = address.substr(first_colon + 1);
+  if (host_part.empty()) {
+    return std::nullopt;
+  }
+  const auto parsed_port = ParseValidatedPort(port_part);
+  if (!parsed_port) {
+    return std::nullopt;
+  }
+  return Endpoint{std::string{host_part}, *parsed_port};
 }
 
-auto Endpoint::ValidatePort(std::optional<uint16_t> port) -> bool {
-  if (!port) {
-    return false;
+auto Endpoint::ParseValidatedPort(std::string_view port_str) -> std::optional<uint16_t> {
+  if (port_str.empty() || port_str.front() == '+' || port_str.front() == '-') {
+    spdlog::error(
+        utils::MessageWithLink("Invalid port number '{}'. The port number must be an integer in [0, 65535].",
+                               port_str,
+                               "https://memgr.ph/ports"));
+    return std::nullopt;
   }
 
-  if (port < 0) {
-    spdlog::error(utils::MessageWithLink(
-        "Invalid port number {}. The port number must be a positive integer.", *port, "https://memgr.ph/ports"));
-    return false;
+  int64_t parsed = -1;
+  const auto *begin = port_str.data();
+  const auto *end = port_str.data() + port_str.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+  if (ec != std::errc{} || ptr != end || parsed < 0) {
+    spdlog::error(
+        utils::MessageWithLink("Invalid port number '{}'. The port number must be a non-negative integer.",
+                               port_str,
+                               "https://memgr.ph/ports"));
+    return std::nullopt;
   }
-
-  if (port > std::numeric_limits<uint16_t>::max()) {
+  if (parsed > static_cast<int64_t>(std::numeric_limits<uint16_t>::max())) {
     spdlog::error(utils::MessageWithLink("Invalid port number. The port number exceedes the maximum possible size.",
                                          "https://memgr.ph/ports"));
-    return false;
+    return std::nullopt;
   }
 
-  return true;
+  return static_cast<uint16_t>(parsed);
 }
 
-void Endpoint::SetAddress(std::string address) { address_ = std::move(address); }
+void Endpoint::SetAddress(std::string address) { address_ = NormalizeHostAddress(address); }
 
 void Endpoint::SetPort(uint16_t port) { port_ = port; }
 

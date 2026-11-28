@@ -256,7 +256,11 @@ class EdgeIndexRewriter final : public HierarchicalLogicalOperatorVisitor {
 
   bool PreVisit(HashJoin &op) override {
     prev_ops_.push_back(&op);
-    return true;
+    RewriteBranch(&op.left_op_);
+    op.left_symbols_ = op.left_op_->ModifiedSymbols(*symbol_table_);
+    RewriteBranch(&op.right_op_);
+    op.right_symbols_ = op.right_op_->ModifiedSymbols(*symbol_table_);
+    return false;
   }
 
   bool PostVisit(HashJoin &) override {
@@ -776,7 +780,7 @@ class EdgeIndexRewriter final : public HierarchicalLogicalOperatorVisitor {
     // iteration and must not eliminate an ORDER BY. Suppressing is conservative:
     // if the value is element-independent the scan is still ordered, but at
     // worst we keep an unnecessary sort rather than risk dropping a needed one.
-    if (target->input() && target->input()->GetTypeInfo() == Unwind::kType) {
+    if (!OrderByEliminator<TDbAccessor>::ProducesAtMostOneRow(target->input().get())) {
       order_by_eliminator_.NotifyScan(std::nullopt);
       return;
     }
@@ -1009,9 +1013,9 @@ class EdgeIndexRewriter final : public HierarchicalLogicalOperatorVisitor {
     const auto &input = op.input();
     const auto &view = op.view_;
 
-    const auto &modified_symbols = op.ModifiedSymbols(*symbol_table_);
+    const auto input_symbols = input ? input->ModifiedSymbols(*symbol_table_) : std::vector<Symbol>{};
 
-    std::unordered_set<Symbol> bound_symbols(modified_symbols.begin(), modified_symbols.end());
+    std::unordered_set<Symbol> bound_symbols(input_symbols.begin(), input_symbols.end());
     bound_symbols.insert(additional_bound_symbols_.begin(), additional_bound_symbols_.end());
     bound_symbols.insert(inherited_bound_symbols_.begin(), inherited_bound_symbols_.end());
 

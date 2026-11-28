@@ -64,12 +64,10 @@ bool EdgeImportModeCache::CreateIndex(
 }
 
 bool EdgeImportModeCache::VerticesWithLabelPropertyScanned(LabelId label, PropertyId property) const {
-  return VerticesWithLabelScanned(label) || scanned_label_properties_.contains(std::make_pair(label, property));
+  return scanned_label_properties_.contains(std::make_pair(label, property));
 }
 
-bool EdgeImportModeCache::VerticesWithLabelScanned(LabelId label) const {
-  return AllVerticesScanned() || scanned_labels_.contains(label);
-}
+bool EdgeImportModeCache::VerticesWithLabelScanned(LabelId label) const { return scanned_labels_.contains(label); }
 
 bool EdgeImportModeCache::AllVerticesScanned() const { return scanned_all_vertices_; }
 

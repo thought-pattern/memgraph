@@ -1,7 +1,7 @@
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_results_dict
+import pytest
 
 
 def test_label():

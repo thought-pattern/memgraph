@@ -280,7 +280,10 @@ class OutputFile {
  public:
   enum class Mode : uint8_t {
     OVERWRITE_EXISTING,
+    TRUNCATE_EXISTING,
     APPEND_TO_EXISTING,
+    PATCH_EXISTING,
+    CREATE_NEW,
   };
 
   enum class Position : uint8_t {
@@ -413,7 +416,10 @@ class NonConcurrentOutputFile {
  public:
   enum class Mode : uint8_t {
     OVERWRITE_EXISTING,
+    TRUNCATE_EXISTING,
     APPEND_TO_EXISTING,
+    PATCH_EXISTING,
+    CREATE_NEW,
   };
 
   enum class Position : uint8_t {

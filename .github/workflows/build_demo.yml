@@ -55,13 +55,18 @@ jobs:
             echo "::error::Invalid pr_number '$PR_NUMBER'. Must contain digits only."
             exit 1
           fi
-          # Confirm the PR exists (and grab its head branch + fork status) so a
-          # typo'd number fails here instead of deep inside the build's checkout.
-          if ! pr_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName,isCrossRepository 2>/dev/null); then
+          # Confirm the PR exists (and grab its head branch, exact commit SHA, and fork status)
+          # so both architecture jobs build the identical commit SHA.
+          if ! pr_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName,headRefOid,isCrossRepository 2>/dev/null); then
             echo "::error::Could not find PR #${PR_NUMBER} in ${GITHUB_REPOSITORY}."
             exit 1
           fi
           head_label=$(jq -r '.headRefName' <<<"$pr_json")
+          head_oid=$(jq -r '.headRefOid' <<<"$pr_json")
+          if [[ ! "$head_oid" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Could not resolve a 40-char head commit SHA for PR #${PR_NUMBER} (got '${head_oid}')."
+            exit 1
+          fi
           # Reject fork PRs: the reusable build runs the PR's own build scripts on
           # a self-hosted runner with repository secrets (Docker Hub, S3, Conan,
           # license) in the environment. Building untrusted fork code there is a
@@ -70,13 +75,14 @@ jobs:
             echo "::error::PR #${PR_NUMBER} is from a fork. Demo images can only be built from PRs in ${GITHUB_REPOSITORY} (building fork code with secrets on self-hosted runners is unsafe)."
             exit 1
           fi
-          # Build from the PR head via the refs/pull/<n>/head ref that GitHub
-          # maintains. actions/checkout fetches this ref directly.
-          ref="refs/pull/${PR_NUMBER}/head"
+          # Pin both architecture builds to the exact resolved commit SHA so a
+          # push during the workflow cannot mix two revisions under one tag.
+          ref="${head_oid}"
           tag="${DESCRIPTION}-pr${PR_NUMBER}"
-          # Docker tags are limited to 128 characters.
-          if (( ${#tag} > 128 )); then
-            echo "::error::Resulting tag '$tag' exceeds the 128 character Docker tag limit."
+          # Docker tags are limited to 128 characters, and PushDemo appends
+          # "-amd64" / "-arm64" (6 characters) for temporary per-arch tags.
+          if (( ${#tag} + 6 > 128 )); then
+            echo "::error::Resulting per-arch tag '${tag}-amd64' exceeds the 128 character Docker tag limit (main tag max is 122 characters, got ${#tag})."
             exit 1
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"

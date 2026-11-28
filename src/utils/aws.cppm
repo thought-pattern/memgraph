@@ -79,14 +79,14 @@ struct S3Config {
 
   // ValidationError if there is a mistake, nullopt if all good
   [[nodiscard]] auto Validate() const -> std::optional<AwsValidationError> {
-    if (!aws_region.has_value()) {
+    if (!aws_region.has_value() || aws_region->empty()) {
       return AwsValidationError::AWS_REGION;
     }
-    if (!aws_access_key.has_value()) {
+    if (!aws_access_key.has_value() || aws_access_key->empty()) {
       return AwsValidationError::AWS_ACCESS_KEY;
     }
 
-    if (!aws_secret_key.has_value()) {
+    if (!aws_secret_key.has_value() || aws_secret_key->empty()) {
       return AwsValidationError::AWS_SECRET_KEY;
     }
     return std::nullopt;
@@ -100,7 +100,7 @@ struct S3Config {
     // C++26 get
     auto extract_from_map = [](std::map<std::string, std::string, std::less<>> const &config,
                                std::string_view key) -> std::optional<std::string> {
-      if (auto it = config.find(key); it != config.end()) {
+      if (auto it = config.find(key); it != config.end() && !it->second.empty()) {
         return it->second;
       }
       return std::nullopt;
@@ -108,7 +108,7 @@ struct S3Config {
 
     // Helper to get environment variable
     auto get_env = [](const char *env_name) -> std::optional<std::string> {
-      if (const auto *env_val = std::getenv(env_name)) {
+      if (const auto *env_val = std::getenv(env_name); env_val != nullptr && env_val[0] != '\0') {
         return std::string{env_val};
       }
       return std::nullopt;
@@ -167,7 +167,7 @@ auto BuildClientConfiguration(std::string const &aws_region, std::optional<std::
     -> Aws::Client::ClientConfiguration {
   Aws::Client::ClientConfiguration client_config;
   client_config.region = aws_region;
-  if (aws_endpoint_url.has_value()) {
+  if (aws_endpoint_url.has_value() && !aws_endpoint_url->empty()) {
     client_config.endpointOverride = *aws_endpoint_url;
   }
   // How long the transfer may stay below lowSpeedLimit before it is given up on, which the default
@@ -208,7 +208,7 @@ auto ExtractBucketAndObjectKey(std::string_view uri)
 
   // Find first slash separating bucket from the object key
   auto const slash_pos = uri.find('/');
-  if (slash_pos == std::string_view::npos || slash_pos == uri.size() - 1) {
+  if (slash_pos == std::string_view::npos || slash_pos == 0 || slash_pos == uri.size() - 1) {
     return std::unexpected{S3Error{.status_code = S3ErrorCode::BUCKET_OBJECT_KEY_MISSING,
                                    .message = "URI must contain bucket and object key"}};
   }
@@ -222,6 +222,11 @@ constexpr auto kStreamingGetTag = "MemgraphS3StreamingGet";
 // ever holds the whole object. The SDK's default response stream would collect it in full first.
 auto GetS3ObjectStreaming(std::string_view uri, S3Config const &s3_config, std::streambuf &sink)
     -> std::expected<void, S3Error> {
+  if (auto const validation_error = s3_config.Validate(); validation_error.has_value()) {
+    return std::unexpected{
+        S3Error{.status_code = S3ErrorCode::S3_API_ERROR, .message = AwsValidationErrorToStr(*validation_error)}};
+  }
+
   GlobalS3APIManager::GetInstance();
 
   auto bucket_info = ExtractBucketAndObjectKey(uri);
@@ -283,6 +288,11 @@ auto GetS3Object(std::string uri, S3Config const &s3_config, std::ostream &ostre
 // Writes the content of the S3 object from the uri into a file on the local disk
 auto GetS3Object(std::string uri, S3Config const &s3_config, std::string local_file_path)
     -> std::expected<void, S3Error> {
+  if (auto const validation_error = s3_config.Validate(); validation_error.has_value()) {
+    return std::unexpected{
+        S3Error{.status_code = S3ErrorCode::S3_API_ERROR, .message = AwsValidationErrorToStr(*validation_error)}};
+  }
+
   GlobalS3APIManager::GetInstance();
 
   Aws::Auth::AWSCredentials const credentials(*s3_config.aws_access_key, *s3_config.aws_secret_key);

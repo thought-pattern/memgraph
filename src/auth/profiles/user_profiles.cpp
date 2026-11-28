@@ -24,6 +24,7 @@
 #include "slk/serialization.hpp"
 #include "spdlog/spdlog.h"
 
+#include "auth/exceptions.hpp"
 #include "auth/rpc.hpp"
 #include "utils/string.hpp"
 
@@ -48,15 +49,28 @@ void to_json(nlohmann::json &data, const memgraph::auth::UserProfiles::limits_t 
 
 void from_json(const nlohmann::json &data, memgraph::auth::UserProfiles::limits_t &limits) {
   using up = memgraph::auth::UserProfiles;
-  if (!data.is_object()) return;
+  if (!data.is_object()) {
+    throw AuthException("Invalid resource profile limits: expected JSON object.");
+  }
+  limits.clear();
   for (const auto &[key, val] : data.items()) {
     const auto *key_it = std::ranges::find(up::kLimits, key);
-    if (key_it == up::kLimits.end()) continue;  // unkown key
+    if (key_it == up::kLimits.end()) {
+      throw AuthException("Unknown resource profile limit '{}'.", key);
+    }
     const auto key_idx = std::distance(up::kLimits.begin(), key_it);
     if (val.is_null()) {
       limits[(up::Limits)key_idx] = up::unlimitted_t{};
-    } else {
+    } else if (val.is_number_unsigned()) {
       limits[(up::Limits)key_idx] = val.get<uint64_t>();
+    } else if (val.is_number_integer()) {
+      const auto signed_val = val.get<int64_t>();
+      if (signed_val < 0) {
+        throw AuthException("Negative value for resource profile limit '{}'.", key);
+      }
+      limits[(up::Limits)key_idx] = static_cast<uint64_t>(signed_val);
+    } else {
+      throw AuthException("Invalid value type for resource profile limit '{}'.", key);
     }
   }
 }
@@ -67,15 +81,28 @@ void to_json(nlohmann::json &data, const memgraph::auth::UserProfiles::Profile &
 }
 
 void from_json(const nlohmann::json &data, memgraph::auth::UserProfiles::Profile &profile) {
-  if (data.contains("limits")) profile.limits = data["limits"].get<memgraph::auth::UserProfiles::limits_t>();
-  if (data.contains("usernames")) {
-    // Fold on load so a raw spelling persisted by a pre-fix binary stays matchable without a durable rewrite.
-    std::unordered_set<std::string> usernames;
-    for (const auto &username : data["usernames"].get<std::unordered_set<std::string>>()) {
-      usernames.insert(FoldUsername(username));
-    }
-    profile.usernames = std::move(usernames);
+  if (!data.is_object()) {
+    throw AuthException("Invalid resource profile record: expected JSON object.");
   }
+  memgraph::auth::UserProfiles::limits_t parsed_limits;
+  if (auto lim_it = data.find("limits"); lim_it != data.end()) {
+    from_json(*lim_it, parsed_limits);
+  }
+  std::unordered_set<std::string> parsed_usernames;
+  if (auto usr_it = data.find("usernames"); usr_it != data.end()) {
+    if (!usr_it->is_array()) {
+      throw AuthException("Invalid resource profile membership list: expected JSON array.");
+    }
+    // Fold on load so a raw spelling persisted by a pre-fix binary stays matchable without a durable rewrite.
+    for (const auto &entry : *usr_it) {
+      if (!entry.is_string()) {
+        throw AuthException("Invalid resource profile member entry: expected string.");
+      }
+      parsed_usernames.insert(FoldUsername(entry.get<std::string>()));
+    }
+  }
+  profile.limits = std::move(parsed_limits);
+  profile.usernames = std::move(parsed_usernames);
 }
 
 UserProfiles::UserProfiles(Repository &durability) : durability_{&durability} {
@@ -91,16 +118,19 @@ UserProfiles::UserProfiles(Repository &durability) : durability_{&durability} {
   durability_->ForEachProfile([this, &spellings](auto const &name, auto const &value) {
     try {
       const auto data = nlohmann::json::parse(value);
-      if (data.contains("usernames")) {
-        for (auto &raw : data["usernames"].template get<std::vector<std::string>>()) {
+      auto profile = data.template get<memgraph::auth::UserProfiles::Profile>();
+      profile.name = name;
+      if (auto usr_it = data.find("usernames"); usr_it != data.end()) {
+        for (const auto &raw_json : *usr_it) {
+          auto raw = raw_json.template get<std::string>();
           spellings[FoldUsername(raw)].emplace_back(std::move(raw), name);
         }
       }
-      auto profile = data.template get<memgraph::auth::UserProfiles::Profile>();
-      profile.name = name;
       profiles_.emplace(std::move(profile));
-    } catch (const nlohmann::json::parse_error &) {
-      spdlog::warn("Failed to parse user profile {}", name);
+    } catch (const AuthException &e) {
+      spdlog::error("Failed to load resource profile '{}': {}", name, e.what());
+    } catch (const nlohmann::json::exception &e) {
+      spdlog::error("Failed to parse resource profile '{}': {}", name, e.what());
     }
   });
 
@@ -136,14 +166,20 @@ UserProfiles::UserProfiles(Repository &durability) : durability_{&durability} {
   }
 };
 
-bool UserProfiles::Persist(const Profile &profile) {
+std::string UserProfiles::SerializeWithStale(const Profile &profile, const std::vector<std::string> *stale_spellings) {
   nlohmann::json json = profile;
-  if (const auto it = stale_.find(profile.name); it != stale_.end()) {
-    for (const auto &raw : it->second) {
+  if (stale_spellings != nullptr) {
+    for (const auto &raw : *stale_spellings) {
       json["usernames"].push_back(raw);
     }
   }
-  return durability_->Put(Repository::ProfileKey(profile.name), json.dump());
+  return json.dump();
+}
+
+bool UserProfiles::Persist(const Profile &profile) {
+  const auto it = stale_.find(profile.name);
+  const std::vector<std::string> *stale_ptr = (it != stale_.end()) ? &it->second : nullptr;
+  return durability_->Put(Repository::ProfileKey(profile.name), SerializeWithStale(profile, stale_ptr));
 }
 
 void UserProfiles::Resolve(const std::string &folded) {
@@ -167,7 +203,6 @@ bool UserProfiles::Create(std::string_view name, limits_t defined_limits,
     return false;
   }
 
-  // Create profile with initial usernames
   std::unordered_set<std::string> folded_usernames;
   folded_usernames.reserve(usernames.size());
   for (const auto &username : usernames) {
@@ -175,30 +210,49 @@ bool UserProfiles::Create(std::string_view name, limits_t defined_limits,
   }
   Profile profile{std::string{name}, std::move(defined_limits), std::move(folded_usernames)};
 
-  // Remove usernames from other profiles if they exist
-  for (const auto &username : profile.usernames) {
-    // Check if username is already in another profile and remove it
-    for (auto &existing_profile : profiles_) {  // NOLINT
-      if (existing_profile.usernames.contains(username)) {
-        existing_profile.usernames.erase(username);
-        // Update the other profile in durability
-        Persist(existing_profile);
-      }
+  auto next_stale = stale_;
+  std::unordered_set<std::string> stale_touched_profiles;
+  for (auto st_it = next_stale.begin(); st_it != next_stale.end();) {
+    const auto erased = std::erase_if(
+        st_it->second, [&](const auto &raw) { return profile.usernames.contains(FoldUsername(raw)); });
+    if (erased > 0) {
+      stale_touched_profiles.insert(st_it->first);
     }
+    st_it = st_it->second.empty() ? next_stale.erase(st_it) : std::next(st_it);
   }
 
-  const auto [it, succ] = profiles_.emplace(std::move(profile));
-  if (!succ) {
-    return false;
+  std::map<std::string, std::string> batch_puts;
+  for (const auto &existing_profile : profiles_) {
+    bool modified = stale_touched_profiles.contains(existing_profile.name);
+    for (const auto &username : profile.usernames) {
+      if (existing_profile.usernames.contains(username)) {
+        modified = true;
+        break;
+      }
+    }
+    if (!modified) continue;
+
+    Profile updated_existing = existing_profile;
+    for (const auto &username : profile.usernames) {
+      updated_existing.usernames.erase(username);
+    }
+    const auto st_it = next_stale.find(updated_existing.name);
+    const std::vector<std::string> *st_ptr = (st_it != next_stale.end()) ? &st_it->second : nullptr;
+    batch_puts.emplace(Repository::ProfileKey(updated_existing.name), SerializeWithStale(updated_existing, st_ptr));
   }
-  if (!Persist(*it)) {
-    // Remove new profile
-    profiles_.erase(it);
-    return false;
+  batch_puts.emplace(Repository::ProfileKey(profile.name), SerializeWithStale(profile, nullptr));
+
+  if (!durability_->PutMultiple(batch_puts)) {
+    throw AuthException("Failed to persist resource profile '{}'!", name);
   }
-  for (const auto &username : it->usernames) {
-    Resolve(username);
+
+  for (auto &existing_profile : profiles_) {  // NOLINT
+    for (const auto &username : profile.usernames) {
+      existing_profile.usernames.erase(username);
+    }
   }
+  stale_ = std::move(next_stale);
+  profiles_.emplace(std::move(profile));
   return true;
 }
 
@@ -208,33 +262,31 @@ std::optional<UserProfiles::Profile> UserProfiles::Update(std::string_view name,
   if (profile_it == profiles_.end()) {
     return std::nullopt;
   }
-  auto old_limits = profile_it->limits;  // copy
-  // Update local storage
+  Profile updated = *profile_it;
   for (const auto &[key, val] : updated_limits) {
-    profile_it->limits[key] = val;
+    updated.limits[key] = val;
   }
-  // Update durability
-  if (!Persist(*profile_it)) {
-    // Revert to old profile
-    profile_it->limits = std::move(old_limits);
-    return std::nullopt;
+  if (!Persist(updated)) {
+    throw AuthException("Failed to persist resource profile '{}'!", name);
   }
-  return *profile_it;  // Return updated profile
+  profile_it->limits = std::move(updated.limits);
+  return *profile_it;
 }
 
 UserProfiles::DropResult UserProfiles::Drop(std::string_view name) {
   auto l = std::unique_lock{mtx_};
   auto profile_it = profiles_.find(name);
   if (profile_it == profiles_.end()) {
+    if (durability_->Get(Repository::ProfileKey(name))) {
+      return durability_->Delete(Repository::ProfileKey(name)) ? DropResult::kDropped : DropResult::kFailed;
+    }
     return DropResult::kAbsent;
   }
-  auto old_profile = *profile_it;  // copy
-  profiles_.erase(profile_it);
   if (!durability_->Delete(Repository::ProfileKey(name))) {
-    // Revert to old profile
-    profiles_.emplace(std::move(old_profile));
     return DropResult::kFailed;
   }
+  auto old_profile = *profile_it;
+  profiles_.erase(profile_it);
   stale_.erase(old_profile.name);
   for (const auto &username : old_profile.usernames) {
     Resolve(username);
@@ -271,26 +323,47 @@ std::optional<UserProfiles::Profile> UserProfiles::AddUsername(std::string_view 
 
   const auto folded_username = FoldUsername(username);
 
-  // Check if username is already in another profile and remove it
-  for (auto &profile : profiles_) {  // NOLINT
-    if (profile.usernames.contains(folded_username)) {
-      profile.usernames.erase(folded_username);
-      // Update the other profile in durability
-      Persist(profile);
+  auto next_stale = stale_;
+  std::unordered_set<std::string> stale_touched_profiles;
+  for (auto st_it = next_stale.begin(); st_it != next_stale.end();) {
+    const auto erased =
+        std::erase_if(st_it->second, [&](const auto &raw) { return FoldUsername(raw) == folded_username; });
+    if (erased > 0) {
+      stale_touched_profiles.insert(st_it->first);
+    }
+    st_it = st_it->second.empty() ? next_stale.erase(st_it) : std::next(st_it);
+  }
+
+  std::map<std::string, std::string> batch_puts;
+  for (const auto &other : profiles_) {
+    if (other.name == profile_it->name) continue;
+    if (!other.usernames.contains(folded_username) && !stale_touched_profiles.contains(other.name)) continue;
+    Profile updated_other = other;
+    updated_other.usernames.erase(folded_username);
+    const auto st_it = next_stale.find(updated_other.name);
+    const std::vector<std::string> *st_ptr = (st_it != next_stale.end()) ? &st_it->second : nullptr;
+    batch_puts.emplace(Repository::ProfileKey(updated_other.name), SerializeWithStale(updated_other, st_ptr));
+  }
+
+  Profile updated_target = *profile_it;
+  updated_target.usernames.insert(folded_username);
+  {
+    const auto st_it = next_stale.find(updated_target.name);
+    const std::vector<std::string> *st_ptr = (st_it != next_stale.end()) ? &st_it->second : nullptr;
+    batch_puts.emplace(Repository::ProfileKey(updated_target.name), SerializeWithStale(updated_target, st_ptr));
+  }
+
+  if (!durability_->PutMultiple(batch_puts)) {
+    throw AuthException("Failed to persist profile '{}' for '{}'!", profile_name, username);
+  }
+
+  for (auto &other : profiles_) {  // NOLINT
+    if (other.name != profile_it->name) {
+      other.usernames.erase(folded_username);
     }
   }
-
-  // Add username to the target profile
   profile_it->usernames.insert(folded_username);
-
-  // Update durability
-  if (!Persist(*profile_it)) {
-    // Revert changes
-    profile_it->usernames.erase(folded_username);
-    return std::nullopt;
-  }
-
-  Resolve(folded_username);
+  stale_ = std::move(next_stale);
   return *profile_it;
 }
 
@@ -373,6 +446,20 @@ std::optional<UserProfiles::Profile> UserProfiles::Merge(const std::optional<Pro
     }
   }
   return merged;
+}
+
+UserProfiles::MemorySnapshot UserProfiles::CaptureMemorySnapshot() const {
+  const std::shared_lock lk(mtx_);
+  return MemorySnapshot{.profiles = std::vector<Profile>{profiles_.begin(), profiles_.end()}, .stale = stale_};
+}
+
+void UserProfiles::RestoreMemorySnapshot(MemorySnapshot snapshot) {
+  const std::unique_lock lk(mtx_);
+  profiles_.clear();
+  for (auto &profile : snapshot.profiles) {
+    profiles_.insert(std::move(profile));
+  }
+  stale_ = std::move(snapshot.stale);
 }
 
 }  // namespace memgraph::auth

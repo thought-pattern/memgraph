@@ -46,13 +46,21 @@ inline constexpr std::size_t kCoarseClockCacheLine = 64;
 
 struct alignas(kCoarseClockCacheLine) CoarseSteadyClock {
   std::atomic<std::chrono::steady_clock::rep> ticks{std::chrono::steady_clock::now().time_since_epoch().count()};
+  std::atomic<bool> ticker_active{false};
 
-  CoarseSteadyClock() {
-    ticker_.SetInterval(kCoarseClockTick);
-    ticker_.Run("coarse_clk", [this]() {
-      ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
-    });
+  CoarseSteadyClock() noexcept {
+    try {
+      ticker_.SetInterval(kCoarseClockTick);
+      ticker_.Run("coarse_clk", [this]() {
+        ticks.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+      });
+      ticker_active.store(true, std::memory_order_relaxed);
+    } catch (...) {
+      ticker_active.store(false, std::memory_order_relaxed);
+    }
   }
+
+  bool IsTickerActive() const noexcept { return ticker_active.load(std::memory_order_relaxed); }
 
  private:
   Scheduler ticker_;  // refreshes `ticks`; stopped by ~Scheduler at static teardown
@@ -66,8 +74,12 @@ inline CoarseSteadyClock &CoarseClockInstance() noexcept {
 
 // Cached steady_clock time (same timeline as steady_clock::now()), at most ~100ms stale and never ahead.
 inline SteadyTimePoint CoarseSteadyNow() noexcept {
+  auto &clock = detail::CoarseClockInstance();
+  if (!clock.IsTickerActive()) [[unlikely]] {
+    return std::chrono::steady_clock::now();
+  }
   return SteadyTimePoint{
-      std::chrono::steady_clock::duration{detail::CoarseClockInstance().ticks.load(std::memory_order_relaxed)}};
+      std::chrono::steady_clock::duration{clock.ticks.load(std::memory_order_relaxed)}};
 }
 
 }  // namespace memgraph::utils

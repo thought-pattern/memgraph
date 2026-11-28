@@ -49,12 +49,12 @@ jobs:
   stress_test_standalone:
     name: "Stress Tests Standalone"
     if: ${{ inputs.deployment == 'standalone/native' }}
-    runs-on: [self-hosted, X64, Memory256G]
+    runs-on: [self-hosted, "${{ inputs.arch == 'arm' && 'ARM64' || 'X64' }}", Memory256G]
     timeout-minutes: 180
     env:
       OS: ubuntu-24.04
       TOOLCHAIN: v8
-      ARCH: amd
+      ARCH: ${{ inputs.arch }}
       THREADS: 24
       BUILD_TYPE: RelWithDebInfo
     steps:
@@ -135,7 +135,7 @@ jobs:
         run: |
           ./tools/ci/core-dumps/collect.sh \
           --toolchain $TOOLCHAIN \
-          --os $OS \
+          --os "${OS}$([ "$ARCH" = "arm" ] && printf '%s' '-arm')" \
           --run-id "${{ github.run_id }}" \
           --job-id "${{ github.job }}-${{ github.run_attempt }}"
 
@@ -156,12 +156,12 @@ jobs:
   stress_test_native_ha:
     name: "Stress Tests Native HA"
     if: ${{ inputs.deployment == 'ha/native' }}
-    runs-on: [self-hosted, X64, Memory256G]
+    runs-on: [self-hosted, "${{ inputs.arch == 'arm' && 'ARM64' || 'X64' }}", Memory256G]
     timeout-minutes: 180
     env:
       OS: ubuntu-24.04
       TOOLCHAIN: v8
-      ARCH: amd
+      ARCH: ${{ inputs.arch }}
       THREADS: 24
       BUILD_TYPE: RelWithDebInfo
     steps:
@@ -246,7 +246,7 @@ jobs:
         run: |
           ./tools/ci/core-dumps/collect.sh \
           --toolchain $TOOLCHAIN \
-          --os $OS \
+          --os "${OS}$([ "$ARCH" = "arm" ] && printf '%s' '-arm')" \
           --run-id "${{ github.run_id }}" \
           --job-id "${{ github.job }}-${{ github.run_attempt }}"
 
@@ -267,7 +267,7 @@ jobs:
   stress_test_docker_ha:
     name: "Stress Tests Docker HA"
     if: ${{ inputs.deployment == 'ha/docker' }}
-    runs-on: [self-hosted, X64, Memory256G]
+    runs-on: [self-hosted, "${{ inputs.arch == 'arm' && 'ARM64' || 'X64' }}", Memory256G]
     timeout-minutes: 180
     steps:
       - name: Set up repository
@@ -315,11 +315,18 @@ jobs:
           curl --proto "=https" --tlsv1.2 -L "${{ env.IMAGE_VALUE }}" > memgraph.tar.gz
           load_output=$(docker load -i memgraph.tar.gz)
 
-          # grab each repo:tag, drop the ":latest" one, pick the first real tag
+          # Prefer a non-:latest tag when multiple tags are loaded; fall back to the first loaded tag
           repo_tag=$(echo "$load_output" \
             | awk -F': ' '/Loaded image:/ {print $2}' \
-            | grep -v ':latest$' \
+            | { grep -v ':latest$' || true; } \
             | head -n1)
+          if [[ -z "$repo_tag" ]]; then
+            repo_tag=$(echo "$load_output" | awk -F': ' '/Loaded image:/ {print $2}' | head -n1)
+          fi
+          if [[ -z "$repo_tag" ]]; then
+            echo "::error::Failed to extract loaded Docker image reference from memgraph.tar.gz"
+            exit 1
+          fi
 
           echo "MEMGRAPH_IMAGE=${repo_tag}" >> $GITHUB_ENV
 
@@ -331,6 +338,7 @@ jobs:
       - name: Run stress tests (docker HA)
         run: |
           ./release/package/mgbuild.sh \
+          --arch "${{ inputs.arch }}" \
           --enable-monitoring \
           --monitoring-host $MONITORING_HOST \
           --cluster-id $CLUSTER_ID \
@@ -434,11 +442,15 @@ jobs:
 
           repo_tag=$(echo "$load_output" \
             | awk -F': ' '/Loaded image:/ {print $2}' \
-            | grep -v ':latest$' \
+            | { grep -v ':latest$' || true; } \
             | head -n1)
 
           if [[ -z "$repo_tag" ]]; then
             repo_tag=$(echo "$load_output" | awk -F': ' '/Loaded image:/ {print $2}' | head -n1)
+          fi
+          if [[ -z "$repo_tag" ]]; then
+            echo "::error::Failed to extract loaded Docker image reference from memgraph.tar.gz"
+            exit 1
           fi
 
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -494,6 +506,7 @@ jobs:
       - name: Run stress tests (EKS HA)
         run: |
           ./release/package/mgbuild.sh \
+          --arch "${{ inputs.arch }}" \
           --enable-monitoring \
           --monitoring-host $MONITORING_HOST \
           --cluster-id $CLUSTER_ID \

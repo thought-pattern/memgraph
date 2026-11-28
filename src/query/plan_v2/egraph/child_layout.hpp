@@ -55,6 +55,11 @@ namespace subquery {
 inline constexpr std::size_t outer = 0, inner = 1, first_exposed = 2;
 }
 
+namespace distinct {
+inline constexpr std::size_t input = 0;
+inline constexpr std::size_t arity = 1;
+}
+
 namespace function {
 inline constexpr std::size_t first_arg = 0;
 }

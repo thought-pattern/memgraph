@@ -24,9 +24,9 @@ Memgraph 3.9 permissions:
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
 from mgclient import DatabaseError
+import pytest
 
 
 def get_admin_cursor():

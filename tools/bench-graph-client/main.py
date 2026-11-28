@@ -5,13 +5,13 @@ Bench Graph client responsible for sending benchmarking data in JSON format to
 the Bench Graph server.
 """
 
+from argparse import ArgumentParser
+from datetime import datetime
 import json
 import logging
 import os
 import subprocess
 import time
-from argparse import ArgumentParser
-from datetime import datetime
 
 import requests
 

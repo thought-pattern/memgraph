@@ -11,10 +11,16 @@
 
 #pragma once
 
+#include <charconv>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -66,39 +72,50 @@ inline void LoadConfig(const std::string &product_name) {
 
 inline std::pair<std::string, std::string> LoadUsernameAndPassword(const std::string &pass_file) {
   std::ifstream file(pass_file);
-  if (file.fail()) {
-    spdlog::warn("Problem with opening MG_PASSFILE, memgraph server will start without user");
-    return {};
+  if (!file.is_open()) {
+    throw std::runtime_error("Unable to open MG_PASSFILE: " + pass_file);
   }
-  std::vector<std::string> result;
 
   std::string line;
-  std::getline(file, line);
-  size_t pos = 0;
-  std::string token;
-  static constexpr std::string_view delimiter{":"};
-  while ((pos = line.find(delimiter)) != std::string::npos) {
-    if (line[pos - 1] == '\\') {
-      line.erase(pos - 1, 1);
-      token += line.substr(0, pos);
-      line.erase(0, pos);
+  if (!std::getline(file, line)) {
+    throw std::runtime_error("MG_PASSFILE is empty or unreadable: " + pass_file);
+  }
+  if (!line.empty() && line.back() == '\r') {
+    line.pop_back();
+  }
 
+  std::vector<std::string> fields;
+  std::string token;
+  for (std::size_t idx = 0; idx < line.size(); ++idx) {
+    if (line[idx] == '\\' && idx + 1 < line.size() && line[idx + 1] == ':') {
+      token.push_back(':');
+      ++idx;
+    } else if (line[idx] == ':') {
+      fields.push_back(std::move(token));
+      token.clear();
     } else {
-      token += line.substr(0, pos);
-      result.push_back(token);
-      line.erase(0, pos + delimiter.length());
-      token = "";
+      token.push_back(line[idx]);
     }
   }
-  result.push_back(line);
-  file.close();
+  fields.push_back(std::move(token));
 
-  if (result.size() != 2) {
-    spdlog::warn(
-        "Wrong data format. Data should be store in format: username:password, memgraph server will start without "
-        "user");
-    return {};
+  if (fields.size() != 2 || fields[0].empty() || fields[1].empty()) {
+    throw std::runtime_error("Invalid MG_PASSFILE format; expected non-empty username:password");
   }
 
-  return {result[0], result[1]};
+  return {std::move(fields[0]), std::move(fields[1])};
+}
+
+inline std::optional<uint16_t> ParseBoltPortOverride(std::string_view raw) noexcept {
+  if (raw.empty()) {
+    return std::nullopt;
+  }
+  uint32_t parsed = 0;
+  const auto *begin = raw.data();
+  const auto *end = raw.data() + raw.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+  if (ec != std::errc{} || ptr != end || parsed > std::numeric_limits<uint16_t>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<uint16_t>(parsed);
 }

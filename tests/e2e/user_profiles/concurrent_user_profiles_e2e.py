@@ -14,8 +14,8 @@ import sys
 import threading
 import time
 
-import pytest
 from gqlalchemy import Memgraph
+import pytest
 
 
 @pytest.fixture

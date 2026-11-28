@@ -27,8 +27,25 @@ bool IsTransactional(const StorageMode storage_mode) noexcept {
 void to_json(nlohmann::json &j, StorageMode mode) { j = std::to_underlying(mode); }
 
 void from_json(const nlohmann::json &j, StorageMode &mode) {
-  const auto raw = j.get<std::underlying_type_t<StorageMode>>();
-  if (!utils::NumToEnum(raw, mode)) mode = StorageMode::IN_MEMORY_TRANSACTIONAL;
+  if (!j.is_number_integer()) {
+    mode = StorageMode::IN_MEMORY_TRANSACTIONAL;
+    return;
+  }
+  if (j.is_number_unsigned()) {
+    const auto raw = j.get<uint64_t>();
+    if (raw >= std::to_underlying(StorageMode::N)) {
+      mode = StorageMode::IN_MEMORY_TRANSACTIONAL;
+      return;
+    }
+    mode = static_cast<StorageMode>(raw);
+    return;
+  }
+  const auto raw = j.get<int64_t>();
+  if (raw < 0 || raw >= static_cast<int64_t>(std::to_underlying(StorageMode::N))) {
+    mode = StorageMode::IN_MEMORY_TRANSACTIONAL;
+    return;
+  }
+  mode = static_cast<StorageMode>(raw);
 }
 
 std::string_view StorageModeToString(StorageMode storage_mode) {

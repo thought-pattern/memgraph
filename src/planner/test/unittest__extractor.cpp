@@ -631,26 +631,102 @@ TEST(Extract_MultiAlt, TwoAlternatives_MergeFrontier) {
 }
 
 TEST(Extract_MultiAlt, DemandPropagation) {
-  // Parent (B) depends on child (A or B equivalent).
-  // A produces {cost=1,req={1}} and {cost=2,req={}}
-  // B produces {cost=1,req={}}
-  // After merging A and B in child eclass: frontier = [{cost=1,req={},B_node}]
-  // Parent (symbol B, one child): {cost=1+1=2, req={}, parent_node}
+  // Child e-class has TWO Pareto-incomparable surviving candidates:
+  //   - symbol::A leaf: {cost=1, req={1}} (cheaper, requires binding 1 from parent)
+  //   - symbol::LITERAL leaf: {cost=3, req={}} (costlier, self-contained)
+  //
+  // Isolation / min-cost without requirement checking would always pick symbol::A (cost=1).
+  // A parent with symbol::ADD supplies NO bindings (only req={} children are compatible),
+  // whereas a parent with symbol::B supplies binding 1 (allowing {cost=1, req={1}}).
+  struct PropagatingDemandModel {
+    using CostResult = TestFrontier;
+
+    static auto operator()(ENode<symbol> const &current, ENodeId enode_id, std::span<CostResult const *const> children)
+        -> CostResult {
+      if (children.empty()) {
+        if (current.symbol() == symbol::A) {
+          return CostResult{{{.cost = 1.0, .required = {1}, .enode_id = enode_id}}};
+        }
+        return CostResult{{{.cost = 3.0, .required = {}, .enode_id = enode_id}}};
+      }
+
+      std::vector<TestDemandAlt> alts;
+      for (auto const &child_alt : children[0]->alts()) {
+        if (current.symbol() == symbol::ADD) {
+          // Strict parent: requires child to have no unsatisfied demands
+          if (child_alt.required.empty()) {
+            alts.push_back({.cost = 1.0 + child_alt.cost, .required = {}, .enode_id = enode_id});
+          }
+        } else {
+          // Providing parent (symbol::B): satisfies demand 1
+          auto rem = child_alt.required;
+          rem.erase(1);
+          alts.push_back({.cost = 1.0 + child_alt.cost, .required = std::move(rem), .enode_id = enode_id});
+        }
+      }
+      return CostResult{std::move(alts)};
+    }
+  };
+
+  auto resolve_with_parent_demand = [](EGraph<symbol, analysis> const &eg,
+                                       extract::FrontierMap<TestFrontier> const &fmap,
+                                       EClassId root_id) -> std::vector<std::pair<EClassId, ENodeId>> {
+    auto const &root_frontier = *fmap.find(eg.find(root_id))->second;
+    auto const [root_enode_id, _] = root_frontier.resolve();
+    auto const &root_enode = eg.get_enode(root_enode_id);
+    std::set<int> provided_by_parent;
+    if (root_enode.symbol() == symbol::B) {
+      provided_by_parent.insert(1);
+    }
+
+    std::vector<std::pair<EClassId, ENodeId>> out;
+    for (auto child_raw : root_enode.children()) {
+      auto const child_cid = eg.find(child_raw);
+      auto const &child_frontier = *fmap.find(child_cid)->second;
+      std::optional<TestDemandAlt> best;
+      for (auto const &alt : child_frontier.alts()) {
+        if (std::ranges::includes(provided_by_parent, alt.required)) {
+          if (!best || alt.cost < best->cost) {
+            best = alt;
+          }
+        }
+      }
+      if (best) {
+        out.emplace_back(child_cid, best->enode_id);
+      }
+    }
+    out.emplace_back(eg.find(root_id), root_enode_id);
+    return out;
+  };
+
   auto egraph = EGraph<symbol, analysis>{};
   auto [a_class, a_node, a_new] = egraph.emplace(symbol::A);
-  auto [b_class, b_node, b_new] = egraph.emplace(symbol::B);
-  auto [child_class, _] = egraph.merge(a_class, b_class);
+  auto [lit_class, lit_node, lit_new] = egraph.emplace(symbol::LITERAL, 0);
+  auto [child_class, _] = egraph.merge(a_class, lit_class);
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
 
-  auto [parent_class, parent_node, parent_new] = egraph.emplace(symbol::B, {child_class});
+  auto [strict_parent_class, strict_parent_node, sp_new] = egraph.emplace(symbol::ADD, {child_class});
+  auto [providing_parent_class, providing_parent_node, pp_new] = egraph.emplace(symbol::B, {child_class});
 
-  auto extracted = TestExtract(egraph, DemandAwareMultiAltCostModel{}, parent_class);
+  // Under strict parent (no demands satisfied): child frontier has 2 surviving candidates,
+  // and demand propagation selects lit_node (cost=3, req={}) instead of isolated min-cost a_node.
+  extract::FrontierContext<TestFrontier> strict_ctx;
+  (void)extract::ComputeFrontiers(egraph, PropagatingDemandModel{}, strict_parent_class, strict_ctx);
+  ASSERT_EQ(strict_ctx.frontier_map.at(egraph.find(child_class))->alts().size(), 2u);
+  auto strict_extracted = resolve_with_parent_demand(egraph, strict_ctx.frontier_map, strict_parent_class);
+  ASSERT_EQ(strict_extracted.size(), 2u);
+  EXPECT_EQ(strict_extracted[0].second, lit_node);
+  EXPECT_EQ(strict_extracted[1].second, strict_parent_node);
 
-  ASSERT_EQ(extracted.size(), 2);
-  ASSERT_EQ(extracted.back().first, parent_class);
-  ASSERT_EQ(extracted.back().second, parent_node);
-  ASSERT_EQ(extracted[0].second, b_node);
+  // Under providing parent (satisfies demand 1): demand propagation selects cheaper a_node (cost=1, req={1}).
+  extract::FrontierContext<TestFrontier> providing_ctx;
+  (void)extract::ComputeFrontiers(egraph, PropagatingDemandModel{}, providing_parent_class, providing_ctx);
+  ASSERT_EQ(providing_ctx.frontier_map.at(egraph.find(child_class))->alts().size(), 2u);
+  auto providing_extracted = resolve_with_parent_demand(egraph, providing_ctx.frontier_map, providing_parent_class);
+  ASSERT_EQ(providing_extracted.size(), 2u);
+  EXPECT_EQ(providing_extracted[0].second, a_node);
+  EXPECT_EQ(providing_extracted[1].second, providing_parent_node);
 }
 
 TEST(Extract_MultiAlt, DiamondDAG_WithDemand) {

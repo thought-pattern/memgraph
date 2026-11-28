@@ -14,11 +14,13 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace memgraph::query::frontend {
 
 // These are the functions for parsing literals and parameter names from
 // opencypher query.
+bool IsInt64MinMagnitudeLiteral(std::string_view s);
 int64_t ParseIntegerLiteral(const std::string &s);
 std::string ParseStringLiteral(const std::string &s);
 double ParseDoubleLiteral(const std::string &s);

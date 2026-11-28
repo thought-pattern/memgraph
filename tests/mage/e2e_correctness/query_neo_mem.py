@@ -24,6 +24,18 @@ logger = logging.getLogger("query_neo_mem")
 logger.setLevel(logging.DEBUG)
 
 
+def _property_values_equal(left, right) -> bool:
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_property_values_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict) and isinstance(right, dict):
+        return set(left.keys()) == set(right.keys()) and all(
+            _property_values_equal(left[k], right[k]) for k in left
+        )
+    return left == right
+
+
 class Vertex:
     def __init__(self, id: int, labels: List[str], properties: Dict[str, Any]):
         self._id = id
@@ -61,7 +73,7 @@ class Vertex:
             if k not in other._properties:
                 logger.debug(f"Property with key {k} not in {other._properties.keys()}")
                 return False
-            if v != other._properties[k]:
+            if not _property_values_equal(v, other._properties[k]):
                 logger.debug(f"Value {v} not equal to {other._properties[k]}")
                 return False
 
@@ -121,7 +133,7 @@ class Edge:
             if k not in other._properties:
                 logger.debug(f"Property with key {k} not in {other._properties.keys()}")
                 return False
-            if v != other._properties[k]:
+            if not _property_values_equal(v, other._properties[k]):
                 logger.debug(f"Value {v} not equal to {other._properties[k]}")
                 return False
         return True

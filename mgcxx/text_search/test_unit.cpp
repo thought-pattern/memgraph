@@ -87,31 +87,32 @@ TEST(text_search_test_case, simple_test2) {
 }
 
 TEST(text_search_test_case, mappings) {
-  try {
-    constexpr auto index_name = "tantivy_index_mappings";
-    nlohmann::json mappings = {};
-    mappings["properties"] = {};
-    mappings["properties"]["prop1"] = {{"type", "u64"}, {"fast", true}, {"indexed", true}};
-    mappings["properties"]["prop2"] = {{"type", "text"}, {"stored", true}, {"text", true}, {"fast", true}};
-    mappings["properties"]["prop3"] = {{"type", "json"}, {"stored", true}, {"text", true}, {"fast", true}};
-    mappings["properties"]["prop4"] = {{"type", "bool"}, {"stored", true}, {"text", true}, {"fast", true}};
-    auto context =
-        mgcxx::text_search::create_index(index_name, mgcxx::text_search::IndexConfig{.mappings = mappings.dump()});
+  constexpr auto index_name = "tantivy_index_mappings";
+  nlohmann::json mappings = {};
+  mappings["properties"] = {};
+  mappings["properties"]["prop1"] = {{"type", "u64"}, {"fast", true}, {"indexed", true}};
+  mappings["properties"]["prop2"] = {{"type", "text"}, {"stored", true}, {"text", true}, {"fast", true}};
+  mappings["properties"]["prop3"] = {{"type", "json"}, {"stored", true}, {"text", true}, {"fast", true}};
+  mappings["properties"]["prop4"] = {{"type", "bool"}, {"stored", true}, {"text", true}, {"fast", true}};
+  auto context =
+      mgcxx::text_search::create_index(index_name, mgcxx::text_search::IndexConfig{.mappings = mappings.dump()});
 
-    // NOTE: This test just verifies the code can be called, add deeper test
-    // when improving extract_schema.
-    // TODO(gitbuda): Implement full range of extract_schema options.
-    mgcxx::text_search::SearchInput search_input = {
-        .search_fields = {"data"}, .search_query = "bla", .return_fields = {"data"}};
+  mgcxx::text_search::SearchInput search_input = {
+      .search_fields = {"data"}, .search_query = "bla", .return_fields = {"data"}};
+  bool threw_missing_field = false;
+  {
     auto searcher = mgcxx::text_search::acquire_searcher(context);
-    mgcxx::text_search::search_gids_pinned(context, *searcher, search_input);
-    mgcxx::text_search::drop_index(std::move(context));
-  } catch (const ::rust::Error &error) {
-    std::cout << error.what() << std::endl;
-    EXPECT_STREQ(error.what(),
-                 "The field does not exist: 'data' inside "
-                 "\"tantivy_index_mappings\" text search index");
+    try {
+      mgcxx::text_search::search_gids_pinned(context, *searcher, search_input);
+    } catch (const ::rust::Error &error) {
+      threw_missing_field = true;
+      EXPECT_STREQ(error.what(),
+                   "The field does not exist: 'data' inside "
+                   "\"tantivy_index_mappings\" text search index");
+    }
   }
+  mgcxx::text_search::drop_index(std::move(context));
+  ASSERT_TRUE(threw_missing_field);
 }
 
 TEST(text_search_test_case, limit_test) {

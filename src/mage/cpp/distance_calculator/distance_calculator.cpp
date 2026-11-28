@@ -9,6 +9,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include <algorithm>
 #include <cmath>
 #include <mgp.hpp>
 
@@ -35,12 +36,27 @@ constexpr int64_t kDefaultArgumentDecimals = 2;
 const double pi_rad = M_PI / 180.0;
 const double R = 6371000.0;
 
-double distance_calc(const mgp::Node &node1, const mgp::Node &node2, bool use_km, int decimals) {
-  const double lat1 = node1.GetProperty("lat").ValueDouble();
-  const double lng1 = node1.GetProperty("lng").ValueDouble();
+double round_to_decimals(double value, int64_t decimals) {
+  if (decimals >= 0) {
+    const double factor = std::pow(10.0, static_cast<double>(decimals));
+    if (!std::isfinite(factor) || factor == 0.0) {
+      return value;
+    }
+    return std::round(value * factor) / factor;
+  }
+  const double divisor = std::pow(10.0, -static_cast<double>(decimals));
+  if (!std::isfinite(divisor) || divisor == 0.0) {
+    return 0.0;
+  }
+  return std::round(value / divisor) * divisor;
+}
 
-  const double lat2 = node2.GetProperty("lat").ValueDouble();
-  const double lng2 = node2.GetProperty("lng").ValueDouble();
+double distance_calc(const mgp::Node &node1, const mgp::Node &node2, bool use_km, int64_t decimals) {
+  const double lat1 = node1.GetProperty("lat").ValueNumeric();
+  const double lng1 = node1.GetProperty("lng").ValueNumeric();
+
+  const double lat2 = node2.GetProperty("lat").ValueNumeric();
+  const double lng2 = node2.GetProperty("lng").ValueNumeric();
 
   const double phi_1 = lat1 * pi_rad;
   const double phi_2 = lat2 * pi_rad;
@@ -48,17 +64,18 @@ double distance_calc(const mgp::Node &node1, const mgp::Node &node2, bool use_km
   const double delta_phi = (lat2 - lat1) * pi_rad;
   const double delta_lambda = (lng2 - lng1) * pi_rad;
 
-  const double sin_delta_phi = sin(delta_phi / 2);
-  const double sin_delta_lambda = sin(delta_lambda / 2);
+  const double sin_delta_phi = std::sin(delta_phi / 2.0);
+  const double sin_delta_lambda = std::sin(delta_lambda / 2.0);
 
-  const double a = (sin_delta_phi * sin_delta_phi) + (cos(phi_1) * cos(phi_2) * (sin_delta_lambda * sin_delta_lambda));
-  const double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  double a =
+      (sin_delta_phi * sin_delta_phi) + (std::cos(phi_1) * std::cos(phi_2) * (sin_delta_lambda * sin_delta_lambda));
+  a = std::clamp(a, 0.0, 1.0);
+  const double c = 2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
   double distance = R * c;
   if (use_km) {
     distance *= KM_MUL;
   }
-  const int rounding = static_cast<int>(std::pow(10, decimals));
-  return round(distance * rounding) / rounding;
+  return round_to_decimals(distance, decimals);
 }
 
 // NOLINTNEXTLINE(misc-unused-parameters)
@@ -75,7 +92,7 @@ void Single(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_m
 
     mgp::Record record = record_factory.NewRecord();
 
-    record.Insert(kReturnDistance, distance_calc(node1, node2, metrics == "km", static_cast<int>(decimals)));
+    record.Insert(kReturnDistance, distance_calc(node1, node2, metrics == "km", decimals));
   } catch (const std::exception &e) {
     record_factory.SetErrorMessage(e.what());
     return;
@@ -104,7 +121,7 @@ void Multiple(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp
     for (decltype(start_points.Size()) i = 0; i < start_points.Size(); i++) {
       const mgp::Node &node1 = start_points[i].ValueNode();
       const mgp::Node &node2 = end_points[i].ValueNode();
-      distances.AppendExtend(mgp::Value(distance_calc(node1, node2, use_km, static_cast<int>(decimals))));
+      distances.AppendExtend(mgp::Value(distance_calc(node1, node2, use_km, decimals)));
     }
 
     mgp::Record record = record_factory.NewRecord();

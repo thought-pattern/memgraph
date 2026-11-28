@@ -13,6 +13,7 @@
 # (MG_COMPRESS_DEBUG_FORMAT); zlib when that module is not included.
 
 option(MG_SPLIT_DEBUG "Extract debug info into sidecar .debug files post-link" OFF)
+set(MG_EXTRACT_ELF_BUILD_ID_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/extract_elf_build_id.py")
 
 if(MG_SPLIT_DEBUG)
     if(NOT CMAKE_BUILD_TYPE MATCHES "^(RelWithDebInfo|Debug)$")
@@ -22,6 +23,11 @@ if(MG_SPLIT_DEBUG)
     endif()
     if(NOT CMAKE_OBJCOPY)
         message(FATAL_ERROR "MG_SPLIT_DEBUG requires objcopy, but CMAKE_OBJCOPY is unset.")
+    endif()
+    if(CMAKE_READELF)
+        set(MG_SPLIT_DEBUG_READELF "${CMAKE_READELF}")
+    else()
+        find_program(MG_SPLIT_DEBUG_READELF NAMES readelf llvm-readelf)
     endif()
     message(STATUS "MG_SPLIT_DEBUG enabled (using ${CMAKE_OBJCOPY})")
 endif()
@@ -87,7 +93,8 @@ function(mg_split_debug target)
         #   2. the FHS-standard build-id path that debuginfod and the kernel
         #      core-dumper use when there's no binary to anchor the lookup
         #      from (e.g. resolving symbols from a bare core).
-        # CMake 3.24+ exposes the build-id via file(READ_ELF ... BUILD_ID).
+        # Extract the GNU build-id from the staged sidecar via readelf -n (with
+        # cmake/extract_elf_build_id.py as fallback when readelf is absent).
         # file(RELATIVE_PATH ...) computes the link target from the symlink
         # parent dir to the .debug file's actual location, so the result is
         # whatever traversal is correct given where each ends up under
@@ -95,15 +102,45 @@ function(mg_split_debug target)
         # if either path is ever relocated. The target stays relative so the
         # link still resolves under chroot / container rebasing / DESTDIR.
         install(CODE "
-            set(_debug_file \"\${CMAKE_INSTALL_PREFIX}/${MGSD_INSTALL_DESTINATION}/$<TARGET_FILE_NAME:${target}>.debug\")
+            set(_destdir \"\$ENV{DESTDIR}\")
+            set(_debug_file \"\${_destdir}\${CMAKE_INSTALL_PREFIX}/${MGSD_INSTALL_DESTINATION}/$<TARGET_FILE_NAME:${target}>.debug\")
             if(EXISTS \"\${_debug_file}\")
-                file(READ_ELF \"\${_debug_file}\" BUILD_ID _bid)
+                set(_bid \"\")
+                set(_readelf \"${MG_SPLIT_DEBUG_READELF}\")
+                if(NOT _readelf)
+                    find_program(_readelf NAMES readelf llvm-readelf)
+                endif()
+                if(_readelf)
+                    execute_process(
+                        COMMAND \"\${_readelf}\" -n \"\${_debug_file}\"
+                        OUTPUT_VARIABLE _elf_notes
+                        ERROR_QUIET
+                        RESULT_VARIABLE _readelf_rc)
+                    if(_readelf_rc EQUAL 0 AND _elf_notes MATCHES \"Build ID:[ \\t]*([0-9a-fA-F]+)\")
+                        string(TOLOWER \"\${CMAKE_MATCH_1}\" _bid)
+                    endif()
+                endif()
+                if(NOT _bid)
+                    find_program(_py3 NAMES python3)
+                    if(_py3 AND EXISTS \"${MG_EXTRACT_ELF_BUILD_ID_SCRIPT}\")
+                        execute_process(
+                            COMMAND \"\${_py3}\" \"${MG_EXTRACT_ELF_BUILD_ID_SCRIPT}\" \"\${_debug_file}\"
+                            OUTPUT_VARIABLE _py_bid
+                            OUTPUT_STRIP_TRAILING_WHITESPACE
+                            ERROR_QUIET
+                            RESULT_VARIABLE _py_rc)
+                        if(_py_rc EQUAL 0 AND _py_bid MATCHES \"^[0-9a-fA-F]+$\")
+                            string(TOLOWER \"\${_py_bid}\" _bid)
+                        endif()
+                    endif()
+                endif()
                 if(_bid)
                     string(SUBSTRING \"\${_bid}\" 0 2 _aa)
                     string(SUBSTRING \"\${_bid}\" 2 -1 _rest)
-                    set(_link_dir \"\${CMAKE_INSTALL_PREFIX}/lib/debug/.build-id/\${_aa}\")
+                    set(_link_dir \"\${_destdir}\${CMAKE_INSTALL_PREFIX}/lib/debug/.build-id/\${_aa}\")
                     file(MAKE_DIRECTORY \"\${_link_dir}\")
                     file(RELATIVE_PATH _rel_target \"\${_link_dir}\" \"\${_debug_file}\")
+                    file(REMOVE \"\${_link_dir}/\${_rest}.debug\")
                     file(CREATE_LINK
                         \"\${_rel_target}\"
                         \"\${_link_dir}/\${_rest}.debug\"

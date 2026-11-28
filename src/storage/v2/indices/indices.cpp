@@ -274,14 +274,12 @@ void Indices::AbortProcessor::CollectOnEdgePropertyChange(PropertyId property, P
         out_edge_links_.emplace();
         for (auto const &delta : deltas) {
           if (delta.action != Delta::Action::ADD_OUT_EDGE && delta.action != Delta::Action::REMOVE_OUT_EDGE) continue;
-          out_edge_links_->emplace_back(
+          out_edge_links_->try_emplace(
               delta.vertex_edge.edge.ptr, delta.vertex_edge.edge_type, delta.vertex_edge.vertex.Get());
         }
       }
-      for (auto const &[linked_edge, edge_type, to_vertex] : *out_edge_links_) {
-        if (linked_edge != edge) continue;
-        link = std::pair{edge_type, to_vertex};
-        break;
+      if (auto const it = out_edge_links_->find(edge); it != out_edge_links_->end()) {
+        link = it->second;
       }
     }
   }

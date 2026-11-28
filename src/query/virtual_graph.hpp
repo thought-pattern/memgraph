@@ -45,7 +45,7 @@ class VirtualGraph final {
   VirtualGraph(VirtualGraph &&other, allocator_type alloc);
 
   VirtualGraph &operator=(const VirtualGraph &other);
-  VirtualGraph &operator=(VirtualGraph &&other) noexcept;
+  VirtualGraph &operator=(VirtualGraph &&other);
   ~VirtualGraph() = default;
 
   const VirtualNode &InsertNode(VirtualNode node);
@@ -68,6 +68,7 @@ class VirtualGraph final {
   [[nodiscard]] auto get_allocator() const noexcept -> allocator_type { return nodes_.get_allocator(); }
 
  private:
+  void CopyFrom(const VirtualGraph &other);
   void IndexEdge(const VirtualEdge *edge);
   void RebuildEdgeIndexes();
 

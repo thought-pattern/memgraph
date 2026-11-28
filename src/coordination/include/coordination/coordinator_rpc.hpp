@@ -110,6 +110,55 @@ struct UpgradeableEmptyReq {
   UpgradeableEmptyReq() = default;
 };
 
+template <rpc::RpcMessage PriorVersionType>
+struct UpgradeableSingleArgMsg {
+  using ArgType = decltype(std::declval<PriorVersionType>().arg_);
+  static constexpr utils::TypeInfo kType{PriorVersionType::kType};
+  static constexpr uint64_t kVersion{PriorVersionType::kVersion + 1};
+
+  static void Save(UpgradeableSingleArgMsg const &self, memgraph::slk::Builder *builder) {
+    memgraph::slk::Save(self.arg_, builder);
+  }
+
+  static void Load(UpgradeableSingleArgMsg *self, memgraph::slk::Reader *reader) {
+    memgraph::slk::Load(&self->arg_, reader);
+  }
+
+  UpgradeableSingleArgMsg(ArgType arg) : arg_(std::move(arg)) {}
+
+  UpgradeableSingleArgMsg() = default;
+
+  static UpgradeableSingleArgMsg Upgrade(PriorVersionType prev) {
+    return UpgradeableSingleArgMsg{std::move(prev.arg_)};
+  }
+
+  PriorVersionType Downgrade() const { return PriorVersionType{arg_}; }
+
+  ArgType arg_;
+};
+
+template <rpc::RpcMessage PriorBoolMsg, ForwardableStatus StatusEnum>
+struct DowngradeableStatusMsg {
+  static constexpr utils::TypeInfo kType{PriorBoolMsg::kType};
+  static constexpr uint64_t kVersion{PriorBoolMsg::kVersion + 1};
+
+  static void Save(DowngradeableStatusMsg const &self, memgraph::slk::Builder *builder) {
+    memgraph::slk::Save(self.arg_, builder);
+  }
+
+  static void Load(DowngradeableStatusMsg *self, memgraph::slk::Reader *reader) {
+    memgraph::slk::Load(&self->arg_, reader);
+  }
+
+  DowngradeableStatusMsg(std::optional<StatusEnum> arg) : arg_(arg) {}
+
+  DowngradeableStatusMsg() = default;
+
+  PriorBoolMsg Downgrade() const { return PriorBoolMsg{arg_.has_value() && *arg_ == StatusEnum::SUCCESS}; }
+
+  std::optional<StatusEnum> arg_;
+};
+
 // PromoteToMainReq gained a `writing_enabled` flag in v2: the coordinator projects its global_read_only setting onto
 // the promoted main (writing_enabled = !global_read_only) so read-only is honored across failover. v1 carried only the
 // uuid and replicas; a v1 sender doesn't know about read-only mode, so Upgrade keeps writing enabled to preserve
@@ -223,30 +272,63 @@ struct RegisterReplicaOnMainRes {
 
 using RegisterReplicaOnMainRpc = rpc::RequestResponse<RegisterReplicaOnMainReq, RegisterReplicaOnMainRes>;
 
-struct DemoteMainToReplicaReq {
+struct DemoteMainToReplicaReqV1 {
   static constexpr utils::TypeInfo kType{.id = utils::TypeId::COORD_SET_REPL_MAIN_REQ,
                                          .name = "DemoteMainToReplicaReq"};
   static constexpr uint64_t kVersion{1};
 
+  static void Load(DemoteMainToReplicaReqV1 *self, memgraph::slk::Reader *reader);
+  static void Save(const DemoteMainToReplicaReqV1 &self, memgraph::slk::Builder *builder);
+
+  explicit DemoteMainToReplicaReqV1(ReplicationClientInfo replication_client_info)
+      : replication_client_info_(std::move(replication_client_info)) {}
+
+  DemoteMainToReplicaReqV1() = default;
+
+  ReplicationClientInfo replication_client_info_;
+};
+
+struct DemoteMainToReplicaReq {
+  static constexpr utils::TypeInfo kType{DemoteMainToReplicaReqV1::kType};
+  static constexpr uint64_t kVersion{2};
+
   static void Load(DemoteMainToReplicaReq *self, memgraph::slk::Reader *reader);
   static void Save(const DemoteMainToReplicaReq &self, memgraph::slk::Builder *builder);
 
-  // main uuid is provided when Demote is called from InstanceSuccessCallback because at that point we already know
-  // what's next main uuid since the failover has already been done
   explicit DemoteMainToReplicaReq(ReplicationClientInfo replication_client_info,
                                   std::optional<utils::UUID> const &main_uuid = std::nullopt)
       : replication_client_info_(std::move(replication_client_info)), main_uuid_(main_uuid) {}
 
   DemoteMainToReplicaReq() = default;
 
+  static DemoteMainToReplicaReq Upgrade(DemoteMainToReplicaReqV1 prev) {
+    return DemoteMainToReplicaReq{std::move(prev.replication_client_info_), std::nullopt};
+  }
+
+  DemoteMainToReplicaReqV1 Downgrade() const { return DemoteMainToReplicaReqV1{replication_client_info_}; }
+
   ReplicationClientInfo replication_client_info_;
   std::optional<utils::UUID> main_uuid_;
 };
 
-struct DemoteMainToReplicaRes {
+struct DemoteMainToReplicaResV1 {
   static constexpr utils::TypeInfo kType{.id = utils::TypeId::COORD_SET_REPL_MAIN_RES,
                                          .name = "DemoteMainToReplicaRes"};
   static constexpr uint64_t kVersion{1};
+
+  static void Load(DemoteMainToReplicaResV1 *self, memgraph::slk::Reader *reader);
+  static void Save(const DemoteMainToReplicaResV1 &self, memgraph::slk::Builder *builder);
+
+  explicit DemoteMainToReplicaResV1(bool success) : arg_(success) {}
+
+  DemoteMainToReplicaResV1() = default;
+
+  bool arg_;
+};
+
+struct DemoteMainToReplicaRes {
+  static constexpr utils::TypeInfo kType{DemoteMainToReplicaResV1::kType};
+  static constexpr uint64_t kVersion{2};
 
   static void Load(DemoteMainToReplicaRes *self, memgraph::slk::Reader *reader);
   static void Save(const DemoteMainToReplicaRes &self, memgraph::slk::Builder *builder);
@@ -254,6 +336,8 @@ struct DemoteMainToReplicaRes {
   explicit DemoteMainToReplicaRes(bool success) : arg_(success) {}
 
   DemoteMainToReplicaRes() = default;
+
+  DemoteMainToReplicaResV1 Downgrade() const { return DemoteMainToReplicaResV1{arg_}; }
 
   bool arg_;
 };
@@ -382,10 +466,24 @@ struct ShowInstancesRes {
 
 using ShowInstancesRpc = rpc::RequestResponse<ShowInstancesReq, ShowInstancesRes>;
 
-struct GetRoutingTableReq {
+struct GetRoutingTableReqV1 {
   static constexpr utils::TypeInfo kType{.id = utils::TypeId::COORD_GET_ROUTING_TABLE_REQ,
                                          .name = "GetRoutingTableReq"};
   static constexpr uint64_t kVersion{1};
+
+  static void Load(GetRoutingTableReqV1 *self, memgraph::slk::Reader *reader);
+  static void Save(const GetRoutingTableReqV1 &self, memgraph::slk::Builder *builder);
+
+  GetRoutingTableReqV1() = default;
+
+  explicit GetRoutingTableReqV1(std::string arg) : arg_(std::move(arg)) {}
+
+  std::string arg_;
+};
+
+struct GetRoutingTableReq {
+  static constexpr utils::TypeInfo kType{GetRoutingTableReqV1::kType};
+  static constexpr uint64_t kVersion{2};
 
   static void Load(GetRoutingTableReq *self, memgraph::slk::Reader *reader);
   static void Save(const GetRoutingTableReq &self, memgraph::slk::Builder *builder);
@@ -394,22 +492,42 @@ struct GetRoutingTableReq {
 
   explicit GetRoutingTableReq(std::string arg) : arg_(std::move(arg)) {}
 
+  static GetRoutingTableReq Upgrade(GetRoutingTableReqV1 prev) { return GetRoutingTableReq{std::move(prev.arg_)}; }
+
+  GetRoutingTableReqV1 Downgrade() const { return GetRoutingTableReqV1{arg_}; }
+
   std::string arg_;
 };
 
-struct GetRoutingTableRes {
+struct GetRoutingTableResV1 {
   static constexpr utils::TypeInfo kType{.id = utils::TypeId::COORD_GET_ROUTING_TABLE_RES,
                                          .name = "GetRoutingTableRes"};
   static constexpr uint64_t kVersion{1};
 
+  static void Load(GetRoutingTableResV1 *self, memgraph::slk::Reader *reader);
+  static void Save(const GetRoutingTableResV1 &self, memgraph::slk::Builder *builder);
+
+  explicit GetRoutingTableResV1(RoutingTable routing_table) : arg_(std::move(routing_table)) {}
+
+  GetRoutingTableResV1() = default;
+
+  RoutingTable arg_;
+};
+
+struct GetRoutingTableRes {
+  static constexpr utils::TypeInfo kType{GetRoutingTableResV1::kType};
+  static constexpr uint64_t kVersion{2};
+
   static void Load(GetRoutingTableRes *self, memgraph::slk::Reader *reader);
   static void Save(const GetRoutingTableRes &self, memgraph::slk::Builder *builder);
 
-  explicit GetRoutingTableRes(RoutingTable routing_table) : arg_(std::move(routing_table)) {}
+  explicit GetRoutingTableRes(std::optional<RoutingTable> routing_table) : arg_(std::move(routing_table)) {}
 
   GetRoutingTableRes() = default;
 
-  RoutingTable arg_;
+  GetRoutingTableResV1 Downgrade() const { return GetRoutingTableResV1{arg_.value_or(RoutingTable{})}; }
+
+  std::optional<RoutingTable> arg_;
 };
 
 using GetRoutingTableRpc = rpc::RequestResponse<GetRoutingTableReq, GetRoutingTableRes>;
@@ -497,42 +615,58 @@ struct ReplicationLagRes {
 
 using ReplicationLagRpc = rpc::RequestResponse<ReplicationLagReq, ReplicationLagRes>;
 
-using AddCoordinatorReq =
+using AddCoordinatorReqV1 =
     SingleArgMsg<utils::TypeId::COORD_ADD_COORD_REQ, "AddCoordinatorReq", 1, CoordinatorInstanceConfig>;
-using AddCoordinatorRes = SingleArgMsg<utils::TypeId::COORD_ADD_COORD_RES, "AddCoordinatorRes", 1, bool>;
+using AddCoordinatorReq = UpgradeableSingleArgMsg<AddCoordinatorReqV1>;
+using AddCoordinatorResV1 = SingleArgMsg<utils::TypeId::COORD_ADD_COORD_RES, "AddCoordinatorRes", 1, bool>;
+using AddCoordinatorRes = DowngradeableStatusMsg<AddCoordinatorResV1, AddCoordinatorInstanceStatus>;
 using AddCoordinatorRpc = rpc::RequestResponse<AddCoordinatorReq, AddCoordinatorRes>;
 
-using RemoveCoordinatorReq = SingleArgMsg<utils::TypeId::COORD_REMOVE_COORD_REQ, "RemoveCoordinatorReq", 1, int>;
-using RemoveCoordinatorRes = SingleArgMsg<utils::TypeId::COORD_REMOVE_COORD_RES, "RemoveCoordinatorRes", 1, bool>;
+using RemoveCoordinatorReqV1 = SingleArgMsg<utils::TypeId::COORD_REMOVE_COORD_REQ, "RemoveCoordinatorReq", 1, int>;
+using RemoveCoordinatorReq = UpgradeableSingleArgMsg<RemoveCoordinatorReqV1>;
+using RemoveCoordinatorResV1 = SingleArgMsg<utils::TypeId::COORD_REMOVE_COORD_RES, "RemoveCoordinatorRes", 1, bool>;
+using RemoveCoordinatorRes = DowngradeableStatusMsg<RemoveCoordinatorResV1, RemoveCoordinatorInstanceStatus>;
 using RemoveCoordinatorRpc = rpc::RequestResponse<RemoveCoordinatorReq, RemoveCoordinatorRes>;
 
-using RegisterInstanceReq =
+using RegisterInstanceReqV1 =
     SingleArgMsg<utils::TypeId::COORD_REGISTER_INSTANCE_REQ, "RegisterInstanceReq", 1, DataInstanceConfig>;
-using RegisterInstanceRes = SingleArgMsg<utils::TypeId::COORD_REGISTER_INSTANCE_RES, "RegisterInstanceRes", 1, bool>;
+using RegisterInstanceReq = UpgradeableSingleArgMsg<RegisterInstanceReqV1>;
+using RegisterInstanceResV1 = SingleArgMsg<utils::TypeId::COORD_REGISTER_INSTANCE_RES, "RegisterInstanceRes", 1, bool>;
+using RegisterInstanceRes = DowngradeableStatusMsg<RegisterInstanceResV1, RegisterInstanceCoordinatorStatus>;
 using RegisterInstanceRpc = rpc::RequestResponse<RegisterInstanceReq, RegisterInstanceRes>;
 
-using UnregisterInstanceReq =
+using UnregisterInstanceReqV1 =
     SingleArgMsg<utils::TypeId::COORD_UNREGISTER_INSTANCE_REQ, "UnregisterInstanceReq", 1, std::string>;
-using UnregisterInstanceRes =
+using UnregisterInstanceReq = UpgradeableSingleArgMsg<UnregisterInstanceReqV1>;
+using UnregisterInstanceResV1 =
     SingleArgMsg<utils::TypeId::COORD_UNREGISTER_INSTANCE_RES, "UnregisterInstanceRes", 1, bool>;
+using UnregisterInstanceRes = DowngradeableStatusMsg<UnregisterInstanceResV1, UnregisterInstanceCoordinatorStatus>;
 using UnregisterInstanceRpc = rpc::RequestResponse<UnregisterInstanceReq, UnregisterInstanceRes>;
 
-using SetInstanceToMainReq =
+using SetInstanceToMainReqV1 =
     SingleArgMsg<utils::TypeId::COORD_SET_INSTANCE_TO_MAIN_REQ, "SetInstanceToMainReq", 1, std::string>;
-using SetInstanceToMainRes =
+using SetInstanceToMainReq = UpgradeableSingleArgMsg<SetInstanceToMainReqV1>;
+using SetInstanceToMainResV1 =
     SingleArgMsg<utils::TypeId::COORD_SET_INSTANCE_TO_MAIN_RES, "SetInstanceToMainRes", 1, bool>;
+using SetInstanceToMainRes = DowngradeableStatusMsg<SetInstanceToMainResV1, SetInstanceToMainCoordinatorStatus>;
 using SetInstanceToMainRpc = rpc::RequestResponse<SetInstanceToMainReq, SetInstanceToMainRes>;
 
-using DemoteInstanceReq = SingleArgMsg<utils::TypeId::COORD_DEMOTE_INSTANCE_REQ, "DemoteInstanceReq", 1, std::string>;
-using DemoteInstanceRes = SingleArgMsg<utils::TypeId::COORD_DEMOTE_INSTANCE_RES, "DemoteInstanceRes", 1, bool>;
+using DemoteInstanceReqV1 = SingleArgMsg<utils::TypeId::COORD_DEMOTE_INSTANCE_REQ, "DemoteInstanceReq", 1, std::string>;
+using DemoteInstanceReq = UpgradeableSingleArgMsg<DemoteInstanceReqV1>;
+using DemoteInstanceResV1 = SingleArgMsg<utils::TypeId::COORD_DEMOTE_INSTANCE_RES, "DemoteInstanceRes", 1, bool>;
+using DemoteInstanceRes = DowngradeableStatusMsg<DemoteInstanceResV1, DemoteInstanceCoordinatorStatus>;
 using DemoteInstanceRpc = rpc::RequestResponse<DemoteInstanceReq, DemoteInstanceRes>;
 
-using ForceResetReq = EmptyReq<utils::TypeId::COORD_FORCE_RESET_REQ, "ForceResetReq", 1>;
-using ForceResetRes = SingleArgMsg<utils::TypeId::COORD_FORCE_RESET_RES, "ForceResetRes", 1, bool>;
+using ForceResetReqV1 = EmptyReq<utils::TypeId::COORD_FORCE_RESET_REQ, "ForceResetReq", 1>;
+using ForceResetReq = UpgradeableEmptyReq<ForceResetReqV1>;
+using ForceResetResV1 = SingleArgMsg<utils::TypeId::COORD_FORCE_RESET_RES, "ForceResetRes", 1, bool>;
+using ForceResetRes = DowngradeableStatusMsg<ForceResetResV1, ReconcileClusterStateStatus>;
 using ForceResetRpc = rpc::RequestResponse<ForceResetReq, ForceResetRes>;
 
-using YieldLeadershipReq = EmptyReq<utils::TypeId::COORD_YIELD_LEADERSHIP_REQ, "YieldLeadershipReq", 1>;
-using YieldLeadershipRes = SingleArgMsg<utils::TypeId::COORD_YIELD_LEADERSHIP_RES, "YieldLeadershipRes", 1, bool>;
+using YieldLeadershipReqV1 = EmptyReq<utils::TypeId::COORD_YIELD_LEADERSHIP_REQ, "YieldLeadershipReq", 1>;
+using YieldLeadershipReq = UpgradeableEmptyReq<YieldLeadershipReqV1>;
+using YieldLeadershipResV1 = SingleArgMsg<utils::TypeId::COORD_YIELD_LEADERSHIP_RES, "YieldLeadershipRes", 1, bool>;
+using YieldLeadershipRes = DowngradeableStatusMsg<YieldLeadershipResV1, YieldLeadershipStatus>;
 using YieldLeadershipRpc = rpc::RequestResponse<YieldLeadershipReq, YieldLeadershipRes>;
 
 using ShowCoordSettingsReq = EmptyReq<utils::TypeId::COORD_SHOW_COORD_SETTINGS_REQ, "ShowCoordSettingsReq", 1>;
@@ -541,9 +675,11 @@ using ShowCoordSettingsRes = SingleArgMsg<utils::TypeId::COORD_SHOW_COORD_SETTIN
                                           std::optional<std::vector<std::pair<std::string, std::string>>>>;
 using ShowCoordSettingsRpc = rpc::RequestResponse<ShowCoordSettingsReq, ShowCoordSettingsRes>;
 
-using UpdateConfigReq =
+using UpdateConfigReqV1 =
     SingleArgMsg<utils::TypeId::COORD_UPDATE_CONFIG_REQ, "UpdateConfigReq", 1, UpdateInstanceConfig>;
-using UpdateConfigRes = SingleArgMsg<utils::TypeId::COORD_UPDATE_CONFIG_RES, "UpdateConfigRes", 1, bool>;
+using UpdateConfigReq = UpgradeableSingleArgMsg<UpdateConfigReqV1>;
+using UpdateConfigResV1 = SingleArgMsg<utils::TypeId::COORD_UPDATE_CONFIG_RES, "UpdateConfigRes", 1, bool>;
+using UpdateConfigRes = DowngradeableStatusMsg<UpdateConfigResV1, UpdateConfigStatus>;
 using UpdateConfigRpc = rpc::RequestResponse<UpdateConfigReq, UpdateConfigRes>;
 
 // v1 answered with a bare map, where an empty map meant both "the leader has no lag data" and "the leader couldn't
@@ -582,20 +718,20 @@ struct UpdateDataInstanceConfigReq {
   static void Load(UpdateDataInstanceConfigReq *self, memgraph::slk::Reader *reader);
   static void Save(const UpdateDataInstanceConfigReq &self, memgraph::slk::Builder *builder);
 
-  UpdateDataInstanceConfigReq(uint64_t deltas_batch_progress_size, bool disable_writing)
+  UpdateDataInstanceConfigReq(uint64_t deltas_batch_progress_size, std::optional<bool> disable_writing)
       : deltas_batch_progress_size(deltas_batch_progress_size), disable_writing(disable_writing) {}
 
   UpdateDataInstanceConfigReq() = default;
 
-  // A v1 sender doesn't know about read-only mode; keep writing enabled to preserve pre-feature behavior.
+  // A v1 sender carries no instruction about writing state; preserve whatever state the receiver currently holds.
   static UpdateDataInstanceConfigReq Upgrade(UpdateDataInstanceConfigReqV1 const &prev) {
-    return UpdateDataInstanceConfigReq{prev.deltas_batch_progress_size, false};
+    return UpdateDataInstanceConfigReq{prev.deltas_batch_progress_size, std::nullopt};
   }
 
   UpdateDataInstanceConfigReqV1 Downgrade() const { return UpdateDataInstanceConfigReqV1{deltas_batch_progress_size}; }
 
-  uint64_t deltas_batch_progress_size;
-  bool disable_writing;
+  uint64_t deltas_batch_progress_size{};
+  std::optional<bool> disable_writing{};
 };
 
 struct UpdateDataInstanceConfigResV1 {
@@ -704,8 +840,12 @@ void Save(const memgraph::coordination::RegisterReplicaOnMainRes &self, memgraph
 void Load(memgraph::coordination::RegisterReplicaOnMainRes *self, memgraph::slk::Reader *reader);
 
 // DemoteMainToReplicaRpc
+void Save(const memgraph::coordination::DemoteMainToReplicaResV1 &self, memgraph::slk::Builder *builder);
+void Load(memgraph::coordination::DemoteMainToReplicaResV1 *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::coordination::DemoteMainToReplicaRes &self, memgraph::slk::Builder *builder);
 void Load(memgraph::coordination::DemoteMainToReplicaRes *self, memgraph::slk::Reader *reader);
+void Save(const memgraph::coordination::DemoteMainToReplicaReqV1 &self, memgraph::slk::Builder *builder);
+void Load(memgraph::coordination::DemoteMainToReplicaReqV1 *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::coordination::DemoteMainToReplicaReq &self, memgraph::slk::Builder *builder);
 void Load(memgraph::coordination::DemoteMainToReplicaReq *self, memgraph::slk::Reader *reader);
 
@@ -728,8 +868,12 @@ void Save(memgraph::coordination::ShowInstancesReq const &self, memgraph::slk::B
 void Load(memgraph::coordination::ShowInstancesReq *self, memgraph::slk::Reader *reader);
 
 // GetRoutingTableRpc
+void Save(memgraph::coordination::GetRoutingTableResV1 const &self, memgraph::slk::Builder *builder);
+void Load(memgraph::coordination::GetRoutingTableResV1 *self, memgraph::slk::Reader *reader);
 void Save(memgraph::coordination::GetRoutingTableRes const &self, memgraph::slk::Builder *builder);
 void Load(memgraph::coordination::GetRoutingTableRes *self, memgraph::slk::Reader *reader);
+void Save(memgraph::coordination::GetRoutingTableReqV1 const &self, memgraph::slk::Builder *builder);
+void Load(memgraph::coordination::GetRoutingTableReqV1 *self, memgraph::slk::Reader *reader);
 void Save(memgraph::coordination::GetRoutingTableReq const &self, memgraph::slk::Builder *builder);
 void Load(memgraph::coordination::GetRoutingTableReq *self, memgraph::slk::Reader *reader);
 
@@ -764,6 +908,25 @@ DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UpdateDataInstanceConfigReqV1)
 DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UpdateDataInstanceConfigReq)
 DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UpdateDataInstanceConfigResV1)
 DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UpdateDataInstanceConfigRes)
+
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::AddCoordinatorReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::AddCoordinatorResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::RemoveCoordinatorReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::RemoveCoordinatorResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::RegisterInstanceReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::RegisterInstanceResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UnregisterInstanceReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UnregisterInstanceResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::SetInstanceToMainReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::SetInstanceToMainResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::DemoteInstanceReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::DemoteInstanceResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::ForceResetReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::ForceResetResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::YieldLeadershipReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::YieldLeadershipResV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UpdateConfigReqV1)
+DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::UpdateConfigResV1)
 
 DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::CoordReplicationLagReqV1)
 DECLARE_SLK_SERIALIZATION_FUNCTIONS(coordination::CoordReplicationLagResV1)

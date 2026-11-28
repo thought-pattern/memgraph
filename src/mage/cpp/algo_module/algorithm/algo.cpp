@@ -107,9 +107,9 @@ void Algo::PathFinder::DFS(const mgp::Node &curr_node, mgp::Path &curr_path, std
   }
 
   visited.insert(curr_node.Id().AsInt());
-  std::unordered_set<int64_t> seen;
+  std::unordered_map<std::string, std::unordered_set<int64_t>> seen_by_type;
 
-  auto iterate = [&visited, &seen, &curr_path, this](
+  auto iterate = [&visited, &seen_by_type, &curr_path, this](
                      mgp::Relationships relationships, RelDirection direction, bool always_expand) {
     for (const auto relationship : relationships) {
       auto next_node_id =
@@ -127,12 +127,15 @@ void Algo::PathFinder::DFS(const mgp::Node &curr_node, mgp::Path &curr_path, std
         DFS(direction == RelDirection::kOutgoing ? relationship.To() : relationship.From(), curr_path, visited);
         curr_path.Pop();
       } else if (wanted_direction == RelDirection::kBoth) {
-        if (direction == RelDirection::kOutgoing && seen.contains(relationship.To().Id().AsInt())) {
-          curr_path.Expand(relationship);
-          DFS(relationship.To(), curr_path, visited);
-          curr_path.Pop();
+        if (direction == RelDirection::kOutgoing) {
+          const auto seen_it = seen_by_type.find(type);
+          if (seen_it != seen_by_type.end() && seen_it->second.contains(relationship.To().Id().AsInt())) {
+            curr_path.Expand(relationship);
+            DFS(relationship.To(), curr_path, visited);
+            curr_path.Pop();
+          }
         } else if (direction == RelDirection::kIncoming) {
-          seen.insert(relationship.From().Id().AsInt());
+          seen_by_type[type].insert(relationship.From().Id().AsInt());
         }
       }
     }
@@ -253,6 +256,9 @@ void Algo::CheckConfigTypes(const mgp::Map &map) {
         throw mgp::ValueException("Elements in relationships_filter config list must be strings!");
       }
       auto rel_type = std::string(value.ValueString());
+      if (rel_type.empty()) {
+        throw mgp::ValueException("Relationship filter entry must not be empty!");
+      }
       const size_t size = rel_type.size();
       const char first_elem = rel_type[0];
       const char last_elem = rel_type[size - 1];

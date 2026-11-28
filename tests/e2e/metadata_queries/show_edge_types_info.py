@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import are_results_equal, cursor, execute_and_fetch_all
+import pytest
 
 
 # Helper functions

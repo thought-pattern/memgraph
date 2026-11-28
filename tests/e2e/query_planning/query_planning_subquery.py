@@ -1,7 +1,7 @@
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_variable_start_planner_shared_ast_corruption(memgraph):

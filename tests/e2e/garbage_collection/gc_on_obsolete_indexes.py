@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import cursor, execute_and_fetch_all
+import pytest
 
 
 def test_removing_obsolete_indexes(cursor):

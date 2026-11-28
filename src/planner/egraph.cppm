@@ -13,6 +13,8 @@ module;
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
+#include <string>
 
 #include "utils/small_vector.hpp"
 
@@ -76,8 +78,16 @@ class EClassSet {
 
   void add(EClassId id) {
     assert(static_cast<std::size_t>(id.value_of()) == id_to_index_.size());
+    buffer_.reserve(buffer_.size() + 1);
     id_to_index_.emplace_back(buffer_.size());
     buffer_.push_back(id);
+  }
+
+  void pop_last(EClassId id) {
+    assert(!buffer_.empty() && buffer_.back() == id);
+    assert(id_to_index_.size() == static_cast<std::size_t>(id.value_of()) + 1);
+    buffer_.pop_back();
+    id_to_index_.pop_back();
   }
 
   void remove(EClassId id) {
@@ -609,11 +619,29 @@ auto EGraph<Symbol, Analysis>::emplace(Symbol symbol, uint64_t disambiguator, An
   auto new_eclass_id = EClassId{new_id};
   auto new_enode_id = ENodeId{new_id};
 
-  auto enode_ref = intern_enode(std::move(canonical_node));
-  hashcons_[enode_ref] = ENodeInfo{.current_eclassid = new_eclass_id, .enode_id = new_enode_id};
-  classes_.emplace(new_eclass_id, std::make_unique<EClass<Analysis>>(new_enode_id, std::move(seed)));
-  canonical_eclasses_.add(new_eclass_id);
-  mark_changed(new_eclass_id);
+  bool storage_pushed = false;
+  bool hashcons_inserted = false;
+  bool class_inserted = false;
+  bool eclass_set_added = false;
+  try {
+    auto eclass_ptr = std::make_unique<EClass<Analysis>>(new_enode_id, std::move(seed));
+    auto enode_ref = intern_enode(std::move(canonical_node));
+    storage_pushed = true;
+    hashcons_[enode_ref] = ENodeInfo{.current_eclassid = new_eclass_id, .enode_id = new_enode_id};
+    hashcons_inserted = true;
+    classes_.emplace(new_eclass_id, std::move(eclass_ptr));
+    class_inserted = true;
+    canonical_eclasses_.add(new_eclass_id);
+    eclass_set_added = true;
+    mark_changed(new_eclass_id);
+  } catch (...) {
+    if (eclass_set_added) canonical_eclasses_.pop_last(new_eclass_id);
+    if (class_inserted) classes_.erase(new_eclass_id);
+    if (hashcons_inserted) hashcons_.erase(ENodeRef{enode_storage_.back()});
+    if (storage_pushed) enode_storage_.pop_back();
+    union_find_.PopLastSingleton();
+    throw;
+  }
 
   return {.eclass_id = new_eclass_id, .enode_id = new_enode_id, .did_insert = true};
 }
@@ -638,20 +666,48 @@ auto EGraph<Symbol, Analysis>::emplace(Symbol symbol, utils::small_vector<EClass
   auto new_eclass_id = EClassId{new_id};
   auto new_enode_id = ENodeId{new_id};
 
-  auto enode_ref = intern_enode(std::move(canonical_node));
-  hashcons_[enode_ref] = ENodeInfo{.current_eclassid = new_eclass_id, .enode_id = new_enode_id};
-  classes_.emplace(new_eclass_id, std::make_unique<EClass<Analysis>>(new_enode_id, std::move(seed)));
+  bool storage_pushed = false;
+  bool hashcons_inserted = false;
+  bool class_inserted = false;
+  bool eclass_set_added = false;
+  std::size_t parents_added = 0;
+  try {
+    auto eclass_ptr = std::make_unique<EClass<Analysis>>(new_enode_id, std::move(seed));
+    auto enode_ref = intern_enode(std::move(canonical_node));
+    storage_pushed = true;
+    hashcons_[enode_ref] = ENodeInfo{.current_eclassid = new_eclass_id, .enode_id = new_enode_id};
+    hashcons_inserted = true;
+    classes_.emplace(new_eclass_id, std::move(eclass_ptr));
+    class_inserted = true;
 
-  // Update parent lists for children - ESSENTIAL for congruence closure
-  for (EClassId child_id : enode_ref.value().children()) {
-    assert(canonical_eclass(union_find_, child_id) == child_id);
-    auto child_it = classes_.find(child_id);
-    assert(child_it != classes_.end());
-    child_it->second->add_parent(new_enode_id);
+    // Update parent lists for children - ESSENTIAL for congruence closure
+    for (EClassId child_id : enode_ref.value().children()) {
+      assert(canonical_eclass(union_find_, child_id) == child_id);
+      auto child_it = classes_.find(child_id);
+      assert(child_it != classes_.end());
+      child_it->second->add_parent(new_enode_id);
+      ++parents_added;
+    }
+
+    canonical_eclasses_.add(new_eclass_id);
+    eclass_set_added = true;
+    mark_changed(new_eclass_id);
+  } catch (...) {
+    if (eclass_set_added) canonical_eclasses_.pop_last(new_eclass_id);
+    if (storage_pushed) {
+      auto const &kids = enode_storage_.back().children();
+      for (std::size_t idx = 0; idx < parents_added; ++idx) {
+        if (auto child_it = classes_.find(kids[idx]); child_it != classes_.end()) {
+          child_it->second->remove_parent(new_enode_id);
+        }
+      }
+    }
+    if (class_inserted) classes_.erase(new_eclass_id);
+    if (hashcons_inserted) hashcons_.erase(ENodeRef{enode_storage_.back()});
+    if (storage_pushed) enode_storage_.pop_back();
+    union_find_.PopLastSingleton();
+    throw;
   }
-
-  canonical_eclasses_.add(new_eclass_id);
-  mark_changed(new_eclass_id);
 
   return {.eclass_id = new_eclass_id, .enode_id = new_enode_id, .did_insert = true};
 }
@@ -670,19 +726,41 @@ auto EGraph<Symbol, Analysis>::merge(EClassId a, EClassId b) -> MergeResult {
     return {.eclass_id = EClassId{canonical_a}, .did_merge = false};
   }
 
-  auto merged_result = union_find_.UnionSets(canonical_a, canonical_b);
-  auto merged_id = EClassId{merged_result};
-  auto other_id = EClassId{(merged_result == canonical_a) ? canonical_b : canonical_a};
+  auto const id_a = EClassId{canonical_a};
+  auto const id_b = EClassId{canonical_b};
 
-  // defer hashcons and congruence processing
-  rebuild_worklist_.insert(merged_id);
-  // Record the change for the per-pass touched-set. Cascade merges during
-  // rebuild re-enter here, so this captures the full cascade.
-  mark_changed(merged_id);
+  if constexpr (std::copy_constructible<Analysis>) {
+    // Verify analysis compatibility on a temporary copy before mutating union-find, worklists, or e-classes.
+    Analysis combined = classes_.find(id_a)->second->analysis();
+    combined.merge(classes_.find(id_b)->second->analysis());
 
-  merge_eclasses(*classes_[merged_id], other_id);
+    auto merged_result = union_find_.UnionSets(canonical_a, canonical_b);
+    auto merged_id = EClassId{merged_result};
+    auto other_id = (merged_id == id_a) ? id_b : id_a;
 
-  return {.eclass_id = merged_id, .did_merge = true};
+    rebuild_worklist_.insert(merged_id);
+    mark_changed(merged_id);
+
+    auto other_it = classes_.find(other_id);
+    assert(other_it != classes_.end());
+    auto &dest = *classes_.find(merged_id)->second;
+    dest.merge_base_only(*other_it->second);
+    dest.set_analysis(std::move(combined));
+    classes_.erase(other_it);
+    canonical_eclasses_.remove(other_id);
+
+    return {.eclass_id = merged_id, .did_merge = true};
+  } else {
+    auto merged_result = union_find_.UnionSets(canonical_a, canonical_b);
+    auto merged_id = EClassId{merged_result};
+    auto other_id = EClassId{(merged_result == canonical_a) ? canonical_b : canonical_a};
+
+    rebuild_worklist_.insert(merged_id);
+    mark_changed(merged_id);
+
+    merge_eclasses(*classes_[merged_id], other_id);
+    return {.eclass_id = merged_id, .did_merge = true};
+  }
 }
 
 template <typename Symbol, typename Analysis>
@@ -754,8 +832,11 @@ void EGraph<Symbol, Analysis>::rebuild(ProcessingContext<Symbol> &ctx) {
         canonicalized_chunk.clear();
       }
     }
-    // ensure we process remaining incomplete chunk
-    chunk_processor();
+    // ensure we process remaining incomplete chunk and clear it before any subsequent pass
+    if (!canonicalized_chunk.empty()) {
+      chunk_processor();
+      canonicalized_chunk.clear();
+    }
   }
 }
 
@@ -893,20 +974,47 @@ auto EGraph<Symbol, Analysis>::merge_all(std::span<const uint32_t> canonical_ids
     return EClassId{canonical_ids[0]};
   }
 
-  auto merged_root = EClassId{union_find_.UnionSets(canonical_ids, uf_ctx)};
-  rebuild_worklist_.insert(merged_root);
-  mark_changed(merged_root);
-
-  auto merged_it = classes_.find(merged_root);
-  assert(merged_it != classes_.end());
-  auto &merged_eclass = *merged_it->second;
-  for (auto id : canonical_ids) {
-    if (EClassId{id} != merged_root) {
-      merge_eclasses(merged_eclass, EClassId{id});
+  if constexpr (std::copy_constructible<Analysis>) {
+    Analysis combined = classes_.find(EClassId{canonical_ids[0]})->second->analysis();
+    for (std::size_t i = 1; i < canonical_ids.size(); ++i) {
+      combined.merge(classes_.find(EClassId{canonical_ids[i]})->second->analysis());
     }
-  }
 
-  return merged_root;
+    auto merged_root = EClassId{union_find_.UnionSets(canonical_ids, uf_ctx)};
+    rebuild_worklist_.insert(merged_root);
+    mark_changed(merged_root);
+
+    auto merged_it = classes_.find(merged_root);
+    assert(merged_it != classes_.end());
+    auto &merged_eclass = *merged_it->second;
+    for (auto id : canonical_ids) {
+      auto const other_id = EClassId{id};
+      if (other_id != merged_root) {
+        auto other_it = classes_.find(other_id);
+        assert(other_it != classes_.end());
+        merged_eclass.merge_base_only(*other_it->second);
+        classes_.erase(other_it);
+        canonical_eclasses_.remove(other_id);
+      }
+    }
+    merged_eclass.set_analysis(std::move(combined));
+    return merged_root;
+  } else {
+    auto merged_root = EClassId{union_find_.UnionSets(canonical_ids, uf_ctx)};
+    rebuild_worklist_.insert(merged_root);
+    mark_changed(merged_root);
+
+    auto merged_it = classes_.find(merged_root);
+    assert(merged_it != classes_.end());
+    auto &merged_eclass = *merged_it->second;
+    for (auto id : canonical_ids) {
+      if (EClassId{id} != merged_root) {
+        merge_eclasses(merged_eclass, EClassId{id});
+      }
+    }
+
+    return merged_root;
+  }
 }
 
 template <typename Symbol, typename Analysis>

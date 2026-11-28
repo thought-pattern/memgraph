@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_set_multiple_properties_on_vertex_via_query_module(memgraph):

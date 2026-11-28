@@ -12,13 +12,12 @@
 import re
 import time
 
-import pulsar
-import pytest
 from common import KAFKA_BOOTSTRAP_SERVERS, NAME, PULSAR_ADMIN_URL, PULSAR_SERVICE_URL, connect, execute_and_fetch_all
 from kafka import KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
-
+import pulsar
+import pytest
 import requests
 
 # Running these tests needs the Kafka and Pulsar compose stacks under this

@@ -17,12 +17,12 @@ import json
 import os
 import resource
 import shutil
+from signal import *
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from signal import *
 
 
 class ProcessException(Exception):

@@ -133,8 +133,10 @@ class Decoder {
         }
         switch (static_cast<Signature>(signature)) {
           case Signature::Node:
+            if (major_v_ > 4) return false;
             return ReadVertex(data);
           case Signature::UnboundRelationship:
+            if (major_v_ > 4) return false;
             return ReadUnboundedEdge(data);
           case Signature::Path:
             return ReadPath(data);
@@ -163,6 +165,12 @@ class Decoder {
           return false;
         }
         switch (static_cast<Signature>(signature)) {
+          case Signature::Node:
+            if (major_v_ <= 4) return false;
+            return ReadVertex(data);
+          case Signature::UnboundRelationship:
+            if (major_v_ <= 4) return false;
+            return ReadUnboundedEdge(data);
           case Signature::Duration:
             return ReadDuration(data);
           case Signature::Point3d: {
@@ -179,6 +187,20 @@ class Decoder {
         }
         switch (static_cast<Signature>(signature)) {
           case Signature::Relationship:
+            if (major_v_ > 4) return false;
+            return ReadEdge(data);
+          default:
+            return false;
+        }
+      }
+      case Marker::TinyStruct8: {
+        uint8_t signature = 0;
+        if (!buffer_.Read(&signature, 1)) {
+          return false;
+        }
+        switch (static_cast<Signature>(signature)) {
+          case Signature::Relationship:
+            if (major_v_ <= 4) return false;
             return ReadEdge(data);
           default:
             return false;
@@ -573,6 +595,10 @@ class Decoder {
       path.indices.emplace_back(index.ValueInt());
     }
 
+    if (!path.HasValidStructure()) {
+      return false;
+    }
+
     return true;
   }
 
@@ -611,10 +637,14 @@ class Decoder {
     if (!ReadValue(&nanos, Value::Type::Int)) {
       return false;
     }
+    const int64_t nanos_val = nanos.ValueInt();
+    if (nanos_val < 0 || nanos_val >= 1'000'000'000LL) {
+      return false;
+    }
     namespace chrono = std::chrono;
     const auto chrono_seconds = chrono::seconds(secs.ValueInt());
     const auto sys_seconds = chrono::sys_seconds(chrono_seconds);
-    const auto sys_days = chrono::time_point_cast<chrono::days>(sys_seconds);
+    const auto sys_days = chrono::floor<chrono::days>(sys_seconds);
     const auto date = chrono::year_month_day(sys_days);
 
     const auto ldt = utils::Date(
@@ -624,7 +654,7 @@ class Decoder {
     const auto h = utils::GetAndSubtractDuration<chrono::hours>(secs_leftover);
     const auto m = utils::GetAndSubtractDuration<chrono::minutes>(secs_leftover);
     const auto s = secs_leftover.count();
-    auto nanos_leftover = chrono::nanoseconds(nanos.ValueInt());
+    auto nanos_leftover = chrono::nanoseconds(nanos_val);
     const auto ml = utils::GetAndSubtractDuration<chrono::milliseconds>(nanos_leftover);
     const auto mi = chrono::duration_cast<chrono::microseconds>(nanos_leftover).count();
     const auto params = utils::LocalTimeParameters{h, m, s, ml, mi};
@@ -656,7 +686,9 @@ class Decoder {
     Value dv;
     if (!ReadValue(&dv, Value::Type::Int)) return false;
 
-    auto crs = storage::SridToCrs(storage::Srid{dv.ValueInt()});
+    const int64_t srid_val = dv.ValueInt();
+    if (srid_val < 0 || srid_val > std::numeric_limits<uint16_t>::max()) return false;
+    auto crs = storage::SridToCrs(storage::Srid{static_cast<uint16_t>(srid_val)});
     if (!crs) return false;
     if (!storage::valid2d(*crs)) return false;
 
@@ -674,7 +706,9 @@ class Decoder {
     Value dv;
     if (!ReadValue(&dv, Value::Type::Int)) return false;
 
-    auto crs = storage::SridToCrs(storage::Srid{dv.ValueInt()});
+    const int64_t srid_val = dv.ValueInt();
+    if (srid_val < 0 || srid_val > std::numeric_limits<uint16_t>::max()) return false;
+    auto crs = storage::SridToCrs(storage::Srid{static_cast<uint16_t>(srid_val)});
     if (!crs) return false;
     if (!storage::valid3d(*crs)) return false;
 

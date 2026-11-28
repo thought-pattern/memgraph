@@ -39,6 +39,7 @@ constexpr char const *kDefaultEdgeType = "RELATIONSHIP";
 
 void InsertMessageRecord(mgp_result *result, mgp_memory *memory, const char *message) {
   auto *record = mgp::result_new_record(result);
+  if (record == nullptr) throw mg_exception::NotEnoughMemoryException();
 
   mg_utility::InsertStringValueResult(record, kFieldMessage, message, memory);
 }
@@ -61,9 +62,16 @@ void GenerateRMAT(mgp_list *args, mgp_graph *graph, mgp_result *result, mgp_memo
     auto seed = mgp::value_get_int(mgp::list_at(args, 7));
     auto clip_and_flip = mgp::value_get_bool(mgp::list_at(args, 8));
 
+    if (scale < 0 || scale >= 62) {
+      throw std::invalid_argument("RMAT scale must be between 0 and 61.");
+    }
+    if (num_edges < 0) {
+      throw std::invalid_argument("RMAT num_edges must be non-negative.");
+    }
+
     raft::handle_t handle{};
 
-    auto num_vertices = 1 << scale;  // RMAT generator defines this
+    const std::size_t num_vertices = std::size_t{1} << static_cast<unsigned int>(scale);
 
     // Create RNG state from seed for cuGraph 25.x API
     raft::random::RngState rng_state(static_cast<std::uint64_t>(seed));
@@ -94,8 +102,11 @@ void GenerateRMAT(mgp_list *args, mgp_graph *graph, mgp_result *result, mgp_memo
     }
 
     for (auto [src, dst] : edges) {
-      auto &src_vertex_ptr = vertices[src];
-      auto &dst_vertex_ptr = vertices[dst];
+      if (static_cast<std::size_t>(src) >= num_vertices || static_cast<std::size_t>(dst) >= num_vertices) {
+        throw std::out_of_range("Generated RMAT edge endpoint exceeds vertex range.");
+      }
+      auto &src_vertex_ptr = vertices[static_cast<std::size_t>(src)];
+      auto &dst_vertex_ptr = vertices[static_cast<std::size_t>(dst)];
 
       mgp_vertex *src_vertex = src_vertex_ptr.get();
       mgp_vertex *dst_vertex = dst_vertex_ptr.get();
@@ -122,15 +133,26 @@ void GenerateRMAT(mgp_list *args, mgp_graph *graph, mgp_result *result, mgp_memo
 }  // namespace
 
 extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *memory) {
-  mgp_value *default_scale;
-  mgp_value *default_num_edges;
-  mgp_value *default_node_labels;
-  mgp_value *default_edge_type;
-  mgp_value *default_parameter_a;
-  mgp_value *default_parameter_b;
-  mgp_value *default_parameter_c;
-  mgp_value *default_seed;
-  mgp_value *default_clip_and_flip;
+  mgp_value *default_scale = nullptr;
+  mgp_value *default_num_edges = nullptr;
+  mgp_value *default_node_labels = nullptr;
+  mgp_value *default_edge_type = nullptr;
+  mgp_value *default_parameter_a = nullptr;
+  mgp_value *default_parameter_b = nullptr;
+  mgp_value *default_parameter_c = nullptr;
+  mgp_value *default_seed = nullptr;
+  mgp_value *default_clip_and_flip = nullptr;
+  auto cleanup = [&]() {
+    if (default_scale != nullptr) mgp_value_destroy(default_scale);
+    if (default_num_edges != nullptr) mgp_value_destroy(default_num_edges);
+    if (default_node_labels != nullptr) mgp_value_destroy(default_node_labels);
+    if (default_edge_type != nullptr) mgp_value_destroy(default_edge_type);
+    if (default_parameter_a != nullptr) mgp_value_destroy(default_parameter_a);
+    if (default_parameter_b != nullptr) mgp_value_destroy(default_parameter_b);
+    if (default_parameter_c != nullptr) mgp_value_destroy(default_parameter_c);
+    if (default_seed != nullptr) mgp_value_destroy(default_seed);
+    if (default_clip_and_flip != nullptr) mgp_value_destroy(default_clip_and_flip);
+  };
   try {
     auto *rmat_proc = mgp::module_add_write_procedure(module, kProcedureGenerate, GenerateRMAT);
 
@@ -156,31 +178,15 @@ extern "C" int mgp_init_module(struct mgp_module *module, struct mgp_memory *mem
     mgp::proc_add_opt_arg(rmat_proc, kArgumentSeed, mgp::type_int(), default_seed);
     mgp::proc_add_opt_arg(rmat_proc, kArgumentClipAndFlip, mgp::type_bool(), default_clip_and_flip);
 
-    mgp::proc_add_result(rmat_proc, kFieldMessage, mgp::type_string());
-    mgp::proc_add_result(rmat_proc, kResultFieldSource, mgp::type_int());
-    mgp::proc_add_result(rmat_proc, kResultFieldTarget, mgp::type_int());
+    mgp::proc_add_result(rmat_proc, kFieldMessage, mgp::type_nullable(mgp::type_string()));
+    mgp::proc_add_result(rmat_proc, kResultFieldSource, mgp::type_nullable(mgp::type_int()));
+    mgp::proc_add_result(rmat_proc, kResultFieldTarget, mgp::type_nullable(mgp::type_int()));
   } catch (const std::exception &e) {
-    mgp_value_destroy(default_scale);
-    mgp_value_destroy(default_num_edges);
-    mgp_value_destroy(default_node_labels);
-    mgp_value_destroy(default_edge_type);
-    mgp_value_destroy(default_parameter_a);
-    mgp_value_destroy(default_parameter_b);
-    mgp_value_destroy(default_parameter_c);
-    mgp_value_destroy(default_seed);
-    mgp_value_destroy(default_clip_and_flip);
+    cleanup();
     return 1;
   }
 
-  mgp_value_destroy(default_scale);
-  mgp_value_destroy(default_num_edges);
-  mgp_value_destroy(default_node_labels);
-  mgp_value_destroy(default_edge_type);
-  mgp_value_destroy(default_parameter_a);
-  mgp_value_destroy(default_parameter_b);
-  mgp_value_destroy(default_parameter_c);
-  mgp_value_destroy(default_seed);
-  mgp_value_destroy(default_clip_and_flip);
+  cleanup();
   return 0;
 }
 

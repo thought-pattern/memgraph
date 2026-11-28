@@ -53,9 +53,6 @@ SWIG_VERSION=4.0.2 # used only for LLVM compilation
 
 # Set the right operating system setup script.
 ENV_SCRIPT="$DIR/../../os/$DISTRO.sh"
-if [[ "$for_arm" = true ]]; then
-    ENV_SCRIPT="$DIR/../../os/$DISTRO-arm.sh"
-fi
 echo "ALL BUILD PACKAGES: $(${ENV_SCRIPT} list TOOLCHAIN_BUILD_DEPS)"
 ${ENV_SCRIPT} check TOOLCHAIN_BUILD_DEPS
 echo "ALL RUN PACKAGES: $(${ENV_SCRIPT} list TOOLCHAIN_RUN_DEPS)"
@@ -85,6 +82,17 @@ if [ ! -d $PREFIX ] || [ ! -w $PREFIX ]; then
         fi
     done
 fi
+prev_stdcxx=""
+if [ -f "$PREFIX/.toolchain-stdcxx" ]; then
+    prev_stdcxx="$(cat "$PREFIX/.toolchain-stdcxx")"
+elif [ -d "$PREFIX/include/boost" ]; then
+    prev_stdcxx="unknown"
+fi
+if [ -n "$prev_stdcxx" ] && [ "$prev_stdcxx" != "$TOOLCHAIN_STDCXX" ]; then
+    echo "TOOLCHAIN_STDCXX changed ($prev_stdcxx -> $TOOLCHAIN_STDCXX); cleaning $PREFIX..."
+    find "$PREFIX" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+printf '%s\n' "$TOOLCHAIN_STDCXX" > "$PREFIX/.toolchain-stdcxx"
 
 # create archives directory
 mkdir -p archives
@@ -106,19 +114,19 @@ fi
 if [ ! -f cppcheck-$CPPCHECK_VERSION.tar.gz ]; then
     wget https://github.com/danmar/cppcheck/archive/$CPPCHECK_VERSION.tar.gz -O cppcheck-$CPPCHECK_VERSION.tar.gz
 fi
-if [ ! -f llvm-$LLVM_VERSION.src.tar.xz ]; then
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/llvm-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/lld-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-tools-extra-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/compiler-rt-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/libunwind-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/libcxx-$LLVM_VERSION.src.tar.xz
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/libcxxabi-$LLVM_VERSION.src.tar.xz
-fi
+for llvm_comp in llvm clang lld clang-tools-extra compiler-rt libunwind libcxx libcxxabi; do
+    llvm_archive="${llvm_comp}-${LLVM_VERSION}.src.tar.xz"
+    if [ ! -f "$llvm_archive" ]; then
+        wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$llvm_archive" -O "$llvm_archive.tmp"
+        mv -f "$llvm_archive.tmp" "$llvm_archive"
+    fi
+done
+PAHOLE_SHA256="7abd613e4dfabeb46d8ef312ef85b280808a369301db21cb7c2b76a6660b53de"
 if [ ! -f pahole-gdb-master.zip ]; then
-    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip
+    wget https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -O pahole-gdb-master.zip.tmp
+    mv -f pahole-gdb-master.zip.tmp pahole-gdb-master.zip
 fi
+echo "$PAHOLE_SHA256  pahole-gdb-master.zip" | sha256sum -c -
 if [ ! -f swig-$SWIG_VERSION.tar.gz ]; then
     wget https://github.com/swig/swig/archive/rel-$SWIG_VERSION.tar.gz -O swig-$SWIG_VERSION.tar.gz
 fi
@@ -154,27 +162,25 @@ fi
 $GPG --keyserver $KEYSERVER --recv-keys 0xFF325CF3
 $GPG --verify gdb-$GDB_VERSION.tar.gz.sig gdb-$GDB_VERSION.tar.gz
 # verify cmake
-if [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt ] || [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt.asc ]; then
-    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt
-    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt.asc
-    # Because CentOS 7 doesn't have the `--ignore-missing` flag for `sha256sum`
-    # we filter out the missing files from the sums here manually.
-    cat cmake-$CMAKE_VERSION-SHA-256.txt | grep "cmake-$CMAKE_VERSION.tar.gz" > cmake-$CMAKE_VERSION-SHA-256-filtered.txt
+if [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt ]; then
+    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt -O cmake-$CMAKE_VERSION-SHA-256.txt.tmp
+    mv -f cmake-$CMAKE_VERSION-SHA-256.txt.tmp cmake-$CMAKE_VERSION-SHA-256.txt
+fi
+if [ ! -f cmake-$CMAKE_VERSION-SHA-256.txt.asc ]; then
+    wget https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-SHA-256.txt.asc -O cmake-$CMAKE_VERSION-SHA-256.txt.asc.tmp
+    mv -f cmake-$CMAKE_VERSION-SHA-256.txt.asc.tmp cmake-$CMAKE_VERSION-SHA-256.txt.asc
 fi
 $GPG --keyserver $KEYSERVER --recv-keys 0xC6C265324BBEBDC350B513D02D2CEF1034921684
-sha256sum -c cmake-$CMAKE_VERSION-SHA-256-filtered.txt
 $GPG --verify cmake-$CMAKE_VERSION-SHA-256.txt.asc cmake-$CMAKE_VERSION-SHA-256.txt
-# verify llvm, cfe, lld, clang-tools-extra
-if [ ! -f llvm-$LLVM_VERSION.src.tar.xz.sig ]; then
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/llvm-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/lld-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang-tools-extra-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/compiler-rt-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/libunwind-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/libcxx-$LLVM_VERSION.src.tar.xz.sig
-    wget https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/libcxxabi-$LLVM_VERSION.src.tar.xz.sig
-fi
+grep " cmake-$CMAKE_VERSION\.tar\.gz\$" cmake-$CMAKE_VERSION-SHA-256.txt | sha256sum -c -
+# verify llvm, clang, lld, clang-tools-extra, compiler-rt, libunwind, libcxx, libcxxabi
+for llvm_comp in llvm clang lld clang-tools-extra compiler-rt libunwind libcxx libcxxabi; do
+    llvm_sig="${llvm_comp}-${LLVM_VERSION}.src.tar.xz.sig"
+    if [ ! -f "$llvm_sig" ]; then
+        wget "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$llvm_sig" -O "$llvm_sig.tmp"
+        mv -f "$llvm_sig.tmp" "$llvm_sig"
+    fi
+done
 # list of valid llvm gnupg keys: https://releases.llvm.org/download.html
 $GPG --keyserver $KEYSERVER --recv-keys 0x474E22316ABF4785A88C6E8EA2C794A986419D8A
 $GPG --verify llvm-$LLVM_VERSION.src.tar.xz.sig llvm-$LLVM_VERSION.src.tar.xz
@@ -636,6 +642,7 @@ popd
 
 # create README
 if [ ! -f $PREFIX/README.md ]; then
+    TOOLCHAIN_RUN_DEPS_LIST="$(${ENV_SCRIPT} list TOOLCHAIN_RUN_DEPS)"
     cat >$PREFIX/README.md <<EOF
 # Memgraph Toolchain v$TOOLCHAIN_VERSION
 
@@ -654,7 +661,7 @@ In order to be able to run all of these tools you should install the following
 packages:
 
 \`\`\`
-$($DIR/../../os/$ENV_SCRIPT.sh list TOOLCHAIN_RUN_DEPS)
+$TOOLCHAIN_RUN_DEPS_LIST
 \`\`\`
 
 ## Usage
@@ -1280,35 +1287,46 @@ if [[ "${DISTRO}" != "amzn-2" ]]; then
             -DGFLAGS_NOTHREADS=OFF \
             -DCMAKE_CXX_FLAGS="$CMAKE_CXX_FLAGS"
         make -j$CPUS install
-        popd
+        popd && popd
     fi
 fi
 
 popd
 
 # create toolchain archive
-if [ ! -f $NAME-binaries-$DISTRO.tar.gz ]; then
-    DISTRO_FULL_NAME=${DISTRO}
-    if [[ "${DISTRO}" == centos* ]] || [[ "${DISTRO}" == fedora* ]]; then
-        if [[ "$for_arm" = "true" ]]; then
-            DISTRO_FULL_NAME="$DISTRO_FULL_NAME-aarch64"
-        else
-            DISTRO_FULL_NAME="$DISTRO_FULL_NAME-x86_64"
-        fi
+DISTRO_FULL_NAME=${DISTRO}
+if [[ "${DISTRO}" == centos* ]] || [[ "${DISTRO}" == fedora* ]]; then
+    if [[ "$for_arm" = "true" ]]; then
+        DISTRO_FULL_NAME="$DISTRO_FULL_NAME-aarch64"
     else
-        if [[ "$for_arm" = "true" ]]; then
-            DISTRO_FULL_NAME="$DISTRO_FULL_NAME-arm64"
-        else
-            DISTRO_FULL_NAME="$DISTRO_FULL_NAME-amd64"
-        fi
+        DISTRO_FULL_NAME="$DISTRO_FULL_NAME-x86_64"
     fi
-    if [ "$TOOLCHAIN_STDCXX" = "libstdc++" ]; then
-        # Pass because infra scripts assume there is not C++ standard lib in the name.
-        echo "NOTE: Not adding anything to the archive name that GCC C++ standard lib is used."
+else
+    if [[ "$for_arm" = "true" ]]; then
+        DISTRO_FULL_NAME="$DISTRO_FULL_NAME-arm64"
     else
-        DISTRO_FULL_NAME="$DISTRO_FULL_NAME-libc++"
+        DISTRO_FULL_NAME="$DISTRO_FULL_NAME-amd64"
     fi
-    tar --owner=root --group=root -cpvzf $NAME-binaries-$DISTRO_FULL_NAME.tar.gz -C /opt $NAME
+fi
+if [ "$TOOLCHAIN_STDCXX" = "libstdc++" ]; then
+    # Pass because infra scripts assume there is not C++ standard lib in the name.
+    echo "NOTE: Not adding anything to the archive name that GCC C++ standard lib is used."
+else
+    DISTRO_FULL_NAME="$DISTRO_FULL_NAME-libc++"
+fi
+ARCHIVE_FILE="$NAME-binaries-$DISTRO_FULL_NAME.tar.gz"
+ARCHIVE_PATH="$DIR/build/$ARCHIVE_FILE"
+mkdir -p "$DIR/build"
+if [ -f "$ARCHIVE_PATH" ] && ! (gzip -t "$ARCHIVE_PATH" >/dev/null 2>&1 && tar -tzf "$ARCHIVE_PATH" >/dev/null 2>&1); then
+    echo "Removing unreadable toolchain archive '$ARCHIVE_PATH' before rebuilding..."
+    rm -f "$ARCHIVE_PATH"
+fi
+if [ ! -f "$ARCHIVE_PATH" ]; then
+    rm -f "$ARCHIVE_PATH.tmp."*
+    tar --owner=root --group=root -cpvzf "$ARCHIVE_PATH.tmp.$$" -C /opt "$NAME"
+    gzip -t "$ARCHIVE_PATH.tmp.$$"
+    tar -tzf "$ARCHIVE_PATH.tmp.$$" >/dev/null
+    mv -f "$ARCHIVE_PATH.tmp.$$" "$ARCHIVE_PATH"
 fi
 
 # output final instructions
@@ -1317,7 +1335,7 @@ echo "All tools have been built. They are installed in '$PREFIX'."
 echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'build' directory."
 echo "If you want to install the packed tools you should execute the following command:"
 echo
-echo "    tar -xvzf build/$NAME-binaries.tar.gz -C /opt"
+echo "    tar -xvzf build/$ARCHIVE_FILE -C /opt"
 echo
 echo "Because the tools were built on this machine, you should probably change the permissions of the installation directory using:"
 echo

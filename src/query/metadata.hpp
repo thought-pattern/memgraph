@@ -68,6 +68,7 @@ enum class NotificationCode : uint8_t {
   CREATE_USER,
   CREATE_ROLE,
   DEPRECATED_QUERY,
+  INCOMPLETE_AUTH_LISTING,
 };
 
 struct Notification {

@@ -9,13 +9,13 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from multiprocessing import Manager, Process, Value
 import os
 import time
-from multiprocessing import Manager, Process, Value
 
+from mg_utils import mg_sleep_and_assert
 import mgclient
 import pytest
-from mg_utils import mg_sleep_and_assert
 
 # These are the indices of the different values in the result of SHOW STREAM
 # query

@@ -1,7 +1,7 @@
 import sys
 
-import semver
 from neo4j import GraphDatabase
+import semver
 
 # NOTE: This assumens memgraph is up and running.
 memgrah_version = semver.Version.parse(sys.argv[1])

@@ -1,18 +1,22 @@
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 import os
 import sys
 import threading
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import List
 
 import huggingface_hub  # noqa: F401
-import litellm
 import mgp
 import numpy as np
 
-# Suppress LiteLLM's "Provider List: ..." banner that fires on every
-# get_llm_provider() miss — we probe deliberately for local names.
-litellm.suppress_debug_info = True
+try:
+    import litellm
+
+    # Suppress LiteLLM's "Provider List: ..." banner that fires on every
+    # get_llm_provider() miss — we probe deliberately for local names.
+    litellm.suppress_debug_info = True
+except ImportError:
+    litellm = None
 
 # We need to import huggingface_hub, otherwise sentence_transformers will fail to load the model.
 
@@ -36,8 +40,8 @@ def _get_or_load_model(model_name: str, device: str = "cpu"):
         # Double-check after acquiring lock
         if key in _model_cache:
             return _model_cache[key]
-        import transformers  # noqa: F401
         from sentence_transformers import SentenceTransformer
+        import transformers  # noqa: F401
 
         model = SentenceTransformer(model_name, device=device)
         _model_cache[key] = model
@@ -45,16 +49,16 @@ def _get_or_load_model(model_name: str, device: str = "cpu"):
 
 
 def build_texts(vertices, excluded_properties):
-    logger.debug(f"excluded_properties: {excluded_properties}")
+    excluded_set = set(excluded_properties) if excluded_properties else set()
     out = []
     for vertex in vertices:
         txt = (
             " ".join(lbl.name for lbl in vertex.labels)
             + " "
-            + " ".join(f"{key}: {val}" for key, val in vertex.properties.items() if key not in excluded_properties)
+            + " ".join(f"{key}: {val}" for key, val in vertex.properties.items() if key not in excluded_set)
         )
         out.append(txt)
-    logger.debug(f"text to calc embedding: {out}")
+    logger.debug(f"Prepared {len(out)} item(s) for embedding (excluded_properties={sorted(excluded_set)}).")
     return out
 
 
@@ -142,9 +146,7 @@ def select_device(device: mgp.Any):  # noqa: C901
                     raise ValueError(f"GPU {gpu_index} not available. Available GPUs: {available_gpus}")
                 return [gpu_index]
             except (ValueError, IndexError) as e:
-                raise ValueError(
-                    f"Invalid CUDA device format '{device}'. Expected format: 'cuda:X' where X is a number"
-                ) from e
+                raise ValueError(f"Invalid CUDA device format '{device}'. Expected format: 'cuda:X' where X is a number") from e
         else:
             raise ValueError(f"Invalid device string '{device}'. Expected 'cpu' or 'cuda:X'")
 
@@ -196,6 +198,11 @@ def select_device(device: mgp.Any):  # noqa: C901
         raise TypeError(f"Invalid device type {type(device)}. Expected int, str, or list of int/str")
 
 
+def _ensure_positive_int(value, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"'{name}' must be a positive integer >= 1, got {value!r}")
+
+
 def cpu_compute(
     input_items: mgp.Any,  # Can be vertices or strings
     embedding_property: str = "embedding",
@@ -207,6 +214,7 @@ def cpu_compute(
     return_embeddings: bool = False,
     dimension: int = None,
 ) -> mgp.Record(success=bool, embeddings=mgp.Nullable[mgp.List[list]], dimension=mgp.Nullable[int]):
+    _ensure_positive_int(batch_size, "batch_size")
     model = _get_or_load_model(model_name, "cpu")
     vertex_input = isinstance(embedding_property, str)
     if vertex_input:
@@ -215,6 +223,14 @@ def cpu_compute(
         texts = input_items
 
     n = len(input_items)
+    if n == 0:
+        return return_data(
+            input_items if vertex_input else [],
+            embedding_property_name=embedding_property if vertex_input else None,
+            return_embeddings=return_embeddings,
+            success=True,
+            dimension=dimension,
+        )
     embs = model.encode(
         texts,
         batch_size=min(batch_size, n),
@@ -249,6 +265,7 @@ def single_gpu_compute(
     return_embeddings: bool = False,
     dimension: int = None,
 ) -> mgp.Record(success=bool, embeddings=mgp.Nullable[mgp.List[list]], dimension=mgp.Nullable[int]):
+    _ensure_positive_int(batch_size, "batch_size")
     vertex_input = isinstance(embedding_property, str)
     try:
         model = _get_or_load_model(model_name, f"cuda:{device}")
@@ -312,6 +329,8 @@ def multi_gpu_compute(
     return_embeddings: bool = False,
     dimension: int = None,
 ) -> mgp.Record(success=bool, embeddings=mgp.Nullable[mgp.List[list]], dimension=mgp.Nullable[int]):
+    _ensure_positive_int(batch_size, "batch_size")
+    _ensure_positive_int(chunk_size, "chunk_size")
     vertex_input = isinstance(embedding_property, str)
 
     try:
@@ -320,30 +339,32 @@ def multi_gpu_compute(
         logger.error(f"Failed to import worker module: {e}")
         return return_data(
             input_items if vertex_input else None,
-            embedding_property_name=embedding_property,
+            embedding_property_name=embedding_property if vertex_input else None,
             return_embeddings=return_embeddings,
             success=False,
             dimension=dimension,
         )
 
     n = len(input_items)
+    if n == 0:
+        return return_data(
+            input_items if vertex_input else [],
+            embedding_property_name=embedding_property if vertex_input else None,
+            return_embeddings=return_embeddings,
+            success=True,
+            dimension=dimension,
+        )
 
-    # Multi-GPU via spawn - process in chunks to avoid memory issues
-    # We spawn a worker process for each GPU every time we process a chunk.
-    # every time that happens, it takes about 8-10s to import libraries and load the model.
-    # `chunk_size` should be tweaked to minimize the number of times we spawn a worker process,
-    # while avoiding OOM.
     chunk_size = min(batch_size * chunk_size, n)
     total_processed = 0
 
-    # Create an iterator from the input items
     item_iter = iter(input_items)
 
-    all_embeddings = []  # only used for string inputs
+    # Pre-size string output by global input offset so out-of-order GPU worker completions never scramble vector order.
+    all_embeddings = [] if vertex_input else [None] * n
     for chunk_start in range(0, n, chunk_size):
         chunk_end = min(chunk_start + chunk_size, n)
 
-        # Collect only the input items for this chunk
         chunk_items = []
         for _ in range(chunk_end - chunk_start):
             try:
@@ -359,18 +380,16 @@ def multi_gpu_compute(
         else:
             chunk_texts = chunk_items
 
-        # Split this chunk across GPUs
         chunk_slices = split_slices(len(chunk_texts), len(gpus))
         tasks = []
         for gpu, (a, b) in zip(gpus, chunk_slices):
             if a < b:
                 tasks.append((gpu, model_name, chunk_texts[a:b], batch_size, chunk_start + a, chunk_start + b))
 
-        # Process this chunk
         chunk_results = []
         chunk_total = 0
 
-        mp.set_executable("/usr/bin/python3")
+        mp.set_executable(sys.executable or "/usr/bin/python3")
         ctx_spawn = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=len(tasks), mp_context=ctx_spawn) as ex:
             fut2info = {
@@ -393,20 +412,19 @@ def multi_gpu_compute(
                 except Exception as e:
                     logger.error(f"Worker on GPU {gpu} failed: {e}")
 
-        # Write back results for this chunk
         for a, b, embs in chunk_results:
             if vertex_input:
                 for i, e in enumerate(embs, start=a):
                     chunk_items[i - chunk_start].properties[embedding_property] = e
             else:
-                all_embeddings.extend(embs)
+                all_embeddings[a:b] = embs
         total_processed += chunk_total
 
     logger.info(f"Successfully processed {total_processed}/{n} items across {len(gpus)} GPU(s).")
     success_flag = total_processed == n
     return return_data(
         input_items if vertex_input else all_embeddings,
-        embedding_property_name=embedding_property,
+        embedding_property_name=embedding_property if vertex_input else None,
         return_embeddings=return_embeddings,
         success=success_flag,
         dimension=dimension,
@@ -420,7 +438,7 @@ def resolve_remote_model(model_name):
     ``"openai/text-embedding-3-small"``), otherwise ``None`` — in which case
     the caller should fall through to the local SentenceTransformer path.
     """
-    if not isinstance(model_name, str) or not model_name:
+    if litellm is None or not isinstance(model_name, str) or not model_name:
         return None
     try:
         model, provider, _dynamic_key, default_api_base = litellm.get_llm_provider(model_name)
@@ -601,9 +619,10 @@ def validate_configuration(configuration: mgp.Map):
     if configuration["embedding_property"] is not None and configuration["embedding_property"] not in excluded:
         excluded.append(configuration["embedding_property"])
 
-    # Validate numeric remote-path keys at config time so we fail loudly with
-    # a clear message rather than producing weird runtime errors downstream
-    # (e.g. range(0, n, 0) raises, ThreadPoolExecutor(max_workers=0) raises).
+    # Validate numeric local & remote-path keys at config time so we fail loudly
+    # with a clear message rather than producing empty or weird runtime behavior.
+    _require_int_ge(configuration, "batch_size", minimum=1)
+    _require_int_ge(configuration, "chunk_size", minimum=1)
     _require_positive_number(configuration, "timeout")
     _require_int_ge(configuration, "num_retries", minimum=0)
     _require_int_ge(configuration, "concurrency", minimum=1, maximum=_CONCURRENCY_MAX)
@@ -613,9 +632,7 @@ def validate_configuration(configuration: mgp.Map):
     # When routing remote, a local `device` setting has no meaning — warn so the
     # user knows we're ignoring it rather than silently doing the wrong thing.
     if resolve_remote_model(configuration["model_name"]) is not None and configuration["device"] is not None:
-        logger.warning(
-            f"'device' is ignored when model_name '{configuration['model_name']}' routes to a remote provider."
-        )
+        logger.warning(f"'device' is ignored when model_name '{configuration['model_name']}' routes to a remote provider.")
 
     logger.debug(f"Using embedding configuration: {_redacted_config(configuration)}")
 
@@ -624,6 +641,7 @@ def validate_configuration(configuration: mgp.Map):
 
 # Upper bound on `concurrency` (in-flight HTTP requests per remote_compute call).
 _CONCURRENCY_MAX = 32
+_SENSITIVE_KEY_TOKENS = ("key", "token", "secret", "password", "auth", "credential")
 
 
 def _require_int_ge(cfg, key, minimum, allow_none=False, maximum=None):
@@ -646,34 +664,33 @@ def _require_positive_number(cfg, key):
 
 
 def _redacted_config(cfg):
-    """Return a shallow-copied config with credentials in ``api_base`` masked.
-
-    The only vector for leaks is the api_base URL — we don't accept any
-    secret-bearing config keys (credentials come from provider env vars).
-    Covers all three places auth can hide in a URL: userinfo
-    (``user:pass@host``), query string (``?token=...``, ``?api_key=...``),
-    and fragment. Scheme/host/port/path are preserved so the log line is
-    still useful for debugging where Memgraph thinks it's calling.
-    """
+    """Return a shallow-copied config with credentials in ``api_base`` and sensitive keys masked."""
     from urllib.parse import urlsplit, urlunsplit
 
+    redacted = {
+        k: ("<redacted>" if any(tok in str(k).lower() for tok in _SENSITIVE_KEY_TOKENS) and v is not None else v)
+        for k, v in cfg.items()
+    }
     api_base = cfg.get("api_base")
     if not isinstance(api_base, str):
-        return cfg
+        return redacted
     try:
         parts = urlsplit(api_base)
+        hostname = parts.hostname or ""
+        port = parts.port
+        has_userinfo = bool(parts.username or parts.password or "@" in parts.netloc)
     except ValueError:
-        return cfg
-    if not (parts.username or parts.password or parts.query or parts.fragment):
-        return cfg
-    netloc = parts.hostname or ""
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
-    if parts.username or parts.password:
+        redacted["api_base"] = "<redacted-invalid-url>"
+        return redacted
+    if not (has_userinfo or parts.query or parts.fragment):
+        return redacted
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    if has_userinfo:
         netloc = f"<redacted>@{netloc}"
     query = "<redacted>" if parts.query else ""
     fragment = "<redacted>" if parts.fragment else ""
-    return {**cfg, "api_base": urlunsplit((parts.scheme, netloc, parts.path, query, fragment))}
+    redacted["api_base"] = urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+    return redacted
 
 
 def compute_embeddings(  # noqa: C901
@@ -844,16 +861,18 @@ def get_model_info(configuration: mgp.Map):
 def _remote_model_info(configuration, resolved):
     """Probe a remote provider once to learn its embedding dimension.
 
-    Cached per (model_name, api_base) so subsequent calls don't re-hit the API.
+    Cached per (model_name, api_base, requested_dimensions) so requests with
+    distinct dimension overrides never return each other's cached vector width.
     """
     _model, _provider, default_api_base = resolved
     api_base = configuration.get("api_base") or default_api_base
-    cache_key = (configuration["model_name"], api_base)
+    requested_dimensions = configuration.get("dimensions")
+    cache_key = (configuration["model_name"], api_base, requested_dimensions)
 
     with _remote_info_lock:
         cached = _remote_info_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return dict(cached)
 
     kwargs = {
         "model": configuration["model_name"],
@@ -863,8 +882,8 @@ def _remote_model_info(configuration, resolved):
     }
     if api_base:
         kwargs["api_base"] = api_base
-    if configuration.get("dimensions"):
-        kwargs["dimensions"] = configuration["dimensions"]
+    if requested_dimensions:
+        kwargs["dimensions"] = requested_dimensions
 
     resp = litellm.embedding(**kwargs)
     dim = len(resp["data"][0]["embedding"])
@@ -876,14 +895,14 @@ def _remote_model_info(configuration, resolved):
 
     with _remote_info_lock:
         _remote_info_cache[cache_key] = info
-    return info
+    return dict(info)
 
 
 @mgp.read_proc
 def model_info(
     configuration: mgp.Map = {},
 ) -> mgp.Record(info=mgp.Map):
-    configuration = validate_configuration(configuration)
+    configuration = validate_configuration(dict(configuration))
 
     info = get_model_info(configuration)
     return mgp.Record(info=info)
@@ -897,11 +916,8 @@ def node_sentence(
 ) -> mgp.Record(success=bool, embeddings=mgp.Nullable[mgp.List[list]], dimension=mgp.Nullable[int]):
     logger.info(f"compute_embeddings: starting (py_exec={sys.executable}, py_ver={sys.version.split()[0]})")
 
-    configuration = validate_configuration(configuration)
-    if input_nodes:
-        vertices = input_nodes
-    else:
-        vertices = ctx.graph.vertices
+    configuration = validate_configuration(dict(configuration))
+    vertices = list(ctx.graph.vertices) if input_nodes is None else list(input_nodes)
 
     return compute_embeddings(vertices, configuration)
 
@@ -914,8 +930,8 @@ def text(
 ) -> mgp.Record(success=bool, embeddings=mgp.Nullable[mgp.List[list]], dimension=mgp.Nullable[int]):
     logger.info(f"embed: starting (py_exec={sys.executable}, py_ver={sys.version.split()[0]})")
 
-    # hard code embedding_property to None for string input
-    configuration["embedding_property"] = None
-    configuration = validate_configuration(configuration)
+    cfg_copy = dict(configuration)
+    cfg_copy["embedding_property"] = None
+    cfg_copy = validate_configuration(cfg_copy)
 
-    return compute_embeddings(input_strings, configuration)
+    return compute_embeddings(input_strings, cfg_copy)

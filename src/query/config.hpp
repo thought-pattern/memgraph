@@ -21,6 +21,7 @@ struct InterpreterConfig {
 
   // The same as \ref memgraph::replication::ReplicationClientConfig
   std::chrono::seconds replication_replica_check_frequency{1};
+  int bolt_port{7687};
 
   std::string default_kafka_bootstrap_servers;
   std::string default_pulsar_service_url;

@@ -154,9 +154,40 @@ elif [[ "$DEB_PACKAGE" == "true" ]]; then
   pip_install --no-cache-dir -r "$(requirements_source "/usr/lib/memgraph/mage-requirements.txt")"
   pip_install --no-cache-dir -r "$(requirements_source "/usr/lib/memgraph/auth_module/requirements.txt")"
 else
-  # for installing locally, from within the memgraph repo, under the mage directory
-  pip_install --no-cache-dir -r "$(requirements_source "$(pwd)/python/${requirements_file}")"
-  pip_install --no-cache-dir -r "$(requirements_source "$(pwd)/../src/auth/reference_modules/requirements.txt")"
+  # for installing locally, from within the memgraph repo (src/mage or release/package/mage) or standalone mage
+  script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+  mage_req_path=""
+  for candidate in \
+    "$(pwd)/python/${requirements_file}" \
+    "${script_dir}/../../../src/mage/python/${requirements_file}"; do
+    if [[ -f "$candidate" ]]; then
+      mage_req_path="$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+      break
+    fi
+  done
+  if [[ -z "$mage_req_path" ]]; then
+    echo "Error: Could not find MAGE Python requirements file '${requirements_file}'" >&2
+    exit 1
+  fi
+
+  auth_req_path=""
+  for candidate in \
+    "$(pwd)/../auth/reference_modules/requirements.txt" \
+    "$(pwd)/../../src/auth/reference_modules/requirements.txt" \
+    "${script_dir}/../../../src/auth/reference_modules/requirements.txt" \
+    "$(pwd)/../src/auth/reference_modules/requirements.txt"; do
+    if [[ -f "$candidate" ]]; then
+      auth_req_path="$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")"
+      break
+    fi
+  done
+  if [[ -z "$auth_req_path" ]]; then
+    echo "Error: Could not find authentication module requirements.txt" >&2
+    exit 1
+  fi
+
+  pip_install --no-cache-dir -r "$(requirements_source "$mage_req_path")"
+  pip_install --no-cache-dir -r "$(requirements_source "$auth_req_path")"
 fi
 
 # custom package links TODO(matt): use official binaries when available
@@ -223,4 +254,6 @@ else
     pip_install --no-cache-dir "$DGL"
   fi
 fi
-rm -fr /home/memgraph/.cache/pip
+if [[ -d /home/memgraph/.cache/pip ]]; then
+  rm -rf /home/memgraph/.cache/pip
+fi

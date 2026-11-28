@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -19,8 +20,8 @@
 
 namespace memgraph::glue {
 
-// Answers a websocket session's questions out of the user store, caching the authenticated party
-// and refreshing it when the store's epoch moves on.
+// Answers a websocket session's questions out of the account store, providing each session its own
+// principal cache that refreshes when the store's epoch advances.
 class SafeAuth : public communication::websocket::AuthenticationInterface {
  public:
   explicit SafeAuth(auth::SynchedAuth *auth) : auth_{auth} {}
@@ -30,6 +31,8 @@ class SafeAuth : public communication::websocket::AuthenticationInterface {
   bool HasWebsocketPermission() const override;
 
   bool AccessControlled() const override;
+
+  std::unique_ptr<SessionAuth> CreateSessionAuth() const override;
 
  private:
   auth::SynchedAuth *auth_;

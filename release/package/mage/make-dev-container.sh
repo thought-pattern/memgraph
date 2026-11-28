@@ -8,6 +8,33 @@
 
 set -euo pipefail
 
+TOOLCHAIN_SHA256="${TOOLCHAIN_SHA256:-}"
+SKIP_TOOLCHAIN=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-toolchain)
+      SKIP_TOOLCHAIN=true
+      shift
+      ;;
+    --toolchain-sha256)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+        echo "Error: --toolchain-sha256 requires a 64-character hex SHA-256 digest" >&2
+        exit 1
+      fi
+      TOOLCHAIN_SHA256="$2"
+      shift 2
+      ;;
+    --toolchain-sha256=*)
+      TOOLCHAIN_SHA256="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "Error: Unknown option '$1'" >&2
+      exit 1
+      ;;
+  esac
+done
+
 # install dependencies
 apt-get update
 apt-get install -y libpython${PY_VERSION:-$(python3 --version | sed 's/Python //')} \
@@ -51,35 +78,44 @@ get_toolchain_url() {
 
 
 toolchain_version=7
-TOOLCHAIN_URL=$(get_toolchain_url "$toolchain_version")
-echo "Downloading toolchain from: $TOOLCHAIN_URL"
-# Download the toolchain using curl
-curl -L "$TOOLCHAIN_URL" -o /toolchain.tar.gz
-tar xzvfm /toolchain.tar.gz -C /opt
+if [[ "$SKIP_TOOLCHAIN" == false ]]; then
+  if [[ ! "$TOOLCHAIN_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "Error: A valid 64-character hex SHA-256 digest is required via --toolchain-sha256 or TOOLCHAIN_SHA256 to verify the toolchain archive." >&2
+    exit 1
+  fi
+  TOOLCHAIN_URL=$(get_toolchain_url "$toolchain_version")
+  echo "Downloading toolchain from: $TOOLCHAIN_URL"
+  (
+    set -euo pipefail
+    tmp_toolchain_dir="$(mktemp -d "${TMPDIR:-/tmp}/toolchain.XXXXXX")"
+    tmp_toolchain="$tmp_toolchain_dir/toolchain.tar.gz"
+    trap 'rm -rf "$tmp_toolchain_dir"' EXIT
+    if [[ "$TOOLCHAIN_URL" == https://* ]]; then
+      curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 "$TOOLCHAIN_URL" -o "$tmp_toolchain"
+    else
+      curl -fL "$TOOLCHAIN_URL" -o "$tmp_toolchain"
+    fi
+    expected_sha256="$(printf '%s' "$TOOLCHAIN_SHA256" | tr '[:upper:]' '[:lower:]')"
+    if command -v sha256sum >/dev/null 2>&1; then
+      printf '%s  %s\n' "$expected_sha256" "$tmp_toolchain" | sha256sum -c -
+    else
+      printf '%s  %s\n' "$expected_sha256" "$tmp_toolchain" | shasum -a 256 -c -
+    fi
+    tar xzvfm "$tmp_toolchain" -C /opt
+  )
+else
+  echo "Skipping toolchain download (--no-toolchain)"
+fi
 
 
 # ENV from the Dockerfile; empty when the build arg wasn't passed.
 MEMGRAPH_REF="${MEMGRAPH_REF:-master}"
 
-echo "Cloning Memgraph repo commit/tag: $MEMGRAPH_REF"
+echo "Cloning Memgraph repo commit/tag/branch: $MEMGRAPH_REF"
 cd /root
 git clone https://github.com/memgraph/memgraph.git
 cd /root/memgraph
-
-# Check if MEMGRAPH_REF matches a version tag format: vX.Y or vX.Y.Z
-if [[ "$MEMGRAPH_REF" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-    echo "Detected valid tag format. Checking out tag: $MEMGRAPH_REF"
-    git checkout "$MEMGRAPH_REF"
-else
-    echo "Detected branch name. Checking out branch: $MEMGRAPH_REF"
-    git checkout "$MEMGRAPH_REF"
-
-    echo "Fetching latest master branch..."
-    git fetch origin master
-
-    echo "Merging origin/master into branch $MEMGRAPH_REF..."
-    git merge origin/master
-fi
+git checkout "$MEMGRAPH_REF"
 
 cd /
 
@@ -93,8 +129,10 @@ chown -R memgraph: /mage/
 # remove git repo from `/root`
 rm -rf /root/memgraph
 
-# install toolchain run dependencies
-./mage/environment/os/install_deps.sh install TOOLCHAIN_RUN_DEPS
+if [[ "$SKIP_TOOLCHAIN" == false ]]; then
+  # install toolchain run dependencies
+  ./mage/environment/os/install_deps.sh install TOOLCHAIN_RUN_DEPS
+fi
 
 # install Rust as `memgraph` user - this is required for building mage. The
 # version and the hash-verified rustup-init come from environment/util.sh, so
@@ -107,7 +145,11 @@ su - memgraph -s /bin/bash -c 'source /mage/environment/util.sh && retry_install
 
 # build everything again (because it isn't copied into the prod image);
 # MAGE modules end up in /mage/build/mage/dist
-build_cmd="source /opt/toolchain-v${toolchain_version}/activate && cd /mage && ./build.sh --mage on --build-type ${BUILD_TYPE:-RelWithDebInfo}"
+if [[ "$SKIP_TOOLCHAIN" == false && -f "/opt/toolchain-v${toolchain_version}/activate" ]]; then
+  build_cmd="source /opt/toolchain-v${toolchain_version}/activate && cd /mage && ./build.sh --mage on --build-type ${BUILD_TYPE:-RelWithDebInfo}"
+else
+  build_cmd="cd /mage && ./build.sh --mage on --build-type ${BUILD_TYPE:-RelWithDebInfo} -DMG_BUNDLED_TOOLCHAIN=OFF"
+fi
 su - memgraph -c "bash -c '$build_cmd'"
 
 

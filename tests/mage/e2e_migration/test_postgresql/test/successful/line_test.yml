@@ -9,4 +9,6 @@ query: |
   YIELD row
   RETURN valueType(row.line_col) AS line_col_type, toString(row.line_col) AS line_col
 
-exception: true
+output:
+  - line_col_type: 'STRING'
+    line_col: '{1,-1,0}'

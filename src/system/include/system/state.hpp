@@ -29,11 +29,22 @@ constexpr std::string_view kLastCommitedSystemTsKey = "last_committed_system_ts"
 struct State {
   explicit State(std::optional<std::filesystem::path> storage, bool recovery_on_startup);
 
-  void FinalizeTransaction(std::uint64_t timestamp) {
-    if (durability_) {
-      durability_->Put(kLastCommitedSystemTsKey, std::to_string(timestamp));
+  [[nodiscard]] bool PersistTimestamp(std::uint64_t timestamp) {
+    if (durability_ && !durability_->Put(kLastCommitedSystemTsKey, std::to_string(timestamp))) {
+      return false;
     }
+    return true;
+  }
+
+  void AdvanceInMemoryTimestamp(std::uint64_t timestamp) noexcept {
     last_committed_system_timestamp_.store(timestamp, std::memory_order_release);
+  }
+
+  void FinalizeTransaction(std::uint64_t timestamp) {
+    if (!PersistTimestamp(timestamp)) {
+      throw kvstore::KVStoreError("Failed to persist committed system transaction timestamp {}", timestamp);
+    }
+    AdvanceInMemoryTimestamp(timestamp);
   }
 
   auto LastCommittedSystemTimestamp() const -> uint64_t {
@@ -55,8 +66,12 @@ struct ReplicaHandlerAccessToState {
     return state_->last_committed_system_timestamp_.load(std::memory_order_acquire);
   }
 
-  void SetLastCommitedTS(uint64_t new_timestamp) {
-    state_->last_committed_system_timestamp_.store(new_timestamp, std::memory_order_release);
+  bool SetLastCommitedTS(uint64_t new_timestamp) {
+    if (!state_->PersistTimestamp(new_timestamp)) {
+      return false;
+    }
+    state_->AdvanceInMemoryTimestamp(new_timestamp);
+    return true;
   }
 
  private:

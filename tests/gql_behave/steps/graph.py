@@ -13,8 +13,8 @@
 
 import os
 
-import database
 from behave import given
+import database
 
 
 def clear_graph(context):

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <limits>
 #include <string_view>
 #include <type_traits>
 
@@ -84,7 +85,113 @@ class BaseEncoder {
     WritePrimitiveValue(tmp);
   }
 
+  static constexpr size_t kMaxPackStreamSize = std::numeric_limits<uint32_t>::max();
+
+  [[nodiscard]] static bool CanEncodeSize(size_t size) noexcept { return size <= kMaxPackStreamSize; }
+
+  [[nodiscard]] static bool CanEncodeString(std::string_view value) noexcept { return CanEncodeSize(value.size()); }
+
+  [[nodiscard]] bool CanEncodeList(const std::vector<Value> &value) const noexcept {
+    if (!CanEncodeSize(value.size())) return false;
+    for (const auto &elem : value) {
+      if (!CanEncodeValue(elem)) return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool CanEncodeMap(const map_t &value) const noexcept {
+    if (!CanEncodeSize(value.size())) return false;
+    for (const auto &[k, v] : value) {
+      if (!CanEncodeString(k) || !CanEncodeValue(v)) return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool CanEncodeVertex(const Vertex &vertex) const noexcept {
+    if (!CanEncodeSize(vertex.labels.size())) return false;
+    for (const auto &label : vertex.labels) {
+      if (!CanEncodeString(label)) return false;
+    }
+    if (!CanEncodeMap(vertex.properties)) return false;
+    if (major_v_ > 4 && !CanEncodeString(vertex.element_id)) return false;
+    return true;
+  }
+
+  [[nodiscard]] bool CanEncodeEdge(const Edge &edge, bool unbound = false) const noexcept {
+    if (!CanEncodeString(edge.type) || !CanEncodeMap(edge.properties)) return false;
+    if (major_v_ > 4) {
+      if (!CanEncodeString(edge.element_id)) return false;
+      if (!unbound && (!CanEncodeString(edge.from_element_id) || !CanEncodeString(edge.to_element_id))) return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool CanEncodeEdge(const UnboundedEdge &edge) const noexcept {
+    if (!CanEncodeString(edge.type) || !CanEncodeMap(edge.properties)) return false;
+    if (major_v_ > 4 && !CanEncodeString(edge.element_id)) return false;
+    return true;
+  }
+
+  [[nodiscard]] bool CanEncodePath(const Path &path) const noexcept {
+    if (!CanEncodeSize(path.vertices.size()) || !CanEncodeSize(path.edges.size()) ||
+        !CanEncodeSize(path.indices.size())) {
+      return false;
+    }
+    for (const auto &v : path.vertices) {
+      if (!CanEncodeVertex(v)) return false;
+    }
+    for (const auto &e : path.edges) {
+      if (!CanEncodeEdge(e)) return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool CanEncodeValue(const Value &value) const noexcept {
+    switch (value.type()) {
+      case Value::Type::Null:
+      case Value::Type::Bool:
+      case Value::Type::Int:
+      case Value::Type::Double:
+      case Value::Type::Date:
+      case Value::Type::LocalTime:
+      case Value::Type::LocalDateTime:
+      case Value::Type::Duration:
+      case Value::Type::Point2d:
+      case Value::Type::Point3d:
+        return true;
+      case Value::Type::String:
+        return CanEncodeString(value.ValueString());
+      case Value::Type::List:
+        return CanEncodeList(value.ValueList());
+      case Value::Type::Map:
+        return CanEncodeMap(value.ValueMap());
+      case Value::Type::Vertex:
+        return CanEncodeVertex(value.ValueVertex());
+      case Value::Type::Edge:
+        return CanEncodeEdge(value.ValueEdge());
+      case Value::Type::UnboundedEdge:
+        return CanEncodeEdge(value.ValueUnboundedEdge());
+      case Value::Type::Path:
+        return CanEncodePath(value.ValuePath());
+      case Value::Type::ZonedDateTime: {
+        const auto &zdt = value.ValueZonedDateTime();
+        if (zdt.GetTimezone().InTzDatabase()) {
+          return CanEncodeString(zdt.GetTimezone().TimezoneName());
+        }
+        return true;
+      }
+    }
+    return true;
+  }
+
+  void RequireEncodable(bool ok) const {
+    if (!ok) {
+      throw ValueException("Bolt value exceeds maximum representable 32-bit PackStream length!");
+    }
+  }
+
   void WriteTypeSize(const size_t size, const uint8_t typ) {
+    RequireEncodable(CanEncodeSize(size));
     if (size <= 15) {
       uint8_t len = size;
       len &= 0x0F;
@@ -98,23 +205,26 @@ class BaseEncoder {
       WriteRAW(std::to_underlying(Marker16[typ]));
       WritePrimitiveValue(len);
     } else {
-      uint32_t len = size;
+      auto len = static_cast<uint32_t>(size);
       WriteRAW(std::to_underlying(Marker32[typ]));
       WritePrimitiveValue(len);
     }
   }
 
   void WriteString(std::string_view value) {
+    RequireEncodable(CanEncodeString(value));
     WriteTypeSize(value.size(), MarkerString);
     WriteRAW(value.data(), value.size());
   }
 
   void WriteList(const std::vector<Value> &value) {
+    RequireEncodable(CanEncodeList(value));
     WriteTypeSize(value.size(), MarkerList);
     for (const auto &x : value) WriteValue(x);
   }
 
   void WriteMap(const map_t &value) {
+    RequireEncodable(CanEncodeMap(value));
     WriteTypeSize(value.size(), MarkerMap);
     for (const auto &x : value) {
       WriteString(x.first);
@@ -123,6 +233,7 @@ class BaseEncoder {
   }
 
   void WriteVertex(const Vertex &vertex) {
+    RequireEncodable(CanEncodeVertex(vertex));
     int struct_n = 3 + 1 * int(major_v_ > 4);  // element_id introduced from v5
     WriteRAW(std::to_underlying(Marker::TinyStruct) + struct_n);
     WriteRAW(std::to_underlying(Signature::Node));
@@ -148,6 +259,7 @@ class BaseEncoder {
   }
 
   void WriteEdge(const Edge &edge, bool unbound = false) {
+    RequireEncodable(CanEncodeEdge(edge, unbound));
     int struct_n = (unbound ? 3 + 1 * int(major_v_ > 4) : 5 + 3 * int(major_v_ > 4));  // element_id introduced from v5
     WriteRAW(std::to_underlying(Marker::TinyStruct) + struct_n);
     WriteRAW(std::to_underlying(unbound ? Signature::UnboundRelationship : Signature::Relationship));
@@ -180,6 +292,7 @@ class BaseEncoder {
   }
 
   void WriteEdge(const UnboundedEdge &edge) {
+    RequireEncodable(CanEncodeEdge(edge));
     const int struct_n = 3 + 1 * int(major_v_ > 4);  // element_id introduced from v5
     WriteRAW(std::to_underlying(Marker::TinyStruct) + struct_n);
     WriteRAW(std::to_underlying(Signature::UnboundRelationship));
@@ -202,6 +315,7 @@ class BaseEncoder {
   }
 
   void WritePath(const Path &path) {
+    RequireEncodable(CanEncodePath(path));
     WriteRAW(std::to_underlying(Marker::TinyStruct) + 3);
     WriteRAW(std::to_underlying(Signature::Path));
     WriteTypeSize(path.vertices.size(), MarkerList);

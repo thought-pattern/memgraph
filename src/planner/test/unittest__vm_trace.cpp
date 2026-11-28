@@ -119,22 +119,26 @@ TEST_F(PatternVM_Trace, SimpleMatch_TracesBindAndYield) {
 }
 
 TEST_F(PatternVM_Trace, NoMatch_TracesCheckFailure) {
-  // Neg(?x) against Add(a, b) - symbol check fails, no yield.
-  //
-  //   E-graph:    Add(a, b)
-  //   Pattern:    Neg(?x)
-  //   Expected:   CheckFail for symbol mismatch, no Yield
+  // Neg(Add(?x, ?y)) against Neg(Mul(a, b)) and Mul(Add(a, b), a):
+  // whether the compiler enters at deepest symbol Add (walking parents to Mul != Neg)
+  // or at root Neg (loading child Mul != Add), CheckSymbol runs and fails with 0 yields.
   auto a = leaf(Op::A);
   auto b = leaf(Op::B);
-  node(Op::Add, a, b);
+  node(Op::Neg, node(Op::Mul, a, b));
+  node(Op::Mul, node(Op::Add, a, b), a);
   rebuild_index();
 
-  use_patterns(TestPattern::build(kTestRoot, Op::Neg, {Var{kVarX}}));
+  use_patterns(TestPattern::build(kTestRoot, Op::Neg, {Sym(Op::Add, Var{kVarX}, Var{kVarY})}));
   run_traced();
 
   EXPECT_TRUE(matches.empty());
   EXPECT_EQ(stats().yields, 0u);
   EXPECT_EQ(yields().size(), 0u) << trace_dump();
+  EXPECT_GT(stats().symbol_check_misses, 0u) << "Expected inner CheckSymbol miss\n" << trace_dump();
+  auto fails = check_fails();
+  bool has_symbol_mismatch = std::ranges::any_of(
+      fails, [](auto const *e) { return e->details().find("symbol mismatch") != std::string::npos; });
+  EXPECT_TRUE(has_symbol_mismatch) << "Expected CheckFail event for symbol mismatch\n" << trace_dump();
 }
 
 TEST_F(PatternVM_Trace, Deduplication_TracesBindDuplicate) {
@@ -233,31 +237,31 @@ TEST_F(PatternVM_Trace, MultiPatternJoin_TracesParentTraversal) {
 }
 
 TEST_F(PatternVM_Trace, MultiPatternJoin_NoMatch_TracesCheckSlotMiss) {
-  // Join fails because ?sym differs between patterns - should see slot mismatch.
-  //
-  //   E-graph:    Bind(_, sym1, expr)    Ident(sym2)
-  //   Pattern 1:  Bind(_, ?sym, ?expr)
-  //   Pattern 2:  Ident(?sym)
-  //   Expected:   CheckSlot or CheckEClassEq failure for ?sym mismatch
+  // Join reaches CheckSlot regardless of whether the compiler walks parents from ?x or ?y:
+  //   - F(sym1, expr2) shares ?x=sym1 with Bind(_, sym1, expr1) and mismatches ?y (expr2 != expr1)
+  //   - F(sym2, expr1) shares ?y=expr1 with Bind(_, sym1, expr1) and mismatches ?x (sym2 != sym1)
   auto placeholder = leaf(Op::Const, 0);
   auto sym1 = leaf(Op::Const, 1);
   auto sym2 = leaf(Op::Const, 2);
-  auto expr = leaf(Op::Const, 3);
-  node(Op::Bind, placeholder, sym1, expr);
-  node(Op::Ident, sym2);
+  auto expr1 = leaf(Op::Const, 3);
+  auto expr2 = leaf(Op::Const, 4);
+  node(Op::Bind, placeholder, sym1, expr1);
+  node(Op::F, sym1, expr2);
+  node(Op::F, sym2, expr1);
   rebuild_index();
 
   use_patterns(TestPattern::build(kTestRoot, Op::Bind, {Wildcard{}, Var{kVarX}, Var{kVarY}}),
-               TestPattern::build(kVarZ, Op::Ident, {Var{kVarX}}));
+               TestPattern::build(kVarZ, Op::F, {Var{kVarX}, Var{kVarY}}));
   run_traced();
 
   EXPECT_TRUE(matches.empty()) << trace_dump();
   EXPECT_EQ(stats().yields, 0u);
-
-  // The parent traversal from sym1 won't find Ident as parent (Ident uses sym2).
-  // This manifests as zero symbol_check_hits for the Ident pattern, or
-  // exhausted parent iteration.
   EXPECT_EQ(yields().size(), 0u);
+  EXPECT_GT(stats().check_slot_misses, 0u) << "Expected CheckSlot miss on second shared variable\n" << trace_dump();
+  auto fails = check_fails();
+  bool has_slot_mismatch =
+      std::ranges::any_of(fails, [](auto const *e) { return e->details().find("slot mismatch") != std::string::npos; });
+  EXPECT_TRUE(has_slot_mismatch) << "Expected CheckFail event for slot mismatch\n" << trace_dump();
 }
 
 // ============================================================================
@@ -418,49 +422,78 @@ TEST_F(PatternVM_Trace, FullFeatureExercise_ThreePatternJoinWithMerge) {
   expect_event(EventType::Bind, 11, std::format("slot=1 value={}", b.value_of()));  // ?y=b
 
   // --- Join P2: parent traversal from ?y(=b) for H (H first in join order) ---
+  // Parent sets are unordered hash sets, so b's parents {H(b), F(a,b)} may be
+  // visited in either order: either H(b) immediately, or F(a,b) mismatch then H(b).
   expect_instr(12, "IterParents");
-  expect_event(EventType::IterStart, 12, "count=2");  // b has 2 parents: H(b), F(a,b)
+  expect_event(EventType::IterStart, 12, "count=2");
   expect_instr(13, "Jump");
 
-  // First parent of b: H(b) - passes H check
-  expect_instr(15, "CheckSymbol");  // H ✓
+  std::size_t expected_misses = 1u;  // F(a,b) always fails G's symbol check
+  std::size_t expected_total_instrs = 30u;
+
+  expect_instr(15, "CheckSymbol");
+  ASSERT_LT(i, ev.size()) << trace_dump();
+  if (ev[i].type == EventType::CheckFail) {
+    // F(a,b) visited before H(b) in b's parent set
+    expect_event(EventType::CheckFail, 15, "symbol mismatch");
+    expect_event(EventType::Backtrack, 15, "target=14");
+    expect_instr(14, "NextParent");
+    expect_event(EventType::IterAdvance, 14, "remaining=1");
+    expect_instr(15, "CheckSymbol");
+    expected_misses = 2u;
+    expected_total_instrs = 32u;
+  }
   expect_event(EventType::CheckPass, 15, "symbol match");
-  expect_instr(16, "CheckArity");  // arity 1 ✓
+  expect_instr(16, "CheckArity");
   expect_event(EventType::CheckPass, 16, "arity match");
 
   // --- Join P3: parent traversal from ?x(=a) for G ---
+  // G(?x, ?z) introduces a new binding (?z), so BOTH parents of a ({G(a,c), F(a,b)})
+  // are always visited regardless of hash-set iteration order.
   expect_instr(17, "IterParents");
-  expect_event(EventType::IterStart, 17, "count=2");  // a has 2 parents: G(a,c), F(a,b)
+  expect_event(EventType::IterStart, 17, "count=2");
   expect_instr(18, "Jump");
 
-  // First parent of a: G(a,c) - passes G check
-  expect_instr(20, "CheckSymbol");  // G ✓
-  expect_event(EventType::CheckPass, 20, "symbol match");
-  expect_instr(21, "CheckArity");  // arity 2 ✓
-  expect_event(EventType::CheckPass, 21, "arity match");
-  expect_instr(22, "LoadChild");      // G's child 0
-  expect_instr(23, "CheckEClassEq");  // child 0 == ?x's e-class ✓
-  expect_event(EventType::CheckPass, 23, std::format("eclass match: value={}", a.value_of()));
-  expect_instr(24, "LoadChild");  // G's child 1
-  expect_instr(25, "BindSlot");
-  expect_event(EventType::Bind, 25, std::format("slot=2 value={}", c.value_of()));  // ?z=c
+  auto expect_g_match_and_yield = [&]() {
+    expect_event(EventType::CheckPass, 20, "symbol match");
+    expect_instr(21, "CheckArity");
+    expect_event(EventType::CheckPass, 21, "arity match");
+    expect_instr(22, "LoadChild");
+    expect_instr(23, "CheckEClassEq");
+    expect_event(EventType::CheckPass, 23, std::format("eclass match: value={}", a.value_of()));
+    expect_instr(24, "LoadChild");
+    expect_instr(25, "BindSlot");
+    expect_event(EventType::Bind, 25, std::format("slot=2 value={}", c.value_of()));
+    expect_instr(26, "Yield");
+    expect_event(EventType::MarkSeen, 26, std::format("slot=2 value={}", c.value_of()));
+    expect_event(EventType::Yield, 26, std::format("slots=[{}, {}, {}]", a.value_of(), b.value_of(), c.value_of()));
+    expect_instr(27, "Jump");
+  };
 
-  // --- Yield ---
-  expect_instr(26, "Yield");
-  expect_event(EventType::MarkSeen, 26, std::format("slot=2 value={}", c.value_of()));
-  expect_event(EventType::Yield, 26, std::format("slots=[{}, {}, {}]", a.value_of(), b.value_of(), c.value_of()));
+  auto expect_g_symbol_miss = [&]() {
+    expect_event(EventType::CheckFail, 20, "symbol mismatch");
+    expect_event(EventType::Backtrack, 20, "target=19");
+  };
 
-  // --- Continue: backtrack through G parent loop ---
-  expect_instr(27, "Jump");  // → @19 (G's NextParent)
+  expect_instr(20, "CheckSymbol");
+  ASSERT_LT(i, ev.size()) << trace_dump();
+  if (ev[i].type == EventType::CheckPass) {
+    // Order 1: G(a,c) visited first, then F(a,b)
+    expect_g_match_and_yield();
+    expect_instr(19, "NextParent");
+    expect_event(EventType::IterAdvance, 19, "remaining=1");
+    expect_instr(20, "CheckSymbol");
+    expect_g_symbol_miss();
+  } else {
+    // Order 2: F(a,b) visited first, then G(a,c)
+    expect_g_symbol_miss();
+    expect_instr(19, "NextParent");
+    expect_event(EventType::IterAdvance, 19, "remaining=1");
+    expect_instr(20, "CheckSymbol");
+    expect_g_match_and_yield();
+  }
 
-  // Second parent of a: F(a,b) - fails G symbol check
-  expect_instr(19, "NextParent");  // G's NextParent
-  expect_event(EventType::IterAdvance, 19, "remaining=1");
-  expect_instr(20, "CheckSymbol");  // G ✗ (it's F)
-  expect_event(EventType::CheckFail, 20, "symbol mismatch");
-  expect_event(EventType::Backtrack, 20, "target=19");
-
-  // Exhaust G parents → backtrack to @5 (skipping H's parent walk)
+  // Exhaust G parents → backtrack to @5 (skipping H's existential parent walk)
   expect_instr(19, "NextParent");
   expect_event(EventType::IterAdvance, 19, "remaining=0");
   expect_event(EventType::Backtrack, 19, "target=5");
@@ -477,16 +510,16 @@ TEST_F(PatternVM_Trace, FullFeatureExercise_ThreePatternJoinWithMerge) {
 
   // --- Halt ---
   expect_instr(28, "Halt");
-  expect_event(EventType::Halt, 28, "total=30");
+  expect_event(EventType::Halt, 28, std::format("total={}", expected_total_instrs));
 
   // Verify we consumed the entire trace
   EXPECT_EQ(i, ev.size()) << "Unexpected extra events after index " << i << "\n" << trace_dump();
 
   // Stats cross-check
-  EXPECT_EQ(stats().instructions_executed, 30u);
+  EXPECT_EQ(stats().instructions_executed, expected_total_instrs);
   EXPECT_EQ(stats().yields, 1u);
   EXPECT_EQ(stats().iter_parent_calls, 2u);
-  EXPECT_EQ(stats().symbol_check_misses, 1u);  // F(a,b) fails G check; H found H(b) first
+  EXPECT_EQ(stats().symbol_check_misses, expected_misses);
 }
 
 TEST_F(PatternVM_Trace, FullFeatureExercise_WithMergeAndDedup) {
@@ -559,34 +592,34 @@ TEST_F(PatternVM_Trace, Stats_ParentFilterRate) {
 }
 
 TEST_F(PatternVM_Trace, Stats_CheckSlotHitsAndMisses) {
-  // Verify CheckSlot stats when shared variable matches and doesn't match.
+  // Verify CheckSlot stats when a second shared variable both matches and mismatches.
   //
   //   E-graph:
-  //     F(a, b), G(a, c), G(b, d)
-  //     Pattern: F(?x, ?y) joined with G(?x, ?z)
+  //     F(a, b), G(a, b), G(a, c), G(d, b)
+  //     Pattern: F(?x, ?y) joined with G(?x, ?y)
   //
-  //   G(a, c) matches (CheckSlot ?x=a passes), G(b, d) doesn't (?x=a != b).
+  //   Regardless of whether parent traversal starts from ?x (= a) or ?y (= b),
+  //   G(a, b) produces one CheckSlot hit and G(a, c) / G(d, b) produces one CheckSlot miss.
   auto a = leaf(Op::A);
   auto b = leaf(Op::B);
   auto c = leaf(Op::C);
   auto d = leaf(Op::D);
   node(Op::F, a, b);
+  node(Op::G, a, b);
   node(Op::G, a, c);
-  node(Op::G, b, d);
+  node(Op::G, d, b);
   rebuild_index();
 
-  use_patterns(TestPattern::build(Op::F, {Var{kVarX}, Var{kVarY}}),
-               TestPattern::build(Op::G, {Var{kVarX}, Var{kVarZ}}));
+  use_patterns(TestPattern::build(kTestRoot, Op::F, {Var{kVarX}, Var{kVarY}}),
+               TestPattern::build(kVarZ, Op::G, {Var{kVarX}, Var{kVarY}}));
   run_traced();
 
   ASSERT_EQ(matches.size(), 1u) << trace_dump();
 
   auto const &s = stats();
   EXPECT_EQ(s.yields, 1u);
-  // The join traversal will explore parents of ?x (which is 'a').
-  // Since we traverse from ?x, we look at parents of 'a', and G(a, c) matches.
-  // The specific hit/miss counts depend on traversal strategy, but we should
-  // see the stats are being collected.
+  EXPECT_EQ(s.check_slot_hits, 1u) << "Expected one CheckSlot hit for G(a, b)\n" << trace_dump();
+  EXPECT_EQ(s.check_slot_misses, 1u) << "Expected one CheckSlot miss\n" << trace_dump();
   EXPECT_GT(s.instructions_executed, 0u) << trace_dump();
 }
 

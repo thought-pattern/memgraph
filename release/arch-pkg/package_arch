@@ -21,18 +21,18 @@ tgz_name=`echo $(basename $1) | sed 's/.tar.gz//'`
 version=`echo ${tgz_name} | sed 's/.*[-_]\(.*\)-.*/\1/'`
 
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-rm -rf ${script_dir}/_pack
-mkdir -p ${script_dir}/_pack
+pack_dir="$(mktemp -d "${script_dir}/_pack.XXXXXX")"
+trap 'rm -rf "$pack_dir"' EXIT
 # Copy the .tar.gz to packaging directory.
-cp "$1" ${script_dir}/_pack/memgraph-${version}.tar.gz
+cp "$1" "${pack_dir}/memgraph-${version}.tar.gz"
 
-cd ${script_dir}/_pack
+cd "$pack_dir"
 
 # Setup PKGBUILD.
 echo "pkgver=${version}" > PKGBUILD
-cat ../PKGBUILD.proto >> PKGBUILD
+cat "${script_dir}/PKGBUILD.proto" >> PKGBUILD
 # Copy the installation script.
-cp ../memgraph.install ./
+cp "${script_dir}/memgraph.install" ./
 
 # Check PKGBUILD validity
 updpkgsums PKGBUILD
@@ -40,9 +40,19 @@ namcap PKGBUILD
 
 # TODO: Maybe add a custom makepkg.conf and use that
 makepkg PACKAGER="tech@memgraph.com (Memgraph Ltd.)"
-# Check the final package archive validity and move it in parent directory.
-pkg_name=memgraph-${version}-1-x86_64.pkg.tar.xz
-namcap --exclude=emptydir $pkg_name
-cp $pkg_name ../
-echo "Built Arch Package at '${script_dir}/${pkg_name}'"
-rm -rf ${script_dir}/_pack
+# Check every built package archive reported by makepkg and copy it to script_dir.
+copied_any=false
+while IFS= read -r pkg_path; do
+  [[ -z "$pkg_path" ]] && continue
+  if [[ -f "$pkg_path" ]]; then
+    pkg_name="$(basename "$pkg_path")"
+    namcap --exclude=emptydir "$pkg_path"
+    cp "$pkg_path" "${script_dir}/${pkg_name}"
+    echo "Built Arch Package at '${script_dir}/${pkg_name}'"
+    copied_any=true
+  fi
+done < <(makepkg --packagelist)
+if [[ "$copied_any" != true ]]; then
+  echo "Error: makepkg finished without producing a package archive!" >&2
+  exit 1
+fi

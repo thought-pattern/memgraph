@@ -168,7 +168,8 @@ void RenameNodeProperty(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *r
 
 void Categorize(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory);
 
-void InsertCloneNodesRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, int cycle_id, int node_id);
+void InsertCloneNodesRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, int64_t cycle_id,
+                            int64_t node_id);
 
 void CloneNodes(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory);
 

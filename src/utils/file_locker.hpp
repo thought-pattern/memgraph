@@ -139,16 +139,44 @@ class FileRetainer {
     ret_type RemovePath(const std::filesystem::path &path);
 
     FileLockerAccessor(const FileLockerAccessor &) = delete;
-    FileLockerAccessor(FileLockerAccessor &&) = default;
+    FileLockerAccessor(FileLockerAccessor &&other) noexcept;
     FileLockerAccessor &operator=(const FileLockerAccessor &) = delete;
-    FileLockerAccessor &operator=(FileLockerAccessor &&) = default;
+    FileLockerAccessor &operator=(FileLockerAccessor &&other) noexcept;
 
     ~FileLockerAccessor();
 
    private:
+    struct ActiveAccessorGuard {
+      explicit ActiveAccessorGuard(FileRetainer *retainer) noexcept : retainer_{retainer} {
+        if (retainer_ != nullptr) {
+          retainer_->active_accessors_.fetch_add(1, std::memory_order_acq_rel);
+        }
+      }
+      ActiveAccessorGuard(const ActiveAccessorGuard &) = delete;
+      ActiveAccessorGuard &operator=(const ActiveAccessorGuard &) = delete;
+      ActiveAccessorGuard(ActiveAccessorGuard &&other) noexcept
+          : retainer_{std::exchange(other.retainer_, nullptr)} {}
+      ActiveAccessorGuard &operator=(ActiveAccessorGuard &&other) noexcept {
+        if (this != &other) {
+          if (retainer_ != nullptr) {
+            retainer_->active_accessors_.fetch_sub(1, std::memory_order_acq_rel);
+          }
+          retainer_ = std::exchange(other.retainer_, nullptr);
+        }
+        return *this;
+      }
+      ~ActiveAccessorGuard() {
+        if (retainer_ != nullptr) {
+          retainer_->active_accessors_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+      }
+      FileRetainer *retainer_{nullptr};
+    };
+
     explicit FileLockerAccessor(FileRetainer *retainer, size_t locker_id);
 
     FileRetainer *file_retainer_;
+    ActiveAccessorGuard active_accessor_guard_;
     std::shared_lock<utils::RWLock> retainer_guard_;
     size_t locker_id_;
   };
@@ -161,7 +189,7 @@ class FileRetainer {
    */
   void DeleteFile(const std::filesystem::path &path);
 
-  void RenameFile(const std::filesystem::path &orig, const std::filesystem::path &dest);
+  bool RenameFile(const std::filesystem::path &orig, const std::filesystem::path &dest);
 
   /**
    * Create and return a new locker.

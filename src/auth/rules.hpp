@@ -29,8 +29,23 @@ namespace memgraph::auth::rules {
 /// Parses a stored user or role record and brings it up to the current format.
 nlohmann::json ParseAndMigrateJson(std::string_view str);
 
+struct RoleMembersListing {
+  std::vector<User> users;
+  std::vector<std::string> unreadable_entries;
+  bool complete{true};
+};
+
+struct RoleMemberNamesListing {
+  std::vector<std::string> usernames;
+  std::vector<std::string> unreadable_entries;
+  bool complete{true};
+};
+
 /// Resolves a user's roles, per-database then global, and attaches them. Reads the link entries.
 void LinkUser(Repository const &repo, User &user);
+
+/// Resolves a user's roles strictly, throwing AuthException if any role link or referenced role is unreadable.
+void LinkUserStrict(Repository const &repo, User &user);
 
 std::optional<User> GetUser(Repository const &repo, std::string_view username);
 
@@ -38,11 +53,18 @@ std::optional<Role> GetRole(Repository const &repo, std::string_view rolename);
 
 std::vector<User> AllUsers(Repository const &repo);
 
+/// Enumerates all users strictly for system recovery, failing if any user record or role link is unreadable.
+std::vector<User> AllUsersStrict(Repository const &repo);
+
 std::vector<std::string> AllUsernames(Repository const &repo);
 
 std::vector<Role> AllRoles(Repository const &repo);
 
 std::vector<std::string> AllRolenames(Repository const &repo);
+
+RoleMembersListing ListUsersForRole(Repository const &repo, std::string_view rolename);
+
+RoleMemberNamesListing ListUsernamesForRole(Repository const &repo, std::string_view rolename);
 
 std::vector<User> AllUsersForRole(Repository const &repo, std::string_view rolename);
 

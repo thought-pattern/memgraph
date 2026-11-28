@@ -20,6 +20,7 @@
 #include "replication_query_handler.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "utils/synchronized.hpp"
+#include "utils/variant_helpers.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -43,11 +44,13 @@ void RecoverReplication(utils::Synchronized<ReplicationState, utils::RWSpinLock>
   };
 
   // Replication recovery and frequent check start
-  auto main = [&system, &dbms_handler, &auth, &parameters](RoleMainData &mainData) {
+  auto main = [&repl_state, &system, &dbms_handler, &auth, &parameters](RoleMainData &mainData) {
     for (auto &client : mainData.registered_replicas_) {
       if (client.try_set_uuid &&
           replication_coordination_glue::SendSwapMainUUIDRpc(client.rpc_client_, mainData.uuid_)) {
-        client.try_set_uuid = false;
+        if (repl_state->TryClearReplicaUuidSyncNeeded(client.name_)) {
+          client.try_set_uuid = false;
+        }
       }
       SystemRestore(client, system, dbms_handler, mainData.uuid_, auth, parameters);
     }
@@ -57,7 +60,7 @@ void RecoverReplication(utils::Synchronized<ReplicationState, utils::RWSpinLock>
     });
 
     for (auto &client : mainData.registered_replicas_) {
-      StartReplicaClient(client, system, dbms_handler, mainData.uuid_, auth, parameters);
+      StartReplicaClient(client, system, dbms_handler, mainData.uuid_, auth, parameters, &repl_state);
     }
 
     // Warning
@@ -97,15 +100,17 @@ void RecoverReplication(utils::Synchronized<ReplicationState, utils::RWSpinLock>
   };
 
   // Replication recovery and frequent check start
-  auto main = [&dbms_handler, &system, &parameters](replication::RoleMainData &mainData) {
+  auto main = [&repl_state, &dbms_handler, &system, &parameters](replication::RoleMainData &mainData) {
     dbms::DbmsHandler::RecoverStorageReplication(dbms_handler.Get(), mainData);
 
     for (auto &client : mainData.registered_replicas_) {
       if (client.try_set_uuid &&
           replication_coordination_glue::SendSwapMainUUIDRpc(client.rpc_client_, mainData.uuid_)) {
-        client.try_set_uuid = false;
+        if (repl_state->TryClearReplicaUuidSyncNeeded(client.name_)) {
+          client.try_set_uuid = false;
+        }
       }
-      replication::StartReplicaClient(client, system, dbms_handler, mainData.uuid_, parameters);
+      replication::StartReplicaClient(client, system, dbms_handler, mainData.uuid_, parameters, &repl_state);
     }
 
     // Warning
@@ -148,21 +153,29 @@ inline std::optional<query::RegisterReplicaError> HandleRegisterReplicaStatus(
 
 #ifdef MG_ENTERPRISE
 void StartReplicaClient(ReplicationClient &client, system::System &system, dbms::DbmsHandler &dbms_handler,
-                        utils::UUID main_uuid, auth::SynchedAuth &auth, parameters::Parameters &parameters) {
+                        utils::UUID main_uuid, auth::SynchedAuth &auth, parameters::Parameters &parameters,
+                        utils::Synchronized<ReplicationState, utils::RWSpinLock> *repl_state) {
 #else
 void StartReplicaClient(replication::ReplicationClient &client, system::System &system, dbms::DbmsHandler &dbms_handler,
-                        utils::UUID main_uuid, parameters::Parameters &parameters) {
+                        utils::UUID main_uuid, parameters::Parameters &parameters,
+                        utils::Synchronized<ReplicationState, utils::RWSpinLock> *repl_state) {
 #endif
   // No client error, start instance level client
   auto const &endpoint = client.rpc_client_.Endpoint();
   spdlog::info("Replication client started at: {}", endpoint.SocketAddress());  // non-resolved IP
   client.StartFrequentCheck(
-      [&, license = license::global_license_checker.IsEnterpriseValidFast(), main_uuid](
+      [&, license = license::global_license_checker.IsEnterpriseValidFast(), main_uuid, repl_state](
           ReplicationClient &local_client) mutable {
         // Working connection
         if (local_client.try_set_uuid &&
             replication_coordination_glue::SendSwapMainUUIDRpc(local_client.rpc_client_, main_uuid)) {
-          local_client.try_set_uuid = false;
+          bool cleared = true;
+          if (repl_state != nullptr) {
+            cleared = repl_state->Lock()->TryClearReplicaUuidSyncNeeded(local_client.name_);
+          }
+          if (cleared) {
+            local_client.try_set_uuid = false;
+          }
         }
         // Check if license has changed
         if (const auto new_license = license::global_license_checker.IsEnterpriseValidFast(); new_license != license) {
@@ -220,10 +233,14 @@ bool ReplicationHandler::SetReplicationRoleMain() { return DoToMainPromotion({},
 bool ReplicationHandler::SetReplicationRoleReplica(const ReplicationServerConfig &config,
                                                    std::optional<utils::UUID> const &maybe_main_uuid) {
   try {
-    // Need to take read-only access to all databases so we have a guranteee all write txns are finished before demoting
-    // to replica.
+    // Need to take read-only access to all databases so we have a guarantee all write txns are finished before demoting
+    // to replica. TTL and existing clients are stopped inside SetReplicationRoleReplica_ only after the new listener
+    // and durable role update succeed.
     std::vector<std::unique_ptr<storage::Storage::Accessor>> accs;
     auto const res = dbms_handler_.AllOf([&accs](dbms::DatabaseAccess db_acc) -> bool {
+      if (db_acc->storage()->storage_mode_ == storage::StorageMode::ON_DISK_TRANSACTIONAL) {
+        return true;
+      }
       // Timeout on read only access for the DB
       constexpr auto read_only_timeout = 2s;
       auto *storage = static_cast<storage::InMemoryStorage *>(db_acc->storage());
@@ -240,12 +257,6 @@ bool ReplicationHandler::SetReplicationRoleReplica(const ReplicationServerConfig
     }
 
     auto locked_repl_state = repl_state_.TryLock();
-
-    dbms_handler_.ForEach([](dbms::DatabaseAccess db_acc) {
-      // Pause TTL
-      db_acc->ttl().Suspend();
-    });
-
     return SetReplicationRoleReplica_<true>(locked_repl_state, config, maybe_main_uuid);
   } catch (const utils::TryLockException & /* unused */) {
     return false;
@@ -265,15 +276,38 @@ bool ReplicationHandler::DoToMainPromotion(const utils::UUID &main_uuid, bool co
   try {
     auto locked_repl_state = repl_state_.TryLock();
 
-    if (locked_repl_state->IsMain()) {
-      if (!force) return false;
-      // Forcing role update...
-      // Shutdown any remaining client
-      // Main can be promoted while being MAIN; we do this in order to update the uuid and epoch
-      // Shutdown must be done after lock on repl_state is taken so that COMMIT and PROMOTION operations are serialized
+    if (locked_repl_state->IsMain() && !force) {
+      return false;
+    }
+
+    // Verify no database rejects epoch preparation before stopping the existing replica listener or main clients.
+    const bool all_supported = dbms_handler_.AllOf([](dbms::DatabaseAccess db_acc) {
+      return db_acc->storage()->storage_mode_ != storage::StorageMode::ON_DISK_TRANSACTIONAL;
+    });
+    if (!all_supported) {
+      spdlog::error("Cannot promote to MAIN while a database is in ON_DISK_TRANSACTIONAL storage mode.");
+      return false;
+    }
+
+    const bool was_replica = locked_repl_state->IsReplica();
+    auto restore_replica_listener = [&]() {
+      if (!was_replica || !locked_repl_state->IsReplica()) return;
+      auto &replica_data = locked_repl_state->GetReplicaRole();
+      try {
+        replica_data.server = std::make_unique<ReplicationServer>(replica_data.config);
+#ifdef MG_ENTERPRISE
+        (void)StartRpcServer(dbms_handler_, repl_state_, replica_data, auth_, system_, parameters_);
+#else
+        (void)StartRpcServer(dbms_handler_, repl_state_, replica_data, system_, parameters_);
+#endif
+      } catch (const utils::BasicException &e) {
+        spdlog::error("Failed to restore replica listener after aborted promotion: {}", e.what());
+      }
+    };
+
+    if (!was_replica) {
       ClientsShutdown(locked_repl_state);
     } else {
-      // Before preparing storage for new epoch, we need to finish everything from ReplicationServer (recovery)
       locked_repl_state->GetReplicaRole().server->Shutdown();
     }
 
@@ -281,17 +315,21 @@ bool ReplicationHandler::DoToMainPromotion(const utils::UUID &main_uuid, bool co
     // because server has already been stopped
     dbms::InMemoryReplicationHandlers::DestroyReplAccessor();
 
-    // STEP 2) bring down all REPLICA servers
-    dbms_handler_.ForEach([](dbms::DatabaseAccess db_acc) {
-      auto *storage = db_acc->storage();
-      // Remember old epoch + storage timestamp association
-      storage->PrepareForNewEpoch();
-    });
+    // STEP 2) Prepare all databases for a new epoch; restore listener on failure.
+    try {
+      dbms_handler_.ForEach([](dbms::DatabaseAccess db_acc) {
+        auto *storage = db_acc->storage();
+        storage->PrepareForNewEpoch();
+      });
+    } catch (const std::exception &e) {
+      spdlog::error("Preparing databases for new epoch failed during promotion: {}", e.what());
+      restore_replica_listener();
+      return false;
+    }
 
-    // STEP 3) Change to MAIN
-    // TODO: restore replication servers if false?
+    // STEP 3) Change to MAIN (atomically removes any retired replica registrations on disk).
     if (!locked_repl_state->SetReplicationRoleMain(main_uuid)) {
-      // TODO: Handle recovery on failure???
+      restore_replica_listener();
       return false;
     }
 
@@ -575,10 +613,15 @@ auto ReplicationHandler::ShowReplicas() const -> std::expected<query::ReplicasIn
 // STEP 2: system_info
 #ifdef MG_ENTERPRISE
       // Already locked on system transaction via the interpreter
-      const auto ts = system_.LastCommittedSystemTimestamp();
-      // NOTE: no system behind at the moment
-      query::ReplicaSystemInfoState const system_info{
-          .ts_ = ts, .behind_ = 0 /* behind ts not implemented */, .state_ = *replica.state_.ReadLock()};
+      const auto main_ts = system_.LastCommittedSystemTimestamp();
+      const auto replica_state = *replica.state_.ReadLock();
+      query::ReplicaSystemInfoState system_info{.state_ = replica_state};
+      if (replica.has_confirmed_system_timestamp_.load(std::memory_order_acquire)) {
+        const auto repl_ts = replica.last_confirmed_system_timestamp_.load(std::memory_order_acquire);
+        const bool is_async = replica.mode_ == replication_coordination_glue::ReplicationMode::ASYNC;
+        system_info.ts_ = repl_ts;
+        system_info.behind_ = ReplicaLagBehindMain(main_ts, repl_ts, is_async);
+      }
 #else
       query::ReplicaSystemInfoState const system_info{};
 #endif

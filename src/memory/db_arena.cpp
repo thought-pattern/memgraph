@@ -351,7 +351,10 @@ ArenaPool::ArenaPool(utils::MemoryTracker *tracker) {
 }
 
 ArenaPool::~ArenaPool() noexcept {
+  size_t restored_arenas = 0;
+  bool restore_failed = false;
   try {
+    const utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_blocker;
     DMG_ASSERT(free_count_ == arenas_.size(), "Destroying DB ArenaPool while some arenas are still in use");
     DMG_ASSERT(first_arena_use_count_ == 0, "Destroying DB ArenaPool while the first arena is still in use");
 
@@ -359,16 +362,13 @@ ArenaPool::~ArenaPool() noexcept {
     DestroyAllTcaches();
 
     // All arenas in the pool share the single `hooks_` struct. If restoring the
-    // default hooks fails for ANY arena, that arena keeps these hooks installed,
-    // so the struct must outlive the pool. Defer the leak until AFTER the loop:
-    // releasing `hooks_` mid-loop would null it and crash the next iteration's
-    // `hooks_->base_hooks` read.
-    bool restore_failed = false;
+    // default hooks fails or throws before every arena is restored, that arena keeps
+    // these hooks installed, so the struct must outlive the pool. Stack buffers avoid
+    // heap allocations while formatting mallctl names.
     for (const auto arena_idx : arenas_) {
-      // Purge all dirty/muzzy pages back to the OS FIRST, while our custom hooks are
-      // still installed.
-      if (int perr = je_mallctl(fmt::format("arena.{}.purge", arena_idx).c_str(), nullptr, nullptr, nullptr, 0);
-          perr != 0) {
+      char purge_ctl[64]{};
+      std::snprintf(purge_ctl, sizeof(purge_ctl), "arena.%u.purge", arena_idx);
+      if (int perr = je_mallctl(purge_ctl, nullptr, nullptr, nullptr, 0); perr != 0) {
         spdlog::error(
             "ArenaPool {}: purge failed (err={}); MemoryTracker may drift before hook restore", arena_idx, perr);
       }
@@ -379,7 +379,9 @@ ArenaPool::~ArenaPool() noexcept {
       if (ConsumeFailureInjection(testing::ArenaPoolFailureInjection::DestructorRestore)) {
         err = EFAULT;  // simulate arenas[ind] nulled by arena.<i>.destroy
       } else {
-        err = je_mallctl(fmt::format("arena.{}.extent_hooks", arena_idx).c_str(),
+        char hooks_ctl[64]{};
+        std::snprintf(hooks_ctl, sizeof(hooks_ctl), "arena.%u.extent_hooks", arena_idx);
+        err = je_mallctl(hooks_ctl,
                          nullptr,
                          nullptr,
                          static_cast<void *>(const_cast<extent_hooks_t **>(&base)),
@@ -392,10 +394,9 @@ ArenaPool::~ArenaPool() noexcept {
             arena_idx,
             err);
         restore_failed = true;
-        // Do NOT release the arena back to GlobalArenaPool: it still has our hooks
-        // installed, so reusing the index would install a second hooks struct on top.
         continue;
       }
+      ++restored_arenas;
 
       try {
         GlobalArenaPool::Instance().Release(arena_idx);
@@ -405,22 +406,17 @@ ArenaPool::~ArenaPool() noexcept {
         LogDestructorCleanupFailure("ArenaPool", arena_idx, "release", "unknown exception");
       }
     }
-
-    if (restore_failed) {
-      // Defense in depth: the only realistic trigger is arenas[ind] nulled by arena.<i>.destroy
-      // (jemalloc 5.2.1 ctl.c) — Memgraph never calls it. If it ever fires, the arena keeps our
-      // hooks, so leak
-      // hooks_ (~64 B) and null the tracker so late background-thread callbacks no-op instead of
-      // touching the destroyed Database's tracker.
-      if (hooks_) {
-        hooks_->tracker.store(nullptr, std::memory_order_relaxed);
-        [[maybe_unused]] auto *leaked = hooks_.release();
-      }
-    }
   } catch (const std::exception &e) {
+    restore_failed = true;
     LogDestructorCleanupFailure("ArenaPool", first_arena_idx_, "cleanup", e.what());
   } catch (...) {
+    restore_failed = true;
     LogDestructorCleanupFailure("ArenaPool", first_arena_idx_, "cleanup", "unknown exception");
+  }
+
+  if ((restore_failed || restored_arenas < arenas_.size()) && hooks_) {
+    hooks_->tracker.store(nullptr, std::memory_order_relaxed);
+    [[maybe_unused]] auto *leaked = hooks_.release();
   }
 }
 
@@ -652,7 +648,15 @@ DbArenaScope::DbArenaScope(ArenaPool *arena_pool) : prev_state_(tls_db_arena_sta
 
   auto acquire = [this]() {
     cur_state_.arena = cur_state_.arena_pool ? cur_state_.arena_pool->Acquire() : 0U;
-    cur_state_.tcache = cur_state_.arena_pool ? cur_state_.arena_pool->AcquireTcache() : 0U;
+    try {
+      cur_state_.tcache = cur_state_.arena_pool ? cur_state_.arena_pool->AcquireTcache() : 0U;
+    } catch (...) {
+      if (cur_state_.arena_pool && cur_state_.arena != 0) {
+        cur_state_.arena_pool->Release(cur_state_.arena);
+        cur_state_.arena = 0U;
+      }
+      throw;
+    }
     tls_db_arena_state = cur_state_;
   };
 

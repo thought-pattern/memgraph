@@ -58,16 +58,22 @@ class VectorIndexTest : public testing::Test {
   void TearDown() override { storage.reset(); }
 
   PropertyValue MakeVectorIndexProperty(Storage::Accessor *accessor,
-                                        const memgraph::utils::small_vector<float> &vector) {
+                                        const memgraph::utils::small_vector<double> &vector) {
     const auto index_id = accessor->GetNameIdMapper()->NameToId(test_index.data());
     return PropertyValue(
         PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{index_id}, .vector = vector});
   }
 
+  PropertyValue MakeVectorIndexProperty(Storage::Accessor *accessor,
+                                        const memgraph::utils::small_vector<float> &vector) {
+    memgraph::utils::small_vector<double> promoted(vector.begin(), vector.end());
+    return MakeVectorIndexProperty(accessor, promoted);
+  }
+
   PropertyValue MakeEmptyVectorIndexProperty(Storage::Accessor *accessor) {
     const auto index_id = accessor->GetNameIdMapper()->NameToId(test_index.data());
     return PropertyValue(PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{index_id},
-                                                          .vector = memgraph::utils::small_vector<float>{}});
+                                                          .vector = memgraph::utils::small_vector<double>{}});
   }
 
   void CreateIndex(std::uint16_t dimension, std::size_t capacity) {
@@ -1083,9 +1089,9 @@ TEST_F(VectorIndexRecoveryTest, RecoverAllVectorIndicesResolvesEachVertexState) 
   }
 
   VectorIndexRecovery::VertexVectors vv;
-  vv[kProp].emplace(Gid::FromUint(200), memgraph::utils::small_vector<float>{9.0F, 10.0F});
-  vv[kProp].emplace(Gid::FromUint(201), memgraph::utils::small_vector<float>{5.0F, 6.0F});
-  vv[kProp].emplace(Gid::FromUint(202), memgraph::utils::small_vector<float>{7.0F, 8.0F});
+  vv[kProp].emplace(Gid::FromUint(200), memgraph::utils::small_vector<double>{9.0, 10.0});
+  vv[kProp].emplace(Gid::FromUint(201), memgraph::utils::small_vector<double>{5.0, 6.0});
+  vv[kProp].emplace(Gid::FromUint(202), memgraph::utils::small_vector<double>{7.0, 8.0});
 
   auto vertices_acc = vertices_.access();
   EXPECT_NO_THROW(vector_index_.RecoverAllVectorIndices(infos,
@@ -1108,7 +1114,7 @@ TEST_F(VectorIndexRecoveryTest, RecoverAllVectorIndicesResolvesEachVertexState) 
     ASSERT_TRUE(prop.IsVectorIndexId());
     EXPECT_EQ(prop.ValueVectorIndexIds(), (memgraph::utils::small_vector<uint64_t>{idx_a_id}));
     const auto vec_from_idx = vector_index_.GetVectorPropertyFromIndex(&*it, "idx_a", storage_->name_id_mapper_.get());
-    EXPECT_EQ(vec_from_idx, (memgraph::utils::small_vector<float>{3.0F, 4.0F}));
+    EXPECT_EQ(vec_from_idx, (memgraph::utils::small_vector<double>{3.0, 4.0}));
   }
 
   {
@@ -1130,7 +1136,7 @@ TEST_F(VectorIndexRecoveryTest, RecoverAllVectorIndicesResolvesEachVertexState) 
     const auto &ids = prop.ValueVectorIndexIds();
     ASSERT_EQ(ids.size(), 2u);
     EXPECT_TRUE(std::ranges::is_permutation(ids, memgraph::utils::small_vector<uint64_t>{idx_a_id, idx_b_id}));
-    const memgraph::utils::small_vector<float> expected{7.0F, 8.0F};
+    const memgraph::utils::small_vector<double> expected{7.0, 8.0};
     EXPECT_EQ(vector_index_.GetVectorPropertyFromIndex(&*it, "idx_a", storage_->name_id_mapper_.get()), expected);
     EXPECT_EQ(vector_index_.GetVectorPropertyFromIndex(&*it, "idx_b", storage_->name_id_mapper_.get()), expected);
   }
@@ -1191,7 +1197,7 @@ TEST_F(VectorIndexRecoveryTest, UpdateOnSetPropertyCapturesVectorWhenSpecExists)
   std::vector<VectorIndexRecoveryInfo> infos{CreateRecoveryInfo()};
   VectorIndexRecovery::VertexVectors vv;
 
-  memgraph::utils::small_vector<float> raw_vec{1.0F, 2.0F};
+  memgraph::utils::small_vector<double> raw_vec{1.0, 2.0};
   PropertyValue tag_value(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{42}, .vector = raw_vec});
 
@@ -1210,7 +1216,7 @@ TEST_F(VectorIndexRecoveryTest, UpdateOnSetPropertyOrphanTagConvertedToList) {
   std::vector<VectorIndexRecoveryInfo> infos;
   VectorIndexRecovery::VertexVectors vv;
 
-  memgraph::utils::small_vector<float> raw_vec{3.0F, 4.0F};
+  memgraph::utils::small_vector<double> raw_vec{3.0, 4.0};
   PropertyValue tag_value(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{99}, .vector = raw_vec});
 
@@ -1231,7 +1237,7 @@ TEST_F(VectorIndexRecoveryTest, UpdateOnIndexDropRestoresTagsToPlainLists) {
   std::vector<VectorIndexRecoveryInfo> infos{CreateRecoveryInfo()};
 
   VectorIndexRecovery::VertexVectors vv;
-  vv[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<float>{7.0F, 8.0F});
+  vv[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<double>{7.0, 8.0});
 
   // Tag without embedded vector, as persisted by property_store.
   auto acc = vertices_.access();
@@ -1266,7 +1272,7 @@ TEST_F(VectorIndexRecoveryTest, UpdateOnIndexDropPreservesVertexVectorsForSurviv
 
   std::vector<VectorIndexRecoveryInfo> infos{CreateRecoveryInfo("idx_a"), CreateRecoveryInfo("idx_b")};
   VectorIndexRecovery::VertexVectors vv;
-  vv[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<float>{1.0F, 2.0F});
+  vv[kProp].emplace(Gid::FromUint(0), memgraph::utils::small_vector<double>{1.0, 2.0});
 
   auto acc = vertices_.access();
   VectorIndexRecovery::UpdateOnIndexDrop("idx_a", infos, vv, acc);
@@ -1564,7 +1570,7 @@ TEST_F(VectorIndexTest, AbortRestoresPriorValueAndIndexMembership) {
       const auto stored = vertex.GetProperty(acc->NameToProperty(test_property), View::OLD);
       ASSERT_TRUE(stored.has_value());
       EXPECT_TRUE(stored->IsVectorIndexId());
-      EXPECT_EQ(stored->ValueVectorIndexList(), (memgraph::utils::small_vector<float>{1.0F, 2.0F}));
+      EXPECT_EQ(stored->ValueVectorIndexList(), (memgraph::utils::small_vector<double>{1.0, 2.0}));
     } else {
       this->ExpectPlainEmptyList(vertex_gid, expected_size);
     }
@@ -1599,7 +1605,7 @@ TEST_F(VectorIndexRecoveryTest, UpdateOnSetPropertyEmptyTagBecomesEmptyList) {
   std::vector<VectorIndexRecoveryInfo> infos{CreateRecoveryInfo()};
   VectorIndexRecovery::VertexVectors vv;
   Vertex vertex(Gid::FromUint(77), nullptr);
-  vv[kProp].emplace(vertex.gid, memgraph::utils::small_vector<float>{1.0F, 2.0F});
+  vv[kProp].emplace(vertex.gid, memgraph::utils::small_vector<double>{1.0, 2.0});
 
   PropertyValue empty_tag(
       PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{42}, .vector = {}});

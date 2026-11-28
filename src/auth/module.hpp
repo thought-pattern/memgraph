@@ -11,6 +11,8 @@
 
 #include <sys/types.h>
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -18,10 +20,33 @@
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
+#include <vector>
 
 namespace memgraph::auth {
+
+inline constexpr size_t kMaxAuthModuleResponseBytes = 1024 * 1024;
+
+bool PutAuthModuleRequestWithDeadline(int fd, const nlohmann::json &data,
+                                      std::chrono::steady_clock::time_point deadline);
+nlohmann::json GetAuthModuleResponseWithDeadline(int fd, std::string &rx_buffer,
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 size_t max_response_bytes = kMaxAuthModuleResponseBytes);
+bool CloseInheritedFdRange(int first, int last, bool allow_procfs = true);
+
+struct ExecStringArray {
+  std::vector<std::string> storage;
+  std::vector<char *> pointers;
+
+  bool Build(const std::vector<std::string> &entries);
+  bool BuildFromNullTerminated(const char *const *entries);
+  char **Data() noexcept { return pointers.empty() ? nullptr : pointers.data(); }
+  bool IsNullTerminated() const noexcept { return !pointers.empty() && pointers.back() == nullptr; }
+};
+
 struct TargetArguments {
   std::filesystem::path module_executable_path;
+  ExecStringArray argv;
+  ExecStringArray envp;
   int pipe_to_module{-1};
   int pipe_from_module{-1};
 };
@@ -53,6 +78,7 @@ class Module final {
  private:
   bool Startup();
   void Shutdown();
+  void CloseAllPipes() noexcept;
 
   std::filesystem::path module_executable_path_;
   std::mutex lock_;
@@ -65,6 +91,7 @@ class Module final {
   std::unique_ptr<TargetArguments> target_arguments_{new TargetArguments()};
   std::array<int, 2> pipe_to_module_ = {-1, -1};
   std::array<int, 2> pipe_from_module_ = {-1, -1};
+  std::string rx_buffer_;
 };
 
 }  // namespace memgraph::auth

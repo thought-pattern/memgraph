@@ -80,7 +80,7 @@
   "apoc.node.degree.out": "node.degree_out",
   "apoc.node.relationship.exists": "node.relationship_exists",
   "apoc.node.relationship.types": "node.relationship_types",
-  "apoc.node.relationships.exist": "node.relationship_exists",
+  "apoc.node.relationships.exist": "node.relationships_exist",
   "apoc.nodes.delete": "nodes.delete",
   "apoc.nodes.link": "nodes.link",
   "apoc.nodes.relationship.types": "nodes.relationship_types",

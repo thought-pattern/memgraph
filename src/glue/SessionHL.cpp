@@ -55,24 +55,6 @@
 
 namespace {
 
-#ifdef MG_ENTERPRISE
-// Helper function to compare bolt_map_t objects
-inline bool operator==(const memgraph::glue::bolt_map_t &lhs, const memgraph::glue::bolt_map_t &rhs) {
-  if (lhs.size() != rhs.size()) return false;
-  return std::ranges::all_of(lhs, [&rhs](const auto &pair) {
-    auto it = rhs.find(pair.first);
-    if (it == rhs.end()) return false;
-    if (pair.second.type() != it->second.type()) return false;
-
-    if (pair.second.IsString()) return pair.second.ValueString() == it->second.ValueString();
-    if (pair.second.IsInt()) return pair.second.ValueInt() == it->second.ValueInt();
-    if (pair.second.IsBool()) return pair.second.ValueBool() == it->second.ValueBool();
-    if (pair.second.IsDouble()) return pair.second.ValueDouble() == it->second.ValueDouble();
-    return false;  // For other types, consider them different to be safe
-  });
-}
-#endif
-
 auto ToQueryExtras(const memgraph::glue::bolt_value_t &extra) -> memgraph::query::QueryExtras {
   auto metadata_pv = memgraph::storage::ExternalPropertyValue::map_t{};
   auto const &as_map = extra.ValueMap();
@@ -105,8 +87,8 @@ class TypedValueResultStream {
       : storage_{storage}, auth_checker_{auth_checker}, encoder_(encoder) {}
 
   void Result(const std::vector<memgraph::query::TypedValue> &values) {
-    // Splitting the MessageRecord allows us to skip vector insertion and just directly encode the value
-    encoder_->MessageRecordHeader(values.size());
+    std::vector<memgraph::communication::bolt::Value> bolt_values;
+    bolt_values.reserve(values.size());
     for (const auto &v : values) {
       auto maybe_value = memgraph::glue::ToBoltValue(v, storage_, memgraph::storage::View::NEW, auth_checker_);
       if (!maybe_value) {
@@ -121,9 +103,9 @@ class TypedValueResultStream {
             throw memgraph::communication::bolt::ClientError("Unexpected storage error when streaming results.");
         }
       }
-      encoder_->MessageRecordAppendValue(maybe_value.value());
+      bolt_values.push_back(std::move(maybe_value.value()));
     }
-    if (!encoder_->MessageRecordFinalize()) {
+    if (!encoder_->MessageRecord(bolt_values)) {
       throw memgraph::communication::bolt::ClientError("Failed to send result to client!");
     }
   }
@@ -319,6 +301,9 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
       interpreter_.SetUser(session_user_or_role_);
 #endif
       interpreter_.SetSessionInfo(UUID(), std::string{auth::kInternalSystemUsername}, GetLoginTimestamp());
+#ifdef MG_ENTERPRISE
+      impersonated_ = false;
+#endif
       TryDefaultDB();
       return {};
     case auth::InternalSystemUserLogin::kRejected:
@@ -326,7 +311,13 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
     case auth::InternalSystemUserLogin::kNotInternal:
       break;
   }
-  bool const access_controlled = auth_->ReadLock()->AccessControlled();
+  bool access_controlled = true;
+  try {
+    access_controlled = auth_->ReadLock()->AccessControlled();
+  } catch (const std::exception &e) {
+    spdlog::error("Failed to verify authentication store state during login: {}", e.what());
+    return std::unexpected{communication::bolt::AuthFailure::kGeneric};
+  }
   // Auth lock is not held past this point; bcrypt and module calls run outside the lock.
   if (access_controlled) {
     auto const user_or_role = std::invoke([&]() -> std::optional<auth::UserOrRole> {
@@ -363,6 +354,9 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
     interpreter_.SetSessionInfo(UUID(), "", GetLoginTimestamp());
   }
 
+#ifdef MG_ENTERPRISE
+  impersonated_ = false;
+#endif
   TryDefaultDB();
   return {};
 }
@@ -370,6 +364,9 @@ std::expected<void, communication::bolt::AuthFailure> SessionHL::Authenticate(co
 std::expected<void, communication::bolt::AuthFailure> SessionHL::SSOAuthenticate(
     const std::string &scheme, const std::string &identity_provider_response) {
   interpreter_.ResetUser();
+#ifdef MG_ENTERPRISE
+  impersonated_ = false;
+#endif
 
   const auto user_or_role = auth::SSOAuthenticate(*auth_, scheme, identity_provider_response);
   if (!user_or_role) {
@@ -467,6 +464,7 @@ std::expected<void, std::string_view> SessionHL::CoordinatorSSOAuthenticate(
   // coordinator authorizes by Raft-replicated role, not by a kvstore user), so the module's username is the only thing
   // that ties a control-plane query -- FORCE RESET CLUSTER STATE, SET INSTANCE TO MAIN -- back to a person.
   interpreter_.SetSessionInfo(UUID(), std::move(auth_result->username), GetLoginTimestamp());
+  impersonated_ = false;
   return {};
 }
 
@@ -485,6 +483,7 @@ std::optional<bool> SessionHL::CoordinatorInternalSystemUserAuthenticate(const s
                                         static_cast<uint64_t>(auth::Permission::COORDINATOR_WRITE));
   interpreter_.SetCoordinatorRoles({});
   interpreter_.SetSessionInfo(UUID(), std::string{auth::kInternalSystemUsername}, GetLoginTimestamp());
+  impersonated_ = false;
   return true;
 }
 
@@ -496,6 +495,7 @@ void SessionHL::CoordinatorPassthroughAuthenticate() {
   // SHOW CURRENT USER reports null. Set unconditionally so a LOGOFF -> passthrough LOGON can't leave the previous SSO
   // session's principal behind, in the same way the privileges above are re-established.
   interpreter_.SetSessionInfo(UUID(), "", GetLoginTimestamp());
+  impersonated_ = false;
 }
 
 std::optional<bool> SessionHL::CoordinatorHasWritableRole() const {
@@ -531,6 +531,7 @@ void SessionHL::LogOff() {
   // A LOGON without a stored user (the internal system user, or no access control) doesn't set it, and Configure would
   // otherwise charge that session to the previous user's limits.
   user_resource_.reset();
+  impersonated_ = false;
 #endif
   interpreter_.ResetUser();
   session_user_or_role_.reset();
@@ -541,7 +542,7 @@ void SessionHL::Abort() {
   interpreter_.Abort();
 }
 
-bolt_map_t SessionHL::Discard(std::optional<int> n, std::optional<int> qid) {
+bolt_map_t SessionHL::Discard(std::optional<int64_t> n, std::optional<int64_t> qid) {
   try {
     memgraph::query::DiscardValueResultStream stream;
     return DecodeSummary(interpreter_.Pull(&stream, n, qid));
@@ -558,7 +559,7 @@ bolt_map_t SessionHL::Discard(std::optional<int> n, std::optional<int> qid) {
   }
 }
 
-bolt_map_t SessionHL::Pull(std::optional<int> n, std::optional<int> qid) {
+bolt_map_t SessionHL::Pull(std::optional<int64_t> n, std::optional<int64_t> qid) {
   try {
     using TEncoder =
         communication::bolt::Encoder<communication::bolt::ChunkedEncoderBuffer<communication::v2::OutputStream>>;
@@ -586,13 +587,17 @@ void SessionHL::InterpretParse(const std::string &query, bolt_map_t params, cons
     const auto &user_or_role = interpreter_.user_or_role_;
     // Coordinator sessions authorize by Raft-replicated role and never build a QueryUserOrRole, so fall back to the
     // principal recorded at login; without it every control-plane query would be audited with an empty username.
+    const auto authenticated_username = session_user_or_role_ && session_user_or_role_->username()
+                                            ? *session_user_or_role_->username()
+                                            : interpreter_.session_info_.username;
     const auto username =
         user_or_role && user_or_role->username() ? *user_or_role->username() : interpreter_.session_info_.username;
-    audit_log_->Record(fmt::format("{}:{}", endpoint_.address().to_string(), std::to_string(endpoint_.port())),
-                       username,
-                       query,
-                       params,
-                       db ? db->get()->name() : "");
+    const auto impersonator = impersonated_ ? authenticated_username : std::string{};
+    const auto peer_address =
+        remote_endpoint_ ? fmt::format("{}:{}", remote_endpoint_->address().to_string(), remote_endpoint_->port())
+                         : std::string{};
+    auto const [audit_query, audit_params] = audit::RedactAuditQueryAndParams(query, params);
+    audit_log_->Record(peer_address, username, audit_query, audit_params, db ? db->get()->name() : "", impersonator);
   }
 #endif
 
@@ -750,7 +755,8 @@ void SessionHL::Configure(const bolt_map_t &run_time_info) {
 }
 
 SessionHL::SessionHL(Context context, memgraph::communication::v2::InputStream *input_stream,
-                     memgraph::communication::v2::OutputStream *output_stream)
+                     memgraph::communication::v2::OutputStream *output_stream,
+                     std::optional<memgraph::communication::v2::ServerEndpoint> remote_endpoint)
     : Session<memgraph::communication::v2::InputStream, memgraph::communication::v2::OutputStream>(input_stream,
                                                                                                    output_stream),
       interpreter_context_(context.ic),
@@ -760,11 +766,16 @@ SessionHL::SessionHL(Context context, memgraph::communication::v2::InputStream *
       runtime_config_{this},
 #endif
       auth_(context.auth),
-      endpoint_(std::move(context.endpoint)) {
+      remote_endpoint_(std::move(remote_endpoint)) {
   bolt_session_gauge_ = metrics::ScopedGauge{metrics::Metrics().global.active_bolt_sessions};
 #ifdef MG_ENTERPRISE
   interpreter_.OnChangeCB([&](std::string_view db_name) {
     auto &user_or_role = interpreter_.user_or_role_;
+    if (impersonated_) {
+      ImpersonateUserAuth(session_user_or_role_.get(),
+                          user_or_role && user_or_role->username() ? *user_or_role->username() : std::string{"----"},
+                          db_name);
+    }
     MultiDatabaseAuth(user_or_role.get(), db_name);
     runtime_config_.OnUseDatabase();
   });
@@ -823,39 +834,57 @@ void RuntimeConfig::Configure(const bolt_map_t &run_time_info, bool in_explicit_
   // NOTE: Once in a transaction, the drivers stop explicitly sending the config and count on using it until commit
   // Runtime config is sent at the beginning of the transaction, but is missing during the transaction
   if (in_explicit_tx) return;
-  if (previous_run_time_info_ && run_time_info == *previous_run_time_info_ && BoundDbMatches(run_time_info)) return;
+
+  RoutingConfig current_routing{};
+  if (const auto imp_it = run_time_info.find("imp_user"); imp_it != run_time_info.end()) {
+    if (!imp_it->second.IsString()) {
+      throw memgraph::communication::bolt::ClientError("Malformed config input.");
+    }
+    current_routing.imp_user = imp_it->second.ValueString();
+  }
+  if (const auto db_it = run_time_info.find("db"); db_it != run_time_info.end()) {
+    if (!db_it->second.IsString()) {
+      throw memgraph::communication::bolt::ClientError("Malformed config input.");
+    }
+    current_routing.db = db_it->second.ValueString();
+  }
+
+  if (previous_routing_config_ && current_routing == *previous_routing_config_ && BoundDbMatches(run_time_info)) return;
 
   // Step 1: Handle user configuration first
   // NOTE: This must be called first because it defines the default database for the user
   std::shared_ptr<query::QueryUserOrRole> user;
-  if (run_time_info.contains("imp_user")) {
-    const auto &info = run_time_info.at("imp_user");
-    if (!info.IsString()) {
-      throw memgraph::communication::bolt::ClientError("Malformed config input.");
-    }
-    const auto auth_user = session_->auth_->ReadLock()->GetUser(info.ValueString());
+  if (current_routing.imp_user) {
+    const auto auth_user = session_->auth_->ReadLock()->GetUser(*current_routing.imp_user);
     if (!auth_user) throw auth::AuthException("Trying to impersonate a user that doesn't exist.");
     user = AuthChecker::GenQueryUser(session_->auth_, *auth_user);
   }
 
   // Step 2: Handle database configuration with consideration for user impersonation
-  bool db_explicit = false;
-  std::optional<std::string> defined_db;
-  if (run_time_info.contains("db")) {
-    db_explicit = true;
-    const auto &info = run_time_info.at("db");
-    if (!info.IsString()) {
-      throw memgraph::communication::bolt::ClientError("Malformed config input.");
-    }
-    defined_db = info.ValueString();
-  }
+  const bool db_explicit = current_routing.db.has_value();
+  const bool preserve_use_selection = !db_explicit && db_selected_by_use_;
+  std::optional<std::string> defined_db = current_routing.db;
 
   // Step 3: Determine final target database
+  if (!defined_db && preserve_use_selection) {
+    const auto &current_acc = session_->interpreter_.current_db_.db_acc_;
+    if (current_acc && !current_acc->is_marked_for_deletion()) {
+      defined_db = std::string{*current_acc->get()->name_view()};
+    }
+  }
   if (!defined_db) {
+    auto resolve_default_db = [](const query::QueryUserOrRole &principal) -> std::optional<std::string> {
+      try {
+        const auto &db_name = principal.GetDefaultDB();
+        return db_name.empty() ? std::nullopt : std::make_optional(db_name);
+      } catch (const auth::AuthException &) {
+        return std::nullopt;
+      }
+    };
     if (user) {
-      defined_db = user->GetDefaultDB();
+      defined_db = resolve_default_db(*user);
     } else if (session_->session_user_or_role_) {
-      defined_db = session_->session_user_or_role_->GetDefaultDB();
+      defined_db = resolve_default_db(*session_->session_user_or_role_);
     } else {
       defined_db = std::string{memgraph::dbms::kDefaultDB};
     }
@@ -863,11 +892,23 @@ void RuntimeConfig::Configure(const bolt_map_t &run_time_info, bool in_explicit_
 
   // Validate everything before mutating the session, so a failure leaves it untouched.
   if (user) {
-    spdlog::trace(
-        "Trying to impersonate user '{}' on database '{}'...", user->username().value_or("----"), *defined_db);
+    spdlog::trace("Trying to impersonate user '{}' on database '{}'...",
+                  user->username().value_or("----"),
+                  defined_db.value_or("<none>"));
     ImpersonateUserAuth(session_->session_user_or_role_.get(), user->username().value_or("----"), defined_db);
   }
   const auto &target = user ? user : session_->session_user_or_role_;
+  if (!defined_db) {
+    auto resource =
+        user ? ResourceAtLogin(*user, session_->interpreter_context_->resource_monitoring) : session_->user_resource_;
+    session_->interpreter_.SetUser(target, std::move(resource));
+    session_->impersonated_ = static_cast<bool>(user);
+    previous_routing_config_.reset();
+    session_->interpreter_.ResetDB();
+    previous_routing_config_ = std::move(current_routing);
+    db_selected_by_use_ = false;
+    return;
+  }
   MultiDatabaseAuth(target.get(), *defined_db);
 
   auto db_acc = [&]() -> std::optional<memgraph::dbms::DatabaseAccess> {
@@ -876,7 +917,7 @@ void RuntimeConfig::Configure(const bolt_map_t &run_time_info, bool in_explicit_
     } catch (const memgraph::dbms::UnknownDatabaseException &e) {
       // Surface the unknown/suspended database as a ClientError with its own message. An unchanged request
       // without db/imp_user whose home db is gone behaves as a cache hit; Prepare releases the db (ReleaseDbIfMarked).
-      if (!db_explicit && !user && previous_run_time_info_ && run_time_info == *previous_run_time_info_) {
+      if (!db_explicit && !user && previous_routing_config_ && current_routing == *previous_routing_config_) {
         return std::nullopt;
       }
       throw memgraph::communication::bolt::ClientError(e.what());
@@ -887,12 +928,13 @@ void RuntimeConfig::Configure(const bolt_map_t &run_time_info, bool in_explicit_
   auto resource =
       user ? ResourceAtLogin(*user, session_->interpreter_context_->resource_monitoring) : session_->user_resource_;
   session_->interpreter_.SetUser(target, std::move(resource));
+  session_->impersonated_ = static_cast<bool>(user);
   // The session changes from here on; a failure below must not leave the old entry cached.
-  previous_run_time_info_.reset();
+  previous_routing_config_.reset();
   session_->interpreter_.SetCurrentDB(std::move(*db_acc), db_explicit);
 
-  previous_run_time_info_ = run_time_info;
-  db_selected_by_use_ = false;
+  previous_routing_config_ = std::move(current_routing);
+  db_selected_by_use_ = preserve_use_selection;
 }
 #endif
 }  // namespace memgraph::glue

@@ -20,6 +20,20 @@ set -e
 
 var_files="/var/lib/memgraph /var/log/memgraph"
 
+# Remove only the exact libpython3.so symlink recorded by postinst, before
+# purge deletes /var/lib/memgraph where the marker is stored.
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    marker_file="/var/lib/memgraph/.created_libpython3_symlink"
+    if [ -f "$marker_file" ]; then
+        IFS="$(printf '\t')" read -r recorded_link recorded_target < "$marker_file" || true
+        if [ -n "$recorded_link" ] && [ -L "$recorded_link" ] && [ "$(readlink "$recorded_link")" = "$recorded_target" ]; then
+            rm -f "$recorded_link"
+            ldconfig || true
+        fi
+        rm -f "$marker_file"
+    fi
+fi
+
 case "$1" in
     purge)
         # Remove 'var/*/memgraph' directories, even if they contain something.
@@ -62,27 +76,6 @@ if [ "$1" = "purge" ]; then
     if [ -x "/usr/bin/deb-systemd-helper" ]; then
         deb-systemd-helper purge memgraph.service >/dev/null
         deb-systemd-helper unmask memgraph.service >/dev/null
-    fi
-fi
-
-# Remove the libpython3.so symlink created in postinst, but only on actual
-# removal/purge (not upgrade, where the replacement still needs it) and only if
-# it is still a symlink pointing at a versioned libpython (i.e. one we created,
-# not a file owned by another package such as libpython3-dev).
-if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
-    removed_symlink=false
-    for link in /usr/lib/*/libpython3.so /usr/lib64/libpython3.so /usr/lib/libpython3.so; do
-        if [ -L "$link" ]; then
-            case "$(readlink "$link")" in
-                libpython3.*.so.1.0)
-                    rm -f "$link"
-                    removed_symlink=true
-                ;;
-            esac
-        fi
-    done
-    if [ "$removed_symlink" = true ]; then
-        ldconfig || true
     fi
 fi
 

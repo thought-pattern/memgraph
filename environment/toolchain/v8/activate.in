@@ -1,8 +1,8 @@
 # Detect the shell
-if [ -n "$BASH_VERSION" ]; then
+if [ -n "${BASH_VERSION:-}" ]; then
     current_shell="bash"
     SCRIPT_SOURCE="${BASH_SOURCE[0]}"
-elif [ -n "$ZSH_VERSION" ]; then
+elif [ -n "${ZSH_VERSION:-}" ]; then
     current_shell="zsh"
     SCRIPT_SOURCE="${(%):-%N}"
 else
@@ -10,8 +10,8 @@ else
     return 1 2>/dev/null || exit 1
 fi
 
-readonly SCRIPT_DIR=$( cd -- "$( dirname -- "${SCRIPT_SOURCE}" )" &> /dev/null && pwd )
-PREFIX=$SCRIPT_DIR
+PREFIX="$( cd -- "$( dirname -- "${SCRIPT_SOURCE}" )" &> /dev/null && pwd )"
+unset SCRIPT_SOURCE
 
 # This file must be used with "source /path/to/toolchain/activate" *from bash*
 # You can't run it directly!
@@ -56,6 +56,7 @@ export CXXFLAGS=-isystem\ $PREFIX/include\ ${CXXFLAGS:-}
 export CFLAGS=-isystem\ $PREFIX/include\ ${CFLAGS:-}
 export MG_TOOLCHAIN_ROOT=$PREFIX
 export MG_TOOLCHAIN_VERSION=@TOOLCHAIN_VERSION@
+unset current_shell env_error PREFIX
 
 # disable root
 function su () {
@@ -75,6 +76,6 @@ function deactivate() {
     export CXXFLAGS=${ORIG_CXXFLAGS:-}
     export CFLAGS=${ORIG_CFLAGS:-}
     unset ORIG_PATH ORIG_PS1 ORIG_LD_LIBRARY_PATH ORIG_CXXFLAGS ORIG_CFLAGS 2>/dev/null || true
-    unset MG_TOOLCHAIN_ROOT MG_TOOLCHAIN_VERSION 2>/dev/null || true
+    unset MG_TOOLCHAIN_ROOT MG_TOOLCHAIN_VERSION SCRIPT_DIR 2>/dev/null || true
     unset -f su sudo deactivate
 }

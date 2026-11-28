@@ -1,9 +1,9 @@
 import sys
 
-import mgclient
-import pytest
 from common import memgraph
 from gqlalchemy import Memgraph
+import mgclient
+import pytest
 
 
 def get_explain(memgraph, query):

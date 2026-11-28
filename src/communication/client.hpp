@@ -133,7 +133,7 @@ class Client final {
 
  private:
   void ReleaseSslObjects();
-  auto SetupSslObjects() -> std::expected<void, std::string>;
+  auto SetupSslObjects(const io::network::Endpoint &endpoint) -> std::expected<void, std::string>;
   auto DriveSslHandshake() -> std::expected<void, std::string>;
 
   io::network::Socket socket_;

@@ -12,8 +12,11 @@
 #include "query/plan_v2/frontend/ast_converter.hpp"
 
 #include <array>
+#include <map>
 #include <optional>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "query/exceptions.hpp"
@@ -120,7 +123,7 @@ template <typename AstNode>
 auto SymEclassFor(LoweringCtx &ctx, AstNode &node) -> eclass {
   DMG_ASSERT(node.symbol_pos_ != -1, "AST symbol should have already been mapped into the frame");
   auto const &sym = ctx.symbol_table.at(node);
-  return ctx.g.MakeSymbol(node.symbol_pos_, sym.name());
+  return ctx.g.MakeSymbol(node.symbol_pos_, sym.name(), sym.user_declared(), sym.type(), sym.token_position());
 }
 
 // Expression AST nodes not yet lowered. Each entry expands to a
@@ -291,103 +294,120 @@ auto Lower(LoweringCtx &ctx, Expression &expr) -> eclass {
   return v.result();
 }
 
-auto LowerSingleQuery(SingleQuery &sq, LoweringCtx &ctx) -> eclass;
+using ScopeMap = std::map<std::string, eclass>;
 
-// ORDER BY / SKIP / LIMIT expressions are lowered for their e-graph
-// presence only; their result e-classes are not chained into the row-pipe
-// in the minimum scope. Hashconsing dedupes shared expressions across
-// clauses; when Sort/Skip/Limit operators land, the resolver will recover
-// these e-classes by hashconsing again.
-void HashConsTailExpressions(ReturnBody const &body, LoweringCtx &ctx) {
-  for (auto const &ob : body.order_by) (void)Lower(ctx, *ob.expression);
-  if (body.skip) (void)Lower(ctx, *body.skip);
-  if (body.limit) (void)Lower(ctx, *body.limit);
+struct SingleQueryLowering {
+  eclass root;
+  ScopeMap scope;
+  bool saw_return{false};
+};
+
+auto LowerSingleQuery(SingleQuery &sq, LoweringCtx &ctx) -> SingleQueryLowering;
+
+void RejectUnsupportedTailClauses(ReturnBody const &body) {
+  if (!body.order_by.empty()) ThrowNotImplementedYet("ORDER BY clause");
+  if (body.skip != nullptr) ThrowNotImplementedYet("SKIP clause");
+  if (body.limit != nullptr) ThrowNotImplementedYet("LIMIT clause");
 }
 
-// exposed_syms come from the inner cypher_query_'s last RETURN clause.
-// Hashconsing makes MakeSymbol(pos, name) return the SAME e-class the
-// inner Output's NamedOutputs did, so the Subquery e-node and the inner
-// Output reference identical Symbol leaves.
-auto CollectSubqueryExposedSyms(SingleQuery &inner, LoweringCtx &ctx, ScratchFrame &frame) -> bool {
-  bool saw_return = false;
-  for (auto *clause : inner.clauses_) {
-    auto *ret = utils::Downcast<query::Return>(clause);
-    if (ret == nullptr) continue;
-    saw_return = true;
-    // Last RETURN wins.
-    frame.reset();
-    for (auto *ne : ret->body_.named_expressions) frame.push(SymEclassFor(ctx, *ne));
+auto LowerWith(query::With &with, eclass pipe, LoweringCtx &ctx, ScopeMap &scope) -> eclass {
+  RejectUnsupportedTailClauses(with.body_);
+  if (with.where_ != nullptr) ThrowNotImplementedYet(*with.where_);
+  ScopeMap next_scope = with.body_.all_identifiers ? scope : ScopeMap{};
+  if (with.body_.distinct) {
+    auto frame = ctx.OpenScratch();
+    if (with.body_.all_identifiers) {
+      for (auto const &[name, sym] : scope) {
+        frame.push(ctx.g.MakeNamedOutput(name, sym, ctx.g.MakeIdentifier(sym)));
+      }
+    }
+    for (auto *ne : with.body_.named_expressions) {
+      auto expr = Lower(ctx, *ne->expression_);
+      auto sym = SymEclassFor(ctx, *ne);
+      frame.push(ctx.g.MakeNamedOutput(ne->name_, sym, expr));
+      if (ctx.symbol_table.at(*ne).user_declared()) next_scope[ne->name_] = sym;
+    }
+    scope = std::move(next_scope);
+    return ctx.g.MakeDistinct(ctx.g.MakeOutput(pipe, frame.as_span()));
   }
-  return saw_return;
-}
-
-auto LowerWith(query::With &with, eclass pipe, LoweringCtx &ctx) -> eclass {
-  // A `*` projection carries its symbols in body_.all_identifiers, not in
-  // named_expressions, so we never lower them to Identifier e-nodes. Bail out
-  // rather than silently drop them - and rather than let referenced_syms miss a
-  // `*`-referenced symbol and mis-classify a live binder as dead.
-  if (with.body_.all_identifiers) ThrowNotImplementedYet("WITH * projection");
   for (auto *ne : with.body_.named_expressions) {
     auto expr = Lower(ctx, *ne->expression_);
-    pipe = ctx.g.MakeBind(pipe, SymEclassFor(ctx, *ne), expr);
+    auto sym = SymEclassFor(ctx, *ne);
+    pipe = ctx.g.MakeBind(pipe, sym, expr);
+    if (ctx.symbol_table.at(*ne).user_declared()) next_scope[ne->name_] = sym;
   }
-  HashConsTailExpressions(with.body_, ctx);
-  if (with.where_ != nullptr) ThrowNotImplementedYet(*with.where_);
+  scope = std::move(next_scope);
   return pipe;
 }
 
-auto LowerReturn(query::Return &ret, eclass pipe, LoweringCtx &ctx) -> eclass {
-  // See LowerWith: `*` symbols bypass named_expressions, so refuse them rather
-  // than drop columns or let referenced_syms miss a `*`-referenced binding.
-  if (ret.body_.all_identifiers) ThrowNotImplementedYet("RETURN * projection");
+auto LowerReturn(query::Return &ret, eclass pipe, LoweringCtx &ctx, ScopeMap &scope, bool &saw_return) -> eclass {
+  RejectUnsupportedTailClauses(ret.body_);
+  ScopeMap next_scope;
   auto frame = ctx.OpenScratch();
+  if (ret.body_.all_identifiers) {
+    for (auto const &[name, sym] : scope) {
+      frame.push(ctx.g.MakeNamedOutput(name, sym, ctx.g.MakeIdentifier(sym)));
+      next_scope[name] = sym;
+    }
+  }
   for (auto *ne : ret.body_.named_expressions) {
     auto expr = Lower(ctx, *ne->expression_);
-    frame.push(ctx.g.MakeNamedOutput(ne->name_, SymEclassFor(ctx, *ne), expr));
+    auto sym = SymEclassFor(ctx, *ne);
+    frame.push(ctx.g.MakeNamedOutput(ne->name_, sym, expr));
+    if (ctx.symbol_table.at(*ne).user_declared()) next_scope[ne->name_] = sym;
   }
+  scope = std::move(next_scope);
+  saw_return = true;
   auto output = ctx.g.MakeOutput(pipe, frame.as_span());
-  HashConsTailExpressions(ret.body_, ctx);
+  if (ret.body_.distinct) {
+    output = ctx.g.MakeDistinct(output);
+  }
   return output;
 }
 
-auto LowerUnwind(query::Unwind &unwind, eclass pipe, LoweringCtx &ctx) -> eclass {
+auto LowerUnwind(query::Unwind &unwind, eclass pipe, LoweringCtx &ctx, ScopeMap &scope) -> eclass {
   DMG_ASSERT(unwind.named_expression_ != nullptr, "Unwind must have a named expression");
   auto &ne = *unwind.named_expression_;
   auto list_expr = Lower(ctx, *ne.expression_);
-  return ctx.g.MakeUnwind(pipe, SymEclassFor(ctx, ne), list_expr);
+  auto sym = SymEclassFor(ctx, ne);
+  if (ctx.symbol_table.at(ne).user_declared()) scope[ne.name_] = sym;
+  return ctx.g.MakeUnwind(pipe, sym, list_expr);
 }
 
-auto LowerCallSubquery(query::CallSubquery &cs, eclass pipe, LoweringCtx &ctx) -> eclass {
+auto LowerCallSubquery(query::CallSubquery &cs, eclass pipe, LoweringCtx &ctx, ScopeMap &scope) -> eclass {
   // Minimum scope: non-importing CALL { ... } RETURN ...
   if (cs.optional_) ThrowNotImplementedYet("OPTIONAL CALL subquery");
   if (cs.has_variable_scope_) ThrowNotImplementedYet("importing CALL with explicit scope clause");
   if (cs.all_variables_scoped_) ThrowNotImplementedYet("CALL with implicit star scope clause");
   DMG_ASSERT(cs.cypher_query_ != nullptr && cs.cypher_query_->single_query_ != nullptr,
              "CALL block missing inner cypher query");
+  if (!cs.cypher_query_->cypher_unions_.empty()) ThrowNotImplementedYet("CALL subquery with UNION");
 
-  auto &inner = *cs.cypher_query_->single_query_;
-  auto inner_root = LowerSingleQuery(inner, ctx);
+  auto inner_lowered = LowerSingleQuery(*cs.cypher_query_->single_query_, ctx);
 
   auto frame = ctx.OpenScratch();
-  auto saw_return = CollectSubqueryExposedSyms(inner, ctx, frame);
-  MG_ASSERT(saw_return && !frame.empty(), "CALL block must end in RETURN; unit subqueries are TODO");
-  return ctx.g.MakeSubquery(pipe, inner_root, frame.as_span());
+  for (auto const &[name, sym] : inner_lowered.scope) {
+    frame.push(sym);
+    scope[name] = sym;
+  }
+  MG_ASSERT(inner_lowered.saw_return && !frame.empty(), "CALL block must end in RETURN; unit subqueries are TODO");
+  return ctx.g.MakeSubquery(pipe, inner_lowered.root, frame.as_span());
 }
 
-auto LowerClause(Clause &clause, eclass pipe, LoweringCtx &ctx) -> eclass {
-  if (auto *w = utils::Downcast<query::With>(&clause)) return LowerWith(*w, pipe, ctx);
-  if (auto *r = utils::Downcast<query::Return>(&clause)) return LowerReturn(*r, pipe, ctx);
-  if (auto *u = utils::Downcast<query::Unwind>(&clause)) return LowerUnwind(*u, pipe, ctx);
-  if (auto *cs = utils::Downcast<query::CallSubquery>(&clause)) return LowerCallSubquery(*cs, pipe, ctx);
+auto LowerClause(Clause &clause, eclass pipe, LoweringCtx &ctx, ScopeMap &scope, bool &saw_return) -> eclass {
+  if (auto *w = utils::Downcast<query::With>(&clause)) return LowerWith(*w, pipe, ctx, scope);
+  if (auto *r = utils::Downcast<query::Return>(&clause)) return LowerReturn(*r, pipe, ctx, scope, saw_return);
+  if (auto *u = utils::Downcast<query::Unwind>(&clause)) return LowerUnwind(*u, pipe, ctx, scope);
+  if (auto *cs = utils::Downcast<query::CallSubquery>(&clause)) return LowerCallSubquery(*cs, pipe, ctx, scope);
   ThrowNotImplementedYet(clause);
 }
 
-auto LowerSingleQuery(SingleQuery &sq, LoweringCtx &ctx) -> eclass {
-  auto pipe = ctx.g.MakeOnce();
+auto LowerSingleQuery(SingleQuery &sq, LoweringCtx &ctx) -> SingleQueryLowering {
+  SingleQueryLowering out{.root = ctx.g.MakeOnce(), .scope = {}, .saw_return = false};
   for (auto *clause : sq.clauses_) {
-    pipe = LowerClause(*clause, pipe, ctx);
+    out.root = LowerClause(*clause, out.root, ctx, out.scope, out.saw_return);
   }
-  return pipe;
+  return out;
 }
 
 auto LowerCypherQuery(CypherQuery &cq, LoweringCtx &ctx) -> eclass {
@@ -396,8 +416,9 @@ auto LowerCypherQuery(CypherQuery &cq, LoweringCtx &ctx) -> eclass {
   if (cq.pre_query_directives_.commit_frequency_ != nullptr) ThrowNotImplementedYet("commit frequency directive");
   if (cq.pre_query_directives_.hops_limit_ != nullptr) ThrowNotImplementedYet("hop limit directive");
   if (!cq.pre_query_directives_.index_hints_.empty()) ThrowNotImplementedYet("index hints directive");
+  if (!cq.cypher_unions_.empty()) ThrowNotImplementedYet("UNION query");
   DMG_ASSERT(cq.single_query_ != nullptr, "CypherQuery missing single_query_");
-  return LowerSingleQuery(*cq.single_query_, ctx);
+  return LowerSingleQuery(*cq.single_query_, ctx).root;
 }
 
 }  // namespace

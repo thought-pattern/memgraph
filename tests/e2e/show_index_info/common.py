@@ -9,8 +9,8 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import typing
 from enum import IntEnum
+import typing
 
 import mgclient
 import pytest

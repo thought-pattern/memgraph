@@ -44,17 +44,21 @@ def compare_packages(installed, packages):
 
 def check_packages_apt(packages):
     """Check which apt packages are missing"""
-    # list installed packages
     apt = subprocess.run(["apt", "list", "--installed"], capture_output=True, text=True)
-    installed = [item.split("/")[0] for item in apt.stdout.splitlines()]
+    if apt.returncode != 0:
+        detail = apt.stderr.strip() or f"apt list --installed exited with status {apt.returncode}"
+        raise RuntimeError(f"Error querying packages: {detail}")
 
+    installed = [item.split("/")[0] for item in apt.stdout.splitlines() if "/" in item]
     return compare_packages(installed, packages)
 
 
 def check_packages_dnf(packages):
     """Check which dnf packages are missing"""
-    # list installed packages
     rpm = subprocess.run(["rpm", "--query", "--all", "--queryformat", "%{NAME}\n"], capture_output=True, text=True)
+    if rpm.returncode != 0:
+        detail = rpm.stderr.strip() or f"rpm --query exited with status {rpm.returncode}"
+        raise RuntimeError(f"Error querying packages: {detail}")
 
     installed = rpm.stdout.splitlines()
     return compare_packages(installed, packages)
@@ -64,8 +68,8 @@ def check_packages_pkg(packages):
     """Check which pkg packages are missing"""
     pkg = subprocess.run(["pkg", "query", "%n"], capture_output=True, text=True)
     if pkg.returncode != 0:
-        print(f"Error querying packages: {pkg.stderr}")
-        return list(packages)
+        detail = pkg.stderr.strip() or f"pkg query exited with status {pkg.returncode}"
+        raise RuntimeError(f"Error querying packages: {detail}")
 
     installed = pkg.stdout.splitlines()
     return compare_packages(installed, packages)
@@ -73,45 +77,69 @@ def check_packages_pkg(packages):
 
 def install_packages_apt(packages, dry_run=False):
     """Install missing apt packages"""
-    # Check which packages are missing
-    missing = check_packages_apt(packages)
+    try:
+        missing = check_packages_apt(packages)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return False
 
-    if missing and not dry_run:
-        print(f"Installing missing packages: {' '.join(missing)}")
-        result = subprocess.run(["apt", "install", "-y"] + missing)
-        if result.returncode != 0:
-            print(f"Error installing packages: {result.stderr}")
-            return False
+    if not missing:
+        return True
+    if dry_run:
+        print(f"Would install missing packages: {' '.join(missing)}")
+        return True
+
+    print(f"Installing missing packages: {' '.join(missing)}")
+    result = subprocess.run(["apt", "install", "-y"] + missing)
+    if result.returncode != 0:
+        print(f"Error installing packages (exit status {result.returncode})", file=sys.stderr)
+        return False
 
     return True
 
 
 def install_packages_dnf(packages, dry_run=False):
     """Install missing dnf packages"""
-    # Check which packages are missing
-    missing = check_packages_dnf(packages)
+    try:
+        missing = check_packages_dnf(packages)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return False
 
-    if missing and not dry_run:
-        print(f"Installing missing packages: {' '.join(missing)}")
-        result = subprocess.run(["dnf", "install", "-y"] + missing)
-        if result.returncode != 0:
-            print(f"Error installing packages: {result.stderr}")
-            return False
+    if not missing:
+        return True
+    if dry_run:
+        print(f"Would install missing packages: {' '.join(missing)}")
+        return True
+
+    print(f"Installing missing packages: {' '.join(missing)}")
+    result = subprocess.run(["dnf", "install", "-y"] + missing)
+    if result.returncode != 0:
+        print(f"Error installing packages (exit status {result.returncode})", file=sys.stderr)
+        return False
 
     return True
 
 
 def install_packages_pkg(packages, dry_run=False):
     """Install missing pkg packages"""
-    # Check which packages are missing
-    missing = check_packages_pkg(packages)
+    try:
+        missing = check_packages_pkg(packages)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return False
 
-    if missing and not dry_run:
-        print(f"Installing missing packages: {' '.join(missing)}")
-        result = subprocess.run(["pkg", "install", "-y"] + missing, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error installing packages: {result.stderr}")
-            return False
+    if not missing:
+        return True
+    if dry_run:
+        print(f"Would install missing packages: {' '.join(missing)}")
+        return True
+
+    print(f"Installing missing packages: {' '.join(missing)}")
+    result = subprocess.run(["pkg", "install", "-y"] + missing, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error installing packages: {result.stderr}", file=sys.stderr)
+        return False
 
     return True
 
@@ -132,12 +160,16 @@ if __name__ == "__main__":
     parser.add_argument("action", choices=["check", "install"], help="Action to perform")
     parser.add_argument("os", help="Operating system identifier")
     parser.add_argument("packages", nargs="+", help="List of packages")
-    parser.add_argument("--dry-run", action="store_true", help="Don't actually install packages")
+    parser.add_argument("--dry-run", action="store_true", help="Preview missing packages without installing them")
 
     args = parser.parse_args()
 
     if args.action == "check":
-        missing = check_packages(args.os, args.packages)
+        try:
+            missing = check_packages(args.os, args.packages)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
         print(" ".join(missing))
     elif args.action == "install":
         success = install_packages(args.os, args.packages, args.dry_run)

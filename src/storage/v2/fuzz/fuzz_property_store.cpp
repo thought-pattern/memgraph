@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -27,7 +28,7 @@ namespace {
 bool shouldBeEqual(PropertyValue const &val) {
   switch (val.type()) {
     case PropertyValueType::Double: {
-      return !isnanl(val.ValueDouble());
+      return !std::isnan(val.ValueDouble());
     }
     case PropertyValueType::List: {
       auto const &l = val.ValueList();
@@ -48,13 +49,20 @@ bool shouldBeEqual(PropertyValue const &val) {
     }
     case PropertyValueType::Point2d: {
       auto const &p = val.ValuePoint2d();
-      return !isnanl(p.x()) && !isnanl(p.y());
+      return !std::isnan(p.x()) && !std::isnan(p.y());
     }
     case PropertyValueType::Point3d: {
       auto const &p = val.ValuePoint3d();
-      return !isnanl(p.x()) && !isnanl(p.y()) && !isnanl(p.z());
+      return !std::isnan(p.x()) && !std::isnan(p.y()) && !std::isnan(p.z());
+    }
+    case PropertyValueType::IntList:
+    case PropertyValueType::DoubleList:
+    case PropertyValueType::NumericList:
+    case PropertyValueType::VectorIndexId: {
+      return true;
     }
   }
+  return true;
 };
 
 bool Validate(PropertyStore const &store, std::map<PropertyId, PropertyValue> const &properties) {
@@ -164,10 +172,14 @@ bool ApplyCommand(PropertyStore &store, std::map<PropertyId, PropertyValue> &pro
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const *data, std::size_t size) {
+  FLAGS_storage_property_store_compression_enabled = false;
   auto store = PropertyStore{};
   auto properties = std::map<PropertyId, PropertyValue>{};
   while (true) {
-    if (!ApplyCommand(store, properties, data, size)) return 0;
+    if (!ApplyCommand(store, properties, data, size)) {
+      FLAGS_storage_property_store_compression_enabled = false;
+      return 0;
+    }
     if (!Validate(store, properties)) {
       abort();
     }

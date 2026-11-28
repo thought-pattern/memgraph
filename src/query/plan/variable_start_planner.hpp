@@ -349,9 +349,9 @@ class VariableStartPlanner {
     return iter::slice(MakeCartesianProduct(std::move(varying_query_matchings)), 0UL, FLAGS_query_max_plans);
   }
 
-  std::vector<SingleQueryPart> ExtractSingleQueryParts(const QueryParts &query_parts) {
+  static std::vector<SingleQueryPart> ExtractSingleQueryParts(const QueryParts &query_parts) {
     std::vector<SingleQueryPart> results;
-    auto const append = [this, &results](const QueryParts &parts) {
+    auto const append = [&results](const QueryParts &parts) {
       auto part_results = ExtractSingleQueryParts(parts);
       results.insert(
           results.end(), std::make_move_iterator(part_results.begin()), std::make_move_iterator(part_results.end()));
@@ -372,8 +372,9 @@ class VariableStartPlanner {
     return results;
   }
 
-  QueryParts ReconstructQueryParts(const QueryParts &old_query_parts,
-                                   const std::vector<SingleQueryPart> &single_query_parts_variation, uint64_t &index) {
+  static QueryParts ReconstructQueryParts(const QueryParts &old_query_parts,
+                                          const std::vector<SingleQueryPart> &single_query_parts_variation,
+                                          uint64_t &index) {
     auto reconstructed_query_parts = old_query_parts;
 
     for (auto i = 0; i < old_query_parts.query_parts.size(); i++) {
@@ -411,7 +412,7 @@ class VariableStartPlanner {
   /// @brief Generate multiple plans by varying the order of graph traversal.
   auto Plan(const QueryParts &query_parts) {
     return iter::imap(
-        [context = context_, old_query_parts = query_parts, this](
+        [context = context_, old_query_parts = query_parts](
             const auto &alternative_query_parts) -> RuleBasedPlanner<TPlanningContext>::PlanResult {
           uint64_t index = 0;
           auto reconstructed_query_parts = ReconstructQueryParts(old_query_parts, alternative_query_parts, index);
@@ -419,6 +420,7 @@ class VariableStartPlanner {
           RuleBasedPlanner<TPlanningContext> rule_planner(context);
           context->bound_symbols.clear();
           context->scoped_call_imports.clear();
+          context->next_procedure_id = 1;
           return rule_planner.Plan(reconstructed_query_parts);
         },
         VaryQueryMatching(query_parts, *context_->symbol_table));
@@ -426,8 +428,8 @@ class VariableStartPlanner {
 
   /// @brief The result of plan generation is an iterable of roots to multiple
   /// generated operator trees.
-  using PlanResult = std::result_of_t<decltype (&VariableStartPlanner<TPlanningContext>::Plan)(
-      VariableStartPlanner<TPlanningContext>, QueryParts &)>;
+  using PlanResult = std::invoke_result_t<decltype(&VariableStartPlanner<TPlanningContext>::Plan),
+                                          VariableStartPlanner<TPlanningContext>, QueryParts &>;
 };
 
 }  // namespace memgraph::query::plan

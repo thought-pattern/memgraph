@@ -1,7 +1,7 @@
-import sys
 from collections import OrderedDict
 from inspect import cleandoc
 from itertools import chain, repeat
+import sys
 from typing import List, Tuple
 
 import mgp
@@ -94,8 +94,8 @@ def analyze_subgraph(
     vertices, edges = map(set, [vertices, edges])
     g = nx.subgraph_view(
         MemgraphMultiDiGraph(ctx=context),
-        lambda n: n in vertices,
-        lambda n1, n2, e: e in edges,
+        filter_node=lambda n: n in vertices,
+        filter_edge=lambda n1, n2, e: e in edges,
     )
     recs = _analyze_graph(context, g, analyses)
     return [mgp.Record(name=name, value=value) for name, value in recs]
@@ -113,7 +113,7 @@ def _get_analysis_mapping():
             ("self_loops", _self_loops),
             ("is_bipartite", _is_bipartite),
             ("is_planar", _is_planar),
-            ("is_biconnected: ", _is_biconnected),
+            ("is_biconnected", _is_biconnected),
             ("is_weakly_connected", _is_weakly_connected),
             ("number_of_weakly_components", _weakly_components),
             ("is_strongly_connected", _is_strongly_connected),
@@ -164,8 +164,8 @@ def _number_of_edges(g: nx.MultiDiGraph) -> Tuple[str, int]:
 def _avg_degree(g: nx.MultiDiGraph) -> Tuple[str, float]:
     """Returns average degree."""
     _, number_of_nodes = _number_of_nodes(g)
-    _, number_of_edges = _number_of_edges(g)
-    avg_degree = 0 if number_of_nodes == 0 else number_of_edges / number_of_nodes
+    total_degree = sum(degree for _, degree in g.degree())
+    avg_degree = 0 if number_of_nodes == 0 else total_degree / number_of_nodes
     return "Average degree", avg_degree
 
 

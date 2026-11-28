@@ -82,7 +82,7 @@ struct ReplicationState {
   ReplicationState &operator=(ReplicationState const &) = delete;
   ReplicationState &operator=(ReplicationState &&) = delete;
 
-  enum class FetchReplicationError : uint8_t { NOTHING_FETCHED, PARSE_ERROR, REPL_SERVER_FAILURE };
+  enum class FetchReplicationError : uint8_t { NOTHING_FETCHED, PARSE_ERROR, REPL_SERVER_FAILURE, READ_ERROR };
 
   using FetchReplicationResult_t = std::expected<ReplicationData_t, FetchReplicationError>;
   using FetchVariantResult_t = std::expected<std::variant<RoleMainData, RoleReplicaData>, FetchReplicationError>;
@@ -143,10 +143,12 @@ struct ReplicationState {
 
   bool HasDurability() const { return nullptr != durability_; }
 
-  bool TryPersistRoleMain(utils::UUID main_uuid);
-  bool TryPersistRoleReplica(const ReplicationServerConfig &config, utils::UUID const &main_uuid);
+  bool TryPersistRoleMain(utils::UUID main_uuid, bool clear_registered_replicas = false);
+  bool TryPersistRoleReplica(const ReplicationServerConfig &config, utils::UUID const &main_uuid,
+                             bool clear_registered_replicas = true);
   bool TryPersistUnregisterReplica(std::string_view name);
   bool TryPersistRegisteredReplica(const ReplicationClientConfig &config, utils::UUID main_uuid);
+  bool TryClearReplicaUuidSyncNeeded(std::string_view name);
 
   auto ReplicationData() -> std::variant<RoleMainData, RoleReplicaData> & { return replication_data_.data_; }
 
@@ -167,7 +169,7 @@ struct ReplicationState {
   void Shutdown() const;
 
   auto GetDeltasBatchProgressSize() const -> uint64_t;
-  void UpdateDeltasBatchProgressSize(uint64_t new_value);
+  [[nodiscard]] bool UpdateDeltasBatchProgressSize(uint64_t new_value);
 
  private:
   bool HandleVersionMigration(durability::ReplicationRoleEntry &data) const;

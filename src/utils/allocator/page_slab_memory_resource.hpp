@@ -11,9 +11,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <limits>
 #include <memory_resource>
+#include <new>
 #include <utility>
 
 namespace memgraph::utils {
@@ -39,27 +42,23 @@ struct PageSlabMemoryResource : std::pmr::memory_resource {
   PageSlabMemoryResource(PageSlabMemoryResource const &) = delete;
   PageSlabMemoryResource &operator=(PageSlabMemoryResource const &) = delete;
 
-  PageSlabMemoryResource(PageSlabMemoryResource &&other) noexcept {
-    std::swap(upstream_, other.upstream_);
-    std::swap(pages, other.pages);
-    std::swap(ptr, other.ptr);
-    std::swap(space, other.space);
-  }
+  PageSlabMemoryResource(PageSlabMemoryResource &&other) noexcept
+      : upstream_(other.upstream_),
+        pages(std::exchange(other.pages, nullptr)),
+        ptr(std::exchange(other.ptr, nullptr)),
+        space(std::exchange(other.space, 0)) {}
 
   PageSlabMemoryResource &operator=(PageSlabMemoryResource &&other) noexcept {
     if (this == &other) return *this;
-    std::swap(*this, other);
+    release_pages();
+    upstream_ = other.upstream_;
+    pages = std::exchange(other.pages, nullptr);
+    ptr = std::exchange(other.ptr, nullptr);
+    space = std::exchange(other.space, 0);
     return *this;
   }
 
-  ~PageSlabMemoryResource() override {
-    auto current = pages;
-    while (current) {
-      auto next = current->next;
-      upstream_->deallocate(current, current->alloc_size, static_cast<std::size_t>(current->alignment));
-      current = next;
-    }
-  }
+  ~PageSlabMemoryResource() override { release_pages(); }
 
  private:
   struct header {
@@ -71,20 +70,39 @@ struct PageSlabMemoryResource : std::pmr::memory_resource {
     std::align_val_t alignment;
   };
 
-  constexpr static size_t alignSize(size_t size, size_t alignment) noexcept {
+  void release_pages() noexcept {
+    auto *current = std::exchange(pages, nullptr);
+    ptr = nullptr;
+    space = 0;
+    while (current) {
+      auto *next = current->next;
+      upstream_->deallocate(current, current->alloc_size, static_cast<std::size_t>(current->alignment));
+      current = next;
+    }
+  }
+
+  constexpr static size_t alignSize(size_t size, size_t alignment) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+        size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+      throw std::bad_alloc();
+    }
     return (size + alignment - 1) & ~(alignment - 1);
   }
 
   void *do_allocate(size_t bytes, size_t alignment) final {
     // 1. could this fit inside a page slab?
     constexpr auto header_size = sizeof(header);
-    auto earliest_slab_position = alignSize(header_size, alignment);
-    auto max_slab_capacity = PAGE_SIZE - earliest_slab_position;
-    if (max_slab_capacity < bytes) [[unlikely]] {
-      auto required_bytes = bytes + earliest_slab_position;
-      auto *newmem = reinterpret_cast<header *>(upstream_->allocate(required_bytes, alignment));
+    const auto effective_alignment = std::max(alignment, alignof(header));
+    const auto earliest_slab_position = alignSize(header_size, effective_alignment);
+    if (effective_alignment > PAGE_SIZE || earliest_slab_position >= PAGE_SIZE ||
+        (PAGE_SIZE - earliest_slab_position) < bytes) [[unlikely]] {
+      if (bytes > std::numeric_limits<size_t>::max() - earliest_slab_position) {
+        throw std::bad_alloc();
+      }
+      const auto required_bytes = bytes + earliest_slab_position;
+      auto *newmem = reinterpret_cast<header *>(upstream_->allocate(required_bytes, effective_alignment));
       // add to the allocation list
-      pages = std::construct_at<header>(newmem, pages, required_bytes, std::align_val_t{alignment});
+      pages = std::construct_at<header>(newmem, pages, required_bytes, std::align_val_t{effective_alignment});
       return reinterpret_cast<std::byte *>(pages) + earliest_slab_position;
     }
 

@@ -16,8 +16,8 @@ The hops budget applies after the replay, and bounded expansions share the many-
 
 import sys
 
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 URI = "bolt://localhost:7687"
 AUTH = ("", "")

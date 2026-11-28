@@ -54,23 +54,28 @@ class Session : public std::enable_shared_from_this<Session<TRequestHandler, TSe
   }
 
   void Run() {
-    if (auto *ssl = std::get_if<SSLSocket>(&stream_); ssl != nullptr) {
-      try {
+    boost::asio::dispatch(strand_, [shared_this = shared_from_this()] {
+      if (auto *ssl = std::get_if<SSLSocket>(&shared_this->stream_); ssl != nullptr) {
         boost::beast::get_lowest_layer(*ssl).expires_after(std::chrono::seconds(kSSLExpirySeconds));
-        ssl->handshake(boost::asio::ssl::stream_base::server);
-      } catch (const boost::system::system_error &e) {
-        spdlog::warn("Failed on SSL handshake: {}", e.what());
+        ssl->async_handshake(
+            boost::asio::ssl::stream_base::server,
+            boost::asio::bind_executor(shared_this->strand_, std::bind_front(&Session::OnHandshake, shared_this)));
         return;
       }
-    }
-
-    // run on the strand
-    boost::asio::dispatch(strand_, [shared_this = shared_from_this()] { shared_this->DoRead(); });
+      shared_this->DoRead();
+    });
   }
 
  private:
   using PlainSocket = boost::beast::tcp_stream;
   using SSLSocket = boost::beast::ssl_stream<boost::beast::tcp_stream>;
+
+  void OnHandshake(boost::beast::error_code ec) {
+    if (ec) {
+      return LogError(ec, "handshake");
+    }
+    DoRead();
+  }
 
   explicit Session(tcp::socket &&socket, TSessionContext *data, ServerContext &context)
       : stream_(CreateSocket(std::move(socket), context)),
@@ -136,6 +141,7 @@ class Session : public std::enable_shared_from_this<Session<TRequestHandler, TSe
         // for the duration of the async operation so
         // we use a shared_ptr to manage it.
         auto sp = std::make_shared<boost::beast::http::response<boost::beast::http::string_body>>(std::move(msg));
+        close_ = sp->need_eof();
 
         // Store a type-erased version of the shared
         // pointer in the class to keep it alive.

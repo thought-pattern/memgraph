@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
+import pytest
 
 
 def test_allow_switching_from_memory_to_disk_when_database_is_empty(connect):

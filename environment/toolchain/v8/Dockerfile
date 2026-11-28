@@ -21,7 +21,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         coreutils gcc g++ build-essential make file \
-        wget gnupg \
+        curl wget gnupg \
         tar gzip bzip2 xz-utils unzip \
         git \
         rsync \

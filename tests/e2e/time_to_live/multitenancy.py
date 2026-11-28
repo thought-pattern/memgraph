@@ -9,12 +9,12 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
-import sys
 from functools import partial
+import sys
 
-import pytest
 from common import connect, execute_and_fetch_all
 from mg_utils import mg_sleep_and_assert
+import pytest
 
 
 def assert_db(cursor, db):

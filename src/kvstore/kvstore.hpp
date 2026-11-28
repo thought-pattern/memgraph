@@ -12,6 +12,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <iterator>
 #include <map>
@@ -85,7 +87,15 @@ class KVStore final {
    * @return Value for the given key. std::nullopt in case of any error
    *         OR the value doesn't exist.
    */
+  enum class GetError : uint8_t {
+    kNotFound,
+    kReadError,
+  };
+
   std::optional<std::string> Get(std::string_view key) const noexcept;
+
+  /// Retrieves the value for `key`, distinguishing a missing key (`kNotFound`) from a storage read error (`kReadError`).
+  std::expected<std::string, GetError> GetStrict(std::string_view key) const noexcept;
 
   /**
    * Deletes the key and corresponding value from storage.
@@ -205,6 +215,10 @@ class KVStore final {
     void SetInvalid();
 
     bool IsValid();
+
+    bool HasError() const noexcept;
+
+    std::string_view ErrorMessage() const noexcept;
 
    private:
     struct impl;

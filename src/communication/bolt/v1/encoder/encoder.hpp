@@ -26,6 +26,11 @@ namespace memgraph::communication::bolt {
 template <typename Buffer>
 class Encoder : private BaseEncoder<Buffer> {
  private:
+  using BaseEncoder<Buffer>::CanEncodeList;
+  using BaseEncoder<Buffer>::CanEncodeMap;
+  using BaseEncoder<Buffer>::CanEncodeSize;
+  using BaseEncoder<Buffer>::CanEncodeValue;
+  using BaseEncoder<Buffer>::RequireEncodable;
   using BaseEncoder<Buffer>::WriteRAW;
   using BaseEncoder<Buffer>::WriteList;
   using BaseEncoder<Buffer>::WriteMap;
@@ -50,12 +55,16 @@ class Encoder : private BaseEncoder<Buffer> {
    */
 
   void MessageRecordHeader(size_t n_values) {
+    RequireEncodable(CanEncodeSize(n_values));
     WriteRAW(std::to_underlying(Marker::TinyStruct1));
     WriteRAW(std::to_underlying(Signature::Record));
     WriteTypeSize(n_values, MarkerList);
   }
 
-  void MessageRecordAppendValue(const Value &value) { WriteValue(value); }
+  void MessageRecordAppendValue(const Value &value) {
+    RequireEncodable(CanEncodeValue(value));
+    WriteValue(value);
+  }
 
   bool MessageRecordFinalize() {
     // Try to flush all remaining data in the buffer, but tell it that we will
@@ -69,6 +78,7 @@ class Encoder : private BaseEncoder<Buffer> {
   }
 
   bool MessageRecord(const std::vector<Value> &values) {
+    if (!CanEncodeList(values)) return false;
     MessageRecordHeader(values.size());
     for (const auto &v : values) MessageRecordAppendValue(v);
     return MessageRecordFinalize();
@@ -89,6 +99,7 @@ class Encoder : private BaseEncoder<Buffer> {
    *          earlier if the buffer fills.
    */
   bool MessageSuccess(const map_t &metadata) {
+    if (!CanEncodeMap(metadata)) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct1));
     WriteRAW(std::to_underlying(Signature::Success));
     WriteMap(metadata);
@@ -128,6 +139,7 @@ class Encoder : private BaseEncoder<Buffer> {
    *          false otherwise
    */
   bool MessageFailure(const map_t &metadata) {
+    if (!CanEncodeMap(metadata)) return false;
     WriteRAW(std::to_underlying(Marker::TinyStruct1));
     WriteRAW(std::to_underlying(Signature::Failure));
     WriteMap(metadata);

@@ -105,11 +105,22 @@ def get_username(auth, attributes, use_nameid, username_attribute):
 
 
 def get_role_mappings(raw_role_mappings: str):
-    if not raw_role_mappings:
+    if not raw_role_mappings or not raw_role_mappings.strip():
         return {}
 
-    role_mappings = "".join(raw_role_mappings.split(" "))  # remove whitespace
-    return {mapping.split(":")[0]: mapping.split(":")[1] for mapping in role_mappings.split(";")}
+    mappings = {}
+    for raw_entry in raw_role_mappings.split(";"):
+        if not raw_entry.strip():
+            continue
+        parts = raw_entry.split(":", 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid role mapping: {raw_entry.strip()}")
+        idp_group = parts[0].strip()
+        db_roles = [r.strip() for r in parts[1].split(",") if r.strip()]
+        if not idp_group or not db_roles:
+            raise ValueError(f"Invalid role mapping: {raw_entry.strip()}")
+        mappings[idp_group] = db_roles
+    return mappings
 
 
 def authenticate(scheme: str, response: str):
@@ -174,10 +185,10 @@ def authenticate(scheme: str, response: str):
         if scheme == "saml-entra-id"
         else os.environ.get("MEMGRAPH_SSO_OKTA_SAML_ROLE_ATTRIBUTE", "")
     )
-    idp_role = attributes[attribute_name]
-    if not isinstance(idp_role, (str, list)):
+    idp_role_attr = attributes[attribute_name]
+    if not isinstance(idp_role_attr, (str, list)):
         return {"authenticated": False, "errors": "The role attribute must be a string or a list."}
-    idp_role = idp_role[0] if isinstance(idp_role, list) else idp_role
+    idp_roles = [idp_role_attr] if isinstance(idp_role_attr, str) else list(idp_role_attr)
 
     try:
         username = get_username(
@@ -189,30 +200,66 @@ def authenticate(scheme: str, response: str):
     except Exception as e:
         return {"authenticated": False, "errors": str(e)}
 
-    role_mappings = get_role_mappings(os.environ.get(f"MEMGRAPH_SSO_{scheme_env}_SAML_ROLE_MAPPING", ""))
-    if idp_role not in role_mappings:
+    try:
+        role_mappings = get_role_mappings(os.environ.get(f"MEMGRAPH_SSO_{scheme_env}_SAML_ROLE_MAPPING", ""))
+    except ValueError as e:
+        return {"authenticated": False, "errors": str(e)}
+
+    mapped_roles = []
+    for candidate_role in idp_roles:
+        if candidate_role in role_mappings:
+            for db_role in role_mappings[candidate_role]:
+                if db_role not in mapped_roles:
+                    mapped_roles.append(db_role)
+
+    if not mapped_roles:
+        if len(idp_roles) == 1:
+            return {
+                "authenticated": False,
+                "errors": f'The role "{idp_roles[0]}" is not present in the given role mappings.',
+            }
         return {
             "authenticated": False,
-            "errors": f'The role "{idp_role}" is not present in the given role mappings.',
+            "errors": f"None of the roles {idp_roles} are present in the given role mappings.",
         }
 
+    if len(mapped_roles) == 1:
+        return {
+            "authenticated": True,
+            "role": mapped_roles[0],
+            "username": username,
+        }
     return {
         "authenticated": True,
-        "role": role_mappings[idp_role],
+        "roles": mapped_roles,
         "username": username,
     }
 
 
-if __name__ == "__main__":
+def process_pipe_line(raw_line: bytes) -> bytes:
     from common import add_call_id_to_response, pop_call_id
 
+    call_id = None
+    try:
+        params = json.loads(raw_line.decode("utf-8"))
+        if not isinstance(params, dict):
+            raise ValueError("Request payload must be a JSON object")
+        call_id = pop_call_id(params)
+        ret = authenticate(**params)
+    except Exception as exc:
+        ret = {"authenticated": False, "errors": f"Invalid authentication request: {exc}"}
+    add_call_id_to_response(ret, call_id)
+    return (json.dumps(ret) + "\n").encode("utf-8")
+
+
+if __name__ == "__main__":
     # Stateless: each request is independent. Do not cache tokens or user data,
     # or the next connection may get the previous user (wrong-user bug).
     input_stream = io.FileIO(1000, mode="r")
     output_stream = io.FileIO(1001, mode="w")
     while True:
-        params = json.loads(input_stream.readline().decode("ascii"))
-        call_id = pop_call_id(params)
-        ret = authenticate(**params)
-        add_call_id_to_response(ret, call_id)
-        output_stream.write((json.dumps(ret) + "\n").encode("ascii"))
+        line = input_stream.readline()
+        if not line:
+            break
+        output_stream.write(process_pipe_line(line))
+        output_stream.flush()

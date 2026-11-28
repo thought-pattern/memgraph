@@ -22,6 +22,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_node_map.hpp>
 
+#include "query/frontend/semantic/symbol.hpp"
 #include "query/plan_v2/egraph/analysis.hpp"
 #include "query/plan_v2/egraph/builtin_functions.hpp"
 #include "query/plan_v2/egraph/constant_identity.hpp"
@@ -87,14 +88,22 @@ struct symbol_make_traits<symbol::Once> {
   static auto make(storage_type &s) -> seeded_node;
 };
 
-/// Symbol: position -> name mapping
+struct SymbolInfo {
+  std::string name;
+  bool user_declared{false};
+  query::Symbol::Type type{query::Symbol::Type::ANY};
+  int32_t token_position{-1};
+};
+
+/// Symbol: position -> SymbolInfo mapping
 template <>
 struct symbol_make_traits<symbol::Symbol> {
   struct storage_type {
-    std::map<int32_t, std::string> store;
+    std::map<int32_t, SymbolInfo> store;
   };
 
-  static auto make(storage_type &s, int32_t pos, std::string_view name) -> seeded_node;
+  static auto make(storage_type &s, int32_t pos, std::string_view name, bool user_declared = false,
+                   query::Symbol::Type type = query::Symbol::Type::ANY, int32_t token_position = -1) -> seeded_node;
 };
 
 /// Literal: the value is interned and its id is the disambiguator; the Builder
@@ -211,6 +220,14 @@ struct symbol_make_traits<symbol::Subquery> {
   static auto make(storage_type &, utils::small_vector<planner::core::EClassId> children) -> seeded_node;
 };
 
+/// Distinct: no storage, unary pipe operator [input].
+template <>
+struct symbol_make_traits<symbol::Distinct> {
+  struct storage_type {};
+
+  static auto make(storage_type &, planner::core::EClassId input) -> seeded_node;
+};
+
 /// Binary operator: no storage, just two children
 template <symbol S>
   requires(is_binary_op_v<S>)
@@ -220,6 +237,20 @@ struct symbol_make_traits<S> {
   static auto make(storage_type & /*s*/, planner::core::EClassId lhs, planner::core::EClassId rhs) -> seeded_node {
     return {.lowered = {.children = utils::small_vector{lhs, rhs}, .disambiguator = std::nullopt},
             .seed = default_analysis_seed<S>()};
+  }
+
+  static auto update(planner::core::EGraph<symbol, analysis> const &eg, storage_type const & /*s*/,
+                     std::span<planner::core::EClassId const> children, std::uint64_t /*disambiguator*/, analysis &out)
+      -> bool {
+    auto *expr = out.expression_for_update();
+    if (expr == nullptr || expr->has_impure) return false;
+    for (auto child : children) {
+      if (eg.analysis_of(child).has_impure()) {
+        expr->has_impure = true;
+        return true;
+      }
+    }
+    return false;
   }
 };
 
@@ -251,6 +282,18 @@ struct symbol_make_traits<S> {
   static auto make(storage_type & /*s*/, planner::core::EClassId operand) -> seeded_node {
     return {.lowered = {.children = utils::small_vector{operand}, .disambiguator = std::nullopt},
             .seed = default_analysis_seed<S>()};
+  }
+
+  static auto update(planner::core::EGraph<symbol, analysis> const &eg, storage_type const & /*s*/,
+                     std::span<planner::core::EClassId const> children, std::uint64_t /*disambiguator*/, analysis &out)
+      -> bool {
+    auto *expr = out.expression_for_update();
+    if (expr == nullptr || expr->has_impure || children.empty()) return false;
+    if (eg.analysis_of(children[0]).has_impure()) {
+      expr->has_impure = true;
+      return true;
+    }
+    return false;
   }
 };
 

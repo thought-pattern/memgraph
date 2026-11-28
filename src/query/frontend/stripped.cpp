@@ -192,7 +192,11 @@ StrippedQuery::StrippedQuery(std::string query) : original_(std::move(query)) {
         replace_stripped(token_index, ParseStringLiteral(token.second), kStrippedStringToken);
         break;
       case Token::INT:
-        replace_stripped(token_index, ParseIntegerLiteral(token.second), kStrippedIntToken);
+        if (IsInt64MinMagnitudeLiteral(token.second)) {
+          token_strings.push_back(token.second);
+        } else {
+          replace_stripped(token_index, ParseIntegerLiteral(token.second), kStrippedIntToken);
+        }
         break;
       case Token::REAL:
         replace_stripped(token_index, ParseDoubleLiteral(token.second), kStrippedDoubleToken);
@@ -251,6 +255,7 @@ StrippedQuery::StrippedQuery(std::string query) : original_(std::move(query)) {
       if (it == tokens.end()) break;
 
       bool has_as = false;
+      bool prev_was_dot = false;
       auto last_non_space = it;
       auto jt = it;
       // We should track number of opened braces and parantheses so that we can
@@ -259,12 +264,17 @@ StrippedQuery::StrippedQuery(std::string query) : original_(std::move(query)) {
       int num_open_braces = 0;
       int num_open_parantheses = 0;
       int num_open_brackets = 0;
-      for (;
-           jt != tokens.end() && (jt->second != "," || num_open_braces || num_open_parantheses || num_open_brackets) &&
-           !utils::IEquals(jt->second, "order") && !utils::IEquals(jt->second, "skip") &&
-           !utils::IEquals(jt->second, "limit") && !utils::IEquals(jt->second, "union") &&
-           !utils::IEquals(jt->second, "query") && jt->second != ";";
-           ++jt) {
+      for (; jt != tokens.end(); ++jt) {
+        bool const at_top_level = (num_open_braces == 0 && num_open_parantheses == 0 && num_open_brackets == 0);
+        if (at_top_level && jt->second == ",") {
+          break;
+        }
+        if (at_top_level && !prev_was_dot &&
+            (utils::IEquals(jt->second, "order") || utils::IEquals(jt->second, "skip") ||
+             utils::IEquals(jt->second, "limit") || utils::IEquals(jt->second, "union") ||
+             utils::IEquals(jt->second, "query") || jt->second == ";")) {
+          break;
+        }
         if (jt->second == "(") {
           ++num_open_parantheses;
         } else if (jt->second == ")") {
@@ -278,8 +288,11 @@ StrippedQuery::StrippedQuery(std::string query) : original_(std::move(query)) {
         } else if (jt->second == "}") {
           --num_open_brackets;
         }
-        has_as |= utils::IEquals(jt->second, "as");
+        if (at_top_level && !prev_was_dot && utils::IEquals(jt->second, "as")) {
+          has_as = true;
+        }
         if (jt->first != Token::SPACE) {
+          prev_was_dot = (jt->second == ".");
           last_non_space = jt;
         }
       }
@@ -453,7 +466,7 @@ int StrippedQuery::MatchHexadecimalInt(int start) const {
 }
 
 int StrippedQuery::MatchReal(int start) const {
-  enum class State { START, BEFORE_DOT, DOT, AFTER_DOT, E, E_MINUS, AFTER_E };
+  enum class State { START, BEFORE_DOT, DOT_FROM_START, DOT_AFTER_DIGIT, AFTER_DOT, E, E_MINUS, AFTER_E };
   State state = State::START;
   auto i = start;
   // A real literal needs a fractional part or an exponent, so tracking where
@@ -464,18 +477,23 @@ int StrippedQuery::MatchReal(int start) const {
   auto end_of_real = start;
   while (i < static_cast<int>(original_.size())) {
     if (original_[i] == '.') {
-      if (state != State::BEFORE_DOT && state != State::START) break;
-      state = State::DOT;
+      if (state == State::START) {
+        state = State::DOT_FROM_START;
+      } else if (state == State::BEFORE_DOT) {
+        state = State::DOT_AFTER_DIGIT;
+      } else {
+        break;
+      }
     } else if ('0' <= original_[i] && original_[i] <= '9') {
       if (state == State::START) {
         state = State::BEFORE_DOT;
-      } else if (state == State::DOT) {
+      } else if (state == State::DOT_FROM_START || state == State::DOT_AFTER_DIGIT) {
         state = State::AFTER_DOT;
       } else if (state == State::E || state == State::E_MINUS) {
         state = State::AFTER_E;
       }
     } else if (original_[i] == 'e' || original_[i] == 'E') {
-      if (state != State::BEFORE_DOT && state != State::AFTER_DOT) break;
+      if (state != State::BEFORE_DOT && state != State::DOT_AFTER_DIGIT && state != State::AFTER_DOT) break;
       state = State::E;
     } else if (original_[i] == '-') {
       if (state != State::E) break;
@@ -575,7 +593,8 @@ int StrippedQuery::MatchWhitespaceAndComments(int start) const {
         state = State::OUT;
         i += 2;
       } else if (original_[i] == '\r') {
-        break;
+        state = State::OUT;
+        ++i;
       } else if (i + 1 == len) {
         state = State::OUT;
         ++i;

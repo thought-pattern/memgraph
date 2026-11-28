@@ -11,9 +11,9 @@
 
 from abc import ABC
 
-import helpers
 from benchmark_context import BenchmarkContext
 from constants import DatabaseLanguage, GraphVendors
+import helpers
 
 
 # Base dataset class used as a template to create each individual dataset. All

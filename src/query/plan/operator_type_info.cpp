@@ -59,8 +59,9 @@ constexpr utils::TypeInfo query::plan::ScanAllByVertexProperty::kType{.id = util
                                                                       .name = "ScanAllByVertexProperty",
                                                                       .superclass = &query::plan::ScanAll::kType};
 
-constexpr utils::TypeInfo query::plan::ScanAllByEdgeId::kType{
-    .id = utils::TypeId::SCAN_ALL_BY_ID, .name = "ScanAllByEdgeId", .superclass = &query::plan::ScanAllByEdge::kType};
+constexpr utils::TypeInfo query::plan::ScanAllByEdgeId::kType{.id = utils::TypeId::SCAN_ALL_BY_EDGE_ID,
+                                                              .name = "ScanAllByEdgeId",
+                                                              .superclass = &query::plan::ScanAllByEdge::kType};
 
 constexpr utils::TypeInfo query::plan::ExpandCommon::kType{utils::TypeId::EXPAND_COMMON, "ExpandCommon", nullptr};
 constexpr utils::TypeInfo query::plan::ScanByEdgeCommon::kType{
@@ -201,8 +202,9 @@ constexpr utils::TypeInfo query::plan::ScanChunkByEdge::kType{.id = utils::TypeI
                                                               .name = "ScanChunkByEdge",
                                                               .superclass = &query::plan::ScanAllByEdge::kType};
 
-constexpr utils::TypeInfo query::plan::ScanParallel::kType{
-    .id = utils::TypeId::SCAN_PARALLEL, .name = "ScanParallel", .superclass = &query::plan::ScanAll::kType};
+constexpr utils::TypeInfo query::plan::ScanParallel::kType{.id = utils::TypeId::SCAN_PARALLEL,
+                                                           .name = "ScanParallel",
+                                                           .superclass = &query::plan::LogicalOperator::kType};
 
 constexpr utils::TypeInfo query::plan::ScanParallelByLabel::kType{.id = utils::TypeId::SCAN_PARALLEL_BY_LABEL,
                                                                   .name = "ScanParallelByLabel",

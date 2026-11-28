@@ -11,68 +11,155 @@
 
 #include "glue/websocket_auth.hpp"
 
+#include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 
+#include "auth/exceptions.hpp"
 #include "dbms/constants.hpp"
 #include "utils/variant_helpers.hpp"
 
 namespace memgraph::glue {
 
+namespace {
+
+bool RefreshCachedPrincipal(const auth::Auth &locked_auth, std::optional<auth::UserOrRole> &principal) {
+  if (!principal) {
+    return false;
+  }
+  bool valid = true;
+  std::visit(utils::Overloaded{[&](auth::User &user) {
+                                 auto tmp = locked_auth.GetUser(user.username());
+                                 if (!tmp) {
+                                   valid = false;
+                                   return;
+                                 }
+                                 user = std::move(*tmp);
+                               },
+                               [&](auth::Roles &roles) {
+                                 auth::Roles updated_roles;
+                                 for (const auto &role : roles) {
+                                   auto tmp = locked_auth.GetRole(role.rolename());
+                                   if (tmp) {
+                                     updated_roles.AddRole(*tmp);
+                                   } else {
+                                     valid = false;
+                                     return;
+                                   }
+                                 }
+                                 if (updated_roles.rolenames().empty()) {
+                                   valid = false;
+                                   return;
+                                 }
+                                 roles = std::move(updated_roles);
+                               }},
+             *principal);
+  if (!valid) {
+    principal.reset();
+    return false;
+  }
+  return true;
+}
+
+bool PrincipalHasWebsocketPermission(const auth::UserOrRole &principal) {
+  return std::visit(utils::Overloaded{[](const auto &entity) {
+#ifdef MG_ENTERPRISE
+                      std::optional<std::string> db_name;
+                      try {
+                        const auto &main_db = entity.GetMain();
+                        if (!main_db.empty()) db_name = main_db;
+                      } catch (const auth::AuthException &) {
+                        db_name = std::nullopt;
+                      }
+                      const std::optional<std::string_view> db_view =
+                          db_name ? std::optional<std::string_view>{*db_name} : std::nullopt;
+                      return entity.GetPermissions(db_view).Has(auth::Permission::WEBSOCKET) ==
+                             auth::PermissionLevel::GRANT;
+#else
+                      return entity.GetPermissions(dbms::kDefaultDB).Has(auth::Permission::WEBSOCKET) ==
+                             auth::PermissionLevel::GRANT;
+#endif
+                    }},
+                    principal);
+}
+
+class PerSessionSafeAuth final : public communication::websocket::AuthenticationInterface::SessionAuth {
+ public:
+  explicit PerSessionSafeAuth(auth::SynchedAuth *auth) : auth_(auth) {}
+
+  bool Authenticate(const std::string &username, const std::string &password) override {
+    dropped_ = false;
+    principal_ = auth::Authenticate(*auth_, username, password);
+    signed_in_ = principal_.has_value();
+    if (!signed_in_) {
+      return false;
+    }
+    auto locked_auth = auth_->ReadLock();
+    (void)locked_auth->UpToDate(auth_epoch_);
+    return true;
+  }
+
+  bool IsAuthorized() override {
+    auto locked_auth = auth_->ReadLock();
+    if (dropped_) {
+      return false;
+    }
+    if (!signed_in_) {
+      return !locked_auth->AccessControlled();
+    }
+    if (!principal_) {
+      return false;
+    }
+    if (!locked_auth->UpToDate(auth_epoch_)) {
+      if (!RefreshCachedPrincipal(*locked_auth, principal_)) {
+        dropped_ = true;
+        return false;
+      }
+    }
+#ifdef MG_ENTERPRISE
+    return PrincipalHasWebsocketPermission(*principal_);
+#else
+    return true;
+#endif
+  }
+
+ private:
+  auth::SynchedAuth *auth_;
+  std::optional<auth::UserOrRole> principal_{};
+  auth::Auth::Epoch auth_epoch_{};
+  bool signed_in_{false};
+  bool dropped_{false};
+};
+
+}  // namespace
+
 bool SafeAuth::Authenticate(const std::string &username, const std::string &password) const {
   user_or_role_ = auth::Authenticate(*auth_, username, password);
+  if (user_or_role_) {
+    auto locked_auth = auth_->ReadLock();
+    (void)locked_auth->UpToDate(auth_epoch_);
+  }
   return user_or_role_.has_value();
 }
 
 bool SafeAuth::HasWebsocketPermission() const {
   auto locked_auth = auth_->ReadLock();
-  // Update if cache invalidated
-  if (!locked_auth->UpToDate(auth_epoch_) && user_or_role_) {
-    bool success = true;
-    std::visit(utils::Overloaded{[&](auth::User &user) {
-                                   auto tmp = locked_auth->GetUser(user.username());
-                                   if (!tmp) success = false;
-                                   user = std::move(*tmp);
-                                 },
-                                 [&](auth::Roles &roles) {
-                                   // Iterate through all roles and update each one
-                                   auth::Roles updated_roles;
-                                   for (const auto &role : roles) {
-                                     auto tmp = locked_auth->GetRole(role.rolename());
-                                     if (tmp) {
-                                       updated_roles.AddRole(*tmp);
-                                     } else {
-                                       success = false;
-                                       break;
-                                     }
-                                   }
-                                   if (success) {
-                                     roles = std::move(updated_roles);
-                                   }
-                                 }},
-               *user_or_role_);
-    // Missing user/role; delete from cache
-    if (!success) user_or_role_.reset();
+  if (!user_or_role_) {
+    return false;
   }
-  // Check permissions
-  if (user_or_role_) {
-    return std::visit(utils::Overloaded{[&](auto &user_or_role) {
-                        // Main could be deleted, so we will connect without a db; this is only used by websocket on
-                        // connect, so not critical (we will not be able to access any db)
-                        const auto &db_name =
-#ifdef MG_ENTERPRISE
-                            user_or_role.GetMain();
-#else
-                            dbms::kDefaultDB;
-#endif
-                        return user_or_role.GetPermissions(db_name).Has(auth::Permission::WEBSOCKET) ==
-                               auth::PermissionLevel::GRANT;
-                      }},
-                      *user_or_role_);
+  if (!locked_auth->UpToDate(auth_epoch_)) {
+    if (!RefreshCachedPrincipal(*locked_auth, user_or_role_)) {
+      return false;
+    }
   }
-  // NOTE: websocket authenticates only if there is a user, so no need to check if access controlled
-  return false;
+  return PrincipalHasWebsocketPermission(*user_or_role_);
 }
 
 bool SafeAuth::AccessControlled() const { return auth_->ReadLock()->AccessControlled(); }
+
+std::unique_ptr<communication::websocket::AuthenticationInterface::SessionAuth> SafeAuth::CreateSessionAuth() const {
+  return std::make_unique<PerSessionSafeAuth>(auth_);
+}
 
 }  // namespace memgraph::glue

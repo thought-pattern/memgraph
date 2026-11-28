@@ -83,10 +83,13 @@ struct CompressedBuffer {
       memgraph::memory::DbAwareAllocator<uint8_t>{}.deallocate(data_, compressed_size_);
       data_ = nullptr;
     }
+    compressed_size_ = 0;
+    original_size_ = 0;
   }
 
   uint8_t *release() {
     compressed_size_ = 0;
+    original_size_ = 0;
     return std::exchange(data_, nullptr);
   }
 
@@ -124,6 +127,7 @@ struct DecompressedBuffer {
       memgraph::memory::DbAwareAllocator<uint8_t>{}.deallocate(data_, original_size_);
       data_ = nullptr;
     }
+    original_size_ = 0;
   }
 
   uint8_t *release() {

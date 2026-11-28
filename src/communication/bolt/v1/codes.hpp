@@ -76,6 +76,7 @@ enum class Marker : uint8_t {
   TinyStruct3 = 0xB3,
   TinyStruct4 = 0xB4,
   TinyStruct5 = 0xB5,
+  TinyStruct8 = 0xB8,
 
   Null = 0xC0,
   Float64 = 0xC1,

@@ -11,19 +11,19 @@ Usage:
   ./continuous_integration --workload standalone/native/workloads/config_small.yaml
 """
 import argparse
+from argparse import Namespace as Args
+from enum import Enum
 import multiprocessing
 import os
 import signal
 import subprocess
 import sys
 import time
-from argparse import Namespace as Args
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import yaml
 from gqlalchemy import Memgraph
 from workers import get_worker_object, get_worker_steps
+import yaml
 
 # Paths
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))

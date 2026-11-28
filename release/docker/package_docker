@@ -1,11 +1,13 @@
-#!/bin/bash -e
+#!/bin/bash
+set -eo pipefail
 
 # Build and package Docker image of Memgraph.
 
 function print_help () {
-    echo "Usage: $0 [--latest] MEMGRAPH_PACKAGE.(deb|rpm)"
+    echo "Usage: $0 [--latest] --package-path MEMGRAPH_PACKAGE.deb [OPTIONS]"
     echo "Optional arguments:"
     echo -e "\t-h|--help\t\tPrint help."
+    echo -e "\t--package-path <file>\tPath to the Debian Memgraph package (.deb)."
     echo -e "\t--latest\t\tTag image as latest version."
     echo -e "\t--keep-image-loaded <true|false>\tKeep built image loaded in local Docker daemon (default false)."
     echo -e "\t--package-flavour <prod|debug|fips>\tImage variant to build (default prod)."
@@ -118,10 +120,21 @@ if [[ "$malloc" == true ]]; then
   tag_extension="${tag_extension}-malloc"
 fi
 
+extension="${package_path##*.}"
+if [[ "$extension" != "deb" ]]; then
+  echo "Error: Standalone Docker packaging supports only Debian (.deb) packages (got '$package_path')" >&2
+  print_help
+  exit 1
+fi
+
+dockerfile_path="${working_dir}/${toolchain_version}_${extension}.dockerfile"
+if [[ ! -f "$dockerfile_path" ]]; then
+  echo "Error: Missing Docker recipe '$dockerfile_path' for toolchain '$toolchain_version'" >&2
+  exit 1
+fi
+
 # Copy the .deb to working directory.
 cp "$package_path" "${working_dir}/"
-
-extension="${package_path##*.}"
 
 # For the debug flavour, locate the matching memgraph-debuginfo package next
 # to the main one and stage it into the build context. The dockerfile mounts
@@ -129,14 +142,7 @@ extension="${package_path##*.}"
 debuginfo_package_path=""
 debuginfo_package_name=""
 if [[ "$package_flavour" == "debug" ]]; then
-  case "$extension" in
-    deb)
-      debuginfo_package_path="${package_path/memgraph_/memgraph-debuginfo_}"
-      ;;
-    rpm)
-      debuginfo_package_path="${package_path/memgraph-/memgraph-debuginfo-}"
-      ;;
-  esac
+  debuginfo_package_path="${package_path/memgraph_/memgraph-debuginfo_}"
   if [[ ! -f "$debuginfo_package_path" ]]; then
     echo "Error: expected memgraph-debuginfo package next to '$package_path'"
     echo "       (looked for '$debuginfo_package_path' — produce it via component-aware cpack)"
@@ -146,7 +152,7 @@ if [[ "$package_flavour" == "debug" ]]; then
   debuginfo_package_name="$(basename "$debuginfo_package_path" | sed "s/\.${extension}\$//")"
 fi
 
-cd ${working_dir}
+cd "${working_dir}"
 
 # copy SSL files to docker build directory
 mkdir -p "${working_dir}/openssl"
@@ -200,29 +206,23 @@ if [[ "$package_flavour" == "fips" ]]; then
   done
 fi
 
-dockerfile_path="${working_dir}/${toolchain_version}_${extension}.dockerfile"
 echo "Dockerfile: $dockerfile_path (target: $docker_target)"
-if [[ "$extension" == "deb" ]]; then
-  # Extract version and offering from deb name.
-  package_name=`echo $(basename "$package_path") | sed 's/.deb$//'`
-  version=`echo ${package_name} | cut -d '_' -f 2 | rev | cut -d '-' -f 2- | rev | tr '+~' '__'`
-elif [[ "$extension" == "rpm" ]]; then
-  # Extract version and offering from rpm name.
-  package_name=`echo $(basename "$package_path") | sed 's/.rpm$//'`
-  version=`echo ${package_name} | cut -d '-' -f 2 | rev | cut -d '-' -f 2- | rev`
-  version=${version%_1}
-else
-  echo "Invalid file sent as the package"
-  print_help
-  exit 1
-fi
+# Extract version and offering from deb name.
+package_name="$(basename "$package_path" .deb)"
+version="$(echo "${package_name}" | cut -d '_' -f 2 | rev | cut -d '-' -f 2- | rev | tr '+~' '__')"
 
 tag="${version}${tag_extension}"
 image_name="memgraph/memgraph:${tag}"
 image_package_name="memgraph-${tag}-docker.tar.gz"
 
+mirror_secret_args=()
 if [[ "$custom_mirror" == true ]]; then
-  cp -v ../../tools/ci/ubuntu-mirrors/${arch}/ci.sources "${working_dir}/ci.sources"
+  if [[ -z "$arch" || ! -f "../../tools/ci/ubuntu-mirrors/${arch}/ci.sources" ]]; then
+    echo "Error: --custom-mirror true requires --arch <amd|arm> with an existing mirror file" >&2
+    exit 1
+  fi
+  cp -v "../../tools/ci/ubuntu-mirrors/${arch}/ci.sources" "${working_dir}/ci.sources"
+  mirror_secret_args+=(--secret "id=ubuntu_sources,src=${working_dir}/ci.sources")
 fi
 
 # copy scripts to be bind mounted for setting/unsetting mirrors
@@ -237,15 +237,26 @@ fi
 
 # Build docker image.
 # NOTE: --pull is here to always pull that latest base image because of security patches.
-docker build --pull -t ${image_name} ${tag_latest} -f ${dockerfile_path} \
+DOCKER_BUILDKIT=1 docker build --pull -t ${image_name} ${tag_latest} -f "${dockerfile_path}" \
 --target ${docker_target} \
 --build-arg BINARY_NAME=${package_name} \
 --build-arg EXTENSION=${extension} ${docker_arg_source_code} \
-"${debuginfo_build_arg[@]}" \
+${debuginfo_build_arg[@]+"${debuginfo_build_arg[@]}"} \
+${mirror_secret_args[@]+"${mirror_secret_args[@]}"} \
 --build-arg CUSTOM_MIRROR=$custom_mirror \
 --build-arg TARGETARCH="" .
-docker save ${image_name} ${latest_image} | gzip > ${image_package_name}
-rm "${working_dir}/${package_name}.${extension}"
+if ! docker save ${image_name} ${latest_image} | gzip > "${image_package_name}"; then
+  rm -f "${image_package_name}"
+  echo "Error: failed to export Docker image '${image_name}'" >&2
+  exit 1
+fi
+if [[ "$(gzip -dc "${image_package_name}" | wc -c | tr -d ' ')" -eq 0 ]]; then
+  rm -f "${image_package_name}"
+  echo "Error: exported Docker archive '${image_package_name}' is empty" >&2
+  exit 1
+fi
+rm -f "${working_dir}/${package_name}.${extension}" "${working_dir}/ci.sources"
+rm -rf "${working_dir}/mirrors"
 if [[ -n "$debuginfo_package_name" ]]; then
   rm -f "${working_dir}/${debuginfo_package_name}.${extension}"
 fi

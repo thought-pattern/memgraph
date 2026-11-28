@@ -16,14 +16,14 @@ import importlib
 import inspect
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
+from benchmark_context import BenchmarkContext
 import log
 import workloads
-from benchmark_context import BenchmarkContext
 from workloads import *
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))

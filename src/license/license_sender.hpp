@@ -29,7 +29,8 @@ class LicenseInfoSender final {
  public:
   LicenseInfoSender(std::string url, std::string uuid, std::string machine_id, int64_t memory_limit,
                     utils::Synchronized<std::optional<LicenseInfo>, utils::SpinLock> &license_info,
-                    std::chrono::seconds request_interval = std::chrono::seconds(8 * 60 * 60));
+                    std::chrono::seconds request_interval = std::chrono::seconds(8 * 60 * 60),
+                    bool telemetry_enabled = true);
 
   LicenseInfoSender(const LicenseInfoSender &) = delete;
   LicenseInfoSender(LicenseInfoSender &&) noexcept = delete;
@@ -50,6 +51,7 @@ class LicenseInfoSender final {
   const std::string uuid_;
   const std::string machine_id_;
   const int64_t memory_limit_;
+  const bool telemetry_enabled_{true};
 
   utils::Synchronized<std::optional<LicenseInfo>, utils::SpinLock> &license_info_;
   utils::Scheduler scheduler_;

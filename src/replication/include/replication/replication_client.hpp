@@ -16,6 +16,7 @@
 #include "replication/config.hpp"
 #include "replication_coordination_glue/messages.hpp"
 #include "rpc/client.hpp"
+#include "slk/serialization.hpp"
 #include "utils/rw_lock.hpp"
 #include "utils/scheduler.hpp"
 #include "utils/synchronized.hpp"
@@ -70,6 +71,10 @@ struct ReplicationClient {
               if (constexpr auto kFailureAfterN = 3UL; ++failed_attempts == kFailureAfterN) {
                 fail_cb(*this);
               }
+            } catch (const utils::BasicException &) {
+              if (constexpr auto kFailureAfterN = 3UL; ++failed_attempts == kFailureAfterN) {
+                fail_cb(*this);
+              }
             }
           });
     }
@@ -99,6 +104,7 @@ struct ReplicationClient {
         // NOLINTNEXTLINE(bugprone-empty-catch)
         catch (rpc::RpcFailedException const &) {  // timeout exception not handled in a specific way
           // swallow error, fallthrough to error handling
+        } catch (utils::BasicException const &) {
         }
         // This replica needs SYSTEM recovery
         state_.WithLock([](auto &state) { state = State::BEHIND; });
@@ -113,6 +119,9 @@ struct ReplicationClient {
       return task();
     } catch (rpc::RpcFailedException const &) {  // timeout exception not handled in a specific way
       // This replica needs SYSTEM recovery
+      state_.WithLock([](auto &state) { state = State::BEHIND; });
+      return false;
+    } catch (utils::BasicException const &) {
       state_.WithLock([](auto &state) { state = State::BEHIND; });
       return false;
     }
@@ -139,6 +148,13 @@ struct ReplicationClient {
   };
 
   utils::Synchronized<State, utils::WritePrioritizedRWLock> state_{State::BEHIND};
+  std::atomic<uint64_t> last_confirmed_system_timestamp_{0};
+  std::atomic<bool> has_confirmed_system_timestamp_{false};
+
+  void RecordConfirmedSystemTimestamp(uint64_t ts) noexcept {
+    last_confirmed_system_timestamp_.store(ts, std::memory_order_release);
+    has_confirmed_system_timestamp_.store(true, std::memory_order_release);
+  }
 
   replication_coordination_glue::ReplicationMode mode_{replication_coordination_glue::ReplicationMode::STRICT_SYNC};
   // Background tasks are split across two single-threaded pools by what they may block on, because the

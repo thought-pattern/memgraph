@@ -20,6 +20,7 @@
 #include "auth/ops.hpp"
 #include "auth/profiles/user_profiles.hpp"
 #include "rpc/messages.hpp"
+#include "utils/uuid.hpp"
 
 namespace memgraph::replication {
 

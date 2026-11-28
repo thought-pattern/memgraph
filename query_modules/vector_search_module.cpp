@@ -9,11 +9,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 #include <mgp.hpp>
 
@@ -168,25 +170,45 @@ void VectorSearch::CosineSimilarityFunction(mgp_list *args, mgp_func_context * /
       throw std::invalid_argument("Vectors must be non-empty and have the same dimension");
     }
 
+    const auto dim = vector1.Size();
+    std::vector<double> vals1(dim);
+    std::vector<double> vals2(dim);
+    auto max_abs1 = 0.0;
+    auto max_abs2 = 0.0;
+    auto get_numeric_value = [](const mgp::Value &val) {
+      double num = 0.0;
+      if (val.IsDouble()) {
+        num = val.ValueDouble();
+      } else if (val.IsInt()) {
+        num = static_cast<double>(val.ValueInt());
+      } else {
+        throw std::invalid_argument("Vector elements must be numeric (int or double)");
+      }
+      if (!std::isfinite(num)) {
+        throw std::invalid_argument("Vector elements must be finite numeric values");
+      }
+      return num;
+    };
+
+    for (auto i = 0; i < dim; ++i) {
+      vals1[i] = get_numeric_value(vector1[i]);
+      vals2[i] = get_numeric_value(vector2[i]);
+      max_abs1 = std::max(max_abs1, std::abs(vals1[i]));
+      max_abs2 = std::max(max_abs2, std::abs(vals2[i]));
+    }
+    if (max_abs1 == 0.0 || max_abs2 == 0.0) [[unlikely]] {
+      throw std::invalid_argument("Cannot calculate cosine similarity for zero vectors");
+    }
+
     auto dot_product = 0.0;
     auto magnitude1 = 0.0;
     auto magnitude2 = 0.0;
-    for (auto i = 0; i < vector1.Size(); ++i) {
-      auto get_numeric_value = [&](const mgp::Value &val) {
-        if (val.IsDouble()) {
-          return val.ValueDouble();
-        }
-        if (val.IsInt()) {
-          return static_cast<double>(val.ValueInt());
-        }
-        throw std::invalid_argument("Vector elements must be numeric (int or double)");
-      };
-      const auto val1 = get_numeric_value(vector1[i]);
-      const auto val2 = get_numeric_value(vector2[i]);
-
-      dot_product += val1 * val2;
-      magnitude1 += val1 * val1;
-      magnitude2 += val2 * val2;
+    for (auto i = 0; i < dim; ++i) {
+      const auto u1 = vals1[i] / max_abs1;
+      const auto u2 = vals2[i] / max_abs2;
+      dot_product += u1 * u2;
+      magnitude1 += u1 * u1;
+      magnitude2 += u2 * u2;
     }
     magnitude1 = std::sqrt(magnitude1);
     magnitude2 = std::sqrt(magnitude2);
@@ -194,7 +216,7 @@ void VectorSearch::CosineSimilarityFunction(mgp_list *args, mgp_func_context * /
       throw std::invalid_argument("Cannot calculate cosine similarity for zero vectors");
     }
 
-    const auto cosine_similarity = dot_product / (magnitude1 * magnitude2);
+    const auto cosine_similarity = std::clamp(dot_product / (magnitude1 * magnitude2), -1.0, 1.0);
     auto result = mgp::Result(res);
     result.SetValue(cosine_similarity);
   } catch (const std::exception &e) {

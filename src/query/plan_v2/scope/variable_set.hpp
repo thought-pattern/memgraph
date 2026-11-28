@@ -47,7 +47,7 @@ class VariableSet {
     return n;
   }
 
-  [[nodiscard]] auto test(uint16_t bit) const noexcept -> bool {
+  [[nodiscard]] auto test(uint32_t bit) const noexcept -> bool {
     auto const word = static_cast<std::size_t>(bit) / kBitsPerBlock;
     if (word >= bits_.size()) return false;
     return (bits_[word] >> (bit % kBitsPerBlock)) & 1U;
@@ -93,13 +93,13 @@ class VariableSet {
 
   // ---- Mutation (bit-indexed) ----
 
-  void set(uint16_t bit) {
+  void set(uint32_t bit) {
     auto const word = static_cast<std::size_t>(bit) / kBitsPerBlock;
     if (word >= bits_.size()) bits_.resize(word + 1, 0);
     bits_[word] |= block_type{1} << (bit % kBitsPerBlock);
   }
 
-  void unset(uint16_t bit) noexcept {
+  void unset(uint32_t bit) noexcept {
     auto const word = static_cast<std::size_t>(bit) / kBitsPerBlock;
     if (word >= bits_.size()) return;
     bits_[word] &= ~(block_type{1} << (bit % kBitsPerBlock));
@@ -129,19 +129,19 @@ class VariableSet {
     return out;
   }
 
-  [[nodiscard]] auto difference_bit(uint16_t bit) const -> VariableSet {
+  [[nodiscard]] auto difference_bit(uint32_t bit) const -> VariableSet {
     VariableSet out = *this;
     out.unset(bit);
     return out;
   }
 
-  [[nodiscard]] auto union_bit(uint16_t bit) const -> VariableSet {
+  [[nodiscard]] auto union_bit(uint32_t bit) const -> VariableSet {
     VariableSet out = *this;
     out.set(bit);
     return out;
   }
 
-  // ---- Iteration: yields bit positions (uint16_t), ascending ----
+  // ---- Iteration: yields bit positions (uint32_t), ascending ----
   //
   // Iterator-of-the-set-bits.  Walks blocks; per-block extracts lowest set bit
   // via std::countr_zero and clears it.  No EClassIds; translation lives in
@@ -150,10 +150,10 @@ class VariableSet {
   class const_iterator {
    public:
     using iterator_category = std::forward_iterator_tag;
-    using value_type = uint16_t;
+    using value_type = uint32_t;
     using difference_type = std::ptrdiff_t;
     using pointer = void;
-    using reference = uint16_t;
+    using reference = uint32_t;
 
     const_iterator() = default;
 
@@ -162,8 +162,8 @@ class VariableSet {
       advance_to_set();
     }
 
-    auto operator*() const -> uint16_t {
-      return static_cast<uint16_t>(word_ * kBitsPerBlock + static_cast<std::size_t>(std::countr_zero(residual_)));
+    auto operator*() const -> uint32_t {
+      return static_cast<uint32_t>(word_ * kBitsPerBlock + static_cast<std::size_t>(std::countr_zero(residual_)));
     }
 
     auto operator++() -> const_iterator & {

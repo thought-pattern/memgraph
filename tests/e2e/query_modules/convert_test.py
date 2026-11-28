@@ -12,9 +12,9 @@
 import json
 import sys
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 
 def test_convert_list1():

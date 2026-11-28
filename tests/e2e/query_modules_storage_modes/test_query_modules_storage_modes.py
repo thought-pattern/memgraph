@@ -9,12 +9,12 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from multiprocessing import Manager, Process
 import struct
 import sys
-from multiprocessing import Manager, Process
 
-import pytest
 from common import connect, cursor, execute_and_fetch_all
+import pytest
 
 SWITCH_TO_ANALYTICAL = "STORAGE MODE IN_MEMORY_ANALYTICAL;"
 

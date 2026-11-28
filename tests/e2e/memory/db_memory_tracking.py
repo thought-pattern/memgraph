@@ -32,16 +32,16 @@ current configuration E2E environment does not provision Kafka/Pulsar brokers.
 """
 
 import gc
+from itertools import islice
 import re
 import sys
 import threading
 import time
 import uuid
-from itertools import islice
 
 import mgclient
-import pytest
 from neo4j import GraphDatabase
+import pytest
 
 BOLT_PORT = 7687
 TEMP_DB_PREFIX = "e2e_mem_"

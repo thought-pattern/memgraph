@@ -88,6 +88,9 @@ class AuthQueryHandler final : public memgraph::query::AuthQueryHandler {
   std::vector<memgraph::query::TypedValue> GetUsernamesForRole(const std::string &rolename,
                                                                memgraph::auth::AuthTransaction *auth_tx) override;
 
+  query::RoleMemberNamesResult GetUsernamesForRoleWithDiagnostics(const std::string &rolename,
+                                                                  memgraph::auth::AuthTransaction *auth_tx) override;
+
   void SetRoles(const std::string &username, const std::vector<std::string> &roles,
                 const std::unordered_set<std::string> &role_databases, memgraph::auth::AuthTransaction *auth_tx,
                 system::Transaction *system_tx) override;

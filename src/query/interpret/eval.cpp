@@ -186,9 +186,9 @@ TypedValue ExpressionEvaluator::Visit(AllPropertiesLookup &all_properties_lookup
       result.emplace(TypedValue::TString("second", ctx_->memory), TypedValue(dur.SubDaysAsSeconds(), ctx_->memory));
       result.emplace(TypedValue::TString("millisecond", ctx_->memory),
                      TypedValue(dur.SubDaysAsMilliseconds(), ctx_->memory));
-      result.emplace(TypedValue::TString("microseconds", ctx_->memory),
+      result.emplace(TypedValue::TString("microsecond", ctx_->memory),
                      TypedValue(dur.SubDaysAsMicroseconds(), ctx_->memory));
-      result.emplace(TypedValue::TString("nanoseconds", ctx_->memory),
+      result.emplace(TypedValue::TString("nanosecond", ctx_->memory),
                      TypedValue(dur.SubDaysAsNanoseconds(), ctx_->memory));
       return {result, ctx_->memory};
     }
@@ -340,14 +340,18 @@ TypedValue ExpressionEvaluator::Visit(PropertyLookup &property_lookup) {
         return {GetProperty(edge, property_lookup.property_), GetNameIdMapper(), ctx_->memory};
       }
     case TypedValue::Type::VirtualEdge: {
-      auto prop_id = dba_->NameToProperty(property_lookup.property_.name);
-      auto prop_value = expression_result_ptr->ValueVirtualEdge().GetProperty(prop_id);
+      RequireAccessor("Reading a property");
+      auto const maybe_prop_id = dba_->NameToPropertyIfExists(property_lookup.property_.name);
+      if (!maybe_prop_id) return TypedValue(ctx_->memory);
+      auto prop_value = expression_result_ptr->ValueVirtualEdge().GetProperty(*maybe_prop_id);
       if (prop_value.IsNull()) return TypedValue(ctx_->memory);
       return {std::move(prop_value), GetNameIdMapper(), ctx_->memory};
     }
     case TypedValue::Type::VirtualNode: {
-      auto prop_id = dba_->NameToProperty(property_lookup.property_.name);
-      auto prop_value = expression_result_ptr->ValueVirtualNode().GetProperty(prop_id);
+      RequireAccessor("Reading a property");
+      auto const maybe_prop_id = dba_->NameToPropertyIfExists(property_lookup.property_.name);
+      if (!maybe_prop_id) return TypedValue(ctx_->memory);
+      auto prop_value = expression_result_ptr->ValueVirtualNode().GetProperty(*maybe_prop_id);
       if (prop_value.IsNull()) return TypedValue(ctx_->memory);
       return {std::move(prop_value), GetNameIdMapper(), ctx_->memory};
     }

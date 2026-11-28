@@ -27,7 +27,8 @@ DEFINE_VALIDATED_int32(coordinator_port, 0, "Port on which raft servers will be 
                        FLAG_IN_RANGE(0, std::numeric_limits<uint16_t>::max()));  // NOLINT
 // NOLINTEND(performance-avoid-endl)
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_int32(coordinator_id, memgraph::flags::kUnsetCoordinatorId, "Unique ID of the raft server.");
+DEFINE_VALIDATED_int32(coordinator_id, memgraph::flags::kUnsetCoordinatorId, "Unique ID of the raft server.",
+                       FLAG_IN_RANGE(0, std::numeric_limits<int32_t>::max()));
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_string(nuraft_log_file, "", "Path to the file where NuRaft logs are saved.");
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)

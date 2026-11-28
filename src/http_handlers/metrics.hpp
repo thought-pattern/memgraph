@@ -11,10 +11,12 @@
 
 #pragma once
 
+#include <exception>
 #include <functional>
 #include <string>
 #include <variant>
 
+#include <spdlog/spdlog.h>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <nlohmann/json.hpp>
@@ -38,17 +40,19 @@ class MetricsRequestHandler final {
   template <class Body, class Allocator>
   void HandleRequest(boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> &&req,
                      std::function<void(boost::beast::http::response<boost::beast::http::string_body>)> &&send) {
-    auto const bad_request = [&req](std::string_view why) {
+    auto const json_error_response = [&req](boost::beast::http::status status, std::string_view why) {
       nlohmann::json error;
       error["error"] = std::string(why);
-      boost::beast::http::response<boost::beast::http::string_body> res{boost::beast::http::status::bad_request,
-                                                                        req.version()};
+      boost::beast::http::response<boost::beast::http::string_body> res{status, req.version()};
       res.set(boost::beast::http::field::server, BOOST_BEAST_VERSION_STRING);
       res.set(boost::beast::http::field::content_type, "application/json");
       res.keep_alive(req.keep_alive());
       res.body() = error.dump();
       res.prepare_payload();
       return res;
+    };
+    auto const bad_request = [&json_error_response](std::string_view why) {
+      return json_error_response(boost::beast::http::status::bad_request, why);
     };
 
     if (req.method() != boost::beast::http::verb::get) {
@@ -65,56 +69,62 @@ class MetricsRequestHandler final {
                       "running SHOW LICENSE INFO."));
     }
 
-    metrics_->UpdateGauges();
+    std::string body;
+    try {
+      metrics_->UpdateGauges();
 
-    auto const metric_infos = metrics_->GetGlobalMetricsInfoForJson();
+      auto const metric_infos = metrics_->GetGlobalMetricsInfoForJson();
 
-    // Translation table for backwards compatibility with the legacy JSON format.
-    // A source metric may appear multiple times to emit into multiple JSON groups.
-    // Remove when JSON support is dropped.
-    struct Remap {
-      std::string_view name;
-      std::string_view type;
-      std::string_view json_name;
-      std::string_view json_type;
-    };
+      // Translation table for backwards compatibility with the legacy JSON format.
+      // A source metric may appear multiple times to emit into multiple JSON groups.
+      // Remove when JSON support is dropped.
+      struct Remap {
+        std::string_view name;
+        std::string_view type;
+        std::string_view json_name;
+        std::string_view json_type;
+      };
 
-    static constexpr std::array kRemaps = std::to_array<Remap>({
-        {"VertexCount", "General", "vertex_count", "General"},
-        {"EdgeCount", "General", "edge_count", "General"},
-        {"AverageDegree", "General", "average_degree", "General"},
-        {"DiskUsage", "Memory", "disk_usage", "General"},
-        {"MemoryRes", "Memory", "memory_usage", "General"},
-        {"PeakMemoryRes", "Memory", "peak_memory_usage", "General"},
-        {"PeakMemoryRes", "Memory", "PeakMemoryRes", "Memory"},
-        {"UnreleasedDeltaObjects", "Memory", "unreleased_delta_objects", "General"},
-        {"UnreleasedDeltaObjects", "Memory", "UnreleasedDeltaObjects", "Memory"},
-        {"RolledBackTransactions", "Transaction", "RollbackedTransactions", "Transaction"},
-        {"SocketConnect_us_50p", "HighAvailability", "SocketConnect_us_50p", "General"},
-        {"SocketConnect_us_90p", "HighAvailability", "SocketConnect_us_90p", "General"},
-        {"SocketConnect_us_99p", "HighAvailability", "SocketConnect_us_99p", "General"},
-    });
+      static constexpr std::array kRemaps = std::to_array<Remap>({
+          {"VertexCount", "General", "vertex_count", "General"},
+          {"EdgeCount", "General", "edge_count", "General"},
+          {"AverageDegree", "General", "average_degree", "General"},
+          {"DiskUsage", "Memory", "disk_usage", "General"},
+          {"MemoryRes", "Memory", "memory_usage", "General"},
+          {"PeakMemoryRes", "Memory", "peak_memory_usage", "General"},
+          {"PeakMemoryRes", "Memory", "PeakMemoryRes", "Memory"},
+          {"UnreleasedDeltaObjects", "Memory", "unreleased_delta_objects", "General"},
+          {"UnreleasedDeltaObjects", "Memory", "UnreleasedDeltaObjects", "Memory"},
+          {"RolledBackTransactions", "Transaction", "RollbackedTransactions", "Transaction"},
+          {"SocketConnect_us_50p", "HighAvailability", "SocketConnect_us_50p", "General"},
+          {"SocketConnect_us_90p", "HighAvailability", "SocketConnect_us_90p", "General"},
+          {"SocketConnect_us_99p", "HighAvailability", "SocketConnect_us_99p", "General"},
+      });
 
-    auto const emit = [&](nlohmann::json &out,
-                          std::string_view json_type,
-                          std::string_view json_name,
-                          metrics::MetricInfo const &info) {
-      std::visit([&](auto v) { out[json_type][json_name] = v; }, info.value);
-    };
+      auto const emit = [&](nlohmann::json &out,
+                            std::string_view json_type,
+                            std::string_view json_name,
+                            metrics::MetricInfo const &info) {
+        std::visit([&](auto v) { out[json_type][json_name] = v; }, info.value);
+      };
 
-    nlohmann::json result;
-    for (auto const &info : metric_infos) {
-      bool remapped = false;
-      for (auto const &r : kRemaps) {
-        if (r.name == info.name && r.type == info.type) {
-          emit(result, r.json_type, r.json_name, info);
-          remapped = true;
+      nlohmann::json result;
+      for (auto const &info : metric_infos) {
+        bool remapped = false;
+        for (auto const &r : kRemaps) {
+          if (r.name == info.name && r.type == info.type) {
+            emit(result, r.json_type, r.json_name, info);
+            remapped = true;
+          }
         }
+        if (!remapped) emit(result, info.type, info.name, info);
       }
-      if (!remapped) emit(result, info.type, info.name, info);
-    }
 
-    auto body = result.dump();
+      body = result.dump();
+    } catch (std::exception const &e) {
+      spdlog::error("Failed to collect JSON metrics: {}", e.what());
+      return send(json_error_response(boost::beast::http::status::internal_server_error, "Failed to collect metrics"));
+    }
     auto const size = body.size();
 
     boost::beast::http::response<boost::beast::http::string_body> res{

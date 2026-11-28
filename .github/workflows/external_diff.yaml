@@ -77,6 +77,7 @@ jobs:
     with:
       pr_number: ${{ inputs.pr_number }}
       base_master: ${{ inputs.base_master }}
+      workflow_scope: diff-${{ github.run_id }}-${{ github.run_attempt }}
     secrets: inherit
 
   TriggerDiffWorkflow:

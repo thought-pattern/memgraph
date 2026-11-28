@@ -210,7 +210,7 @@ jobs:
       s3_dest_dir: "memgraph${{ inputs.mock && '-mock-rc' || '' }}/${{ needs.PrepareReleaseBranch.outputs.tag_name }}"
       additional_build_args: ${{ matrix.additional_build_args }}
       ref: ${{ needs.PrepareReleaseBranch.outputs.tag_name }}
-      generate_sbom: ${{ (matrix.arch == 'amd' && matrix.additional_build_args == '' && !matrix.fips) && true || false }}
+      generate_sbom: ${{ (matrix.additional_build_args == '' && !matrix.fips) && true || false }}
       run_smoke_tests: true
       package_smoke_os: "all"
       upload_debug_symbols: true
@@ -307,7 +307,7 @@ jobs:
       upload_debug_symbols: true
       run_tests: true
       package_mage: "default"
-      generate_sbom: ${{ matrix.build_arch == 'amd' && !matrix.malloc && !matrix.cuda && !matrix.cugraph }}
+      generate_sbom: ${{ !matrix.malloc && !matrix.cuda && !matrix.cugraph }}
       build_offline_installer: ${{ matrix.build_arch == 'amd' && !matrix.malloc && !matrix.cuda && !matrix.cugraph }}
       ref: ${{ needs.PrepareReleaseBranch.outputs.tag_name }}
       version: ${{ inputs.version }}

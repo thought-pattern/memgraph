@@ -1,4 +1,5 @@
 import mgp
+
 from mage.test_module.test_functions import test_function as test_function1
 
 # isort: off

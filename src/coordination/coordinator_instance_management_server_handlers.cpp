@@ -27,7 +27,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           uint64_t const request_version,
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
-        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<AddCoordinatorRpc, AddCoordinatorInstanceStatus>(
+        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<AddCoordinatorRpc>(
             [&coordinator_instance](CoordinatorInstanceConfig const &config) -> AddCoordinatorInstanceStatus {
               return coordinator_instance.AddCoordinatorInstance(config);
             },
@@ -41,8 +41,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           uint64_t const request_version,
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
-        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<RemoveCoordinatorRpc,
-                                                                       RemoveCoordinatorInstanceStatus>(
+        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<RemoveCoordinatorRpc>(
             [&coordinator_instance](int const coord_id) -> RemoveCoordinatorInstanceStatus {
               return coordinator_instance.RemoveCoordinatorInstance(coord_id);
             },
@@ -56,8 +55,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           uint64_t const request_version,
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
-        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<RegisterInstanceRpc,
-                                                                       RegisterInstanceCoordinatorStatus>(
+        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<RegisterInstanceRpc>(
             [&coordinator_instance](DataInstanceConfig const &config) -> RegisterInstanceCoordinatorStatus {
               return coordinator_instance.RegisterReplicationInstance(config);
             },
@@ -71,8 +69,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           uint64_t const request_version,
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
-        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<UnregisterInstanceRpc,
-                                                                       UnregisterInstanceCoordinatorStatus>(
+        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<UnregisterInstanceRpc>(
             [&coordinator_instance](std::string_view instance_name) -> UnregisterInstanceCoordinatorStatus {
               return coordinator_instance.UnregisterReplicationInstance(instance_name);
             },
@@ -86,8 +83,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           uint64_t const request_version,
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
-        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<SetInstanceToMainRpc,
-                                                                       SetInstanceToMainCoordinatorStatus>(
+        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<SetInstanceToMainRpc>(
             [&coordinator_instance](std::string_view new_main_name) -> SetInstanceToMainCoordinatorStatus {
               return coordinator_instance.SetReplicationInstanceToMain(new_main_name);
             },
@@ -101,7 +97,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
                                          uint64_t const request_version,
                                          slk::Reader *req_reader,
                                          slk::Builder *res_builder) -> void {
-    CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<DemoteInstanceRpc, DemoteInstanceCoordinatorStatus>(
+    CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<DemoteInstanceRpc>(
         [&coordinator_instance](std::string_view instance_name) -> DemoteInstanceCoordinatorStatus {
           return coordinator_instance.DemoteInstanceToReplica(instance_name);
         },
@@ -114,7 +110,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
                                        uint64_t const request_version,
                                        slk::Reader *req_reader,
                                        slk::Builder *res_builder) -> void {
-    CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<UpdateConfigRpc, UpdateConfigStatus>(
+    CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<UpdateConfigRpc>(
         [&coordinator_instance](UpdateInstanceConfig const &config) -> UpdateConfigStatus {
           return coordinator_instance.UpdateConfig(config);
         },
@@ -127,7 +123,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
                                      uint64_t const request_version,
                                      slk::Reader *req_reader,
                                      slk::Builder *res_builder) -> void {
-    CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<ForceResetRpc, ReconcileClusterStateStatus>(
+    CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<ForceResetRpc>(
         [&coordinator_instance]() -> ReconcileClusterStateStatus {
           return coordinator_instance.TryVerifyOrCorrectClusterState();
         },
@@ -141,7 +137,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           uint64_t const request_version,
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
-        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<YieldLeadershipRpc, YieldLeadershipStatus>(
+        CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<YieldLeadershipRpc>(
             [&coordinator_instance]() -> YieldLeadershipStatus {
               return coordinator_instance.YieldLeadershipAsLeader();
             },
@@ -183,7 +179,7 @@ void CoordinatorInstanceManagementServerHandlers::Register(CoordinatorInstanceMa
           slk::Reader *req_reader,
           slk::Builder *res_builder) -> void {
         CoordinatorInstanceManagementServerHandlers::FwdRequestHandler<GetRoutingTableRpc>(
-            [&coordinator_instance](std::string_view const db_name) -> RoutingTable {
+            [&coordinator_instance](std::string_view const db_name) -> std::optional<RoutingTable> {
               return coordinator_instance.GetRoutingTableAsLeader(db_name);
             },
             request_version,

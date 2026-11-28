@@ -136,6 +136,26 @@ void Reader::Load(uint8_t *data, uint64_t size) {
 
 size_t Reader::GetPos() const { return pos_; }
 
+size_t Reader::RemainingPayloadBytes() const noexcept {
+  size_t total = have_;
+  size_t scan = pos_ + have_;
+  while (scan + sizeof(SegmentSize) <= size_) {
+    SegmentSize seg_len = 0;
+    memcpy(&seg_len, data_ + scan, sizeof(SegmentSize));
+    if (seg_len == 0 || seg_len == kFileSegmentMask) {
+      break;
+    }
+    scan += sizeof(SegmentSize);
+    if (scan + seg_len > size_) {
+      total += (size_ - scan);
+      break;
+    }
+    total += seg_len;
+    scan += seg_len;
+  }
+  return total;
+}
+
 void Reader::Finalize() { GetSegment(true); }
 
 void Reader::GetSegment(bool should_be_final) {

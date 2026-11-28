@@ -4,6 +4,14 @@
 -- Create the test database (already created by environment variable)
 -- \c test_db;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'dummy_composite') THEN
+        CREATE TYPE dummy_composite AS (label TEXT, num INTEGER);
+    END IF;
+END
+$$;
+
 -- Create a table with all common PostgreSQL data types
 CREATE TABLE IF NOT EXISTS dummy_table (
     id SERIAL PRIMARY KEY,
@@ -27,6 +35,7 @@ CREATE TABLE IF NOT EXISTS dummy_table (
     interval_col INTERVAL,
     boolean_col BOOLEAN,
     point_col POINT,
+    line_col LINE,
     lseg_col LSEG,
     box_col BOX,
     path_col PATH,
@@ -37,11 +46,13 @@ CREATE TABLE IF NOT EXISTS dummy_table (
     macaddr_col MACADDR,
     bit_col BIT(8),
     bit_varying_col BIT VARYING(8),
+    tsvector_col TSVECTOR,
     uuid_col UUID,
     xml_col XML,
     json_col JSON,
     jsonb_col JSONB,
     array_col INTEGER[],
+    composite_col dummy_composite,
     enum_col TEXT, -- PostgreSQL doesn't have ENUM in this context, using TEXT
     range_col INT4RANGE
 );

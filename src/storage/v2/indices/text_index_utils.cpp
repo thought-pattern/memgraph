@@ -32,30 +32,86 @@ namespace memgraph::storage {
 std::string ToLowerCasePreservingBooleanOperators(std::string_view input) {
   if (input.empty()) return {};
 
+  auto const is_space = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+  auto const is_token_delim = [&](char c) { return is_space(c) || c == '(' || c == ')' || c == '"' || c == ':'; };
+
   std::string result;
   result.reserve(input.length());
 
-  const auto *it = input.cbegin();
-  while (it != input.cend()) {
-    if (std::isspace(*it)) {
-      result += *it++;
+  std::size_t pos = 0;
+  while (pos < input.size()) {
+    const char ch = input[pos];
+    if (is_space(ch)) {
+      result += ch;
+      ++pos;
+      continue;
+    }
+    if (ch == '"') {
+      result += ch;
+      ++pos;
+      while (pos < input.size()) {
+        const char qch = input[pos++];
+        if (qch == '\\' && pos < input.size()) {
+          result += qch;
+          result += static_cast<char>(std::tolower(static_cast<unsigned char>(input[pos++])));
+          continue;
+        }
+        if (qch == '"') {
+          result += qch;
+          break;
+        }
+        result += static_cast<char>(std::tolower(static_cast<unsigned char>(qch)));
+      }
+      continue;
+    }
+    if (ch == '(' || ch == ')' || ch == '+' || ch == '-') {
+      result += ch;
+      ++pos;
       continue;
     }
 
-    const auto *word_start = it;
-    it = r::find_if(word_start, input.cend(), [](char c) { return std::isspace(c); });
+    std::size_t end = pos;
+    while (end < input.size()) {
+      if (input[end] == '\\' && end + 1 < input.size()) {
+        end += 2;
+        continue;
+      }
+      if (is_token_delim(input[end])) break;
+      ++end;
+    }
+    const auto token = input.substr(pos, end - pos);
+    if (token.empty()) {
+      result += input[pos++];
+      continue;
+    }
 
-    // Extract the word
-    auto word = input.substr(word_start - input.cbegin(), it - word_start);
-    auto uppercase_word = utils::ToUpperCase(word);
+    if (end < input.size() && input[end] == ':') {
+      // Field qualifier immediately followed by ':' — preserve case-sensitive property spelling.
+      result.append(token.data(), token.size());
+      result += ':';
+      pos = end + 1;
+      continue;
+    }
 
-    // Check if it's a boolean operator (case-insensitive)
+    std::size_t ws_after = end;
+    while (ws_after < input.size() && is_space(input[ws_after])) {
+      ++ws_after;
+    }
+    if (ws_after > end && ws_after < input.size() && input[ws_after] == ':' &&
+        (token.starts_with("data.") || token == kDataField || token == kAllField || token == kGidField ||
+         token == kEdgeGidField || token == kFromVertexGidField || token == kToVertexGidField)) {
+      result.append(input.data() + pos, ws_after - pos + 1);
+      pos = ws_after + 1;
+      continue;
+    }
+
+    auto uppercase_word = utils::ToUpperCase(token);
     if (uppercase_word == kBooleanAnd || uppercase_word == kBooleanOr || uppercase_word == kBooleanNot) {
-      // Preserve the boolean operator in uppercase
       result += uppercase_word;
     } else {
-      result += utils::ToLowerCase(word);
+      result += utils::ToLowerCase(token);
     }
+    pos = end;
   }
 
   return result;
@@ -65,7 +121,8 @@ void ValidateTextIndexName(std::string_view index_name) {
   if (index_name.empty()) {
     throw TextSearchException("Invalid text index name: name must not be empty.");
   }
-  if (index_name == "." || index_name == ".." || index_name == kTextIndicesWatermarkFile) {
+  if (index_name == "." || index_name == ".." || index_name == kTextIndicesWatermarkFile ||
+      index_name == kTextIndicesWatermarkTmpFile) {
     throw TextSearchException("Invalid text index name '{}'.", index_name);
   }
   for (const char ch : index_name) {
@@ -149,7 +206,7 @@ void WriteTextIndicesWatermark(const std::filesystem::path &text_indices_dir,
     payload["clean_edge_indices"] = std::move(edges);
 
     const auto final_path = text_indices_dir / kTextIndicesWatermarkFile;
-    const auto tmp_path = text_indices_dir / (std::string(kTextIndicesWatermarkFile) + ".tmp");
+    const auto tmp_path = text_indices_dir / kTextIndicesWatermarkTmpFile;
     {
       std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
       if (!out.is_open()) return;
@@ -223,7 +280,7 @@ std::optional<TextIndicesWatermark> ReadTextIndicesWatermark(const std::filesyst
 void ClearTextIndicesWatermark(const std::filesystem::path &text_indices_dir) noexcept {
   std::error_code ec;
   std::filesystem::remove(text_indices_dir / kTextIndicesWatermarkFile, ec);
-  std::filesystem::remove(text_indices_dir / (std::string(kTextIndicesWatermarkFile) + ".tmp"), ec);
+  std::filesystem::remove(text_indices_dir / kTextIndicesWatermarkTmpFile, ec);
 }
 
 namespace {
@@ -328,7 +385,8 @@ void TrackTextIndexChange(TextIndexChangeCollector &collector, std::span<TextInd
   for (auto *idx : indices) {
     auto &entry = collector[idx];
     if (op == TextIndexOp::ADD) {
-      entry.to_remove.erase(vertex);
+      // Retain any prior pending removal in this transaction so removing and restoring an indexed
+      // label deletes the committed document before inserting the replacement document.
       entry.to_add.insert(vertex);
     } else if (op == TextIndexOp::UPDATE) {
       // On update we have to firstly remove the vertex from index and then add it back
@@ -348,7 +406,6 @@ void TrackTextEdgeIndexChange(TextEdgeIndexChangeCollector &collector, std::span
   for (auto *idx : indices) {
     auto &entry = collector[idx];
     if (op == TextIndexOp::ADD) {
-      entry.to_remove.erase(edge);
       entry.to_add.insert(edge_with_vertices);
     } else if (op == TextIndexOp::UPDATE) {
       // On update we have to firstly remove the edge from index and then add it back

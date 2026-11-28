@@ -6,13 +6,13 @@ continuous_integration, or can be configured manually via configure().
 """
 
 import atexit
+from enum import Enum
 import importlib
 import logging
 import multiprocessing
 import os
 import sys
 import time
-from enum import Enum
 from typing import Any, Callable, Iterable, TypeVar
 
 from neo4j import GraphDatabase

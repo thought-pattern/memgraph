@@ -63,9 +63,11 @@ jobs:
             dockerfile="tests/mgbench/Dockerfile.mgbench_full"
           fi
 
+          shared_repo_tag="$repo_tag"
           repo_tag="${repo_tag}-${{ inputs.arch }}64"
 
           echo "Building image: ${repo_tag}"
+          echo "SHARED_REPO_TAG=${shared_repo_tag}" >> $GITHUB_ENV
           echo "REPO_TAG=${repo_tag}" >> $GITHUB_ENV
           echo "DOCKERFILE=${dockerfile}" >> $GITHUB_ENV
 
@@ -110,9 +112,8 @@ jobs:
       - name: Check if specified version is already pushed
         if: ${{ inputs.push_to_dockerhub }}
         run: |
-          EXISTS=$(docker manifest inspect ${{ env.REPO_TAG }} > /dev/null; echo $?)
-          echo $EXISTS
-          if [[ ${EXISTS} -eq 0 ]]; then
+          if docker manifest inspect "${{ env.SHARED_REPO_TAG }}" > /dev/null 2>&1 || \
+             docker manifest inspect "${{ env.REPO_TAG }}" > /dev/null 2>&1; then
               echo 'The specified version has been already released to DockerHub.'
               if [[ ${{ inputs.force_release }} = true ]]; then
                 echo 'Forcing the release!'
@@ -132,9 +133,18 @@ jobs:
       - name: Save image as tar.gz
         if: ${{ inputs.upload_artifact }}
         run: |
+          set -euo pipefail
           tag="${REPO_TAG#*:}"
           image_name="mgbench-${tag}-${{ inputs.arch }}.tar.gz"
-          docker save ${{ env.REPO_TAG }} | gzip > $image_name
+          if ! docker save "${{ env.REPO_TAG }}" | gzip > "$image_name"; then
+            rm -f "$image_name"
+            exit 1
+          fi
+          if [[ "$(gzip -dc "$image_name" | wc -c | tr -d ' ')" -eq 0 ]]; then
+            echo "Error: exported Docker archive '$image_name' is empty" >&2
+            rm -f "$image_name"
+            exit 1
+          fi
           echo "IMAGE_NAME=${image_name}" >> $GITHUB_ENV
 
       - name: Upload Docker image artifact

@@ -108,16 +108,16 @@ index 6a89f88..cd0edad 100644
          cmd  = ("awk '{ " +
                  "gsub(/@GFLAGS_ATTRIBUTE_UNUSED@/, \"\"); " +
                  "gsub(/@INCLUDE_GFLAGS_NS_H@/, \"" + '\n'.join(["#include \\\"gflags/{}\\\"".format(hdr) for hdr in gflags_ns_h_files]) + "\"); " +
-@@ -42,7 +42,7 @@ def gflags_sources(namespace=["google", "gflags"]):
-     native.genrule(
-         name = "gflags_completions_h",
-         srcs = ["src/gflags_completions.h.in"],
+@@ -42,7 +42,1 @@ def gflags_sources(namespace=["google", "gflags"]):
+-    native.genrule(
+-        name = "gflags_completions_h",
+-        srcs = ["src/gflags_completions.h.in"],
 -        outs = ["gflags/gflags_completions.h"],
-+        outs = ["include/gflags/gflags_completions.h"],
-         cmd  = "awk '{ gsub(/@GFLAGS_NAMESPACE@/, \"" + namespace[0] + "\"); print; }' $(<) > $(@)"
-     )
-     hdrs = [":gflags_h", ":gflags_declare_h", ":gflags_completions_h"]
-@@ -85,7 +85,7 @@ def gflags_library(hdrs=[], srcs=[], threads=1):
+-        cmd  = "awk '{ gsub(/@GFLAGS_NAMESPACE@/, \"" + namespace[0] + "\"); print; }' $(<) > $(@)"
+-    )
+-    hdrs = [":gflags_h", ":gflags_declare_h", ":gflags_completions_h"]
++    hdrs = [":gflags_h", ":gflags_declare_h"]
+@@ -85,7 +79,7 @@ def gflags_library(hdrs=[], srcs=[], threads=1):
          name       = name,
          hdrs       = hdrs,
          srcs       = srcs,
@@ -361,16 +361,17 @@ index bc62227..38e2d26 100644
 +      ++flag_file_contents;
      // Windows uses "\r\n"
 -    line_end = strchr(flagfile_contents, '\r');
-+    line_end = strchr(flag_file_contents, '\r');
-     if (line_end == NULL)
+-    if (line_end == NULL)
 -        line_end = strchr(flagfile_contents, '\n');
-+        line_end = strchr(flag_file_contents, '\n');
++    line_end = strpbrk(flag_file_contents, "\r\n");
 
 -    size_t len = line_end ? line_end - flagfile_contents
 -                          : strlen(flagfile_contents);
 -    string line(flagfile_contents, len);
 +    size_t len = line_end ? line_end - flag_file_contents
 +                          : strlen(flag_file_contents);
++    if (line_end != NULL && line_end[0] == '\r' && line_end[1] == '\n')
++      ++line_end;
 +    string line(flag_file_contents, len);
 
      // Each line can be one of four things:
@@ -490,14 +491,14 @@ index 43b3f7a..0d55f00 100644
 
 +#define GFLAGS_NO_FILENAMES @GFLAGS_NO_FILENAMES@
 +
-+// If this flag is true then don't store source filenames
++// If this flag is true then don't store source filenames in gflags metadata
++// without redefining the standard __FILE__ macro for downstream callers.
 +#if GFLAGS_NO_FILENAMES
-+#pragma GCC diagnostic push
-+#pragma GCC diagnostic ignored "-Wbuiltin-macro-redefined"
-+#undef __FILE__
-+#define __FILE__ ""
-+#pragma GCC diagnostic pop
++#define GFLAGS_FILENAME ""
++#else
++#define GFLAGS_FILENAME __FILE__
 +#endif
++
 
  // We always want to export variables defined in user code
  #ifndef GFLAGS_DLL_DEFINE_FLAG
@@ -545,7 +546,7 @@ index 43b3f7a..0d55f00 100644
      type FLAGS_no##name = FLAGS_nono##name;                             \
      static GFLAGS_NAMESPACE::FlagRegisterer o_##name(                   \
 -      #name, MAYBE_STRIPPED_HELP(help), __FILE__,                       \
-+      #name, MAYBE_STRIPPED_HELP(help), __FILE__, hidden,               \
++      #name, MAYBE_STRIPPED_HELP(help), GFLAGS_FILENAME, hidden,        \
        &FLAGS_##name, &FLAGS_no##name);                                  \
    }                                                                     \
    using fL##shorttype::FLAGS_##name
@@ -616,7 +617,7 @@ index 43b3f7a..0d55f00 100644
                                                               val);          \
      static GFLAGS_NAMESPACE::FlagRegisterer o_##name(                       \
 -        #name, MAYBE_STRIPPED_HELP(txt), __FILE__,                          \
-+        #name, MAYBE_STRIPPED_HELP(txt), __FILE__, false,                   \
++        #name, MAYBE_STRIPPED_HELP(txt), GFLAGS_FILENAME, false,            \
 +        FLAGS_no##name, new (s_##name[1].s) clstring(*FLAGS_no##name));     \
 +    static StringFlagDestructor d_##name(s_##name[0].s, s_##name[1].s);     \
 +    extern GFLAGS_DLL_DEFINE_FLAG clstring& FLAGS_##name;                   \
@@ -635,7 +636,7 @@ index 43b3f7a..0d55f00 100644
 +                                   dont_pass0toDEFINE_string(s_##name[0].s, \
 +                                                             val);          \
 +    static GFLAGS_NAMESPACE::FlagRegisterer o_##name(                       \
-+        #name, MAYBE_STRIPPED_HELP(txt), __FILE__, true,                    \
++        #name, MAYBE_STRIPPED_HELP(txt), GFLAGS_FILENAME, true,             \
          FLAGS_no##name, new (s_##name[1].s) clstring(*FLAGS_no##name));     \
      static StringFlagDestructor d_##name(s_##name[0].s, s_##name[1].s);     \
      extern GFLAGS_DLL_DEFINE_FLAG clstring& FLAGS_##name;                   \
@@ -1754,7 +1755,7 @@ index 7cc6691..2bc5f70 100644
    AddXMLTag(&r, "name", flag.name);
    AddXMLTag(&r, "meaning", flag.description);
    AddXMLTag(&r, "default", flag.default_value);
-@@ -267,17 +269,23 @@ static void ShowUsageWithFlagsMatching(const char *argv0,
+@@ -267,17 +269,21 @@ static void ShowUsageWithFlagsMatching(const char *argv0,
    vector<CommandLineFlagInfo> flags;
    GetAllFlags(&flags);           // flags are sorted by filename, then flagname
 
@@ -1766,9 +1767,7 @@ index 7cc6691..2bc5f70 100644
    for (vector<CommandLineFlagInfo>::const_iterator flag = flags.begin();
         flag != flags.end();
         ++flag) {
-+#if GFLAGS_NO_FILENAMES != 0
 +    if (flag->hidden) continue;
-+#endif
      if (substrings.empty() ||
          FileMatchesSubstring(flag->filename, substrings)) {
        // If the flag has been stripped, pretend that it doesn't exist.
@@ -1778,7 +1777,7 @@ index 7cc6691..2bc5f70 100644
        if (flag->filename != last_filename) {                      // new file
          if (Dirname(flag->filename) != Dirname(last_filename)) {  // new dir!
            if (!first_directory)
-@@ -287,6 +295,7 @@ static void ShowUsageWithFlagsMatching(const char *argv0,
+@@ -287,6 +293,7 @@ static void ShowUsageWithFlagsMatching(const char *argv0,
          fprintf(stdout, "\n  Flags from %s:\n", flag->filename.c_str());
          last_filename = flag->filename;
        }
@@ -1786,7 +1785,7 @@ index 7cc6691..2bc5f70 100644
        // Now print this flag
        fprintf(stdout, "%s", DescribeOneFlag(*flag).c_str());
      }
-@@ -372,61 +381,15 @@ static void AppendPrognameStrings(vector<string>* substrings,
+@@ -372,61 +379,15 @@ static void AppendPrognameStrings(vector<string>* substrings,
  void HandleCommandLineHelpFlags() {
    const char* progname = ProgramInvocationShortName();
 

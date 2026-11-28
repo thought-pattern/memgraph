@@ -102,9 +102,9 @@ TEST(TypeBands, FenceAScanAboveEveryValueItCouldHold) {
   // one the order ends with above all, since a fence of any earlier type leaves
   // every value of that last one above it.
   auto const nan = std::numeric_limits<double>::quiet_NaN();
-  auto const nan_coordinate = std::numeric_limits<float>::quiet_NaN();
-  auto const vector_index_id = [](std::initializer_list<float> coordinates) {
-    auto vector = memgraph::utils::small_vector<float>{};
+  auto const nan_coordinate = std::numeric_limits<double>::quiet_NaN();
+  auto const vector_index_id = [](std::initializer_list<double> coordinates) {
+    auto vector = memgraph::utils::small_vector<double>{};
     for (auto const coordinate : coordinates) vector.push_back(coordinate);
     return PropertyValue(PropertyValue::VectorIndexIdData{.ids = memgraph::utils::small_vector<uint64_t>{1},
                                                           .vector = std::move(vector)});

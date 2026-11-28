@@ -57,7 +57,7 @@ inline auto PropertyTypes_ActionMethod(std::map<PropertyId, ExtendedPropertyType
         it->second = ExtendedPropertyType{*delta.property.value};
       }
     } else if (!delta.property.value->IsNull()) {
-      properties.emplace(delta.property.key, delta.property.value->type());
+      properties.emplace(delta.property.key, ExtendedPropertyType{*delta.property.value});
     }
   });
 }
@@ -274,18 +274,18 @@ inline PropertiesDiff GetPropertiesDiff(const Edge *edge, State state, uint64_t 
 
 }  // namespace
 
-template <>
-TrackingInfo<std::unordered_map> &LocalSchemaTracking::edge_lookup(const EdgeKeyRef &key) {
-  auto itr = edge_state_.find(key);
-  if (itr != edge_state_.end()) return itr->second;
-  auto [new_itr, _] =
-      edge_state_.emplace(std::piecewise_construct, std::make_tuple(key.type, key.from, key.to), std::make_tuple());
-  return new_itr->second;
-}
-
-template <>
-TrackingInfo<utils::ConcurrentUnorderedMap> &SharedSchemaTracking::edge_lookup(const EdgeKeyRef &key) {
-  return edge_state_[key];
+template <template <class...> class TContainer>
+decltype(auto) SchemaTracking<TContainer>::edge_lookup(const EdgeKeyRef &key) {
+  if constexpr (std::is_same_v<TContainer<EdgeKey, TrackingInfo<TContainer>>,
+                               std::unordered_map<EdgeKey, TrackingInfo<TContainer>>>) {
+    auto itr = edge_state_.find(key);
+    if (itr != edge_state_.end()) return (itr->second);
+    auto [new_itr, _] =
+        edge_state_.emplace(std::piecewise_construct, std::make_tuple(key.type, key.from, key.to), std::make_tuple());
+    return (new_itr->second);
+  } else {
+    return edge_state_[key];
+  }
 }
 
 template <template <class...> class TContainer>
@@ -335,47 +335,55 @@ void SchemaTracking<TContainer>::ProcessTransaction(const SchemaTracking<TOtherC
     // TODO Possible optimization: check if labels or props changed and skip some lookups/updates
 
     // Revert local changes
-    auto &tracking_11 = edge_lookup(EdgeKeyRef{edge_type, *from_l_diff.pre, *to_l_diff.pre});
+    auto &&tracking_11_ref = edge_lookup(EdgeKeyRef{edge_type, *from_l_diff.pre, *to_l_diff.pre});
+    auto &tracking_11 = utils::UnwrapConcurrentValue(tracking_11_ref);
     ++tracking_11.n;
-    auto &tracking_12 = edge_lookup(EdgeKeyRef{edge_type,
-                                               (from_state == ANOTHER_TX) ? *from_l_diff.pre : *from_l_diff.post,
-                                               (to_state == ANOTHER_TX) ? *to_l_diff.pre : *to_l_diff.post});
+    auto &&tracking_12_ref = edge_lookup(EdgeKeyRef{edge_type,
+                                                    (from_state == ANOTHER_TX) ? *from_l_diff.pre : *from_l_diff.post,
+                                                    (to_state == ANOTHER_TX) ? *to_l_diff.pre : *to_l_diff.post});
+    auto &tracking_12 = utils::UnwrapConcurrentValue(tracking_12_ref);
     --tracking_12.n;
     // Edge props
     if (property_on_edges) {
       for (const auto &[key, type] : edge_prop_diff.pre) {
-        auto &pre_info = tracking_11.properties[key];
+        auto &&pre_info_ref = tracking_11.properties[key];
+        auto &pre_info = utils::UnwrapConcurrentValue(pre_info_ref);
         ++pre_info.n;
         ++pre_info.types[type];
       }
       for (const auto &[key, type] : (edge_state == ANOTHER_TX) ? edge_prop_diff.pre : edge_prop_diff.post) {
-        auto &post_info = tracking_12.properties[key];
+        auto &&post_info_ref = tracking_12.properties[key];
+        auto &post_info = utils::UnwrapConcurrentValue(post_info_ref);
         --post_info.n;
         --post_info.types[type];
       }
     }
 
     // Revert committed changes
-    auto &tracking_21 = edge_lookup(EdgeKeyRef{edge_type,
-                                               (from_state == ANOTHER_TX) ? *from_l_diff.post : *from_l_diff.pre,
-                                               (to_state == ANOTHER_TX) ? *to_l_diff.post : *to_l_diff.pre});
+    auto &&tracking_21_ref = edge_lookup(EdgeKeyRef{edge_type,
+                                                    (from_state == ANOTHER_TX) ? *from_l_diff.post : *from_l_diff.pre,
+                                                    (to_state == ANOTHER_TX) ? *to_l_diff.post : *to_l_diff.pre});
+    auto &tracking_21 = utils::UnwrapConcurrentValue(tracking_21_ref);
     --tracking_21.n;
     // Edge props
     if (property_on_edges) {
       for (const auto &[key, type] : (edge_state == ANOTHER_TX) ? edge_prop_diff.post : edge_prop_diff.pre) {
-        auto &post_info = tracking_21.properties[key];
+        auto &&post_info_ref = tracking_21.properties[key];
+        auto &post_info = utils::UnwrapConcurrentValue(post_info_ref);
         --post_info.n;
         --post_info.types[type];
       }
     }
 
     // Apply the correct changes
-    auto &tracking_22 = edge_lookup(EdgeKeyRef{edge_type, *from_l_diff.post, *to_l_diff.post});
+    auto &&tracking_22_ref = edge_lookup(EdgeKeyRef{edge_type, *from_l_diff.post, *to_l_diff.post});
+    auto &tracking_22 = utils::UnwrapConcurrentValue(tracking_22_ref);
     ++tracking_22.n;
     // Edge props
     if (property_on_edges) {
       for (const auto &[key, type] : edge_prop_diff.post) {
-        auto &pre_info = tracking_22.properties[key];
+        auto &&pre_info_ref = tracking_22.properties[key];
+        auto &pre_info = utils::UnwrapConcurrentValue(pre_info_ref);
         ++pre_info.n;
         ++pre_info.types[type];
       }
@@ -467,11 +475,12 @@ nlohmann::json SchemaTracking<TContainer>::ToJson(
 
   // Cleanup result (we must leave unused stats in analytical)
   auto stats_cleanup = [&json](const std::string &main_key) {
-    erase_if(json[main_key].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
+    std::erase_if(json[main_key].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
     for (auto &val : json[main_key].get_ref<nlohmann::json::array_t &>()) {
-      erase_if(val["properties"].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
+      std::erase_if(val["properties"].get_ref<nlohmann::json::array_t &>(),
+                    [](auto &elem) { return elem["count"] <= 0; });
       for (auto &val : val["properties"].get_ref<nlohmann::json::array_t &>()) {
-        erase_if(val["types"].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
+        std::erase_if(val["types"].get_ref<nlohmann::json::array_t &>(), [](auto &elem) { return elem["count"] <= 0; });
       }
     }
   };
@@ -505,10 +514,12 @@ nlohmann::json SchemaInfo::ToJson(NameIdMapper &name_id_mapper, const EnumStore 
 
 template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::DeleteVertex(Vertex *vertex) {
-  auto &info = vertex_state_[vertex->labels];
+  auto &&info_ref = vertex_state_[vertex->labels];
+  auto &info = utils::UnwrapConcurrentValue(info_ref);
   --info.n;
   for (const auto &[key, val] : vertex->properties.ExtendedPropertyTypes()) {
-    auto &prop_info = info.properties[key];
+    auto &&prop_info_ref = info.properties[key];
+    auto &prop_info = utils::UnwrapConcurrentValue(prop_info_ref);
     --prop_info.n;
     --prop_info.types[val];
   }
@@ -519,15 +530,19 @@ template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::UpdateLabels(Vertex *vertex, const VertexKey &old_labels,
                                               const VertexKey &new_labels) {
   // Move all stats to new labels
-  auto &old_tracking = vertex_state_[old_labels];
-  auto &new_tracking = vertex_state_[new_labels];
+  auto &&old_tracking_ref = vertex_state_[old_labels];
+  auto &&new_tracking_ref = vertex_state_[new_labels];
+  auto &old_tracking = utils::UnwrapConcurrentValue(old_tracking_ref);
+  auto &new_tracking = utils::UnwrapConcurrentValue(new_tracking_ref);
   --old_tracking.n;
   ++new_tracking.n;
   for (const auto &[property, type] : vertex->properties.ExtendedPropertyTypes()) {
-    auto &old_info = old_tracking.properties[property];
+    auto &&old_info_ref = old_tracking.properties[property];
+    auto &old_info = utils::UnwrapConcurrentValue(old_info_ref);
     --old_info.n;
     --old_info.types[type];
-    auto &new_info = new_tracking.properties[property];
+    auto &&new_info_ref = new_tracking.properties[property];
+    auto &new_info = utils::UnwrapConcurrentValue(new_info_ref);
     ++new_info.n;
     ++new_info.types[type];
   }
@@ -545,18 +560,22 @@ void SchemaTracking<TContainer>::UpdateLabels(Vertex *vertex, const VertexKey &o
                          Vertex *to,
                          const VertexKey *old_from_labels,
                          const VertexKey *old_to_labels) {
-    auto &old_tracking = edge_lookup(EdgeKeyRef(
+    auto &&old_tracking_ref = edge_lookup(EdgeKeyRef(
         edge_type, old_from_labels ? *old_from_labels : from->labels, old_to_labels ? *old_to_labels : to->labels));
-    auto &new_tracking = edge_lookup(EdgeKeyRef(edge_type, from->labels, to->labels));
+    auto &&new_tracking_ref = edge_lookup(EdgeKeyRef(edge_type, from->labels, to->labels));
+    auto &old_tracking = utils::UnwrapConcurrentValue(old_tracking_ref);
+    auto &new_tracking = utils::UnwrapConcurrentValue(new_tracking_ref);
     --old_tracking.n;
     ++new_tracking.n;
     if (prop_on_edges) {
       // No need for edge lock since all edge property operations are unique access
       for (const auto &[property, type] : edge_ref.ptr->properties.ExtendedPropertyTypes()) {
-        auto &old_info = old_tracking.properties[property];
+        auto &&old_info_ref = old_tracking.properties[property];
+        auto &old_info = utils::UnwrapConcurrentValue(old_info_ref);
         --old_info.n;
         --old_info.types[type];
-        auto &new_info = new_tracking.properties[property];
+        auto &&new_info_ref = new_tracking.properties[property];
+        auto &new_info = utils::UnwrapConcurrentValue(new_info_ref);
         ++new_info.n;
         ++new_info.types[type];
       }
@@ -564,27 +583,30 @@ void SchemaTracking<TContainer>::UpdateLabels(Vertex *vertex, const VertexKey &o
   };
 
   for (const auto &[edge_type, other_vertex, edge_ref] : vertex->in_edges) {
+    if (other_vertex == vertex) continue;
     update_edge(edge_type, edge_ref, other_vertex, vertex, {}, &old_labels);
   }
   for (const auto &[edge_type, other_vertex, edge_ref] : vertex->out_edges) {
-    update_edge(edge_type, edge_ref, vertex, other_vertex, &old_labels, {});
+    update_edge(edge_type, edge_ref, vertex, other_vertex, &old_labels, other_vertex == vertex ? &old_labels : nullptr);
   }
 }
 
 template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::CreateEdge(Vertex *from, Vertex *to, EdgeTypeId edge_type) {
-  auto &tracking_info = edge_lookup(EdgeKeyRef{edge_type, from->labels, to->labels});
-  ++tracking_info.n;
+  auto &&tracking_info_ref = edge_lookup(EdgeKeyRef{edge_type, from->labels, to->labels});
+  ++utils::UnwrapConcurrentValue(tracking_info_ref).n;
 }
 
 template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::DeleteEdge(EdgeTypeId edge_type, EdgeRef edge, Vertex *from, Vertex *to,
                                             bool prop_on_edges) {
-  auto &tracking_info = edge_lookup(EdgeKeyRef{edge_type, from->labels, to->labels});
+  auto &&tracking_info_ref = edge_lookup(EdgeKeyRef{edge_type, from->labels, to->labels});
+  auto &tracking_info = utils::UnwrapConcurrentValue(tracking_info_ref);
   --tracking_info.n;
   if (prop_on_edges) {
     for (const auto &[key, type] : edge.ptr->properties.ExtendedPropertyTypes()) {
-      auto &prop_info = tracking_info.properties[key];
+      auto &&prop_info_ref = tracking_info.properties[key];
+      auto &prop_info = utils::UnwrapConcurrentValue(prop_info_ref);
       --prop_info.n;
       --prop_info.types[type];
     }
@@ -595,7 +617,8 @@ template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::SetProperty(auto &tracking_info, PropertyId property, const ExtendedPropertyType &now,
                                              const ExtendedPropertyType &before) {
   if (now == before) return;  // Nothing to do
-  auto &info = tracking_info.properties[property];
+  auto &&info_ref = tracking_info.properties[property];
+  auto &info = utils::UnwrapConcurrentValue(info_ref);
   if (before != ExtendedPropertyType{}) {
     --info.n;
     --info.types[before];
@@ -615,8 +638,8 @@ void SchemaTracking<TContainer>::Clear() {
 template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::SetProperty(Vertex *vertex, PropertyId property, const ExtendedPropertyType &now,
                                              const ExtendedPropertyType &before) {
-  auto &tracking_info = vertex_state_[vertex->labels];
-  SetProperty(tracking_info, property, now, before);
+  auto &&tracking_info_ref = vertex_state_[vertex->labels];
+  SetProperty(utils::UnwrapConcurrentValue(tracking_info_ref), property, now, before);
 }
 
 template <template <class...> class TContainer>
@@ -624,8 +647,8 @@ void SchemaTracking<TContainer>::SetProperty(EdgeTypeId type, Vertex *from, Vert
                                              const ExtendedPropertyType &now, const ExtendedPropertyType &before,
                                              bool prop_on_edges) {
   if (prop_on_edges) {
-    auto &tracking_info = edge_lookup(EdgeKeyRef{type, from->labels, to->labels});
-    SetProperty(tracking_info, property, now, before);
+    auto &&tracking_info_ref = edge_lookup(EdgeKeyRef{type, from->labels, to->labels});
+    SetProperty(utils::UnwrapConcurrentValue(tracking_info_ref), property, now, before);
   }
 }
 
@@ -634,10 +657,10 @@ void SchemaTracking<TContainer>::SetProperty(EdgeTypeId type, Vertex *from, Vert
                                              const ExtendedPropertyType &now, const ExtendedPropertyType &before,
                                              bool prop_on_edges, auto &&guard, auto &&other_guard) {
   if (prop_on_edges) {
-    auto &tracking_info = edge_lookup(EdgeKeyRef{type, from->labels, to->labels});
+    auto &&tracking_info_ref = edge_lookup(EdgeKeyRef{type, from->labels, to->labels});
     if (guard.owns_lock()) guard.unlock();
     if (other_guard.owns_lock()) other_guard.unlock();
-    SetProperty(tracking_info, property, now, before);
+    SetProperty(utils::UnwrapConcurrentValue(tracking_info_ref), property, now, before);
   }
 }
 
@@ -646,8 +669,8 @@ void SchemaTracking<TContainer>::SetProperty(EdgeTypeId type, const VertexKey &f
                                              PropertyId property, const ExtendedPropertyType &now,
                                              const ExtendedPropertyType &before, bool prop_on_edges) {
   if (prop_on_edges) {
-    auto &tracking_info = edge_lookup(EdgeKeyRef{type, from, to});
-    SetProperty(tracking_info, property, now, before);
+    auto &&tracking_info_ref = edge_lookup(EdgeKeyRef{type, from, to});
+    SetProperty(utils::UnwrapConcurrentValue(tracking_info_ref), property, now, before);
   }
 }
 
@@ -657,9 +680,10 @@ void SchemaTracking<TContainer>::UpdateEdgeStats(EdgeRef edge_ref, EdgeTypeId ed
                                                  const VertexKey &old_from_labels, const VertexKey &old_to_labels,
                                                  bool prop_on_edges) {
   // Lookup needs to happen while holding the locks, but the update itself does not
-  auto &new_tracking = edge_lookup({edge_type, new_from_labels, new_to_labels});
-  auto &old_tracking = edge_lookup({edge_type, old_from_labels, old_to_labels});
-  UpdateEdgeStats(new_tracking, old_tracking, edge_ref, prop_on_edges);
+  auto &&new_tracking_ref = edge_lookup({edge_type, new_from_labels, new_to_labels});
+  auto &&old_tracking_ref = edge_lookup({edge_type, old_from_labels, old_to_labels});
+  UpdateEdgeStats(
+      utils::UnwrapConcurrentValue(new_tracking_ref), utils::UnwrapConcurrentValue(old_tracking_ref), edge_ref, prop_on_edges);
 }
 
 template <template <class...> class TContainer>
@@ -671,10 +695,12 @@ void SchemaTracking<TContainer>::UpdateEdgeStats(auto &new_tracking, auto &old_t
   if (prop_on_edges) {
     // No need for edge lock since all edge property operations are unique access
     for (const auto &[property, type] : edge_ref.ptr->properties.ExtendedPropertyTypes()) {
-      auto &old_info = old_tracking.properties[property];
+      auto &&old_info_ref = old_tracking.properties[property];
+      auto &old_info = utils::UnwrapConcurrentValue(old_info_ref);
       --old_info.n;
       --old_info.types[type];
-      auto &new_info = new_tracking.properties[property];
+      auto &&new_info_ref = new_tracking.properties[property];
+      auto &new_info = utils::UnwrapConcurrentValue(new_info_ref);
       ++new_info.n;
       ++new_info.types[type];
     }
@@ -687,9 +713,10 @@ void SchemaTracking<TContainer>::UpdateEdgeStats(EdgeRef edge_ref, EdgeTypeId ed
                                                  const VertexKey &old_from_labels, const VertexKey &old_to_labels,
                                                  const std::map<PropertyId, ExtendedPropertyType> &edge_props) {
   // Lookup needs to happen while holding the locks, but the update itself does not
-  auto &new_tracking = edge_lookup({edge_type, new_from_labels, new_to_labels});
-  auto &old_tracking = edge_lookup({edge_type, old_from_labels, old_to_labels});
-  UpdateEdgeStats(new_tracking, old_tracking, edge_ref, edge_props);
+  auto &&new_tracking_ref = edge_lookup({edge_type, new_from_labels, new_to_labels});
+  auto &&old_tracking_ref = edge_lookup({edge_type, old_from_labels, old_to_labels});
+  UpdateEdgeStats(
+      utils::UnwrapConcurrentValue(new_tracking_ref), utils::UnwrapConcurrentValue(old_tracking_ref), edge_ref, edge_props);
 }
 
 template <template <class...> class TContainer>
@@ -699,10 +726,12 @@ void SchemaTracking<TContainer>::UpdateEdgeStats(auto &new_tracking, auto &old_t
   ++new_tracking.n;
 
   for (const auto &[property, type] : edge_props) {
-    auto &old_info = old_tracking.properties[property];
+    auto &&old_info_ref = old_tracking.properties[property];
+    auto &old_info = utils::UnwrapConcurrentValue(old_info_ref);
     --old_info.n;
     --old_info.types[type];
-    auto &new_info = new_tracking.properties[property];
+    auto &&new_info_ref = new_tracking.properties[property];
+    auto &new_info = utils::UnwrapConcurrentValue(new_info_ref);
     ++new_info.n;
     ++new_info.types[type];
   }
@@ -716,10 +745,12 @@ void SchemaTracking<TContainer>::UpdateEdgeStats(auto &new_tracking, auto &old_t
 template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::RecoverVertex(Vertex *vertex) {
   // No locking, since this should only be used to recover data
-  auto &info = vertex_state_[vertex->labels];
+  auto &&info_ref = vertex_state_[vertex->labels];
+  auto &info = utils::UnwrapConcurrentValue(info_ref);
   ++info.n;
   for (const auto &[property, type] : vertex->properties.ExtendedPropertyTypes()) {
-    auto &prop_info = info.properties[property];
+    auto &&prop_info_ref = info.properties[property];
+    auto &prop_info = utils::UnwrapConcurrentValue(prop_info_ref);
     ++prop_info.n;
     ++prop_info.types[type];
   }
@@ -728,11 +759,13 @@ void SchemaTracking<TContainer>::RecoverVertex(Vertex *vertex) {
 template <template <class...> class TContainer>
 void SchemaTracking<TContainer>::RecoverEdge(EdgeTypeId edge_type, EdgeRef edge, Vertex *from, Vertex *to,
                                              bool prop_on_edges) {
-  auto &tracking_info = edge_lookup(EdgeKeyRef{edge_type, from->labels, to->labels});
+  auto &&tracking_info_ref = edge_lookup(EdgeKeyRef{edge_type, from->labels, to->labels});
+  auto &tracking_info = utils::UnwrapConcurrentValue(tracking_info_ref);
   ++tracking_info.n;
   if (prop_on_edges) {
     for (const auto &[key, val] : edge.ptr->properties.ExtendedPropertyTypes()) {
-      auto &prop_post_info = tracking_info.properties[key];
+      auto &&prop_post_info_ref = tracking_info.properties[key];
+      auto &prop_post_info = utils::UnwrapConcurrentValue(prop_post_info_ref);
       ++prop_post_info.n;
       ++prop_post_info.types[val];
     }
@@ -792,9 +825,22 @@ void SchemaInfo::TransactionalEdgeModifyingAccessor::UpdateTransactionalEdges(
     auto edge_lock =
         properties_on_edges_ ? std::shared_lock{edge_ref.ptr->lock} : std::shared_lock<decltype(edge_ref.ptr->lock)>{};
 
-    auto other_labels = GetLabels(other_vertex, snapshot_bound_, commit_ts_, post_process_->vertex_cache);
     Properties edge_props{};
     if (properties_on_edges_) edge_props = GetProperties(edge_ref.ptr, snapshot_bound_, commit_ts_);
+
+    if (other_vertex == vertex) {
+      tracking_->UpdateEdgeStats(
+          edge_ref, edge_type, vertex->labels, vertex->labels, old_labels, old_labels, edge_props.types);
+      SchemaInfoEdge pp_item{edge_ref, edge_type, from_vertex, to_vertex};
+      if (edge_props.needs_pp) {
+        post_process_->edges.emplace(pp_item);
+      } else {
+        post_process_->edges.erase(pp_item);
+      }
+      return;
+    }
+
+    auto other_labels = GetLabels(other_vertex, snapshot_bound_, commit_ts_, post_process_->vertex_cache);
 
     tracking_->UpdateEdgeStats(edge_ref,
                                edge_type,
@@ -813,6 +859,7 @@ void SchemaInfo::TransactionalEdgeModifyingAccessor::UpdateTransactionalEdges(
   };
 
   for (const auto &edge : vertex->in_edges) {
+    if (std::get<1>(edge) == vertex) continue;
     process(edge, InEdge);
   }
 
@@ -832,11 +879,12 @@ void SchemaInfo::AnalyticalEdgeModifyingAccessor::UpdateAnalyticalEdges(Vertex *
                                (edge_dir == InEdge) ? other_vertex->labels : vertex->labels,
                                (edge_dir == InEdge) ? vertex->labels : other_vertex->labels,
                                (edge_dir == InEdge) ? other_vertex->labels : old_labels,
-                               (edge_dir == InEdge) ? old_labels : other_vertex->labels,
+                               (edge_dir == InEdge || other_vertex == vertex) ? old_labels : other_vertex->labels,
                                properties_on_edges_);
   };
 
   for (const auto &edge : vertex->in_edges) {
+    if (std::get<1>(edge) == vertex) continue;
     process(edge, InEdge);
   }
   for (const auto &edge : vertex->out_edges) {

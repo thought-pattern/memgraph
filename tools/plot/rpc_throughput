@@ -7,14 +7,15 @@ To obtain data used for this script use:
 `./tests/benchmark/rpc --benchmark_out=test.json --benchmark_out_format=json`
 """
 
-import json
-import collections
-import os
 import argparse
-import numpy
+import collections
+import json
+import os
 import shutil
 
 import matplotlib
+import numpy
+
 # Must set "Agg" backend before importing pyplot
 # This is so the script works on headless machines (without X11)
 matplotlib.use("Agg")

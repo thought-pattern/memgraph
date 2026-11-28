@@ -27,8 +27,8 @@ constexpr char const *kArgumentNormalized = "normalized";
 constexpr char const *kArgumentThreads = "threads";
 
 void InsertBCRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const double betweenness_centrality,
-                    int node_id) {
-  auto *node = mg_utility::GetNodeForInsertion(node_id, graph, memory);
+                    const std::uint64_t node_id) {
+  auto *node = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(node_id), graph, memory);
   if (!node) return;
 
   auto *record = mgp::result_new_record(result);
@@ -44,9 +44,11 @@ void GetBetweennessCentrality(mgp_list *args, mgp_graph *memgraph_graph, mgp_res
     const auto normalize = mgp::value_get_bool(mgp::list_at(args, 1));
     auto threads = mgp::value_get_int(mgp::list_at(args, 2));
 
-    if (threads <= 0)
-      threads = (std::thread::hardware_concurrency() > 1) ? (std::thread::hardware_concurrency() / 2) : 1;
-    threads = std::min(std::thread::hardware_concurrency(), static_cast<unsigned int>(threads));
+    const auto hw_threads = static_cast<std::int64_t>(std::max(1U, std::thread::hardware_concurrency()));
+    if (threads <= 0) {
+      threads = (hw_threads > 1) ? (hw_threads / 2) : 1;
+    }
+    threads = std::clamp<std::int64_t>(threads, 1, hw_threads);
 
     const auto graph_type = directed ? mg_graph::GraphType::kDirectedGraph : mg_graph::GraphType::kUndirectedGraph;
 
@@ -56,7 +58,7 @@ void GetBetweennessCentrality(mgp_list *args, mgp_graph *memgraph_graph, mgp_res
 
     const auto number_of_nodes = graph->Nodes().size();
     for (std::uint64_t node_id = 0; node_id < number_of_nodes; ++node_id)
-      InsertBCRecord(memgraph_graph, result, memory, BC[node_id], static_cast<int>(graph->GetMemgraphNodeId(node_id)));
+      InsertBCRecord(memgraph_graph, result, memory, BC[node_id], graph->GetMemgraphNodeId(node_id));
 
   } catch (const std::exception &e) {
     // We must not let any exceptions out of our module.
@@ -79,7 +81,8 @@ extern "C" int mgp_init_module(mgp_module *module, mgp_memory *memory) {
     // Query module arguments
     bool_value_directed = mgp::value_make_bool(true, memory);
     bool_value_normalized = mgp::value_make_bool(true, memory);
-    int_value_threads = mgp::value_make_int(std::thread::hardware_concurrency(), memory);
+    int_value_threads =
+        mgp::value_make_int(static_cast<std::int64_t>(std::max(1U, std::thread::hardware_concurrency())), memory);
 
     mgp::proc_add_opt_arg(proc, kArgumentDirected, mgp::type_bool(), bool_value_directed);
     mgp::proc_add_opt_arg(proc, kArgumentNormalized, mgp::type_bool(), bool_value_normalized);

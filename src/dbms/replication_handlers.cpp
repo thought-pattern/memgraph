@@ -192,20 +192,15 @@ void RenameDatabaseHandler(memgraph::system::ReplicaHandlerAccessToState &system
   }
 
   try {
-    // NOTE: Single communication channel can exist at a time, no other database can be renamed/created/deleted at the
-    // moment.
-    auto rename_result = dbms_handler.Rename(req.old_name, req.new_name);
-    if (!rename_result) {
-      if (rename_result.error() == RenameError::NON_EXISTENT) {
-        // Nothing to rename
-        system_state_access.SetLastCommitedTS(req.new_group_timestamp);
-        res = RenameDatabaseRes(RenameDatabaseRes::Result::NO_NEED);
-      }
-    } else {
-      // Successfully renamed db
-      system_state_access.SetLastCommitedTS(req.new_group_timestamp);
+    // Verify the source database's UUID before applying or acknowledging the rename, and leave LCTS advancement to
+    // FinalizeSystemTxHandler so transaction finalization succeeds once.
+    const auto outcome = dbms_handler.RenameForReplication(req.uuid, req.old_name, req.new_name);
+    if (outcome == DbmsHandler::ReplicaRenameOutcome::SUCCESS) {
       res = RenameDatabaseRes(RenameDatabaseRes::Result::SUCCESS);
-      spdlog::debug("RenameDatabaseHandler: SUCCESS updated LCTS to {}", req.new_group_timestamp);
+      spdlog::debug("RenameDatabaseHandler: SUCCESS");
+    } else if (outcome == DbmsHandler::ReplicaRenameOutcome::NO_NEED) {
+      res = RenameDatabaseRes(RenameDatabaseRes::Result::NO_NEED);
+      spdlog::debug("RenameDatabaseHandler: NO_NEED");
     }
   } catch (...) {
     // Failure
@@ -365,7 +360,9 @@ bool ForceSuspendForRecovery(DbmsHandler &dbms_handler, std::string_view name) {
 
 bool SystemRecoveryHandler(DbmsHandler &dbms_handler, const std::vector<storage::SalientConfig> &database_configs,
                            const std::vector<storage::ColdTenantRecovery> &cold_databases,
-                           bool const includes_all_databases) {
+                           bool const includes_all_databases,
+                           const std::vector<TenantProfiles::Profile> &tenant_profiles,
+                           bool const includes_tenant_profiles) {
   /*
    * NO LICENSE, here or on MAIN: only the default DB is reconciled, and no other DB is dropped
    */
@@ -530,22 +527,25 @@ bool SystemRecoveryHandler(DbmsHandler &dbms_handler, const std::vector<storage:
     }
     const auto del = dbms_handler.Delete(remove_db);
     if (!del) {
-      // Some errors are not terminal and must not fail the whole recovery round:
-      //  - DEFAULT_DB / NON_EXISTENT: nothing to drop.
-      //  - USING: the tenant is mid-transition (e.g. a SUSPEND that inserted into suspended_ but whose
-      //    finish_suspend has not run yet, so DeleteCold_ sees state != COLD). This is transient — the
-      //    next recovery round retries once the transition settles. Failing here would needlessly mark
-      //    the replica BEHIND for a self-healing condition.
-      if (del.error() == DeleteError::DEFAULT_DB || del.error() == DeleteError::NON_EXISTENT ||
-          del.error() == DeleteError::USING) {
-        spdlog::debug("SystemRecoveryHandler: leftover database \"{}\" not dropped this round (non-terminal: {}).",
+      // Only DEFAULT_DB and NON_EXISTENT mean there is nothing left to drop. A transient USING error
+      // means the deleted database is still present on this replica, so recovery must return false to
+      // keep retrying before advancing LCTS.
+      if (del.error() == DeleteError::DEFAULT_DB || del.error() == DeleteError::NON_EXISTENT) {
+        spdlog::debug("SystemRecoveryHandler: leftover database \"{}\" already absent or default ({}).",
                       remove_db,
                       static_cast<int>(del.error()));
         continue;
       }
-      spdlog::debug("SystemRecoveryHandler: Failed to drop database \"{}\".", remove_db);
+      spdlog::debug("SystemRecoveryHandler: Failed to drop database \"{}\" (error {}).",
+                    remove_db,
+                    static_cast<int>(del.error()));
       return false;
     }
+  }
+
+  if (includes_tenant_profiles && !dbms_handler.ReconcileTenantProfilesForRecovery(tenant_profiles)) {
+    spdlog::error("SystemRecoveryHandler: failed to reconcile tenant memory profiles from MAIN.");
+    return false;
   }
 
   /*

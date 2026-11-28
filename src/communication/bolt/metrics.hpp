@@ -46,8 +46,8 @@ inline void TouchNewSession(TSession &session, Value &metadata) {
 template <typename TSession>
 inline void UpdateNewSession(TSession &session, Value &metadata) {
   auto &data = metadata.ValueMap();
-  session.metrics_.value()->bolt_v = fmt::format("{}.{}", session.version_.major, session.version_.minor);
-  session.metrics_.value()->supported_bolt_v = session.client_supported_bolt_versions_;
+  session.metrics_.value()->SetVersionInfo(fmt::format("{}.{}", session.version_.major, session.version_.minor),
+                                           session.client_supported_bolt_versions_);
   ++session.metrics_.value()->sessions;
   auto scheme_it = data.find("scheme");
   auto conn_type =

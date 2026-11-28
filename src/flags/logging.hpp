@@ -11,18 +11,29 @@
 #pragma once
 
 #include <ctime>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 
+#include "gflags/gflags.h"
 #include "spdlog/common.h"
 #include "spdlog/sinks/sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DECLARE_string(log_file);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DECLARE_string(logger_type);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+DECLARE_uint64(log_retention_days);
+
 namespace memgraph::flags {
 
 auto LogRetentionDays() -> uint64_t;
+bool IsAsyncLoggerType(std::string_view logger_type);
+bool IsRotatedLogFileFor(const std::filesystem::path &candidate_path, const std::filesystem::path &configured_log_path);
 
 auto GetSinkLocalTime() -> tm;
 

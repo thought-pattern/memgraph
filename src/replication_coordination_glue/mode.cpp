@@ -10,13 +10,15 @@
 // licenses/APL.txt.
 #include "replication_coordination_glue/mode.hpp"
 
+#include <algorithm>
 #include <array>
-#include <iterator>
 #include <nlohmann/json.hpp>
-#include <range/v3/algorithm/find.hpp>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include "utils/logging.hpp"
 
 namespace memgraph::replication_coordination_glue {
 
@@ -28,14 +30,21 @@ constexpr std::array<std::pair<ReplicationMode, std::string_view>, 3> kModeMappi
 }  // namespace
 
 void to_json(nlohmann::json &j, const ReplicationMode &mode) {
-  const auto *it = ranges::find(kModeMapping, mode, &std::pair<ReplicationMode, std::string_view>::first);
-  j = std::string(it != kModeMapping.end() ? it->second : kModeMapping.front().second);
+  const auto *it = std::ranges::find(kModeMapping, mode, &std::pair<ReplicationMode, std::string_view>::first);
+  MG_ASSERT(it != kModeMapping.end(), "Unsupported replication mode enum value");
+  j = std::string(it->second);
 }
 
 void from_json(const nlohmann::json &j, ReplicationMode &mode) {
+  if (!j.is_string()) {
+    throw std::invalid_argument("Replication mode JSON field must be a string");
+  }
   const auto value = j.get<std::string>();
-  const auto *it = ranges::find(kModeMapping, value, &std::pair<ReplicationMode, std::string_view>::second);
-  mode = it != kModeMapping.end() ? it->first : kModeMapping.front().first;
+  const auto *it = std::ranges::find(kModeMapping, value, &std::pair<ReplicationMode, std::string_view>::second);
+  if (it == kModeMapping.end()) {
+    throw std::invalid_argument("Unrecognized replication mode: " + value);
+  }
+  mode = it->first;
 }
 
 }  // namespace memgraph::replication_coordination_glue

@@ -81,10 +81,11 @@ void LinkUser(Repository const &repo, User &user) {
           }
         }
       }
+    } catch (const AuthException &) {
+      spdlog::warn("Found invalid JSON in mtlink format for user '{}'", user.username());
     } catch (const nlohmann::detail::exception &) {
       // This shouldn't happen after V2 migration, but handle gracefully
       spdlog::warn("Found invalid JSON in mtlink format for user '{}'", user.username());
-      return;
     }
   }
 #endif
@@ -114,6 +115,9 @@ void LinkUser(Repository const &repo, User &user) {
         }
       }
 
+    } catch (const AuthException &) {
+      spdlog::warn("Found invalid JSON in link format for user '{}'", user.username());
+      return;
     } catch (const nlohmann::detail::exception &) {
       // This shouldn't happen after V2 migration, but handle gracefully
       spdlog::warn("Found invalid JSON in link format for user '{}'", user.username());
@@ -124,6 +128,58 @@ void LinkUser(Repository const &repo, User &user) {
 #ifdef MG_ENTERPRISE
   // Profile linking moved to UserProfiles class
 #endif
+}
+
+void LinkUserStrict(Repository const &repo, User &user) {
+#ifdef MG_ENTERPRISE
+  auto mt_link = repo.Get(Repository::MtLinkKey(user.username()));
+  if (mt_link) {
+    auto json_data = ParseJson(*mt_link);
+    if (!json_data.is_object()) {
+      throw AuthException("Invalid multi-tenant role link for account '{}'.", user.username());
+    }
+    for (const auto &[db, roles_array] : json_data.items()) {
+      if (!roles_array.is_array()) {
+        throw AuthException("Invalid multi-tenant role list on database '{}' for account '{}'.", db, user.username());
+      }
+      for (const auto &rolename_json : roles_array) {
+        if (!rolename_json.is_string()) {
+          throw AuthException("Invalid multi-tenant role entry on database '{}' for account '{}'.", db, user.username());
+        }
+        const auto rolename = rolename_json.get<std::string>();
+        auto role = GetRole(repo, rolename);
+        if (!role) {
+          throw AuthException("Missing role '{}' referenced in multi-tenant link for account '{}'.",
+                              rolename,
+                              user.username());
+        }
+        user.AddMultiTenantRole(*role, db);
+      }
+    }
+  }
+#endif
+
+  auto link = repo.Get(Repository::RoleLinkKey(user.username()));
+  if (link) {
+    auto json_data = ParseJson(*link);
+    if (!json_data.is_array()) {
+      throw AuthException("Invalid role link format for account '{}'.", user.username());
+    }
+    for (const auto &role_name : json_data) {
+      if (!role_name.is_string()) {
+        throw AuthException("Invalid role entry in role link for account '{}'.", user.username());
+      }
+      const auto rolename = role_name.get<std::string>();
+      if (user.roles().GetRole(rolename)) {
+        continue;
+      }
+      auto role = GetRole(repo, rolename);
+      if (!role) {
+        throw AuthException("Missing role '{}' referenced in role link for account '{}'.", rolename, user.username());
+      }
+      user.AddRole(*role);
+    }
+  }
 }
 
 std::optional<User> GetUser(Repository const &repo, std::string_view username_raw) {
@@ -157,6 +213,19 @@ std::vector<User> AllUsers(Repository const &repo) {
       // One unreadable record must not fail the whole listing.
       spdlog::warn("Skipping user '{}': {}", username, e.what());
     }
+  });
+  return ret;
+}
+
+std::vector<User> AllUsersStrict(Repository const &repo) {
+  std::vector<User> ret;
+  repo.ForEachUser([&](auto username, auto const &value) {
+    if (username != utils::ToLowerCase(username)) {
+      throw AuthException("Encountered non-normalized account key '{}' during strict recovery snapshot.", username);
+    }
+    User user = User::Deserialize(ParseAndMigrateJson(value));
+    LinkUserStrict(repo, user);
+    ret.emplace_back(std::move(user));
   });
   return ret;
 }
@@ -207,66 +276,89 @@ std::vector<std::string> AllRolenames(Repository const &repo) {
   return ret;
 }
 
-std::vector<User> AllUsersForRole(Repository const &repo, std::string_view rolename_raw) {
+namespace {
+bool ParseRoleLinkMembership(std::string const &username, std::string const &value, std::string const &rolename,
+                             std::vector<std::string> &unreadable_entries, bool &complete) {
+  auto mark_unreadable = [&](std::string_view reason) {
+    spdlog::warn("Unreadable role assignment for '{}': {}", username, reason);
+    unreadable_entries.push_back(username);
+    complete = false;
+  };
+
+  try {
+    auto json_data = ParseJson(value);
+    if (!json_data.is_array()) {
+      mark_unreadable("expected JSON array of role names");
+      return false;
+    }
+    bool matched = false;
+    bool malformed_element = false;
+    for (auto const &role_name : json_data) {
+      if (!role_name.is_string()) {
+        malformed_element = true;
+        continue;
+      }
+      if (utils::ToLowerCase(role_name.template get<std::string>()) == rolename) {
+        matched = true;
+      }
+    }
+    if (malformed_element) {
+      mark_unreadable("role assignment contains a non-string entry");
+    }
+    return matched;
+  } catch (AuthException const &e) {
+    mark_unreadable(e.what());
+    return false;
+  } catch (nlohmann::detail::exception const &e) {
+    mark_unreadable(e.what());
+    return false;
+  }
+}
+}  // namespace
+
+RoleMembersListing ListUsersForRole(Repository const &repo, std::string_view rolename_raw) {
   const auto rolename = utils::ToLowerCase(rolename_raw);
-  std::vector<User> ret;
+  RoleMembersListing listing;
   repo.ForEachRoleLink([&](auto username, auto const &value) {
     if (username != utils::ToLowerCase(username)) return;
-
-    bool has_role = false;
-    try {
-      auto json_data = ParseJson(value);
-      if (!json_data.is_array()) {
-        spdlog::warn("Found non-array link format for user '{}'", username);
-        return;
-      }
-      for (auto const &role_name : json_data) {
-        if (role_name.is_string() && utils::ToLowerCase(role_name.template get<std::string>()) == rolename) {
-          has_role = true;
-          break;
-        }
-      }
-    } catch (nlohmann::detail::exception const &) {
-      spdlog::warn("Found invalid JSON in link format for user '{}', treating as single role", username);
+    if (!ParseRoleLinkMembership(username, value, rolename, listing.unreadable_entries, listing.complete)) {
       return;
     }
-
-    if (has_role) {
+    try {
       if (auto user = GetUser(repo, username)) {
-        ret.push_back(std::move(*user));
+        listing.users.push_back(std::move(*user));
       } else {
-        throw AuthException("Couldn't load user '{}'!", username);
+        spdlog::warn("Role assignment for '{}' references a missing account record.", username);
+        listing.unreadable_entries.push_back(username);
+        listing.complete = false;
       }
+    } catch (AuthException const &e) {
+      spdlog::warn("Skipping unreadable account '{}' while listing role '{}': {}", username, rolename, e.what());
+      listing.unreadable_entries.push_back(username);
+      listing.complete = false;
     }
   });
-  return ret;
+  return listing;
+}
+
+RoleMemberNamesListing ListUsernamesForRole(Repository const &repo, std::string_view rolename_raw) {
+  const auto rolename = utils::ToLowerCase(rolename_raw);
+  RoleMemberNamesListing listing;
+  repo.ForEachRoleLink([&](auto username, auto const &value) {
+    if (username != utils::ToLowerCase(username)) return;
+    if (ParseRoleLinkMembership(username, value, rolename, listing.unreadable_entries, listing.complete)) {
+      listing.usernames.push_back(std::move(username));
+    }
+  });
+  return listing;
+}
+
+std::vector<User> AllUsersForRole(Repository const &repo, std::string_view rolename_raw) {
+  return ListUsersForRole(repo, rolename_raw).users;
 }
 
 std::vector<std::string> AllUsernamesForRole(Repository const &repo, std::string_view rolename_raw) {
-  const auto rolename = utils::ToLowerCase(rolename_raw);
-  std::vector<std::string> ret;
-  repo.ForEachRoleLink([&](auto username, auto const &value) {
-    if (username != utils::ToLowerCase(username)) return;
-    bool has_role = false;
-    try {
-      auto json_data = ParseJson(value);
-      if (!json_data.is_array()) {
-        spdlog::warn("Found non-array link format for user '{}'", username);
-        return;
-      }
-      for (auto const &role_name : json_data) {
-        if (role_name.is_string() && utils::ToLowerCase(role_name.template get<std::string>()) == rolename) {
-          has_role = true;
-          break;
-        }
-      }
-    } catch (nlohmann::detail::exception const &) {
-      spdlog::warn("Found invalid JSON in link format for user '{}', treating as single role", username);
-      return;
-    }
-    if (has_role) ret.push_back(std::move(username));
-  });
-  return ret;
+  return ListUsernamesForRole(repo, rolename_raw).usernames;
 }
 
 bool HasUser(Repository const &repo, std::string_view name) {

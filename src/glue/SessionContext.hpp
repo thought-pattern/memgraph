@@ -37,7 +37,6 @@ using SynchedAuth = utils::Synchronized<auth::Auth, utils::WritePrioritizedRWLoc
 
 namespace memgraph::glue {
 struct Context {
-  communication::v2::ServerEndpoint endpoint;
   query::InterpreterContext *ic;
   auth::SynchedAuth *auth;
 #if MG_ENTERPRISE

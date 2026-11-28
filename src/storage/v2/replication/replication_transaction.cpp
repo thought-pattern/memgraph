@@ -138,6 +138,17 @@ auto TransactionReplication::FinalizeTransaction(bool const decision, utils::UUI
   // Reserve first: an emplace_back that throws after its task was enqueued would orphan a running
   // task with no future to collect.
   decisions.reserve(locked_clients->size());
+  auto const drain_decisions_on_unwind = utils::OnScopeExit{[&]() noexcept {
+    for (auto &entry : decisions) {
+      if (entry.second.valid()) {
+        try {
+          entry.second.wait();
+          // NOLINTNEXTLINE(bugprone-empty-catch)
+        } catch (...) {
+        }
+      }
+    }
+  }};
 
   for (auto &&[client, replica_stream] : ranges::views::zip(*locked_clients, streams)) {
     if (client->Mode() == replication_coordination_glue::ReplicationMode::STRICT_SYNC) {

@@ -25,6 +25,7 @@ template <rpc::IsRpc T>
 struct RpcInfo {
   static prometheus::Histogram *histogram();
   static void ObserveThroughput(std::string const &instance_name, double bytes_per_second);
+  static void ObserveApplyLatency(std::string const &instance_name, double seconds);
 };
 
 class InMemoryStorage;
@@ -128,18 +129,25 @@ std::optional<typename T::Response> TransferDurabilityFiles(const R &files, rpc:
   slk::Builder *builder = stream_result.GetBuilder();
   builder->FlushSegment(/*final_segment*/ false, /*force_flush*/ true);
 
-  // If writing files failed, fail the task by returning empty optional
+  // If writing files failed, close the half-written RPC socket before ~StreamHandler unlocks it
   if (replication::Encoder encoder(builder); !WriteFiles(files, root_data_dir, encoder, page_cache)) {
+    client.Shutdown();
     return std::nullopt;
   }
 
-  auto response = stream_result.SendAndWaitProgress();
+  auto transfer_end = transfer_start;
+  auto response = stream_result.SendAndWaitProgress([&transfer_end] { transfer_end = std::chrono::steady_clock::now(); });
+  auto const apply_end = std::chrono::steady_clock::now();
 
-  // Record per-instance recovery throughput (bytes/s) so a slow replication link can be identified.
-  auto const elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - transfer_start).count();
+  // Measure network file transfer time separately from the replica's local recovery/application wait time.
+  auto const transfer_seconds = std::chrono::duration<double>(transfer_end - transfer_start).count();
   if (auto const total_bytes = TotalFileBytes(files);
-      total_bytes.has_value() && *total_bytes > 0 && elapsed_seconds > 0.0) {
-    RpcInfo<T>::ObserveThroughput(instance_name, static_cast<double>(*total_bytes) / elapsed_seconds);
+       total_bytes.has_value() && *total_bytes > 0 && transfer_seconds > 0.0) {
+    RpcInfo<T>::ObserveThroughput(instance_name, static_cast<double>(*total_bytes) / transfer_seconds);
+  }
+  auto const apply_seconds = std::chrono::duration<double>(apply_end - transfer_end).count();
+  if (apply_seconds >= 0.0) {
+    RpcInfo<T>::ObserveApplyLatency(instance_name, apply_seconds);
   }
 
   return response;

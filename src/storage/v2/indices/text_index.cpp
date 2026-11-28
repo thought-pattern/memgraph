@@ -381,13 +381,12 @@ std::vector<TextSearchResult> TextIndex::ActiveIndices::Search(const std::string
     }
     auto &searcher = *tx.text_search_session_->GetOrAcquire(&index_data, context);
 
-    const auto lowered_query = ToLowerCasePreservingBooleanOperators(search_query);
     switch (search_mode) {
       case text_search_mode::SPECIFIED_PROPERTIES:
         search_results = mgcxx::text_search::search_gids_pinned(
             context,
             searcher,
-            mgcxx::text_search::SearchInput{.search_query = lowered_query,
+            mgcxx::text_search::SearchInput{.search_query = ToLowerCasePreservingBooleanOperators(search_query),
                                             .limit = config.limit,
                                             .fuzzy_distance = config.fuzzy_distance,
                                             .fuzzy_prefix = config.fuzzy_prefix,
@@ -399,14 +398,14 @@ std::vector<TextSearchResult> TextIndex::ActiveIndices::Search(const std::string
             context,
             searcher,
             mgcxx::text_search::SearchInput{
-                .search_fields = {kAllField}, .search_query = lowered_query, .limit = config.limit});
+                .search_fields = {kAllField}, .search_query = search_query, .limit = config.limit});
         break;
       case text_search_mode::ALL_PROPERTIES:
         search_results = mgcxx::text_search::search_gids_pinned(
             context,
             searcher,
             mgcxx::text_search::SearchInput{.search_fields = {kAllField},
-                                            .search_query = lowered_query,
+                                            .search_query = ToLowerCasePreservingBooleanOperators(search_query),
                                             .limit = config.limit,
                                             .fuzzy_distance = config.fuzzy_distance,
                                             .fuzzy_prefix = config.fuzzy_prefix,
@@ -417,7 +416,7 @@ std::vector<TextSearchResult> TextIndex::ActiveIndices::Search(const std::string
         search_results = mgcxx::text_search::fuzzy_phrase_search_gids_pinned(
             context,
             searcher,
-            mgcxx::text_search::SearchInput{.search_query = lowered_query,
+            mgcxx::text_search::SearchInput{.search_query = ToLowerCasePreservingBooleanOperators(search_query),
                                             .limit = config.limit,
                                             .fuzzy_distance = config.fuzzy_distance,
                                             .fuzzy_prefix = config.fuzzy_prefix,
@@ -440,17 +439,22 @@ std::vector<TextSearchResult> TextIndex::ActiveIndices::Search(const std::string
 }
 
 std::string TextIndex::ActiveIndices::Aggregate(const std::string &index_name, const std::string &search_query,
-                                                const std::string &aggregation_query) {
-  auto &context = std::invoke([&]() -> mgcxx::text_search::Context & {
-    if (const auto it = index_container_->find(index_name); it != index_container_->end()) {
-      return it->second->context;
-    }
+                                                const std::string &aggregation_query, const Transaction &tx) {
+  auto it = index_container_->find(index_name);
+  if (it == index_container_->end()) {
     throw TextSearchException("Text index {} doesn't exist.", index_name);
-  });
+  }
+  auto &index_data = *it->second;
+  auto &context = index_data.context;
   mgcxx::text_search::DocumentOutput aggregation_result;
   try {
-    aggregation_result = mgcxx::text_search::aggregate(
+    if (!tx.text_search_session_) {
+      tx.text_search_session_ = std::make_unique<TextSearchSession>();
+    }
+    auto &searcher = *tx.text_search_session_->GetOrAcquire(&index_data, context);
+    aggregation_result = mgcxx::text_search::aggregate_pinned(
         context,
+        searcher,
         mgcxx::text_search::SearchInput{
             .search_fields = {kDataField}, .search_query = search_query, .aggregation_query = aggregation_query});
 
@@ -488,6 +492,12 @@ void TextIndex::ActiveIndices::ApplyTrackedChanges(Transaction &tx, NameIdMapper
   // must not stop the batches behind it. An index whose batch was not published is marked dirty,
   // which keeps it out of the shutdown watermark so that recovery rebuilds it from the graph.
   for (const auto &[index_data_ptr, pending] : tx.text_index_change_collector_) {
+    bool index_committed = false;
+    utils::OnScopeExit const mark_dirty_if_uncommitted{[&]() noexcept {
+      if (!index_committed) {
+        index_data_ptr->dirty.store(true, std::memory_order_release);
+      }
+    }};
     try {
       struct PreparedDoc {
         std::int64_t gid;
@@ -536,21 +546,27 @@ void TextIndex::ActiveIndices::ApplyTrackedChanges(Transaction &tx, NameIdMapper
               doc.gid, std::move(doc.properties), std::move(doc.all_property_values), index_data_ptr->context);
         }
         mgcxx::text_search::commit(index_data_ptr->context);
-      } catch (const std::exception &) {
+        index_committed = true;
+      } catch (...) {
         // Rolled back while write_mutex is still held, so no other writer builds on the partial batch.
         try {
           mgcxx::text_search::rollback(index_data_ptr->context);
         } catch (const std::exception &rollback_err) {
           spdlog::error("Failed to roll back text index uncommitted changes: {}", rollback_err.what());
+        } catch (...) {
+          spdlog::error("Failed to roll back text index uncommitted changes.");
         }
         throw;
       }
     } catch (const std::exception &e) {
-      index_data_ptr->dirty.store(true, std::memory_order_release);
       spdlog::error(
           "A committed transaction was not published to a text index, which stays stale until it is rebuilt on "
           "the next startup: {}",
           e.what());
+    } catch (...) {
+      spdlog::error(
+          "A committed transaction was not published to a text index, which stays stale until it is rebuilt on "
+          "the next startup.");
     }
   }
 }

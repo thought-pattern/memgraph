@@ -1,15 +1,12 @@
 import os
-import subprocess
 from pathlib import Path
+import subprocess
 from typing import Dict, List
 
+from gqlalchemy import Memgraph, Node, Path as path_gql, Relationship
+from mgclient import Node as node_mgclient, Relationship as relationship_mgclient
 import pytest
 import yaml
-from gqlalchemy import Memgraph, Node
-from gqlalchemy import Path as path_gql
-from gqlalchemy import Relationship
-from mgclient import Node as node_mgclient
-from mgclient import Relationship as relationship_mgclient
 
 
 @pytest.fixture
@@ -258,6 +255,25 @@ def _test_static(test_dir: Path, db: Memgraph):
     _run_test(test_dict, db)
 
 
+def _checkpoint_pairs(checkpoint_input_cyphers, checkpoint_test_dicts):
+    if not isinstance(checkpoint_input_cyphers, list) or not all(
+        isinstance(value, str) for value in checkpoint_input_cyphers
+    ):
+        pytest.fail("Online test queries must be a list of checkpoint query strings.")
+    if not isinstance(checkpoint_test_dicts, list) or not all(
+        isinstance(value, dict) for value in checkpoint_test_dicts
+    ):
+        pytest.fail("Online test file must be a list of checkpoint tests.")
+    if not checkpoint_test_dicts:
+        pytest.fail("Online test declares no checkpoints.")
+    if len(checkpoint_input_cyphers) != len(checkpoint_test_dicts):
+        pytest.fail(
+            f"Online test has {len(checkpoint_input_cyphers)} checkpoint inputs "
+            f"but {len(checkpoint_test_dicts)} checkpoint tests."
+        )
+    return list(zip(checkpoint_input_cyphers, checkpoint_test_dicts, strict=True))
+
+
 def _test_online(test_dir: Path, db: Memgraph):
     """
     Testing online modules. Checkpoint testing
@@ -268,6 +284,7 @@ def _test_online(test_dir: Path, db: Memgraph):
     setup_cyphers = checkpoint_input.get(TestConstants.ONLINE_TEST_E2E_SETUP, None)
     checkpoint_input_cyphers = checkpoint_input[TestConstants.ONLINE_TEST_E2E_INPUT_QUERIES]
     cleanup_cyphers = checkpoint_input.get(TestConstants.ONLINE_TEST_E2E_CLEANUP, None)
+    checkpoints = _checkpoint_pairs(checkpoint_input_cyphers, checkpoint_test_dicts)
 
     # Run optional setup queries
     if setup_cyphers:
@@ -275,7 +292,7 @@ def _test_online(test_dir: Path, db: Memgraph):
 
     try:
         # Execute cypher queries and compare them with results
-        for input_cyphers_raw, test_dict in zip(checkpoint_input_cyphers, checkpoint_test_dicts):
+        for input_cyphers_raw, test_dict in checkpoints:
             input_cyphers = input_cyphers_raw.splitlines()
             _execute_cyphers(input_cyphers, db)
             _run_test(test_dict, db)

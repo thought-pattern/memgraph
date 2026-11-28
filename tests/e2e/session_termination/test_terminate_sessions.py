@@ -9,15 +9,13 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from contextlib import suppress
 import multiprocessing
+from queue import Empty
 import sys
 import time
 import uuid
-from contextlib import suppress
-from queue import Empty
 
-import mgclient
-import pytest
 from common import (
     assert_connection_alive,
     connect,
@@ -27,7 +25,9 @@ from common import (
     wait_until,
     wait_until_terminated,
 )
+import mgclient
 from neo4j import GraphDatabase
+import pytest
 
 # Tests
 # -------------------------

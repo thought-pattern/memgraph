@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 QUERY_PLAN = "QUERY PLAN"
 

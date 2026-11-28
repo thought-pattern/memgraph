@@ -29,8 +29,36 @@
 #include "utils/counter.hpp"
 #include "utils/exceptions.hpp"
 #include "utils/on_scope_exit.hpp"
+#include "utils/string.hpp"
 
 namespace memgraph::requests {
+
+auto RedactUrlForLog(std::string_view url) -> std::string {
+  if (url.empty()) {
+    return "<empty-url>";
+  }
+  const auto scheme_pos = url.find("://");
+  std::string out;
+  std::string_view rest = url;
+  if (scheme_pos != std::string_view::npos) {
+    out.append(url.substr(0, scheme_pos + 3));
+    rest = url.substr(scheme_pos + 3);
+  }
+  // Authority ends at the first '/', '?', or '#'.
+  const auto auth_end = rest.find_first_of("/?#");
+  const std::string_view authority = auth_end == std::string_view::npos ? rest : rest.substr(0, auth_end);
+  const std::string_view path_and_more = auth_end == std::string_view::npos ? std::string_view{} : rest.substr(auth_end);
+
+  const auto at_pos = authority.rfind('@');
+  const std::string_view host_port = at_pos == std::string_view::npos ? authority : authority.substr(at_pos + 1);
+  out.append(host_port);
+
+  const auto query_or_frag = path_and_more.find_first_of("?#");
+  const std::string_view clean_path =
+      query_or_frag == std::string_view::npos ? path_and_more : path_and_more.substr(0, query_or_frag);
+  out.append(clean_path);
+  return out.empty() ? std::string{"<redacted-url>"} : out;
+}
 
 namespace {
 
@@ -176,8 +204,8 @@ bool RequestPostJson(const std::string &url, const nlohmann::json &data, int tim
     return false;
   }
 
-  if (response_code != 200) {
-    SPDLOG_WARN("Request response code isn't 200 (received {})!", response_code);
+  if (response_code < 200 || response_code >= 300) {
+    SPDLOG_WARN("Request response code isn't 2xx (received {})!", response_code);
     return false;
   }
 
@@ -187,12 +215,25 @@ bool RequestPostJson(const std::string &url, const nlohmann::json &data, int tim
 std::expected<void, DownloadError> CreateAndDownloadFile(const std::string &url, utils::FileUniquePtr file,
                                                          uint64_t const connection_timeout,
                                                          std::function<void()> abort_check) {
+  if (!file) {
+    return std::unexpected{
+        DownloadError{.kind = DownloadFailure::LocalWrite, .http_status = 0, .message = "the download could not be written"}};
+  }
   // A short write ends the transfer, which is what a full disk should do.
   auto const sink = [&file](char const *data, size_t const size) -> size_t {
     return std::fwrite(data, 1, size, file.get());
   };
 
-  return DownloadToSink(url, sink, connection_timeout, std::move(abort_check));
+  auto result = DownloadToSink(url, sink, connection_timeout, std::move(abort_check));
+  FILE *raw_file = file.release();
+  const int flush_rc = std::fflush(raw_file);
+  const int stream_err = std::ferror(raw_file);
+  const int close_rc = std::fclose(raw_file);
+  if (result.has_value() && (flush_rc != 0 || stream_err != 0 || close_rc != 0)) {
+    return std::unexpected{
+        DownloadError{.kind = DownloadFailure::LocalWrite, .http_status = 0, .message = "the download could not be written"}};
+  }
+  return result;
 }
 
 std::expected<void, DownloadError> DownloadToSink(const std::string &url, WriteSink const &write,
@@ -203,7 +244,7 @@ std::expected<void, DownloadError> DownloadToSink(const std::string &url, WriteS
   auto *curl = curl_easy_init();
   if (!curl) {
     spdlog::error("requests: Couldn't init curl");
-    return std::unexpected{DownloadError{.message = "could not start a request"}};
+    return std::unexpected{DownloadError{.kind = DownloadFailure::Configuration, .message = "could not start a request"}};
   }
   utils::OnScopeExit const cleanup{[curl]() { curl_easy_cleanup(curl); }};
 
@@ -265,27 +306,54 @@ std::expected<void, DownloadError> DownloadToSink(const std::string &url, WriteS
       error.kind = DownloadFailure::Stalled;
       error.message = "the transfer stopped making progress";
       break;
+    case CURLE_UNSUPPORTED_PROTOCOL:
+    case CURLE_URL_MALFORMAT:
+    case CURLE_NOT_BUILT_IN:
+    case CURLE_BAD_FUNCTION_ARGUMENT:
+    case CURLE_SSL_CACERT_BADFILE:
+    case CURLE_SSL_CRL_BADFILE:
+    case CURLE_SSL_CERTPROBLEM:
+      error.kind = DownloadFailure::Configuration;
+      break;
     default:
       error.kind = DownloadFailure::Network;
       break;
   }
 
-  spdlog::error("Error happened while downloading {}: {}", url, error.message);
+  spdlog::error("Error happened while downloading {}: {}", RedactUrlForLog(url), error.message);
   return std::unexpected{std::move(error)};
 }
 
 auto DownloadToStream(std::string_view url, std::ostream &os) -> bool {
+  if (!os.good()) {
+    return false;
+  }
   constexpr auto WriteCallback = [](char *ptr, size_t size, size_t nmemb, std::ostream *os) -> size_t {
-    auto const totalSize = static_cast<std::streamsize>(size * nmemb);
-    os->write(ptr, totalSize);
-    return totalSize;
+    const size_t byte_count = size * nmemb;
+    if (byte_count == 0) {
+      return 0;
+    }
+    if (!os->good()) {
+      return 0;
+    }
+    os->write(ptr, static_cast<std::streamsize>(byte_count));
+    if (!(*os)) {
+      return 0;
+    }
+    return byte_count;
   };
 
   auto *curl_handle{curl_easy_init()};
-  // NOLINTNEXTLINE
-  curl_easy_setopt(curl_handle, CURLOPT_URL, url.data());
+  if (!curl_handle) {
+    return false;
+  }
+  const std::string owned_url{url};
+  curl_easy_setopt(curl_handle, CURLOPT_URL, owned_url.c_str());
   curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, +WriteCallback);
   curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, &os);
+  curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 10L);
+  curl_easy_setopt(curl_handle, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1_2));  // NOLINT(google-runtime-int)
   SetCaInfo(curl_handle);
 
   auto const res = curl_easy_perform(curl_handle);
@@ -293,15 +361,22 @@ auto DownloadToStream(std::string_view url, std::ostream &os) -> bool {
   curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
   curl_easy_cleanup(curl_handle);
 
-  if (res != CURLE_OK) {
-    SPDLOG_WARN("Couldn't perform request: {}", curl_easy_strerror(res));
+  if (res != CURLE_OK || !os.good()) {
+    if (res != CURLE_OK) {
+      SPDLOG_WARN("Couldn't perform request: {}", curl_easy_strerror(res));
+    }
     return false;
   }
 
-  constexpr auto protocol_matcher = ctre::starts_with<"(https?|ftp)://">;
-  if (protocol_matcher(url) && response_code != 200) {
-    SPDLOG_WARN("Request response code isn't 200 (received {})!", response_code);
-    return false;
+  const auto scheme_sep = owned_url.find("://");
+  if (scheme_sep != std::string::npos) {
+    const std::string scheme_lower = utils::ToLowerCase(std::string_view{owned_url}.substr(0, scheme_sep));
+    if (scheme_lower == "http" || scheme_lower == "https" || scheme_lower == "ftp" || scheme_lower == "ftps") {
+      if (response_code < 200 || response_code >= 300) {
+        SPDLOG_WARN("Request response code isn't 2xx (received {})!", response_code);
+        return false;
+      }
+    }
   }
 
   return true;
@@ -310,7 +385,7 @@ auto DownloadToStream(std::string_view url, std::ostream &os) -> bool {
 auto UrlToStringStream(std::string_view url) -> std::stringstream {
   auto ss = std::stringstream{};
   if (!requests::DownloadToStream(url, ss)) {
-    throw utils::RetryableException("CSV was unable to be fetched from {}", url);
+    throw utils::RetryableException("CSV was unable to be fetched from {}", RedactUrlForLog(url));
   }
   return ss;
 };

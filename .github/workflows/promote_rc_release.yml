@@ -21,6 +21,7 @@ on:
       test:
         description: "Run in test mode"
         required: false
+        default: false
         type: boolean
       update_bsl:
         type: boolean
@@ -479,13 +480,20 @@ jobs:
           EOF
           cosign attest --yes --type slsaprovenance --predicate provenance.json "${RELEASE_IMAGE}"
 
-          # CycloneDX SBOM — reuse the one scanned from this prod image at build.
-          sbom_src="s3://${rc_bucket}/${rc_dir}/sbom/memgraph-docker-sbom.json"
-          if aws s3 cp "$sbom_src" sbom.json; then
-            cosign attest --yes --type cyclonedx --predicate sbom.json "${RELEASE_IMAGE}"
-          else
-            echo "::warning::SBOM not found at $sbom_src — skipping SBOM attestation"
-          fi
+          # CycloneDX SBOMs — attach each published architecture's inventory to its own image digest.
+          for arch_spec in "amd:${RELEASE_IMAGE_AMD}" "arm:${RELEASE_IMAGE_ARM}"; do
+            arch_key="${arch_spec%%:*}"
+            arch_image="${arch_spec#*:}"
+            sbom_key="${rc_dir}/sbom/${arch_key}/memgraph-docker-sbom.json"
+            sbom_src="s3://${rc_bucket}/${sbom_key}"
+            key_count="$(aws s3api list-objects-v2 --bucket "${rc_bucket}" --prefix "${sbom_key}" --max-items 1 --query 'KeyCount' --output text)"
+            if [[ "$key_count" == "0" ]]; then
+              echo "::warning::SBOM not found at $sbom_src — skipping ${arch_key} SBOM attestation"
+            else
+              aws s3 cp "$sbom_src" "sbom-${arch_key}.json"
+              cosign attest --yes --type cyclonedx --predicate "sbom-${arch_key}.json" "${arch_image}"
+            fi
+          done
 
       - name: Verify attestations are attached (cosign)
         # Non-fatal self-check that the attestations we just attached are
@@ -803,12 +811,21 @@ jobs:
           EOF
           cosign attest --yes --type slsaprovenance --predicate provenance.json "${release_image}"
 
-          sbom_src="s3://${rc_bucket}/${mage_rc_dir}/sbom/mage-sbom.json"
-          if aws s3 cp "$sbom_src" sbom.json; then
-            cosign attest --yes --type cyclonedx --predicate sbom.json "${release_image}"
-          else
-            echo "::warning::SBOM not found at $sbom_src — skipping SBOM attestation"
-          fi
+          for arch_spec in "amd:${has_rc_package_amd}:${release_image_amd}" "arm:${has_rc_package_arm}:${release_image_arm}"; do
+            IFS=':' read -r arch_key arch_enabled arch_image <<< "$arch_spec"
+            if [[ "$arch_enabled" != "true" ]]; then
+              continue
+            fi
+            sbom_key="${mage_rc_dir}/sbom/${arch_key}/mage-sbom.json"
+            sbom_src="s3://${rc_bucket}/${sbom_key}"
+            key_count="$(aws s3api list-objects-v2 --bucket "${rc_bucket}" --prefix "${sbom_key}" --max-items 1 --query 'KeyCount' --output text)"
+            if [[ "$key_count" == "0" ]]; then
+              echo "::warning::SBOM not found at $sbom_src — skipping ${arch_key} SBOM attestation"
+            else
+              aws s3 cp "$sbom_src" "sbom-${arch_key}.json"
+              cosign attest --yes --type cyclonedx --predicate "sbom-${arch_key}.json" "${arch_image}"
+            fi
+          done
 
       - name: Verify attestations are attached (cosign)
         # Non-fatal self-check (see PromoteDocker for rationale).
@@ -934,40 +951,44 @@ jobs:
 
       - name: Setup SBOM paths
         run: |
-          # Both products stage their SBOMs flat under <rc_dir>/sbom/; the
-          # release layout mirrors that under the product's release dir.
-          # memgraph: memgraph-build-sbom.{json,txt}, memgraph-docker-sbom.{json,txt}
-          # mage:     mage-sbom.{json,txt}, memgraph-build-sbom.json
+          # Both products stage their SBOMs per architecture under <rc_dir>/sbom/<arch>/;
+          # the release layout mirrors that under the product's release dir.
           case "${{ matrix.product }}" in
             memgraph)
-              src="s3://${rc_bucket}/${rc_dir}/sbom/"
-              dst="s3://${release_bucket}/${release_dir}/sbom/"
+              src_prefix="${rc_dir}/sbom/"
+              dst_prefix="${release_dir}/sbom/"
               ;;
             mage)
-              src="s3://${rc_bucket}/${mage_rc_dir}/sbom/"
-              dst="s3://${release_bucket}/${mage_release_dir}/sbom/"
+              src_prefix="${mage_rc_dir}/sbom/"
+              dst_prefix="${mage_release_dir}/sbom/"
               ;;
           esac
-          echo "sbom_src=${src}" >> $GITHUB_ENV
-          echo "sbom_dst=${dst}" >> $GITHUB_ENV
+          echo "sbom_src_prefix=${src_prefix}" >> $GITHUB_ENV
+          echo "sbom_dst_prefix=${dst_prefix}" >> $GITHUB_ENV
+          echo "sbom_src=s3://${rc_bucket}/${src_prefix}" >> $GITHUB_ENV
+          echo "sbom_dst=s3://${release_bucket}/${dst_prefix}" >> $GITHUB_ENV
 
       - name: Check if RC SBOMs exist
         run: |
-          # SBOM generation is gated on `generate_sbom` at build time (only the
-          # amd, non-malloc, non-cuda/cugraph builds emit them), so an RC built
-          # with it turned off legitimately has none — warn rather than fail.
-          if [[ -z "$(aws s3 ls "${sbom_src}" 2>/dev/null)" ]]; then
+          set -euo pipefail
+          # SBOM generation is gated on `generate_sbom` at build time, so an RC
+          # built with it turned off legitimately has none — warn on an empty
+          # prefix, while letting S3 lookup errors fail the step.
+          src_count="$(aws s3api list-objects-v2 --bucket "${rc_bucket}" --prefix "${sbom_src_prefix}" --max-items 1 --query 'KeyCount' --output text)"
+          if [[ "$src_count" == "0" ]]; then
             echo "has_rc_sbom=false" >> $GITHUB_ENV
             echo "::warning::No RC SBOMs found at ${sbom_src} — nothing to promote."
           else
             echo "has_rc_sbom=true" >> $GITHUB_ENV
-            aws s3 ls "${sbom_src}"
+            aws s3 ls "${sbom_src}" --recursive
           fi
 
       - name: Check if release SBOMs already exist
         if: ${{ env.has_rc_sbom == 'true' }}
         run: |
-          if [[ -n "$(aws s3 ls "${sbom_dst}" 2>/dev/null)" ]]; then
+          set -euo pipefail
+          dst_count="$(aws s3api list-objects-v2 --bucket "${release_bucket}" --prefix "${sbom_dst_prefix}" --max-items 1 --query 'KeyCount' --output text)"
+          if [[ "$dst_count" != "0" ]]; then
             echo "SBOMs already exist at ${sbom_dst}"
             if [[ "$FORCE_PROMOTE" != "true" ]]; then
               echo "Set force_promote to true to override existing release!"
@@ -979,6 +1000,7 @@ jobs:
       - name: Promote SBOMs to release bucket
         if: ${{ env.has_rc_sbom == 'true' }}
         run: |
+          set -euo pipefail
           aws s3 cp "${sbom_src}" "${sbom_dst}" --recursive
           echo "Promoted ${{ matrix.product }} SBOMs to ${sbom_dst}"
 
@@ -1003,45 +1025,52 @@ jobs:
       - name: Collect debug-symbol manifests
         id: collect
         run: |
+          set -euo pipefail
           # Walk both the memgraph and MAGE RC subtrees and pull every
-          # debug-symbols-manifest*.tsv. Both now emit one per package subdir,
-          # named <arch>[-malloc][-cuda|-cugraph]/debug-symbols-manifest.tsv —
-          # so the two subtrees use overlapping relative keys and MUST land in
-          # separate local dirs, or the second copy silently overwrites the
-          # first (both have, e.g., x86_64/debug-symbols-manifest.tsv).
+          # debug-symbols-manifest*.tsv without suppressing S3/download errors.
           mkdir -p manifests
           for product in memgraph mage; do
             case "$product" in
-              memgraph) src="s3://${rc_bucket}/${rc_dir}/" ;;
-              mage)     src="s3://${rc_bucket}/${mage_rc_dir}/" ;;
+              memgraph) prefix="${rc_dir}/" ;;
+              mage)     prefix="${mage_rc_dir}/" ;;
             esac
+            src="s3://${rc_bucket}/${prefix}"
+            prefix_count="$(aws s3api list-objects-v2 --bucket "${rc_bucket}" --prefix "${prefix}" --max-items 1 --query 'KeyCount' --output text)"
+            if [[ "$prefix_count" == "0" ]]; then
+              echo "Error: RC prefix $src is empty or missing while collecting debug-symbol manifests" >&2
+              exit 1
+            fi
             echo "Pulling manifests from $src ..."
-            # Leading `*` is load-bearing: aws s3 cp's filter rules treat
-            # the pattern as a glob against the full relative key, so a bare
-            # `debug-symbols-manifest*.tsv` would only match files at the
-            # immediate root of the recursion, and every manifest now sits one
-            # level deep.
             aws s3 cp "$src" "manifests/${product}/" --recursive \
-              --exclude '*' --include '*debug-symbols-manifest*.tsv' || true
+              --exclude '*' --include '*debug-symbols-manifest*.tsv'
+            prod_manifests="$(find "manifests/${product}" -name 'debug-symbols-manifest*.tsv' | wc -l | tr -d ' ')"
+            if [[ "$prod_manifests" -eq 0 ]]; then
+              echo "Error: no debug-symbols-manifest*.tsv downloaded for $product from $src" >&2
+              exit 1
+            fi
           done
-          # Manifest format is "<build-id>\t<basename>" — extract column 1
-          # and dedupe. Cross-job overlap (e.g. memgraph and MAGE jobs sharing
-          # the memgraph binary's build-id) is expected and harmless.
-          find manifests -name 'debug-symbols-manifest*.tsv' -print0 \
-            | xargs -0 cat 2>/dev/null \
-            | awk -F '\t' 'NF >= 1 && $1 ~ /^[0-9a-fA-F]{4,}$/ { print $1 }' \
+          : > raw_manifests.tsv
+          while IFS= read -r -d '' mf; do
+            cat "$mf" >> raw_manifests.tsv
+            printf '\n' >> raw_manifests.tsv
+          done < <(find manifests -name 'debug-symbols-manifest*.tsv' -print0)
+          awk -F '\t' 'NF >= 1 && $1 ~ /^[0-9a-fA-F]{4,}$/ { print $1 }' raw_manifests.tsv \
             | sort -u > build_ids.txt
           count=$(wc -l < build_ids.txt | tr -d ' ')
+          if [[ "$count" -eq 0 ]]; then
+            echo "Error: collected debug-symbol manifests contained zero valid build-ids" >&2
+            exit 1
+          fi
           echo "Collected $count unique build-ids"
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
       - name: Promote .debug sidecars to release bucket
         if: steps.collect.outputs.count != '0'
         run: |
+          set -euo pipefail
           # Layout matches what gdb / lldb / debuginfod expect:
           # <bucket>/<aa>/<rest>.debug where aa is the first two hex chars
           # of the build-id and rest is everything else.
-          missing=0
           copied=0
           skipped_existing=0
           while IFS= read -r build_id; do
@@ -1050,25 +1079,25 @@ jobs:
             dst_key="${debugsym_prefix}${build_id:0:2}/${build_id:2}.debug"
             src="s3://${rc_bucket}/${key}"
             dst="s3://${debugsym_bucket}/${dst_key}"
-            if ! aws s3 ls "$src" &> /dev/null; then
-              echo "Warning: $src missing — manifest references a sidecar that isn't in the staging bucket"
-              missing=$((missing + 1))
-              continue
+            src_count="$(aws s3api list-objects-v2 --bucket "${rc_bucket}" --prefix "${key}" --max-items 1 --query 'KeyCount' --output text)"
+            if [[ "$src_count" == "0" ]]; then
+              echo "Error: $src missing — manifest references a sidecar absent from the staging bucket" >&2
+              exit 1
             fi
-            if aws s3 ls "$dst" &> /dev/null && [[ "$FORCE_PROMOTE" != "true" ]]; then
-              skipped_existing=$((skipped_existing + 1))
-              continue
+            if [[ "$FORCE_PROMOTE" != "true" ]]; then
+              dst_count="$(aws s3api list-objects-v2 --bucket "${debugsym_bucket}" --prefix "${dst_key}" --max-items 1 --query 'KeyCount' --output text)"
+              if [[ "$dst_count" != "0" ]]; then
+                skipped_existing=$((skipped_existing + 1))
+                continue
+              fi
             fi
             aws s3 cp --only-show-errors "$src" "$dst"
             copied=$((copied + 1))
           done < build_ids.txt
-          echo "Copied: $copied, missing in staging: $missing, skipped (already in release): $skipped_existing"
-          if [[ "$missing" -gt 0 && "$FORCE_PROMOTE" != "true" ]]; then
-            echo "::warning::Some build-ids listed in the manifests had no sidecar in the staging bucket."
-          fi
+          echo "Copied: $copied, skipped (already in release): $skipped_existing"
 
   TriggerBSLUpdate:
-    if: ${{ github.event.inputs.update_bsl == 'true' }}
+    if: ${{ inputs.update_bsl && !inputs.test && !inputs.use_test_rc && github.event.inputs.test != 'true' && github.event.inputs.use_test_rc != 'true' }}
     uses: ./.github/workflows/update-bsl.yml
     needs: [PromotePackage, PromoteDocker]
     secrets: inherit

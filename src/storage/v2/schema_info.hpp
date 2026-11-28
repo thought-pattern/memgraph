@@ -99,7 +99,10 @@ struct SchemaTracking final : public SchemaTrackingInterface {
 
   void RecoverEdge(EdgeTypeId edge_type, EdgeRef edge, Vertex *from, Vertex *to, bool prop_on_edges) override;
 
-  void AddVertex(Vertex *vertex) override { ++vertex_state_[vertex->labels].n; }
+  void AddVertex(Vertex *vertex) override {
+    auto &&info = vertex_state_[vertex->labels];
+    ++utils::UnwrapConcurrentValue(info).n;
+  }
 
   void DeleteVertex(Vertex *vertex) override;
 
@@ -135,7 +138,7 @@ struct SchemaTracking final : public SchemaTrackingInterface {
   friend LocalSchemaTracking;
   friend SharedSchemaTracking;
 
-  TrackingInfo<TContainer> &edge_lookup(const EdgeKeyRef &key);
+  decltype(auto) edge_lookup(const EdgeKeyRef &key);
 
   void SetProperty(auto &tracking_info, PropertyId property, const ExtendedPropertyType &now,
                    const ExtendedPropertyType &before);

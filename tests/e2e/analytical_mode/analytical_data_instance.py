@@ -11,9 +11,9 @@
 
 import sys
 
+from common import execute_and_fetch_all
 import mgclient
 import pytest
-from common import execute_and_fetch_all
 
 
 def storage_mode(cursor):

@@ -20,6 +20,7 @@
 #include <spdlog/spdlog.h>
 
 #include "flags/general.hpp"
+#include "storage/v2/delta_action_methods.hpp"
 #include "storage/v2/edge.hpp"
 #include "storage/v2/exceptions.hpp"
 #include "storage/v2/id_types.hpp"
@@ -27,6 +28,7 @@
 #include "storage/v2/indices/tracked_vector_allocator.hpp"
 #include "storage/v2/indices/vector_edge_index.hpp"
 #include "storage/v2/indices/vector_index_utils.hpp"
+#include "storage/v2/mvcc.hpp"
 #include "storage/v2/name_id_mapper.hpp"
 #include "storage/v2/property_value.hpp"
 #include "usearch/index_dense.hpp"
@@ -86,13 +88,16 @@ std::optional<uint64_t> VectorEdgeIndex::SetupIndex(const VectorEdgeIndexSpec &s
 
 void VectorEdgeIndex::AddEdgeToIndex(uint64_t index_id, Edge *edge, EdgeTypeId edge_type, Vertex *from_vertex,
                                      Vertex *to_vertex, NameIdMapper *name_id_mapper,
-                                     std::optional<std::size_t> thread_id) {
+                                     std::optional<std::size_t> thread_id,
+                                     std::vector<std::pair<Edge *, PropertyValue>> *original_properties,
+                                     std::vector<Edge *> *newly_tracked_endpoints) {
   auto it = index_->find(index_id);
   if (it == index_->end()) {
     throw VectorSearchException(fmt::format("Vector edge index {} does not exist.", index_id));
   }
   auto &item_ptr = it->second;
   auto &spec = item_ptr->spec;
+  auto raw_before = original_properties ? edge->properties.GetProperty(spec.property) : PropertyValue{};
   auto property = edge->properties.GetProperty(spec.property);
   if (property.IsNull()) return;
   // An empty plain list has nothing to index and stays a plain list; never promote it to a tag.
@@ -106,21 +111,37 @@ void VectorEdgeIndex::AddEdgeToIndex(uint64_t index_id, Edge *edge, EdgeTypeId e
   }
 
   auto vector = RegisterIndexId(property, index_id);
-
-  // Tag only after uSearch accepted the vector: a rejected one (e.g. wrong dimension) must keep its list.
-  // Lock order: uSearch mutex (inside UpdateVectorIndex) → edge_endpoints_mutex_
-  UpdateVectorIndex(item_ptr->mg_index, spec, edge, vector, thread_id);
-  edge->properties.SetProperty(spec.property, property);
+  if (original_properties) {
+    original_properties->emplace_back(edge, std::move(raw_before));
+  }
+  try {
+    // Tag only after uSearch accepted the vector: a rejected one (e.g. wrong dimension) must keep its list.
+    // Lock order: uSearch mutex (inside UpdateVectorIndex) → edge_endpoints_mutex_
+    UpdateVectorIndex(item_ptr->mg_index, spec, edge, vector, thread_id);
+    edge->properties.SetProperty(spec.property, property);
+  } catch (...) {
+    if (original_properties) {
+      original_properties->pop_back();
+    }
+    throw;
+  }
   {
     auto lock = std::unique_lock{edge_endpoints_mutex_};
+    const bool had_endpoint = edge_endpoints_.contains(edge);
     edge_endpoints_[edge] = EdgeEndpoints{.from_vertex = from_vertex, .to_vertex = to_vertex, .edge_type = edge_type};
+    if (!had_endpoint && newly_tracked_endpoints) {
+      newly_tracked_endpoints->push_back(edge);
+    }
   }
 }
 
 bool VectorEdgeIndex::CreateIndex(const VectorEdgeIndexSpec &spec, utils::SkipListDb<Vertex>::Accessor &vertices,
                                   NameIdMapper *name_id_mapper, ProgressCallback const &on_progress) {
+  std::optional<uint64_t> index_id;
+  std::vector<std::pair<Edge *, PropertyValue>> original_properties;
+  std::vector<Edge *> newly_tracked_endpoints;
   try {
-    const auto index_id = SetupIndex(spec, name_id_mapper);
+    index_id = SetupIndex(spec, name_id_mapper);
     if (!index_id.has_value()) return false;
     PopulateVectorIndexSingleThreaded(vertices, [&](Vertex &vertex, std::optional<std::size_t> thread_id) {
       if (vertex.deleted()) return;
@@ -132,13 +153,35 @@ bool VectorEdgeIndex::CreateIndex(const VectorEdgeIndexSpec &spec, utils::SkipLi
         auto *edge = std::get<kEdgeRefPos>(edge_tuple).ptr;
         if (edge->deleted() || to_vertex->deleted()) continue;
 
-        AddEdgeToIndex(*index_id, edge, edge_type, &vertex, to_vertex, name_id_mapper, thread_id);
+        AddEdgeToIndex(*index_id,
+                       edge,
+                       edge_type,
+                       &vertex,
+                       to_vertex,
+                       name_id_mapper,
+                       thread_id,
+                       &original_properties,
+                       &newly_tracked_endpoints);
         if (on_progress) on_progress();
       }
     });
     return true;
-  } catch (const std::exception &) {
-    DropIndex(spec.index_name, name_id_mapper);
+  } catch (...) {
+    const utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_blocker;
+    for (auto &[edge, orig_prop] : original_properties) {
+      edge->properties.SetProperty(spec.property, orig_prop);
+    }
+    {
+      auto lock = std::unique_lock{edge_endpoints_mutex_};
+      for (auto *edge : newly_tracked_endpoints) {
+        edge_endpoints_.erase(edge);
+      }
+    }
+    if (index_id.has_value()) {
+      auto new_map = std::make_shared<VectorEdgeIndexContainer>(*index_);
+      new_map->erase(*index_id);
+      index_ = std::move(new_map);
+    }
     throw;
   }
 }
@@ -164,7 +207,7 @@ void VectorEdgeIndex::RecoverAllVectorEdgeIndices(std::vector<VectorEdgeIndexRec
       prop_to_items[ri.spec.property].emplace_back(*index_id, index_->at(*index_id));
     }
 
-    auto find_captured_vector = [&](PropertyId property, Gid gid) -> utils::small_vector<float> * {
+    auto find_captured_vector = [&](PropertyId property, Gid gid) -> utils::small_vector<double> * {
       auto map_it = edge_vectors.find(property);
       if (map_it == edge_vectors.end()) return nullptr;
       auto entry_it = map_it->second.find(gid);
@@ -180,7 +223,7 @@ void VectorEdgeIndex::RecoverAllVectorEdgeIndices(std::vector<VectorEdgeIndexRec
         if (stored_value.IsNull()) continue;
 
         const bool stored_as_tag = stored_value.IsVectorIndexId();
-        utils::small_vector<float> vec;
+        utils::small_vector<double> vec;
 
         if (stored_as_tag) {
           auto *entry_ptr = find_captured_vector(property, edge->gid);
@@ -267,6 +310,17 @@ void VectorEdgeIndex::RecoverAllVectorEdgeIndices(std::vector<VectorEdgeIndexRec
 std::optional<VectorEdgeIndex::DroppedIndexCapture> VectorEdgeIndex::DropIndex(std::string_view index_name,
                                                                                NameIdMapper *name_id_mapper,
                                                                                ProgressCallback const &on_progress) {
+  return DropIndex(index_name, name_id_mapper, on_progress, /*enforce_memory_limit=*/true);
+}
+
+std::optional<VectorEdgeIndex::DroppedIndexCapture> VectorEdgeIndex::DropIndex(std::string_view index_name,
+                                                                               NameIdMapper *name_id_mapper,
+                                                                               ProgressCallback const &on_progress,
+                                                                               bool enforce_memory_limit) {
+  std::optional<utils::MemoryTracker::OutOfMemoryExceptionBlocker> rollback_oom_blocker;
+  if (!enforce_memory_limit) {
+    rollback_oom_blocker.emplace();
+  }
   auto maybe_id = name_id_mapper->NameToIdIfExists(index_name);
   if (!maybe_id.has_value()) return std::nullopt;
   const auto index_id = *maybe_id;
@@ -276,22 +330,58 @@ std::optional<VectorEdgeIndex::DroppedIndexCapture> VectorEdgeIndex::DropIndex(s
   auto &mg_index = evicted_item->mg_index;
   auto &spec = evicted_item->spec;
 
+  // Prepare replacement container and bookkeeping structures before mutating edge properties or maps.
+  auto new_map = std::make_shared<VectorEdgeIndexContainer>(*index_);
+  new_map->erase(index_id);
+
   std::vector<Edge *> dropped_edges;
+  {
+    auto guard = std::lock_guard{mg_index.mutex};
+    auto const index_size = mg_index.index.size();
+    dropped_edges.resize(index_size);
+    mg_index.index.export_keys(dropped_edges.data(), 0, index_size);
+  }
+
+  std::unordered_set<Edge *> still_indexed;
+  still_indexed.reserve(dropped_edges.size());
+  for (const auto &[_, iptr] : *new_map) {
+    auto guard = utils::SharedResourceLockGuard(iptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    for (auto *edge : dropped_edges) {
+      if (iptr->mg_index.index.contains(edge)) still_indexed.insert(edge);
+    }
+  }
+
+  std::vector<std::pair<Edge *, EdgeEndpoints>> evicted_endpoints;
+  evicted_endpoints.reserve(dropped_edges.size());
+
   {
     auto guard = std::lock_guard{mg_index.mutex};
 
     const auto dimension = mg_index.index.dimensions();
-    CheckGraphMemoryForIndexDrop(index_name, mg_index.index.size(), dimension);
+    if (enforce_memory_limit) {
+      std::size_t vectors_to_materialize = 0;
+      for (auto *edge : dropped_edges) {
+        auto raw_prop = edge->properties.GetProperty(spec.property);
+        if (!raw_prop.IsVectorIndexId()) {
+          ++vectors_to_materialize;
+        } else {
+          auto const &ids = raw_prop.ValueVectorIndexIds();
+          const bool any_other_id = std::ranges::any_of(ids, [&](uint64_t id) { return id != index_id; });
+          if (!any_other_id) {
+            ++vectors_to_materialize;
+          }
+        }
+      }
+      CheckGraphMemoryForIndexDrop(index_name, vectors_to_materialize, dimension);
+    }
 
-    auto const index_size = mg_index.index.size();
-    dropped_edges.resize(index_size);
-    mg_index.index.export_keys(dropped_edges.data(), 0, index_size);
-
-    // Convert indexed vectors back to property values with OOM protection.
-    // Track processed edges so we can roll back on OOM.
+    // Convert indexed vectors back to property values with full rollback on any exception.
     std::size_t processed = 0;
     try {
-      const utils::MemoryTracker::OutOfMemoryExceptionEnabler oom_enabler;
+      std::optional<utils::MemoryTracker::OutOfMemoryExceptionEnabler> oom_enabler;
+      if (enforce_memory_limit) {
+        oom_enabler.emplace();
+      }
       std::vector<double> vector(dimension);
       for (auto *edge : dropped_edges) {
         if (on_progress) on_progress();
@@ -304,26 +394,14 @@ std::optional<VectorEdgeIndex::DroppedIndexCapture> VectorEdgeIndex::DropIndex(s
         }
         ++processed;
       }
-    } catch (const utils::OutOfMemoryException &) {
+    } catch (...) {
       const utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_blocker;
       for (std::size_t i = 0; i < processed; ++i) ReinstallIndexIdInProperty(dropped_edges[i], spec.property, index_id);
       throw;
     }
   }
-  auto new_map = std::make_shared<VectorEdgeIndexContainer>(*index_);
-  new_map->erase(index_id);
-  index_ = new_map;
+  index_ = std::move(new_map);
 
-  // Remove endpoints for edges no longer indexed elsewhere; capture the evicted
-  // entries so RestoreIndex can put them back.
-  std::unordered_set<Edge *> still_indexed;
-  for (const auto &[_, iptr] : *index_) {
-    auto guard = utils::SharedResourceLockGuard(iptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
-    for (auto *edge : dropped_edges) {
-      if (iptr->mg_index.index.contains(edge)) still_indexed.insert(edge);
-    }
-  }
-  std::vector<std::pair<Edge *, EdgeEndpoints>> evicted_endpoints;
   {
     auto lock = std::unique_lock{edge_endpoints_mutex_};
     for (auto *edge : dropped_edges) {
@@ -408,7 +486,7 @@ void VectorEdgeIndex::RemoveEdgeFromIndex(Edge *edge, uint64_t index_id) {
         fmt::format("Error in removing edge from index: index id {} does not exist.", index_id));
   }
   auto &item_ptr = it->second;
-  UpdateVectorIndex(item_ptr->mg_index, item_ptr->spec, edge, utils::small_vector<float>{});
+  UpdateVectorIndex(item_ptr->mg_index, item_ptr->spec, edge, utils::small_vector<double>{});
 }
 
 std::vector<VectorEdgeIndexInfo> VectorEdgeIndex::ListVectorIndicesInfo() const {
@@ -433,8 +511,12 @@ std::vector<VectorEdgeIndexInfo> VectorEdgeIndex::ListVectorIndicesInfo() const 
 std::vector<VectorEdgeIndexSpec> VectorEdgeIndex::ListIndices() const {
   std::vector<VectorEdgeIndexSpec> result;
   result.reserve(index_->size());
-  r::transform(
-      *index_, std::back_inserter(result), [](const auto &id_index_item) { return id_index_item.second->spec; });
+  for (const auto &[_, item_ptr] : *index_) {
+    auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    auto spec_copy = item_ptr->spec;
+    spec_copy.capacity = item_ptr->mg_index.index.capacity();
+    result.push_back(std::move(spec_copy));
+  }
   return result;
 }
 
@@ -492,7 +574,7 @@ VectorEdgeIndex::VectorSearchEdgeResults VectorEdgeIndex::SearchEdges(std::strin
         VectorEdgeIndex::EdgeIndexEntry{
             .from_vertex = from_vertex, .to_vertex = to_vertex, .edge = edge, .edge_type = edge_type},
         static_cast<double>(result_keys[i].distance),
-        std::abs(SimilarityFromDistance(mg_index.index.metric().metric_kind(), result_keys[i].distance)));
+        SimilarityFromDistance(mg_index.index.metric().metric_kind(), result_keys[i].distance));
   }
 
   return result;
@@ -587,8 +669,8 @@ bool VectorEdgeIndex::IndexExists(std::string_view index_name) const {
   return r::any_of(*index_, [&](const auto &id_item) { return id_item.second->spec.index_name == index_name; });
 }
 
-utils::small_vector<float> VectorEdgeIndex::GetVectorPropertyFromEdgeIndex(Edge *edge, std::string_view index_name,
-                                                                           NameIdMapper *name_id_mapper) const {
+utils::small_vector<double> VectorEdgeIndex::GetVectorPropertyFromEdgeIndex(Edge *edge, std::string_view index_name,
+                                                                            NameIdMapper *name_id_mapper) const {
   auto maybe_id = name_id_mapper->NameToIdIfExists(index_name);
   if (!maybe_id.has_value()) {
     throw VectorSearchException("Vector edge index {} does not exist.", index_name);
@@ -599,7 +681,7 @@ utils::small_vector<float> VectorEdgeIndex::GetVectorPropertyFromEdgeIndex(Edge 
   }
   auto &item_ptr = it->second;
   auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
-  utils::small_vector<float> vector(item_ptr->mg_index.index.dimensions());
+  utils::small_vector<double> vector(item_ptr->mg_index.index.dimensions());
   if (!item_ptr->mg_index.index.get(edge, vector.data())) return {};
   return vector;
 }
@@ -639,15 +721,42 @@ std::vector<std::pair<uint64_t, VectorEdgeTypeFilter const *>> VectorEdgeIndex::
 
 void VectorEdgeIndex::SerializeAllVectorEdgeIndices(durability::BaseEncoder *encoder,
                                                     std::unordered_set<uint64_t> &mapped_ids) const {
+  SerializeAllVectorEdgeIndices(encoder, mapped_ids, nullptr, nullptr, std::numeric_limits<uint64_t>::max());
+}
+
+void VectorEdgeIndex::SerializeAllVectorEdgeIndices(durability::BaseEncoder *encoder,
+                                                    std::unordered_set<uint64_t> &mapped_ids,
+                                                    Transaction const *transaction, utils::SkipListDb<Vertex> *vertices,
+                                                    uint64_t unused_edge_gid) const {
   auto write_mapping = [&](auto mapping) {
     mapped_ids.insert(mapping.AsUint());
     encoder->WriteUint(mapping.AsUint());
   };
 
+  std::unordered_map<Edge *, EdgeTypeId> delta_edges;
+  if (transaction != nullptr && vertices != nullptr && !index_->empty()) {
+    auto acc = vertices->access();
+    for (auto &vertex : acc) {
+      auto v_guard = std::shared_lock{vertex.lock};
+      for (auto const &[edge_type, to_v, edge_ref] : vertex.out_edges) {
+        if (edge_ref.ptr != nullptr && edge_ref.ptr->gid.AsUint() < unused_edge_gid && edge_ref.ptr->delta() != nullptr) {
+          delta_edges.try_emplace(edge_ref.ptr, edge_type);
+        }
+      }
+      for (auto const *d = vertex.delta(); d != nullptr; d = d->next.load(std::memory_order_acquire)) {
+        if (d->action == Delta::Action::ADD_OUT_EDGE && d->vertex_edge.edge.ptr != nullptr &&
+            d->vertex_edge.edge.ptr->gid.AsUint() < unused_edge_gid) {
+          delta_edges.try_emplace(d->vertex_edge.edge.ptr, d->vertex_edge.edge_type);
+        }
+      }
+    }
+  }
+
   encoder->WriteUint(index_->size());
   for (const auto &[_, item_ptr] : *index_) {
-    auto &spec = item_ptr->spec;
     auto &mg_index = item_ptr->mg_index;
+    auto guard = utils::SharedResourceLockGuard(mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    auto const &spec = item_ptr->spec;
     encoder->WriteString(spec.index_name);
     encoder->WriteUint(static_cast<uint64_t>(spec.edge_type_filter.mode));
     encoder->WriteUint(spec.edge_type_filter.ids.size());
@@ -658,33 +767,115 @@ void VectorEdgeIndex::SerializeAllVectorEdgeIndices(durability::BaseEncoder *enc
     encoder->WriteString(NameFromMetric(spec.metric_kind));
     encoder->WriteUint(spec.dimension);
     encoder->WriteUint(spec.resize_coefficient);
-    encoder->WriteUint(spec.capacity);
+    encoder->WriteUint(mg_index.index.capacity());
     encoder->WriteUint(static_cast<uint64_t>(spec.scalar_kind));
 
-    using Entry = std::pair<uint64_t, std::vector<float>>;
-    auto const entries = std::invoke([&mg_index]() -> std::vector<Entry> {
-      auto guard = utils::SharedResourceLockGuard(mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
-      auto const size = mg_index.index.size();
-      if (size == 0) return {};
+    auto const size = mg_index.index.size();
+    if (transaction == nullptr) {
+      if (size == 0) {
+        encoder->WriteUint(0);
+        continue;
+      }
 
       std::vector<Edge *> keys(size);
       mg_index.index.export_keys(keys.data(), 0, size);
+      std::erase_if(keys, [&](Edge *edge) {
+        return edge == nullptr || edge->deleted() || !mg_index.index.contains(edge);
+      });
 
-      std::vector<Entry> result;
-      result.reserve(size);
-      std::vector<float> buffer(mg_index.index.dimensions());
+      encoder->WriteUint(keys.size());
+      std::vector<double> buffer(mg_index.index.dimensions());
       for (auto *edge : keys) {
-        if (edge == nullptr || edge->deleted()) continue;
-        if (!mg_index.index.get(edge, buffer.data())) continue;
-        result.emplace_back(edge->gid.AsUint(), buffer);
+        if (!mg_index.index.get(edge, buffer.data())) {
+          std::ranges::fill(buffer, 0.0);
+        }
+        encoder->WriteUint(edge->gid.AsUint());
+        for (auto value : buffer) encoder->WriteDouble(value);
       }
-      return result;
-    });
+      continue;
+    }
 
-    encoder->WriteUint(entries.size());
-    for (const auto &[gid, vector] : entries) {
+    if (size == 0 && delta_edges.empty()) {
+      encoder->WriteUint(0);
+      continue;
+    }
+
+    std::vector<Edge *> candidates(size);
+    if (size > 0) {
+      mg_index.index.export_keys(candidates.data(), 0, size);
+    }
+    std::unordered_set<Edge *> seen(candidates.begin(), candidates.end());
+    for (auto const &[de, _] : delta_edges) {
+      if (seen.insert(de).second) {
+        candidates.push_back(de);
+      }
+    }
+
+    std::vector<std::pair<uint64_t, utils::small_vector<double>>> visible_entries;
+    visible_entries.reserve(candidates.size());
+    utils::small_vector<double> live_buffer(mg_index.index.dimensions());
+    auto ep_lock = std::shared_lock{edge_endpoints_mutex_};
+
+    for (auto *edge : candidates) {
+      if (edge == nullptr || edge->gid.AsUint() >= unused_edge_gid) continue;
+
+      std::optional<EdgeTypeId> edge_type;
+      if (auto ep_it = edge_endpoints_.find(edge); ep_it != edge_endpoints_.end()) {
+        edge_type = ep_it->second.edge_type;
+      } else if (auto de_it = delta_edges.find(edge); de_it != delta_edges.end()) {
+        edge_type = de_it->second;
+      }
+      if (!edge_type || !spec.edge_type_filter.Matches(*edge_type)) continue;
+
+      bool exists = true;
+      bool deleted = false;
+      Delta *delta = nullptr;
+      PropertyValue prop;
+      {
+        auto e_guard = std::shared_lock{edge->lock};
+        deleted = edge->deleted();
+        delta = edge->delta();
+        prop = edge->properties.GetProperty(spec.property);
+        if (prop.IsVectorIndexId() && prop.ValueVectorIndexList().empty()) {
+          if (mg_index.index.get(edge, live_buffer.data())) {
+            prop.ValueVectorIndexList() = live_buffer;
+          }
+        }
+      }
+      if (delta != nullptr && transaction->isolation_level != IsolationLevel::READ_UNCOMMITTED) {
+        ApplyDeltasForRead(transaction, delta, View::OLD, [&](const Delta &d) {
+          DeltaDispatch(d,
+                        utils::ChainedOverloaded{
+                            Exists_ActionMethod(exists),
+                            Deleted_ActionMethod(deleted),
+                            PropertyValue_ActionMethod(prop, spec.property),
+                        });
+        });
+      }
+
+      if (!exists || deleted || prop.IsNull()) continue;
+
+      utils::small_vector<double> coords;
+      if (prop.IsVectorIndexId()) {
+        coords = prop.ValueVectorIndexList();
+      } else if (prop.IsAnyList()) {
+        try {
+          coords = ListToVector(prop);
+        } catch (...) {
+          continue;
+        }
+      } else {
+        continue;
+      }
+
+      if (coords.size() != spec.dimension) continue;
+      visible_entries.emplace_back(edge->gid.AsUint(), std::move(coords));
+    }
+
+    encoder->WriteUint(visible_entries.size());
+    for (const auto &[gid, coords] : visible_entries) {
       encoder->WriteUint(gid);
-      for (auto value : vector) encoder->WriteDouble(value);
+      for (auto value : coords) encoder->WriteDouble(value);
     }
   }
 }
@@ -775,7 +966,12 @@ std::vector<VectorEdgeIndexSpec> VectorEdgeIndex::ActiveIndices::ListIndices() c
   if (!index_container_) return {};
   std::vector<VectorEdgeIndexSpec> result;
   result.reserve(index_container_->size());
-  r::transform(*index_container_, std::back_inserter(result), [](const auto &id_item) { return id_item.second->spec; });
+  for (const auto &[_, item_ptr] : *index_container_) {
+    auto guard = utils::SharedResourceLockGuard(item_ptr->mg_index.mutex, utils::SharedResourceLockGuard::READ_ONLY);
+    auto spec_copy = item_ptr->spec;
+    spec_copy.capacity = item_ptr->mg_index.index.capacity();
+    result.push_back(std::move(spec_copy));
+  }
   return result;
 }
 

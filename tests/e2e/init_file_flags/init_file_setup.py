@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from gqlalchemy import Memgraph
+import pytest
 
 
 def test_given_init_file_when_memgraph_started_then_node_is_created():

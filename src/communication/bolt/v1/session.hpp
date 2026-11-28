@@ -99,8 +99,7 @@ class Session {
       }
       state_ = StateHandshakeRun(impl);
       if (state_ == State::Close) [[unlikely]] {
-        ClientFailureInvalidData();
-        return false;  // no more data
+        throw SessionException("Bolt handshake failed!");
       }
       // Update the decoder's Bolt version (v5 has changed the undelying structure)
       decoder_.UpdateVersion(version_.major);

@@ -67,7 +67,8 @@ std::optional<mgp::Value> ParseJsonToMgpValue(const nlohmann::json &json_obj, mg
   } else if (json_obj.is_array()) {
     return ParseJsonToMgpList(json_obj, memory);
   } else if (json_obj.is_string()) {
-    return mgp::Value(mgp::steal_type, mgp::value_make_string(json_obj.get<std::string>().c_str(), memory));
+    const auto str = json_obj.get<std::string>();
+    return mgp::Value(mgp::steal_type, mgp::value_make_string_with_size(str.data(), str.size(), memory));
   } else if (json_obj.is_number_integer()) {
     return mgp::Value(mgp::steal_type, mgp::value_make_int(json_obj.get<int64_t>(), memory));
   } else if (json_obj.is_number_float()) {

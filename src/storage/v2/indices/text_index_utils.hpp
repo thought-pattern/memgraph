@@ -62,6 +62,7 @@ class TextSearchSession {
 
 inline constexpr std::string_view kTextIndicesDirectory = "text_indices";
 inline constexpr std::string_view kTextIndicesWatermarkFile = ".memgraph_watermark.json";
+inline constexpr std::string_view kTextIndicesWatermarkTmpFile = ".memgraph_watermark.json.tmp";
 inline constexpr bool kDoSkipCommit = true;
 
 // Tantivy schema field names; must stay in sync across index creation, document construction and search.

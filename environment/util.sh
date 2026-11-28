@@ -115,6 +115,13 @@ check_architecture() {
     exit 1
 }
 
+function custom_version_satisfies() {
+    local installed="${1#v}"
+    local requested="${2#v}"
+    [[ -n "$installed" && -n "$requested" ]] || return 1
+    [[ "$installed" == "$requested" || "$installed" == "$requested".* ]]
+}
+
 function check_custom_package() {
     local pkg="$1"
 
@@ -122,8 +129,12 @@ function check_custom_package() {
     # NOT used as a fallback: it is set by login/su but absent in e.g.
     # `docker exec` shells, and the distro scripts run with `set -u`.
     local target_user="${SUDO_USER:-$(id -un)}"
-    local user_home
-    user_home="$(getent passwd "$target_user" | cut -d: -f6)"
+    local user_home=""
+    if command -v getent >/dev/null 2>&1; then
+        user_home="$(getent passwd "$target_user" | cut -d: -f6)"
+    else
+        user_home="$(python3 -c 'import pwd, sys; print(pwd.getpwnam(sys.argv[1]).pw_dir)' "$target_user" 2>/dev/null || printf '%s' "${HOME:-}")"
+    fi
 
     case "$pkg" in
         custom-maven*)
@@ -137,14 +148,55 @@ function check_custom_package() {
             fi
             ;;
         custom-rust)
-            if [ ! -x "$user_home/.cargo/bin/rustup" ]; then
+            local rustup_bin="$user_home/.cargo/bin/rustup"
+            local cargo_home="${CARGO_HOME:-$user_home/.cargo}"
+            local rustup_home="${RUSTUP_HOME:-$user_home/.rustup}"
+            local rust_ok=false
+            if [ -x "$rustup_bin" ] && [ -x "$cargo_home/bin/cargo" ]; then
+                local tc_output tc_line tc_name tc_ver rustc_bin rustc_out rustc_ver
+                tc_output="$(RUSTUP_HOME="$rustup_home" CARGO_HOME="$cargo_home" "$rustup_bin" toolchain list 2>/dev/null || true)"
+                while IFS= read -r tc_line; do
+                    tc_name="${tc_line%% *}"
+                    [[ -n "$tc_name" && "$tc_name" != "("* ]] || continue
+                    tc_ver="${tc_name%%-*}"
+                    if [[ "$tc_name" == "$MG_RUST_VERSION" ]] || custom_version_satisfies "$tc_ver" "$MG_RUST_VERSION"; then
+                        rustc_bin="$(RUSTUP_HOME="$rustup_home" CARGO_HOME="$cargo_home" "$rustup_bin" which --toolchain "$tc_name" rustc 2>/dev/null || true)"
+                        if [ -n "$rustc_bin" ] && [ -x "$rustc_bin" ]; then
+                            rustc_out="$("$rustc_bin" --version 2>/dev/null || true)"
+                            rustc_ver="$(awk '{print $2}' <<<"$rustc_out")"
+                            if [[ "$MG_RUST_VERSION" == "stable" || "$MG_RUST_VERSION" == "nightly" || "$MG_RUST_VERSION" == "beta" ]] || custom_version_satisfies "$rustc_ver" "$MG_RUST_VERSION"; then
+                                rust_ok=true
+                                break
+                            fi
+                        fi
+                    fi
+                done <<<"$tc_output"
+            fi
+            if [[ "$rust_ok" != true ]]; then
                 echo "$pkg"
             fi
             ;;
         custom-node)
-            # nvm-based install (install_node); nvm has no fixed binary path,
-            # so probe for any node on PATH or an nvm dir.
-            if ! command -v node >/dev/null 2>&1 && [ ! -d "$user_home/.nvm" ]; then
+            local node_ok=false
+            local node_out=""
+            if command -v node >/dev/null 2>&1; then
+                node_out="$(node --version 2>/dev/null || true)"
+                if custom_version_satisfies "$node_out" "$MG_NODE_VERSION"; then
+                    node_ok=true
+                fi
+            fi
+            if [[ "$node_ok" != true && -d "$user_home/.nvm/versions/node" ]]; then
+                local nvm_node
+                for nvm_node in "$user_home/.nvm/versions/node"/v*/bin/node; do
+                    [ -x "$nvm_node" ] || continue
+                    node_out="$("$nvm_node" --version 2>/dev/null || true)"
+                    if custom_version_satisfies "$node_out" "$MG_NODE_VERSION"; then
+                        node_ok=true
+                        break
+                    fi
+                done
+            fi
+            if [[ "$node_ok" != true ]]; then
                 echo "$pkg"
             fi
             ;;

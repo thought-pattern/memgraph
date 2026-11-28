@@ -9,14 +9,14 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from argparse import ArgumentParser
+from collections import defaultdict
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
 import time
-from argparse import ArgumentParser
-from collections import defaultdict
 
 from common import get_absolute_path, set_cpus
 

@@ -189,7 +189,7 @@ PropertyValue WrittenAnotherWay(PropertyValue const &value) {
     }
     case PropertyValueType::VectorIndexId: {
       // A coordinate here is a float, which spells a NaN its own several ways.
-      auto coordinates = memgraph::utils::small_vector<float>{};
+      auto coordinates = memgraph::utils::small_vector<double>{};
       for (auto const coordinate : value.ValueVectorIndexList()) {
         coordinates.push_back(ANaNSpeltOtherwise(coordinate));
       }

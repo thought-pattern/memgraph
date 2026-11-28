@@ -63,6 +63,7 @@ struct ReplicationReplicaEntry {
   // NOTE: There are multiple versions of ReplicationReplicaEntry, but we distinguish them in terms of
   // ReplicationRoleEntry.
   ReplicationClientConfig config;
+  bool needs_main_uuid_sync{false};
   friend bool operator==(ReplicationReplicaEntry const &, ReplicationReplicaEntry const &) = default;
 };
 

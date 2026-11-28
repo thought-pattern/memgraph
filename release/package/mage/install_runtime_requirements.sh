@@ -57,7 +57,18 @@ apt-get update
 ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
 apt-get install -y libcurl4 libpython${PY_VERSION} openssl python3 \
     libgomp1 libaio1t64 libatomic1 libkrb5-3 --no-install-recommends
-ln -s /usr/bin/$(ls /usr/bin | grep perf) /usr/bin/perf
+if [[ ! -f /usr/bin/perf || ! -x /usr/bin/perf ]]; then
+    perf_target=""
+    for candidate in /usr/bin/perf_* /usr/bin/perf-* /usr/lib/linux-tools/*/perf /usr/lib/linux-tools-*/perf; do
+        if [[ -f "$candidate" && -x "$candidate" ]]; then
+            perf_target="$candidate"
+            break
+        fi
+    done
+    if [[ -n "$perf_target" ]]; then
+        ln -sfn "$perf_target" /usr/bin/perf
+    fi
+fi
 
 # In CI, we clean up the apt cache to save space in the Docker container.
 if [[ "$CI" == true ]]; then
@@ -65,7 +76,7 @@ if [[ "$CI" == true ]]; then
 fi
 
 if [[ "${TARGET_ARCH}" == "arm64" ]]; then
-    ln -s /usr/lib/aarch64-linux-gnu/libaio.so.1t64 /usr/lib/aarch64-linux-gnu/libaio.so.1;
+    ln -sfn /usr/lib/aarch64-linux-gnu/libaio.so.1t64 /usr/lib/aarch64-linux-gnu/libaio.so.1
 else
-    ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1;
+    ln -sfn /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
 fi

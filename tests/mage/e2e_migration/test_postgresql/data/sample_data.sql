@@ -5,10 +5,10 @@ INSERT INTO dummy_table (
     smallint_col, integer_col, bigint_col, decimal_col, numeric_col, real_col,
     double_precision_col, money_col, char_col, varchar_col, text_col, bytea_col,
     timestamp_col, timestamp_with_timezone_col, date_col, time_col,
-    time_with_timezone_col, interval_col, boolean_col, point_col,
+    time_with_timezone_col, interval_col, boolean_col, point_col, line_col,
     lseg_col, box_col, path_col, polygon_col, circle_col, cidr_col, inet_col,
-    macaddr_col, bit_col, bit_varying_col, uuid_col, xml_col, json_col,
-    jsonb_col, array_col, enum_col, range_col
+    macaddr_col, bit_col, bit_varying_col, tsvector_col, uuid_col, xml_col, json_col,
+    jsonb_col, array_col, composite_col, enum_col, range_col
 ) VALUES (
     32767,                                    -- smallint_col
     2147483647,                              -- integer_col
@@ -30,6 +30,7 @@ INSERT INTO dummy_table (
     '1 day 2 hours 3 minutes',              -- interval_col
     true,                                    -- boolean_col
     '(1,2)',                                -- point_col
+    '{1,-1,0}',                             -- line_col
     '[(1,2),(3,4)]',                        -- lseg_col
     '(1,2),(3,4)',                          -- box_col
     '[(1,2),(3,4),(5,6)]',                  -- path_col
@@ -40,11 +41,13 @@ INSERT INTO dummy_table (
     '08:00:2b:01:02:03',                    -- macaddr_col
     B'10101010',                            -- bit_col
     B'10101010',                            -- bit_varying_col
+    '''alpha'':1 ''beta'':2',               -- tsvector_col
     '550e8400-e29b-41d4-a716-446655440000', -- uuid_col
     '<root><item>test</item></root>',       -- xml_col
     '{"key": "value", "number": 42}',       -- json_col
     '{"key": "value", "number": 42}',       -- jsonb_col
     '{1,2,3,4,5}',                          -- array_col
+    ROW('item', 7),                         -- composite_col
     'option1',                              -- enum_col
     '[1,10)'                                -- range_col
 );

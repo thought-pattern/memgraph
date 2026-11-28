@@ -9,10 +9,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+#include <algorithm>
 #include <fmt/format.h>
 #include <mgp.hpp>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <vector>
 
 constexpr const char *kProcedurePeriodicIterate = "iterate";
 constexpr const char *kProcedurePeriodicDelete = "delete";
@@ -20,8 +23,6 @@ constexpr const char *kArgumentInputQuery = "input_query";
 constexpr const char *kArgumentRunningQuery = "running_query";
 constexpr const char *kArgumentConfig = "config";
 constexpr const char *kConfigKeyBatchSize = "batch_size";
-constexpr const char *kBatchInternalName = "__batch";
-constexpr const char *kBatchRowInternalName = "__batch_row";
 constexpr const char *kConfigKeyLabels = "labels";
 constexpr const char *kConfigKeyEdgeTypes = "edge_types";
 
@@ -30,12 +31,7 @@ constexpr const char *kReturnNumBatches = "number_of_executed_batches";
 constexpr const char *kReturnNumDeletedNodes = "number_of_deleted_nodes";
 constexpr const char *kReturnNumDeletedRelationships = "number_of_deleted_relationships";
 constexpr const char *kReturnInternalNumDeleted = "num_deleted";
-
-struct ParamNames {
-  std::vector<std::string> node_names;
-  std::vector<std::string> relationship_names;
-  std::vector<std::string> primitive_names;
-};
+constexpr const char *kReturnInternalNumExtraRels = "num_extra_rels";
 
 struct DeletionInfo {
   uint64_t batch_size{0};
@@ -51,19 +47,34 @@ struct DeletionResult {
 
 namespace {
 
-ParamNames ExtractParamNames(const mgp::ExecutionHeaders &headers, const mgp::List &batch_row) {
-  ParamNames res;
-  for (size_t i = 0; i < headers.Size(); i++) {
-    if (batch_row[i].IsNode()) {
-      res.node_names.emplace_back(headers[i]);
-    } else if (batch_row[i].IsRelationship()) {
-      res.relationship_names.emplace_back(headers[i]);
-    } else {
-      res.primitive_names.emplace_back(headers[i]);
+std::string QuoteCypherIdentifier(std::string_view identifier) {
+  std::string escaped;
+  escaped.reserve(identifier.size() + 2);
+  escaped.push_back('`');
+  for (const char ch : identifier) {
+    if (ch == '`') {
+      escaped.push_back('`');
     }
+    escaped.push_back(ch);
   }
+  escaped.push_back('`');
+  return escaped;
+}
 
-  return res;
+std::string SelectInternalPrefix(const mgp::ExecutionHeaders &headers) {
+  std::string prefix = "__mg_periodic_";
+  auto collides = [&headers](std::string_view candidate) {
+    for (size_t i = 0; i < headers.Size(); ++i) {
+      if (std::string_view(headers[i]).starts_with(candidate)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  while (collides(prefix)) {
+    prefix.push_back('_');
+  }
+  return prefix;
 }
 
 std::string Join(const std::vector<std::string> &strings, const std::string &delimiter) {
@@ -87,98 +98,106 @@ std::string Join(const std::vector<std::string> &strings, const std::string &del
   return joined_strings;
 }
 
-std::string GetGraphFirstClassEntityAlias(const std::string &internal_name, const std::string &entity_name) {
-  return fmt::format("{0}.{1} AS __{1}_id", internal_name, entity_name);
+std::vector<bool> DetectGraphEntityColumns(const mgp::ExecutionHeaders &headers, const mgp::List &batch) {
+  std::vector<bool> has_entity(headers.Size(), false);
+  for (size_t row = 0; row < batch.Size(); ++row) {
+    const mgp::List row_list = batch[row].ValueList();
+    for (size_t col = 0; col < headers.Size(); ++col) {
+      if (row_list[col].IsNode() || row_list[col].IsRelationship()) {
+        has_entity[col] = true;
+      }
+    }
+  }
+  return has_entity;
 }
 
-std::string GetPrimitiveEntityAlias(const std::string &internal_name, const std::string &primitive_name) {
-  return fmt::format("{0}.{1} AS {1}", internal_name, primitive_name);
-}
-
-std::string ConstructWithStatement(const ParamNames &names) {
-  std::vector<std::string> with_entity_vector;
-  with_entity_vector.reserve(names.node_names.size() + names.relationship_names.size() + names.primitive_names.size());
-  for (const auto &node_name : names.node_names) {
-    with_entity_vector.emplace_back(GetGraphFirstClassEntityAlias(kBatchRowInternalName, node_name));
-  }
-  for (const auto &rel_name : names.relationship_names) {
-    with_entity_vector.emplace_back(GetGraphFirstClassEntityAlias(kBatchRowInternalName, rel_name));
-  }
-  for (const auto &prim_name : names.primitive_names) {
-    with_entity_vector.emplace_back(GetPrimitiveEntityAlias(kBatchRowInternalName, prim_name));
-  }
-
-  return fmt::format("WITH {}", Join(with_entity_vector, ", "));
-}
-
-std::string ConstructMatchingNodeById(const std::string &node_name) {
-  return fmt::format("MATCH ({0}) WHERE ID({0}) = __{0}_id", node_name);
-}
-
-std::string ConstructMatchingRelationshipById(const std::string &rel_name) {
-  return fmt::format("MATCH ()-[{0}]->() WHERE ID({0}) = __{0}_id", rel_name);
-}
-
-std::string ConstructMatchGraphEntitiesById(const ParamNames &names) {
-  std::string match_string;
-  std::vector<std::string> match_by_id_vector;
-  match_by_id_vector.reserve(names.node_names.size() + names.relationship_names.size());
-  for (const auto &node_name : names.node_names) {
-    match_by_id_vector.emplace_back(ConstructMatchingNodeById(node_name));
-  }
-  for (const auto &rel_name : names.relationship_names) {
-    match_by_id_vector.emplace_back(ConstructMatchingRelationshipById(rel_name));
-  }
-
-  if (!match_by_id_vector.empty()) {
-    match_string = Join(match_by_id_vector, " ");
-  }
-
-  return match_string;
-}
-
-std::string ConstructQueryPrefix(const ParamNames &names) {
-  if (names.node_names.empty() && names.relationship_names.empty() && names.primitive_names.empty()) {
+std::string ConstructQueryPrefix(const mgp::ExecutionHeaders &headers, const std::vector<bool> &has_entity,
+                                 const std::string &prefix) {
+  if (headers.Size() == 0) {
     return {};
   }
 
-  auto unwind_batch = fmt::format("UNWIND ${} AS {}", kBatchInternalName, kBatchRowInternalName);
-  auto with_variables = ConstructWithStatement(names);
-  auto match_string = ConstructMatchGraphEntitiesById(names);
+  const auto batch_param = QuoteCypherIdentifier(prefix + "batch");
+  const auto row_var = QuoteCypherIdentifier(prefix + "row");
+  const auto unwind_batch = fmt::format("UNWIND ${} AS {}", batch_param, row_var);
 
-  return fmt::format("{} {} {}", unwind_batch, with_variables, match_string);
+  std::vector<std::string> initial_with;
+  std::vector<std::string> optional_matches;
+  std::vector<std::string> resolved_with;
+  initial_with.reserve(headers.Size());
+  resolved_with.reserve(headers.Size());
+
+  const bool any_entity = std::ranges::any_of(has_entity, [](bool v) { return v; });
+  for (size_t i = 0; i < headers.Size(); ++i) {
+    const auto quoted_col = QuoteCypherIdentifier(headers[i]);
+    if (!has_entity[i]) {
+      initial_with.emplace_back(fmt::format("{0}.{1} AS {1}", row_var, quoted_col));
+      if (any_entity) {
+        resolved_with.emplace_back(quoted_col);
+      }
+      continue;
+    }
+
+    const auto cell_var = QuoteCypherIdentifier(fmt::format("{}c_{}", prefix, i));
+    const auto node_var = QuoteCypherIdentifier(fmt::format("{}n_{}", prefix, i));
+    const auto rel_var = QuoteCypherIdentifier(fmt::format("{}r_{}", prefix, i));
+    initial_with.emplace_back(fmt::format("{}.{} AS {}", row_var, quoted_col, cell_var));
+    optional_matches.emplace_back(
+        fmt::format("OPTIONAL MATCH ({0}) WHERE {1}.k = 1 AND ID({0}) = {1}.id", node_var, cell_var));
+    optional_matches.emplace_back(
+        fmt::format("OPTIONAL MATCH ()-[{0}]->() WHERE {1}.k = 2 AND ID({0}) = {1}.id", rel_var, cell_var));
+    resolved_with.emplace_back(fmt::format(
+        "CASE {0}.k WHEN 1 THEN {1} WHEN 2 THEN {2} ELSE {0}.v END AS {3}", cell_var, node_var, rel_var, quoted_col));
+  }
+
+  if (!any_entity) {
+    return fmt::format("{} WITH {}", unwind_batch, Join(initial_with, ", "));
+  }
+  return fmt::format(
+      "{} WITH {} {} WITH {}", unwind_batch, Join(initial_with, ", "), Join(optional_matches, " "), Join(resolved_with, ", "));
 }
 
-mgp::Map ConstructQueryParams(const mgp::ExecutionHeaders &headers, const mgp::List &batch) {
+mgp::Map ConstructQueryParams(const mgp::ExecutionHeaders &headers, const mgp::List &batch,
+                              const std::vector<bool> &has_entity, const std::string &prefix) {
   mgp::List list_value(batch.Size());
-
-  auto param_row_size = headers.Size();
+  const auto param_row_size = headers.Size();
 
   for (size_t row = 0; row < batch.Size(); row++) {
     mgp::Map constructed_row;
-
     mgp::List row_list = batch[row].ValueList();
 
     for (size_t i = 0; i < param_row_size; i++) {
-      if (row_list[i].IsNode()) {
-        constructed_row.Insert(headers[i], mgp::Value(row_list[i].ValueNode().Id().AsInt()));
-      } else if (row_list[i].IsRelationship()) {
-        constructed_row.Insert(headers[i], mgp::Value(row_list[i].ValueRelationship().Id().AsInt()));
-      } else {
+      if (!has_entity[i]) {
         constructed_row.Insert(headers[i], row_list[i]);
+        continue;
       }
+      mgp::Map tagged_cell;
+      if (row_list[i].IsNode()) {
+        tagged_cell.Insert("k", mgp::Value(int64_t{1}));
+        tagged_cell.Insert("id", mgp::Value(row_list[i].ValueNode().Id().AsInt()));
+      } else if (row_list[i].IsRelationship()) {
+        tagged_cell.Insert("k", mgp::Value(int64_t{2}));
+        tagged_cell.Insert("id", mgp::Value(row_list[i].ValueRelationship().Id().AsInt()));
+      } else {
+        tagged_cell.Insert("k", mgp::Value(int64_t{0}));
+        tagged_cell.Insert("v", row_list[i]);
+      }
+      constructed_row.Insert(headers[i], mgp::Value(std::move(tagged_cell)));
     }
 
     list_value.Append(mgp::Value(std::move(constructed_row)));
   }
 
   mgp::Map params;
-  params.Insert(kBatchInternalName, mgp::Value(std::move(list_value)));
+  params.Insert(prefix + "batch", mgp::Value(std::move(list_value)));
 
   return params;
 }
 
 std::string ConstructFinalQuery(const std::string &running_query, const std::string &prefix_query) {
+  if (prefix_query.empty()) {
+    return running_query;
+  }
   return fmt::format("{} {}", prefix_query, running_query);
 }
 
@@ -188,11 +207,12 @@ void ExecuteRunningQuery(const mgp::QueryExecution &query_execution, std::string
     return;
   }
 
-  auto param_names = ExtractParamNames(headers, batch[0].ValueList());
-  auto prefix_query = ConstructQueryPrefix(param_names);
+  const auto prefix = SelectInternalPrefix(headers);
+  const auto has_entity = DetectGraphEntityColumns(headers, batch);
+  auto prefix_query = ConstructQueryPrefix(headers, has_entity, prefix);
   auto final_query = ConstructFinalQuery(running_query, prefix_query);
 
-  auto query_params = ConstructQueryParams(headers, batch);
+  auto query_params = ConstructQueryParams(headers, batch, has_entity, prefix);
 
   auto execution_result = query_execution.ExecuteQuery(final_query, query_params);
 
@@ -229,12 +249,15 @@ void ValidateDeletionConfigEntities(const mgp::Map &config, std::string config_k
   }
 
   if (value.IsString()) {
+    if (value.ValueString().empty()) {
+      throw std::runtime_error(fmt::format("Config parameter {} must not be an empty string!", config_key));
+    }
     return;
   }
 
   auto list_value = value.ValueList();
   for (auto elem : list_value) {
-    if (!elem.IsString()) {
+    if (!elem.IsString() || elem.ValueString().empty()) {
       throw std::runtime_error(fmt::format("Invalid config for config parameter {}!", config_key));
     }
   }
@@ -243,6 +266,14 @@ void ValidateDeletionConfigEntities(const mgp::Map &config, std::string config_k
 void ValidateDeletionConfig(const mgp::Map &config) {
   auto labels_key = std::string(kConfigKeyLabels);
   auto edge_types_key = std::string(kConfigKeyEdgeTypes);
+
+  for (const auto &item : config) {
+    if (item.key != kConfigKeyBatchSize && item.key != kConfigKeyLabels && item.key != kConfigKeyEdgeTypes) {
+      throw std::runtime_error(fmt::format(
+          "Unknown configuration parameter '{}' for periodic.delete; allowed keys are batch_size, labels, edge_types.",
+          item.key));
+    }
+  }
 
   ValidateBatchSizeFromConfig(config);
   ValidateDeletionConfigEntities(config, labels_key);
@@ -292,26 +323,39 @@ void ExecutePeriodicDelete(const mgp::QueryExecution &query_execution, const Del
   auto delete_nodes = delete_all || !deletion_info.labels.empty();
   auto delete_edges = delete_all || !deletion_info.labels.empty() || !deletion_info.edge_types.empty();
 
-  auto labels_formatted = deletion_info.labels.empty() ? "" : fmt::format(":{}", Join(deletion_info.labels, ":"));
-  auto edge_types_formatted =
-      deletion_info.edge_types.empty() ? "" : fmt::format(":{}", Join(deletion_info.edge_types, "|"));
+  std::vector<std::string> quoted_labels;
+  quoted_labels.reserve(deletion_info.labels.size());
+  for (const auto &lbl : deletion_info.labels) {
+    quoted_labels.push_back(QuoteCypherIdentifier(lbl));
+  }
+  std::vector<std::string> quoted_edge_types;
+  quoted_edge_types.reserve(deletion_info.edge_types.size());
+  for (const auto &et : deletion_info.edge_types) {
+    quoted_edge_types.push_back(QuoteCypherIdentifier(et));
+  }
+
+  auto labels_formatted = quoted_labels.empty() ? "" : fmt::format(":{}", Join(quoted_labels, ":"));
+  auto edge_types_formatted = quoted_edge_types.empty() ? "" : fmt::format(":{}", Join(quoted_edge_types, "|"));
 
   auto relationships_deletion_query =
       fmt::format("MATCH (n{})-[r{}]-(m) WITH DISTINCT r LIMIT {} DELETE r RETURN count(r) AS num_deleted",
                   labels_formatted,
                   edge_types_formatted,
                   deletion_info.batch_size);
-  auto nodes_deletion_query =
-      fmt::format("MATCH (n{}) WITH DISTINCT n LIMIT {} DETACH DELETE n RETURN count(n) AS num_deleted",
-                  labels_formatted,
-                  deletion_info.batch_size);
+  auto nodes_deletion_query = fmt::format(
+      "MATCH (n{}) WITH DISTINCT n LIMIT {} OPTIONAL MATCH (n)-[r]-() "
+      "WITH collect(DISTINCT n) AS __mg_nodes_to_delete, count(DISTINCT r) AS num_extra_rels "
+      "FOREACH (__mg_node IN __mg_nodes_to_delete | DETACH DELETE __mg_node) "
+      "RETURN size(__mg_nodes_to_delete) AS num_deleted, num_extra_rels",
+      labels_formatted,
+      deletion_info.batch_size);
 
   if (delete_edges) {
     while (true) {
       auto execution_result = query_execution.ExecuteQuery(relationships_deletion_query);
 
       auto result = execution_result.PullOne();
-      if (!result || (*result).Size() != 1) {
+      if (!result || (*result).Size() == 0) {
         throw std::runtime_error("No result received from periodic delete!");
       }
 
@@ -332,7 +376,7 @@ void ExecutePeriodicDelete(const mgp::QueryExecution &query_execution, const Del
       auto execution_result = query_execution.ExecuteQuery(nodes_deletion_query);
 
       auto result = execution_result.PullOne();
-      if (!result || (*result).Size() != 1) {
+      if (!result || (*result).Size() == 0) {
         throw std::runtime_error("No result received from periodic delete!");
       }
 
@@ -340,8 +384,13 @@ void ExecutePeriodicDelete(const mgp::QueryExecution &query_execution, const Del
       };
 
       const uint64_t num_deleted = static_cast<uint64_t>((*result).At(kReturnInternalNumDeleted).ValueInt());
+      uint64_t num_extra_rels = 0;
+      if ((*result).KeyExists(kReturnInternalNumExtraRels)) {
+        num_extra_rels = static_cast<uint64_t>((*result).At(kReturnInternalNumExtraRels).ValueInt());
+      }
       deletion_result.num_batches++;
       deletion_result.num_deleted_nodes += num_deleted;
+      deletion_result.num_deleted_relationships += num_extra_rels;
       if (num_deleted < deletion_info.batch_size) {
         break;
       }

@@ -30,8 +30,8 @@ class VariableIndex {
  public:
   /// Assign a bit position to `eclass` if not already present.  Returns the
   /// assigned bit.  Called once per Symbol e-class during the pre-pass.
-  auto assign(planner::core::EClassId eclass) -> uint16_t {
-    auto [it, inserted] = by_eclass_.try_emplace(eclass, static_cast<uint16_t>(by_bit_.size()));
+  auto assign(planner::core::EClassId eclass) -> uint32_t {
+    auto [it, inserted] = by_eclass_.try_emplace(eclass, static_cast<uint32_t>(by_bit_.size()));
     if (inserted) by_bit_.push_back(eclass);
     return it->second;
   }
@@ -39,14 +39,14 @@ class VariableIndex {
   /// Bit position for `eclass`.  Caller must have called `assign` previously;
   /// hitting an unknown EClassId is a planner bug (pre-pass must enumerate
   /// every Symbol e-class that can flow into a VariableSet).
-  [[nodiscard]] auto bit_of(planner::core::EClassId eclass) const -> uint16_t {
+  [[nodiscard]] auto bit_of(planner::core::EClassId eclass) const -> uint32_t {
     auto const it = by_eclass_.find(eclass);
     DMG_ASSERT(it != by_eclass_.end(), "VariableIndex: EClassId not registered (planner bug: pre-pass missed it)");
     return it->second;
   }
 
   /// EClassId for `bit`.  Inverse of `bit_of`.
-  [[nodiscard]] auto eclass_of(uint16_t bit) const -> planner::core::EClassId {
+  [[nodiscard]] auto eclass_of(uint32_t bit) const -> planner::core::EClassId {
     DMG_ASSERT(bit < by_bit_.size(), "VariableIndex: bit out of range");
     return by_bit_[bit];
   }
@@ -70,7 +70,7 @@ class VariableIndex {
   [[nodiscard]] auto size() const noexcept -> std::size_t { return by_bit_.size(); }
 
  private:
-  boost::unordered_flat_map<planner::core::EClassId, uint16_t> by_eclass_;
+  boost::unordered_flat_map<planner::core::EClassId, uint32_t> by_eclass_;
   std::vector<planner::core::EClassId> by_bit_;
 };
 

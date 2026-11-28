@@ -173,8 +173,12 @@ void SystemRecoveryHandler(memgraph::system::ReplicaHandlerAccessToState &system
   }
 
 #ifdef MG_ENTERPRISE
-  if (!dbms::SystemRecoveryHandler(
-          dbms_handler, req.database_configs, req.cold_databases, req.includes_auth_and_databases)) {
+  if (!dbms::SystemRecoveryHandler(dbms_handler,
+                                   req.database_configs,
+                                   req.cold_databases,
+                                   req.includes_auth_and_databases,
+                                   req.tenant_profiles,
+                                   req.includes_tenant_profiles)) {
     return;
   }
   if (req.includes_auth_and_databases &&
@@ -184,7 +188,10 @@ void SystemRecoveryHandler(memgraph::system::ReplicaHandlerAccessToState &system
 #endif
   if (!parameters.ApplyRecovery(req.parameters)) return;
 
-  system_state_access.SetLastCommitedTS(req.forced_group_timestamp);
+  if (!system_state_access.SetLastCommitedTS(req.forced_group_timestamp)) {
+    spdlog::error("SystemRecoveryHandler: failed to persist LCTS {}", req.forced_group_timestamp);
+    return;
+  }
   spdlog::debug("SystemRecoveryHandler: SUCCESS updated LCTS to {}", req.forced_group_timestamp);
   res = SystemRecoveryRes(SystemRecoveryRes::Result::SUCCESS);
 }
@@ -218,7 +225,10 @@ void FinalizeSystemTxHandler(memgraph::system::ReplicaHandlerAccessToState &syst
     return;
   }
 
-  system_state_access.SetLastCommitedTS(req.new_group_timestamp);
+  if (!system_state_access.SetLastCommitedTS(req.new_group_timestamp)) {
+    spdlog::error("FinalizeSystemTxHandler: failed to persist LCTS {}", req.new_group_timestamp);
+    return;
+  }
   spdlog::debug("FinalizeSystemTxHandler: SUCCESS updated LCTS to {}", req.new_group_timestamp);
   res = FinalizeSystemTxRes(true);
 }

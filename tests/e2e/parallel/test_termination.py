@@ -23,22 +23,22 @@ that utilize USING PARALLEL EXECUTION hint to trigger parallel operators
 """
 
 import multiprocessing
+from pathlib import Path
 import sys
 import time
-from pathlib import Path
 from typing import Optional
 
-import pytest
 from neo4j import GraphDatabase
 from neo4j.exceptions import *
+import pytest
 
 # Add standard e2e directory to sys.path
 E2E_ROOT = Path(__file__).resolve().parent.parent
 if str(E2E_ROOT) not in sys.path:
     sys.path.insert(0, str(E2E_ROOT))
 
-import interactive_mg_runner
 from common import pq
+import interactive_mg_runner
 
 # =============================================================================
 # Constants

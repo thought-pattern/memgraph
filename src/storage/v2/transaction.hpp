@@ -83,8 +83,8 @@ struct AbortCallbacks {
   // OutOfMemoryExceptionEnabler in scope), so OOM can't fire from these
   // callbacks, and a true system bad_alloc means we're going down anyway.
   void RunAll() noexcept {
-    for (auto &callback : callbacks_) {
-      callback();
+    for (auto it = callbacks_.rbegin(); it != callbacks_.rend(); ++it) {
+      (*it)();
     }
     callbacks_.clear();
   }

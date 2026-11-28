@@ -286,7 +286,8 @@ namespace {
 
 bool RequiresNoIndices(storage::IndicesCollection const &indices) {
   return indices.label_.empty() && indices.label_properties_.empty() && indices.edge_type_.empty() &&
-         indices.edge_type_properties_.empty() && indices.edge_property_.empty() && indices.vertex_property_.empty();
+         indices.edge_type_properties_.empty() && indices.edge_property_.empty() && indices.vertex_property_.empty() &&
+         indices.point_.empty();
 }
 
 }  // namespace

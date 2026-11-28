@@ -102,14 +102,15 @@ struct EClass : private detail::EClassBase {
    * @brief Merge of another e-class into this one
    */
   void merge_with(EClass &&other) {
-    EClassBase::merge_with(other);
-
-    // Combine per-e-class facts and flag any contradiction. Analyses that carry
-    // no facts (e.g. NoAnalysis) supply a no-op merge.
+    // Combine per-e-class facts and flag any contradiction before mutating nodes/parents.
+    // Analyses that carry no facts (e.g. NoAnalysis) supply a no-op merge.
     analysis_data.merge(other.analysis_data);
+    EClassBase::merge_with(other);
   }
 
  private:
+  void merge_base_only(EClass &other) { EClassBase::merge_with(other); }
+  void set_analysis(Analysis next) { analysis_data = std::move(next); }
   /// Mutable access for the analysis refresh, which widens the facts in place
   /// rather than diffing against a copy: an analysis holding a string, list or
   /// map would allocate on every such copy.

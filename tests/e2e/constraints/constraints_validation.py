@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from common import memgraph
 from gqlalchemy import GQLAlchemyError
+import pytest
 
 
 def test_cant_add_2_nodes_with_same_property_and_unique_constraint(memgraph):

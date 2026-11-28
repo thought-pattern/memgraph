@@ -18,9 +18,9 @@ so the refused allocation lands at different points of the cache's growth.
 
 import sys
 
+from common import connect, connect_no_autocommit, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, connect_no_autocommit, execute_and_fetch_all
 
 BOLT_PORT = 7687
 LIMITS_KB = range(1, 129)

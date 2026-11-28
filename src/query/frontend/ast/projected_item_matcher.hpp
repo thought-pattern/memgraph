@@ -17,13 +17,19 @@
 
 #include "query/frontend/ast/ast.hpp"
 
+namespace memgraph::query {
+class Parameters;
+}  // namespace memgraph::query
+
 namespace memgraph::query::frontend {
 
 // Token positions of `$name` parameters, mapped to their unescaped names. Stripped literals are not in here.
 using ParameterNames = std::unordered_map<int32_t, std::string>;
 
 // When a projection aggregates, ORDER BY and WHERE only see the projected items, so any part of them that repeats a
-// projected item's expression is replaced with a reference to that item.
-void ReferToProjectedItems(ReturnBody &body, Where *where, ParameterNames const &parameter_names, AstStorage &storage);
+// projected item's expression is replaced with a reference to that item. Returns true when a rewrite depended on the
+// values of stripped literals in `parameters`, in which case the rewritten AST cannot be reused for other literals.
+bool ReferToProjectedItems(ReturnBody &body, Where *where, ParameterNames const &parameter_names, AstStorage &storage,
+                           Parameters const *parameters = nullptr);
 
 }  // namespace memgraph::query::frontend

@@ -165,10 +165,13 @@ class AndOperator : public memgraph::query::BinaryOperator {
     return visitor.PostVisit(*this);
   }
 
+  uint32_t chained_comparison_count_{0};
+
   AndOperator *Clone(AstStorage *storage) const override {
     AndOperator *object = storage->Create<AndOperator>();
     object->expression1_ = expression1_ ? expression1_->Clone(storage) : nullptr;
     object->expression2_ = expression2_ ? expression2_->Clone(storage) : nullptr;
+    object->chained_comparison_count_ = chained_comparison_count_;
     return object;
   }
 
@@ -854,12 +857,42 @@ class IfOperator : public Expression {
   memgraph::query::Expression *condition_;
   memgraph::query::Expression *then_expression_;
   memgraph::query::Expression *else_expression_;
+  uint32_t simple_case_arm_count_{0};
 
   IfOperator *Clone(AstStorage *storage) const override {
+    if (simple_case_arm_count_ > 0) {
+      auto const *first_eq = dynamic_cast<EqualOperator const *>(condition_);
+      Expression *cloned_subject =
+          (first_eq && first_eq->expression1_) ? first_eq->expression1_->Clone(storage) : nullptr;
+      std::vector<IfOperator const *> arms;
+      arms.reserve(simple_case_arm_count_);
+      IfOperator const *curr = this;
+      for (uint32_t idx = 0; idx < simple_case_arm_count_ && curr != nullptr; ++idx) {
+        arms.push_back(curr);
+        if (idx + 1 < simple_case_arm_count_) {
+          curr = dynamic_cast<IfOperator const *>(curr->else_expression_);
+        }
+      }
+      if (arms.size() == simple_case_arm_count_ && cloned_subject != nullptr) {
+        Expression *cloned_else =
+            arms.back()->else_expression_ ? arms.back()->else_expression_->Clone(storage) : nullptr;
+        for (auto it = arms.rbegin(); it != arms.rend(); ++it) {
+          auto const *eq = dynamic_cast<EqualOperator const *>((*it)->condition_);
+          Expression *cloned_when = (eq && eq->expression2_) ? eq->expression2_->Clone(storage) : nullptr;
+          Expression *cloned_cond = storage->Create<EqualOperator>(cloned_subject, cloned_when);
+          Expression *cloned_then = (*it)->then_expression_ ? (*it)->then_expression_->Clone(storage) : nullptr;
+          cloned_else = storage->Create<IfOperator>(cloned_cond, cloned_then, cloned_else);
+        }
+        auto *root = static_cast<IfOperator *>(cloned_else);
+        root->simple_case_arm_count_ = simple_case_arm_count_;
+        return root;
+      }
+    }
     IfOperator *object = storage->Create<IfOperator>();
     object->condition_ = condition_ ? condition_->Clone(storage) : nullptr;
     object->then_expression_ = then_expression_ ? then_expression_->Clone(storage) : nullptr;
     object->else_expression_ = else_expression_ ? else_expression_->Clone(storage) : nullptr;
+    object->simple_case_arm_count_ = simple_case_arm_count_;
     return object;
   }
 
@@ -1002,8 +1035,9 @@ class MapLiteral : public memgraph::query::BaseLiteral {
 };
 
 struct MapProjectionData {
-  Expression *map_variable;
+  Expression *map_variable{nullptr};
   std::unordered_map<PropertyIx, Expression *> elements;
+  Expression *all_properties_lookup{nullptr};
 };
 
 class MapProjectionLiteral : public memgraph::query::BaseLiteral {
@@ -1022,6 +1056,9 @@ class MapProjectionLiteral : public memgraph::query::BaseLiteral {
   bool Accept(HierarchicalTreeVisitor &visitor) override {
     if (visitor.PreVisit(*this)) {
       map_variable_->Accept(visitor);
+      if (all_properties_lookup_ != nullptr) {
+        all_properties_lookup_->Accept(visitor);
+      }
 
       for (auto pair : elements_) {
         if (!pair.second) continue;
@@ -1032,12 +1069,14 @@ class MapProjectionLiteral : public memgraph::query::BaseLiteral {
     return visitor.PostVisit(*this);
   }
 
-  Expression *map_variable_;
+  Expression *map_variable_{nullptr};
   std::unordered_map<PropertyIx, Expression *> elements_;
+  Expression *all_properties_lookup_{nullptr};
 
   MapProjectionLiteral *Clone(AstStorage *storage) const override {
     MapProjectionLiteral *object = storage->Create<MapProjectionLiteral>();
     object->map_variable_ = map_variable_->Clone(storage);
+    object->all_properties_lookup_ = all_properties_lookup_ ? all_properties_lookup_->Clone(storage) : nullptr;
 
     for (const auto &entry : elements_) {
       auto key = storage->GetPropertyIx(entry.first.name);
@@ -1053,8 +1092,9 @@ class MapProjectionLiteral : public memgraph::query::BaseLiteral {
   }
 
  protected:
-  explicit MapProjectionLiteral(Expression *map_variable, std::unordered_map<PropertyIx, Expression *> &&elements)
-      : map_variable_(map_variable), elements_(std::move(elements)) {}
+  explicit MapProjectionLiteral(Expression *map_variable, std::unordered_map<PropertyIx, Expression *> &&elements,
+                                Expression *all_properties_lookup = nullptr)
+      : map_variable_(map_variable), elements_(std::move(elements)), all_properties_lookup_(all_properties_lookup) {}
 
  private:
   friend class AstStorage;
@@ -2253,6 +2293,8 @@ class ProfileQuery : public memgraph::query::Query {
   friend class AstStorage;
 };
 
+using ConfigMap = std::vector<std::pair<Expression *, Expression *>>;
+
 class IndexQuery : public memgraph::query::Query {
  public:
   static const utils::TypeInfo kType;
@@ -2276,7 +2318,7 @@ class IndexQuery : public memgraph::query::Query {
   // across calls — evaluating at parse time would bake the first call's parameters into the cache).
   // For CREATE: absent/empty => IndexOrder::ASC.
   // For DROP:   absent/empty => drop both ASC and DESC for (label, properties).
-  std::unordered_map<Expression *, Expression *> config_;
+  ConfigMap config_;
   bool is_global_ = false;
 
   IndexQuery *Clone(AstStorage *storage) const override {
@@ -2288,8 +2330,9 @@ class IndexQuery : public memgraph::query::Query {
       object->properties_.emplace_back(prop_path.Clone(storage));
     }
     object->name_ = name_;
+    object->config_.reserve(config_.size());
     for (auto const &[key_expr, value_expr] : config_) {
-      object->config_.emplace(key_expr->Clone(storage), value_expr->Clone(storage));
+      object->config_.emplace_back(key_expr->Clone(storage), value_expr->Clone(storage));
     }
     object->is_global_ = is_global_;
     return object;
@@ -2446,8 +2489,6 @@ class CreateTextEdgeIndexQuery : public memgraph::query::Query {
   friend class AstStorage;
 };
 
-using ConfigMap = std::unordered_map<Expression *, Expression *>;
-
 class VectorIndexQuery : public memgraph::query::Query {
  public:
   static const utils::TypeInfo kType;
@@ -2481,8 +2522,9 @@ class VectorIndexQuery : public memgraph::query::Query {
     object->config_ =
         std::visit(utils::Overloaded{[storage](const ConfigMap &map) -> std::variant<ConfigMap, Expression *> {
                                        ConfigMap cloned;
+                                       cloned.reserve(map.size());
                                        for (const auto &[key, value] : map) {
-                                         cloned[key->Clone(storage)] = value->Clone(storage);
+                                         cloned.emplace_back(key->Clone(storage), value->Clone(storage));
                                        }
                                        return cloned;
                                      },
@@ -2536,8 +2578,9 @@ class CreateVectorEdgeIndexQuery : public memgraph::query::Query {
     object->config_ =
         std::visit(utils::Overloaded{[storage](const ConfigMap &map) -> std::variant<ConfigMap, Expression *> {
                                        ConfigMap cloned;
+                                       cloned.reserve(map.size());
                                        for (const auto &[key, value] : map) {
-                                         cloned[key->Clone(storage)] = value->Clone(storage);
+                                         cloned.emplace_back(key->Clone(storage), value->Clone(storage));
                                        }
                                        return cloned;
                                      },
@@ -3252,12 +3295,14 @@ class ConstraintQuery : public memgraph::query::Query {
   memgraph::query::ConstraintQuery::ActionType action_type_;
   memgraph::query::Constraint constraint_;
   std::optional<std::string> name_;
+  bool if_not_exists_{false};
 
   ConstraintQuery *Clone(AstStorage *storage) const override {
     ConstraintQuery *object = storage->Create<ConstraintQuery>();
     object->action_type_ = action_type_;
     object->constraint_ = constraint_.Clone(storage);
     object->name_ = name_;
+    object->if_not_exists_ = if_not_exists_;
     return object;
   }
 };
@@ -3395,8 +3440,9 @@ class CoordinatorQuery : public memgraph::query::Query {
     object->instance_name_ = instance_name_;
     object->coordinator_id_ = coordinator_id_ ? coordinator_id_->Clone(storage) : nullptr;
     object->sync_mode_ = sync_mode_;
+    object->configs_.reserve(configs_.size());
     for (const auto &[key, value] : configs_) {
-      object->configs_[key->Clone(storage)] = value->Clone(storage);
+      object->configs_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
     object->setting_name_ = setting_name_ ? setting_name_->Clone(storage) : nullptr;
     object->setting_value_ = setting_value_ ? setting_value_->Clone(storage) : nullptr;
@@ -3554,10 +3600,11 @@ class LoadCsv : public memgraph::query::Clause {
     object->ignore_bad_ = ignore_bad_;
     object->delimiter_ = delimiter_ ? delimiter_->Clone(storage) : nullptr;
     object->quote_ = quote_ ? quote_->Clone(storage) : nullptr;
-    object->nullif_ = nullif_;
+    object->nullif_ = nullif_ ? nullif_->Clone(storage) : nullptr;
     object->row_var_ = row_var_ ? row_var_->Clone(storage) : nullptr;
+    object->configs_.reserve(configs_.size());
     for (auto const &[key, value] : configs_) {
-      object->configs_[key->Clone(storage)] = value->Clone(storage);
+      object->configs_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
     return object;
   }
@@ -3601,8 +3648,9 @@ class LoadParquet : public Clause {
   LoadParquet *Clone(AstStorage *storage) const override {
     auto *object = storage->Create<LoadParquet>();
     object->file_ = file_ ? file_->Clone(storage) : nullptr;
+    object->configs_.reserve(configs_.size());
     for (const auto &[key, value] : configs_) {
-      object->configs_[key->Clone(storage)] = value->Clone(storage);
+      object->configs_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
     object->row_var_ = row_var_ ? row_var_->Clone(storage) : nullptr;
     return object;
@@ -3640,8 +3688,9 @@ class LoadJsonl : public Clause {
     auto *object = storage->Create<LoadJsonl>();
     object->file_ = file_ ? file_->Clone(storage) : nullptr;
     object->row_var_ = row_var_ ? row_var_->Clone(storage) : nullptr;
+    object->configs_.reserve(configs_.size());
     for (auto const &[key, value] : configs_) {
-      object->configs_[key->Clone(storage)] = value->Clone(storage);
+      object->configs_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
     return object;
   }
@@ -3813,8 +3862,9 @@ class RecoverSnapshotQuery : public memgraph::query::Query {
   RecoverSnapshotQuery *Clone(AstStorage *storage) const override {
     auto *object = storage->Create<RecoverSnapshotQuery>();
     object->snapshot_ = snapshot_ ? snapshot_->Clone(storage) : nullptr;
+    object->configs_.reserve(configs_.size());
     for (auto const &[key, value] : configs_) {
-      object->configs_[key->Clone(storage)] = value->Clone(storage);
+      object->configs_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
     object->force_ = force_;
     return object;
@@ -3919,11 +3969,13 @@ class StreamQuery : public memgraph::query::Query {
     object->consumer_group_ = consumer_group_;
     object->bootstrap_servers_ = bootstrap_servers_ ? bootstrap_servers_->Clone(storage) : nullptr;
     object->service_url_ = service_url_ ? service_url_->Clone(storage) : nullptr;
+    object->configs_.reserve(configs_.size());
     for (const auto &[key, value] : configs_) {
-      object->configs_[key->Clone(storage)] = value->Clone(storage);
+      object->configs_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
+    object->credentials_.reserve(credentials_.size());
     for (const auto &[key, value] : credentials_) {
-      object->credentials_[key->Clone(storage)] = value->Clone(storage);
+      object->credentials_.emplace_back(key->Clone(storage), value->Clone(storage));
     }
     return object;
   }
@@ -3980,23 +4032,23 @@ class ParameterQuery : public memgraph::query::Query {
   bool is_global_scope_{true};
   std::string parameter_name_;
   /// SET parameter value: either a single expression (literal or parameter) or a config-style map (like WITH CONFIG).
-  std::variant<Expression *, std::unordered_map<Expression *, Expression *>> parameter_value_{
-      static_cast<Expression *>(nullptr)};
+  std::variant<Expression *, ConfigMap> parameter_value_{static_cast<Expression *>(nullptr)};
 
   ParameterQuery *Clone(AstStorage *storage) const override {
     auto *object = storage->Create<ParameterQuery>();
     object->action_ = action_;
     object->is_global_scope_ = is_global_scope_;
     object->parameter_name_ = parameter_name_;
-    object->parameter_value_ = std::visit(
-        [storage](auto &&arg) -> std::variant<Expression *, std::unordered_map<Expression *, Expression *>> {
+    object->parameter_value_ =
+        std::visit([storage](auto &&arg) -> std::variant<Expression *, ConfigMap> {
           using T = std::decay_t<decltype(arg)>;
           if constexpr (std::is_same_v<T, Expression *>) {
             return arg ? arg->Clone(storage) : nullptr;
           } else {
-            std::unordered_map<Expression *, Expression *> cloned;
+            ConfigMap cloned;
+            cloned.reserve(arg.size());
             for (const auto &[k, v] : arg) {
-              cloned[k->Clone(storage)] = v->Clone(storage);
+              cloned.emplace_back(k->Clone(storage), v->Clone(storage));
             }
             return cloned;
           }
@@ -4121,7 +4173,10 @@ class TransactionQueueQuery : public memgraph::query::Query {
   TransactionQueueQuery *Clone(AstStorage *storage) const override {
     auto *object = storage->Create<TransactionQueueQuery>();
     object->action_ = action_;
-    object->transaction_id_list_ = transaction_id_list_;
+    object->transaction_id_list_.reserve(transaction_id_list_.size());
+    for (auto *expr : transaction_id_list_) {
+      object->transaction_id_list_.push_back(expr ? expr->Clone(storage) : nullptr);
+    }
     object->status_filter_ = status_filter_;
     return object;
   }
@@ -4147,7 +4202,10 @@ class SessionQuery : public memgraph::query::Query {
   SessionQuery *Clone(AstStorage *storage) const override {
     auto *object = storage->Create<SessionQuery>();
     object->action_ = action_;
-    object->session_id_list_ = session_id_list_;
+    object->session_id_list_.reserve(session_id_list_.size());
+    for (auto *expr : session_id_list_) {
+      object->session_id_list_.push_back(expr ? expr->Clone(storage) : nullptr);
+    }
     return object;
   }
 };

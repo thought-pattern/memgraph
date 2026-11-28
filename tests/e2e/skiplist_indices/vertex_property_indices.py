@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from common import memgraph
 from gqlalchemy import Memgraph
+import pytest
 
 
 def get_explain(memgraph, query):

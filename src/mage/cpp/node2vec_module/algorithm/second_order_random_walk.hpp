@@ -14,6 +14,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <random>
 #include <stdexcept>
@@ -30,14 +31,17 @@ class N2vGraph {
  public:
   N2vGraph(bool is_directed) : is_directed_(is_directed) {}
 
+  void AddNode(NodeId node) {
+    if (adj_.find(node) == adj_.end()) {
+      adj_.emplace(node, std::vector<NodeId>{});
+      node_order_.push_back(node);
+    }
+  }
+
   void AddEdge(NodeId from, NodeId to, double weight) {
-    auto &inner = edges_[from];
-    auto it = inner.find(to);
-    if (it == inner.end()) {
-      inner.emplace(to, weight);
-      edge_order_.emplace_back(from, to);
-    } else {
-      it->second += weight;
+    InsertDirectedWeight(from, to, weight);
+    if (!is_directed_ && from != to) {
+      InsertDirectedWeight(to, from, weight);
     }
   }
 
@@ -46,7 +50,11 @@ class N2vGraph {
     for (const auto &e : edge_order_) {
       NodeId from = e.first, to = e.second;
       AddNeighbor(from, to);
-      if (!is_directed_) AddNeighbor(to, from);
+      if (!is_directed_) {
+        AddNeighbor(to, from);
+      } else {
+        AddNode(to);
+      }
     }
     for (auto &kv : adj_) {
       std::sort(kv.second.begin(), kv.second.end());
@@ -88,14 +96,7 @@ class N2vGraph {
 
   // (prev, cur) directed pairs over which edge transition probabilities are
   // defined.
-  std::vector<std::pair<NodeId, NodeId>> Edges() const {
-    std::vector<std::pair<NodeId, NodeId>> out = edge_order_;
-    if (!is_directed_) {
-      out.reserve(edge_order_.size() * 2);
-      for (const auto &e : edge_order_) out.emplace_back(e.second, e.first);
-    }
-    return out;
-  }
+  std::vector<std::pair<NodeId, NodeId>> Edges() const { return edge_order_; }
 
  private:
   bool is_directed_;
@@ -104,6 +105,17 @@ class N2vGraph {
   std::unordered_map<NodeId, std::vector<NodeId>> adj_;
   std::unordered_map<NodeId, std::unordered_set<NodeId>> adj_set_;
   std::vector<NodeId> node_order_;
+
+  void InsertDirectedWeight(NodeId from, NodeId to, double weight) {
+    auto &inner = edges_[from];
+    auto it = inner.find(to);
+    if (it == inner.end()) {
+      inner.emplace(to, weight);
+      edge_order_.emplace_back(from, to);
+    } else {
+      it->second += weight;
+    }
+  }
 
   bool HasDirected(NodeId src, NodeId dest) const {
     auto it = edges_.find(src);
@@ -178,11 +190,24 @@ class SecondOrderRandomWalk {
   std::unordered_map<Edge, std::vector<double>, EdgeHash> edge_probs_;
 
   static std::vector<double> Normalize(const std::vector<double> &v) {
-    double sum = 0.0;
-    for (double x : v) sum += x;
-    std::vector<double> out(v.size());
-    if (sum == 0.0) return out;
-    for (size_t i = 0; i < v.size(); ++i) out[i] = v[i] / sum;
+    std::vector<double> out(v.size(), 0.0);
+    if (v.empty()) return out;
+    double max_val = 0.0;
+    for (double x : v) {
+      if (!std::isfinite(x) || x < 0.0) {
+        throw std::invalid_argument("Transition weights must be finite and non-negative.");
+      }
+      if (x > max_val) max_val = x;
+    }
+    if (max_val == 0.0) return out;
+    double scaled_sum = 0.0;
+    for (size_t i = 0; i < v.size(); ++i) {
+      out[i] = v[i] / max_val;
+      scaled_sum += out[i];
+    }
+    for (size_t i = 0; i < v.size(); ++i) {
+      out[i] /= scaled_sum;
+    }
     return out;
   }
 
@@ -197,15 +222,34 @@ class SecondOrderRandomWalk {
   }
 
   std::vector<double> CalculateEdgeTransitionProbs(N2vGraph &graph, NodeId src, NodeId dest) {
+    const auto &nbrs = graph.Neighbors(dest);
+    std::vector<double> raw_weights;
+    raw_weights.reserve(nbrs.size());
+    double max_w = 0.0;
+    for (NodeId dn : nbrs) {
+      const double w = graph.EdgeWeight(dest, dn);
+      if (!std::isfinite(w) || w < 0.0) {
+        throw std::invalid_argument("Edge weights must be finite and non-negative.");
+      }
+      raw_weights.push_back(w);
+      if (w > max_w) max_w = w;
+    }
+    if (max_w == 0.0) {
+      return std::vector<double>(nbrs.size(), 0.0);
+    }
+    const double min_div = std::min({p_, 1.0, q_});
     std::vector<double> unnorm;
-    for (NodeId dn : graph.Neighbors(dest)) {
-      double w = graph.EdgeWeight(dest, dn);
-      if (dn == src)
-        unnorm.push_back(w / p_);
-      else if (graph.HasEdge(dn, src))
-        unnorm.push_back(w);
-      else
-        unnorm.push_back(w / q_);
+    unnorm.reserve(nbrs.size());
+    for (size_t i = 0; i < nbrs.size(); ++i) {
+      const NodeId dn = nbrs[i];
+      const double w_scaled = raw_weights[i] / max_w;
+      double divisor = q_;
+      if (dn == src) {
+        divisor = p_;
+      } else if (graph.HasEdge(dn, src)) {
+        divisor = 1.0;
+      }
+      unnorm.push_back(w_scaled * (min_div / divisor));
     }
     return Normalize(unnorm);
   }

@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import execute_and_fetch_all, first_connection, memgraph, second_connection
+import pytest
 
 
 def test_concurrency_if_no_delta_on_same_node_property_update(first_connection, second_connection):

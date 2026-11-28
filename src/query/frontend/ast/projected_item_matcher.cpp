@@ -26,6 +26,7 @@
 #include "query/frontend/ast/query/named_expression.hpp"
 #include "query/frontend/ast/query/where.hpp"
 #include "query/interpret/awesome_memgraph_functions.hpp"
+#include "query/parameters.hpp"
 #include "utils/typeinfo.hpp"
 
 namespace memgraph::query::frontend {
@@ -103,6 +104,12 @@ bool SameKeys(MapElements const &lhs, MapElements const &rhs) {
          std::ranges::all_of(lhs, [&](auto const &entry) { return rhs.contains(entry.first); });
 }
 
+struct MatchContext {
+  ParameterNames const &parameter_names;
+  Parameters const *parameters{nullptr};
+  bool used_stripped_literal{false};
+};
+
 // One expression kind's whole contribution to matching: the child slots to pair up, and how whatever state it holds
 // besides those children compares. A kind with no row matches nothing, which is what makes a kind nobody has
 // considered safe rather than silently wrong. Rows name concrete kinds rather than base classes, so an operator
@@ -110,7 +117,7 @@ bool SameKeys(MapElements const &lhs, MapElements const &rhs) {
 struct KindRules {
   utils::TypeInfo const *kind;
   std::vector<Expression **> (*children)(Expression &);
-  bool (*same_own_fields)(Expression &, Expression &, ParameterNames const &);
+  bool (*same_own_fields)(Expression &, Expression &, MatchContext &);
 };
 
 std::vector<Expression **> NoChildren(Expression & /*expr*/) { return {}; }
@@ -155,35 +162,46 @@ std::vector<Expression **> MapChildren(Expression &expr) {
 std::vector<Expression **> MapProjectionChildren(Expression &expr) {
   auto &projection = static_cast<MapProjectionLiteral &>(expr);
   auto children = ValuesByKey(projection.elements_);
+  if (projection.all_properties_lookup_ != nullptr) {
+    children.push_back(&projection.all_properties_lookup_);
+  }
   children.push_back(&projection.map_variable_);
   return children;
 }
 
 // A kind whose whole state is its children matches whenever those children do.
-bool NoOwnFields(Expression & /*lhs*/, Expression & /*rhs*/, ParameterNames const & /*parameter_names*/) {
-  return true;
+bool NoOwnFields(Expression & /*lhs*/, Expression & /*rhs*/, MatchContext & /*ctx*/) { return true; }
+
+bool SameAndOperator(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
+  return static_cast<AndOperator &>(lhs).chained_comparison_count_ ==
+         static_cast<AndOperator &>(rhs).chained_comparison_count_;
 }
 
-bool SameAggregation(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SameIfOperator(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
+  return static_cast<IfOperator &>(lhs).simple_case_arm_count_ ==
+         static_cast<IfOperator &>(rhs).simple_case_arm_count_;
+}
+
+bool SameAggregation(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   auto &l = static_cast<Aggregation &>(lhs);
   auto &r = static_cast<Aggregation &>(rhs);
   return l.op_ == r.op_ && l.distinct_ == r.distinct_;
 }
 
-bool SameIdentifier(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SameIdentifier(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   return static_cast<Identifier &>(lhs).name_ == static_cast<Identifier &>(rhs).name_;
 }
 
 // A literal the stripper left in place matches by value.
-bool SamePrimitiveLiteral(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SamePrimitiveLiteral(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   return static_cast<PrimitiveLiteral &>(lhs).value_ == static_cast<PrimitiveLiteral &>(rhs).value_;
 }
 
-bool SamePropertyLookup(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SamePropertyLookup(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   return static_cast<PropertyLookup &>(lhs).property_path_ == static_cast<PropertyLookup &>(rhs).property_path_;
 }
 
-bool SameLabelsTest(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SameLabelsTest(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   auto &l = static_cast<LabelsTest &>(lhs);
   auto &r = static_cast<LabelsTest &>(rhs);
   if (auto const *lhs_cnf = l.Cnf(), *rhs_cnf = r.Cnf(); lhs_cnf && rhs_cnf) return *lhs_cnf == *rhs_cnf;
@@ -193,28 +211,48 @@ bool SameLabelsTest(Expression &lhs, Expression &rhs, ParameterNames const & /*p
 }
 
 template <typename TKind>
-bool SameMapKeys(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SameMapKeys(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   return SameKeys(static_cast<TKind &>(lhs).elements_, static_cast<TKind &>(rhs).elements_);
 }
 
-bool SameEnumValueAccess(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SameMapProjection(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
+  auto &l = static_cast<MapProjectionLiteral &>(lhs);
+  auto &r = static_cast<MapProjectionLiteral &>(rhs);
+  return (l.all_properties_lookup_ != nullptr) == (r.all_properties_lookup_ != nullptr) &&
+         SameKeys(l.elements_, r.elements_);
+}
+
+bool SameEnumValueAccess(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   auto &l = static_cast<EnumValueAccess &>(lhs);
   auto &r = static_cast<EnumValueAccess &>(rhs);
   return l.enum_name_ == r.enum_name_ && l.enum_value_ == r.enum_value_;
 }
 
-bool SameFunction(Expression &lhs, Expression &rhs, ParameterNames const & /*parameter_names*/) {
+bool SameFunction(Expression &lhs, Expression &rhs, MatchContext & /*ctx*/) {
   auto &l = static_cast<Function &>(lhs);
   auto &r = static_cast<Function &>(rhs);
   return l.function_name_ == r.function_name_ && IsFunctionPure(l.function_name_);
 }
 
-// A literal the stripper replaced is a parameter, and matches by parameter name, which is distinct per literal, so
-// two literals of different value never match.
-bool SameParameterLookup(Expression &lhs, Expression &rhs, ParameterNames const &parameter_names) {
-  auto const lhs_name = parameter_names.find(static_cast<ParameterLookup &>(lhs).token_position_);
-  auto const rhs_name = parameter_names.find(static_cast<ParameterLookup &>(rhs).token_position_);
-  return lhs_name != parameter_names.end() && rhs_name != parameter_names.end() && lhs_name->second == rhs_name->second;
+// Explicit `$name` parameters match by parameter name. Stripped literals are unnamed ParameterLookups keyed by token
+// position in `parameters`, and match when their stripped literal values are equal.
+bool SameParameterLookup(Expression &lhs, Expression &rhs, MatchContext &ctx) {
+  auto const lhs_pos = static_cast<ParameterLookup &>(lhs).token_position_;
+  auto const rhs_pos = static_cast<ParameterLookup &>(rhs).token_position_;
+  auto const lhs_name = ctx.parameter_names.find(lhs_pos);
+  auto const rhs_name = ctx.parameter_names.find(rhs_pos);
+  if (lhs_name != ctx.parameter_names.end() || rhs_name != ctx.parameter_names.end()) {
+    return lhs_name != ctx.parameter_names.end() && rhs_name != ctx.parameter_names.end() &&
+           lhs_name->second == rhs_name->second;
+  }
+  if (ctx.parameters == nullptr) return false;
+  auto const *lhs_val = ctx.parameters->MaybeAtTokenPosition(lhs_pos);
+  auto const *rhs_val = ctx.parameters->MaybeAtTokenPosition(rhs_pos);
+  if (lhs_val != nullptr && rhs_val != nullptr && *lhs_val == *rhs_val) {
+    ctx.used_stripped_literal = true;
+    return true;
+  }
+  return false;
 }
 
 auto const kRules = std::array{
@@ -224,7 +262,7 @@ auto const kRules = std::array{
 
     KindRules{.kind = &OrOperator::kType, .children = BinaryChildren, .same_own_fields = NoOwnFields},
     KindRules{.kind = &XorOperator::kType, .children = BinaryChildren, .same_own_fields = NoOwnFields},
-    KindRules{.kind = &AndOperator::kType, .children = BinaryChildren, .same_own_fields = NoOwnFields},
+    KindRules{.kind = &AndOperator::kType, .children = BinaryChildren, .same_own_fields = SameAndOperator},
     KindRules{.kind = &AdditionOperator::kType, .children = BinaryChildren, .same_own_fields = NoOwnFields},
     KindRules{.kind = &SubtractionOperator::kType, .children = BinaryChildren, .same_own_fields = NoOwnFields},
     KindRules{.kind = &MultiplicationOperator::kType, .children = BinaryChildren, .same_own_fields = NoOwnFields},
@@ -250,13 +288,13 @@ auto const kRules = std::array{
     KindRules{.kind = &LabelsTest::kType, .children = OneChild<LabelsTest>, .same_own_fields = SameLabelsTest},
     KindRules{
         .kind = &AllPropertiesLookup::kType, .children = OneChild<AllPropertiesLookup>, .same_own_fields = NoOwnFields},
-    KindRules{.kind = &IfOperator::kType, .children = IfChildren, .same_own_fields = NoOwnFields},
+    KindRules{.kind = &IfOperator::kType, .children = IfChildren, .same_own_fields = SameIfOperator},
     KindRules{.kind = &ListSlicingOperator::kType, .children = SliceChildren, .same_own_fields = NoOwnFields},
     KindRules{.kind = &RegexMatch::kType, .children = RegexChildren, .same_own_fields = NoOwnFields},
     KindRules{.kind = &MapLiteral::kType, .children = MapChildren, .same_own_fields = SameMapKeys<MapLiteral>},
     KindRules{.kind = &MapProjectionLiteral::kType,
               .children = MapProjectionChildren,
-              .same_own_fields = SameMapKeys<MapProjectionLiteral>},
+              .same_own_fields = SameMapProjection},
     KindRules{.kind = &Function::kType,
               .children = ChildList<Function, &Function::arguments_>,
               .same_own_fields = SameFunction},
@@ -292,16 +330,15 @@ bool IsShadowed(Expression *expr, std::vector<NamedExpression *> const &items) {
   return identifier && std::ranges::contains(items, identifier->name_, &NamedExpression::name_);
 }
 
-bool AreEquivalent(Expression *lhs, Expression *rhs, std::vector<NamedExpression *> const &items,
-                   ParameterNames const &parameter_names) {
+bool AreEquivalent(Expression *lhs, Expression *rhs, std::vector<NamedExpression *> const &items, MatchContext &ctx) {
   if (!lhs || !rhs) return lhs == rhs;
   // Two kinds that differ hold no common state, so neither side is read through the other. Past here both are the
   // one kind the row describes, which is what lets every rule reach its fields by a cast.
   if (lhs->GetTypeInfo() != rhs->GetTypeInfo()) return false;
   auto const *rules = RulesFor(*lhs);
-  if (!rules || !rules->same_own_fields(*lhs, *rhs, parameter_names) || IsShadowed(lhs, items)) return false;
+  if (!rules || !rules->same_own_fields(*lhs, *rhs, ctx) || IsShadowed(lhs, items)) return false;
   return std::ranges::equal(rules->children(*lhs), rules->children(*rhs), [&](auto *l, auto *r) {
-    return AreEquivalent(*l, *r, items, parameter_names);
+    return AreEquivalent(*l, *r, items, ctx);
   });
 }
 
@@ -326,34 +363,59 @@ void DropDetached(AstStorage &storage, std::vector<Expression *> const &roots) {
 }
 
 void ReferToProjectedItems(Expression *&expr, std::vector<NamedExpression *> const &items,
-                           ParameterNames const &parameter_names, AstStorage &storage,
-                           std::vector<Expression *> &detached) {
+                           ParameterNames const &parameter_names, Parameters const *parameters, AstStorage &storage,
+                           std::vector<Expression *> &detached, bool &rewrote_stripped_literal) {
   if (!expr) return;
-  auto const item = std::ranges::find_if(
-      items, [&](auto *item) { return AreEquivalent(item->expression_, expr, items, parameter_names); });
+  bool candidate_used_stripped_literal = false;
+  auto const item = std::ranges::find_if(items, [&](auto *item) {
+    MatchContext ctx{.parameter_names = parameter_names, .parameters = parameters};
+    if (AreEquivalent(item->expression_, expr, items, ctx)) {
+      candidate_used_stripped_literal = ctx.used_stripped_literal;
+      return true;
+    }
+    return false;
+  });
   if (item != items.end()) {
     detached.push_back(expr);
     expr = storage.Create<Identifier>((*item)->name_);
+    rewrote_stripped_literal = rewrote_stripped_literal || candidate_used_stripped_literal;
     return;
   }
   // An aggregation that repeats no projected item is rejected once the symbols are generated, so rewriting within its
   // arguments would only detach a subtree that nothing goes on to read.
   if (utils::IsSubtype(*expr, Aggregation::kType)) return;
   for (auto *child : MatchableChildren(*expr)) {
-    ReferToProjectedItems(*child, items, parameter_names, storage, detached);
+    ReferToProjectedItems(*child, items, parameter_names, parameters, storage, detached, rewrote_stripped_literal);
   }
 }
 
 }  // namespace
 
-void ReferToProjectedItems(ReturnBody &body, Where *where, ParameterNames const &parameter_names, AstStorage &storage) {
-  if ((body.order_by.empty() && !where) || !ProjectsAggregation(body)) return;
+bool ReferToProjectedItems(ReturnBody &body, Where *where, ParameterNames const &parameter_names, AstStorage &storage,
+                           Parameters const *parameters) {
+  if ((body.order_by.empty() && !where) || !ProjectsAggregation(body)) return false;
   auto detached = std::vector<Expression *>{};
+  bool rewrote_stripped_literal = false;
   for (auto &sort_item : body.order_by) {
-    ReferToProjectedItems(sort_item.expression, body.named_expressions, parameter_names, storage, detached);
+    ReferToProjectedItems(sort_item.expression,
+                          body.named_expressions,
+                          parameter_names,
+                          parameters,
+                          storage,
+                          detached,
+                          rewrote_stripped_literal);
   }
-  if (where) ReferToProjectedItems(where->expression_, body.named_expressions, parameter_names, storage, detached);
+  if (where) {
+    ReferToProjectedItems(where->expression_,
+                          body.named_expressions,
+                          parameter_names,
+                          parameters,
+                          storage,
+                          detached,
+                          rewrote_stripped_literal);
+  }
   DropDetached(storage, detached);
+  return rewrote_stripped_literal;
 }
 
 }  // namespace memgraph::query::frontend

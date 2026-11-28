@@ -1,6 +1,7 @@
+from abc import ABC
 import random
 import time
-from abc import ABC
+
 from gqlalchemy import Memgraph
 
 

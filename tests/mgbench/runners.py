@@ -9,9 +9,11 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from abc import ABC, abstractmethod
 import atexit
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -20,12 +22,10 @@ import sys
 import tempfile
 import threading
 import time
-from abc import ABC, abstractmethod
-from pathlib import Path
 
-import log
 from benchmark_context import BenchmarkContext
 from constants import PASSWORD, USERNAME, BenchmarkInstallationType, GraphVendors
+import log
 
 DOCKER_NETWORK_NAME = "mgbench_network"
 
@@ -103,9 +103,14 @@ def get_docker_cpu_usage(container_name):
     command = ["docker", "stats", container_name, "--no-stream", "--format", "{{.CPUPerc}}"]
     ret = run_command(command)
     if not ret:
-        return 0
+        return 0.0
 
-    cpu_perc = float(ret[0].strip("%")) / 100
+    raw_output = ret.stdout if hasattr(ret, "stdout") else (ret[0] if isinstance(ret, list) and ret else "")
+    lines = [line.strip() for line in str(raw_output).splitlines() if line.strip()]
+    if not lines:
+        return 0.0
+
+    cpu_perc = float(lines[0].strip("%")) / 100.0
     return cpu_perc
 
 
@@ -279,19 +284,18 @@ class BoltClient(BaseClient):
         if log_args:
             log.info("Client args: {}".format(args))
 
-        ret = None
-        try:
-            ret = subprocess.run(args, capture_output=True)
-        finally:
-            error = ret.stderr.decode("utf-8").strip().split("\n")
-            data = ret.stdout.decode("utf-8").strip().split("\n")
-            if error and error[0] != "":
-                log.warning("Reported errors from client:")
-                log.warning("There is a possibility that query from: {} is not executed properly".format(file_path))
-                log.error(error)
-                log.error("Results for this query or benchmark run are probably invalid!")
-            data = [x for x in data if not x.startswith("[")]
-            return list(map(json.loads, data))
+        ret = subprocess.run(args, capture_output=True)
+        error = [line for line in ret.stderr.decode("utf-8", errors="replace").strip().split("\n") if line]
+        data = [line for line in ret.stdout.decode("utf-8", errors="replace").strip().split("\n") if line]
+        if error:
+            log.warning("Reported errors from client:")
+            log.warning("There is a possibility that query from: {} is not executed properly".format(file_path))
+            log.error(error)
+            log.error("Results for this query or benchmark run are probably invalid!")
+        if ret.returncode != 0:
+            raise subprocess.CalledProcessError(ret.returncode, args, output=ret.stdout, stderr=ret.stderr)
+        data = [x for x in data if not x.startswith("[")]
+        return list(map(json.loads, data))
 
 
 class BoltClientDocker(BaseClient):
@@ -556,19 +560,18 @@ class PythonClient(BaseClient):
             time_dependent_execution=time_dependent_execution,
         )
 
-        ret = None
-        try:
-            ret = subprocess.run(args, capture_output=True)
-        finally:
-            error = ret.stderr.decode("utf-8").strip().split("\n")
-            data = ret.stdout.decode("utf-8").strip().split("\n")
-            if error and error[0] != "":
-                log.warning("Reported errors from client:")
-                log.warning("There is a possibility that query from: {} is not executed properly".format(file_path))
-                log.error(error)
-                log.error("Results for this query or benchmark run are probably invalid!")
-            data = [x for x in data if not x.startswith("[")]
-            return list(map(json.loads, data))
+        ret = subprocess.run(args, capture_output=True)
+        error = [line for line in ret.stderr.decode("utf-8", errors="replace").strip().split("\n") if line]
+        data = [line for line in ret.stdout.decode("utf-8", errors="replace").strip().split("\n") if line]
+        if error:
+            log.warning("Reported errors from client:")
+            log.warning("There is a possibility that query from: {} is not executed properly".format(file_path))
+            log.error(error)
+            log.error("Results for this query or benchmark run are probably invalid!")
+        if ret.returncode != 0:
+            raise subprocess.CalledProcessError(ret.returncode, args, output=ret.stdout, stderr=ret.stderr)
+        data = [x for x in data if not x.startswith("[")]
+        return list(map(json.loads, data))
 
 
 class BaseRunner(ABC):

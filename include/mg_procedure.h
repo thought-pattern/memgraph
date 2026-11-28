@@ -62,7 +62,7 @@ MGP_ENUM_CLASS MGP_NODISCARD mgp_error{
 
 /// Doesn't allocate anything and can't fail therefore doesn't use
 /// enum mgp_error
-int mgp_is_enterprise_valid();
+int mgp_is_enterprise_valid(void);
 
 ///@}
 
@@ -246,6 +246,12 @@ enum mgp_error mgp_value_make_double(double val, struct mgp_memory *memory, stru
 /// You need to free the instance through mgp_value_destroy.
 /// mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE is returned if unable to allocate a mgp_value.
 enum mgp_error mgp_value_make_string(const char *val, struct mgp_memory *memory, struct mgp_value **result);
+
+/// Construct a character string value with an explicit byte length (preserving embedded NUL bytes and slices).
+/// You need to free the instance through mgp_value_destroy.
+/// mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE is returned if unable to allocate a mgp_value.
+enum mgp_error mgp_value_make_string_with_size(const char *val, size_t size, struct mgp_memory *memory,
+                                               struct mgp_value **result);
 
 /// Create a mgp_value storing a mgp_list.
 /// You need to free the instance through mgp_value_destroy. The ownership of
@@ -445,6 +451,11 @@ enum mgp_error mgp_value_get_double(struct mgp_value *val, double *result);
 /// Current implementation always returns without errors.
 enum mgp_error mgp_value_get_string(struct mgp_value *val, const char **result);
 
+/// Get the byte length of the contained character string.
+/// Result is undefined if mgp_value does not contain the expected type.
+/// Current implementation always returns without errors.
+enum mgp_error mgp_value_get_string_size(struct mgp_value *val, size_t *result);
+
 /// Get the contained list of values.
 /// Result is undefined if mgp_value does not contain the expected type.
 /// Current implementation always returns without errors.
@@ -585,6 +596,8 @@ enum mgp_error mgp_map_contains_deleted(struct mgp_map *map, int *result);
 /// Return mgp_error::MGP_ERROR_KEY_ALREADY_EXISTS if a previous mapping already exists.
 enum mgp_error mgp_map_insert(struct mgp_map *map, const char *key, struct mgp_value *value);
 
+enum mgp_error mgp_map_insert_with_size(struct mgp_map *map, const char *key, size_t key_size, struct mgp_value *value);
+
 enum mgp_error mgp_map_insert_move(struct mgp_map *map, const char *key, struct mgp_value *value);
 
 /// Insert a mapping from a NULL terminated character string to a value.
@@ -595,11 +608,15 @@ enum mgp_error mgp_map_insert_move(struct mgp_map *map, const char *key, struct 
 /// Return mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE is returned if unable to allocate for insertion.
 enum mgp_error mgp_map_update(struct mgp_map *map, const char *key, struct mgp_value *value);
 
+enum mgp_error mgp_map_update_with_size(struct mgp_map *map, const char *key, size_t key_size, struct mgp_value *value);
+
 enum mgp_error mgp_map_update_move(struct mgp_map *map, const char *key, struct mgp_value *value);
 
 // Erase a mapping by key.
 // If the key doesn't exist in the map nothing happens
 enum mgp_error mgp_map_erase(struct mgp_map *map, const char *key);
+
+enum mgp_error mgp_map_erase_with_size(struct mgp_map *map, const char *key, size_t key_size);
 
 /// Get the number of items stored in mgp_map.
 /// Current implementation always returns without errors.
@@ -609,14 +626,21 @@ enum mgp_error mgp_map_size(struct mgp_map *map, size_t *result);
 /// Result is NULL if no mapping exists.
 enum mgp_error mgp_map_at(struct mgp_map *map, const char *key, struct mgp_value **result);
 
+enum mgp_error mgp_map_at_with_size(struct mgp_map *map, const char *key, size_t key_size, struct mgp_value **result);
+
 /// Returns true if key in map.
 enum mgp_error mgp_key_exists(struct mgp_map *map, const char *key, int *result);
+
+enum mgp_error mgp_key_exists_with_size(struct mgp_map *map, const char *key, size_t key_size, int *result);
 
 /// An item in the mgp_map.
 struct mgp_map_item;
 
 /// Get the key of the mapped item.
 enum mgp_error mgp_map_item_key(struct mgp_map_item *item, const char **result);
+
+/// Get the byte length of the key of the mapped item.
+enum mgp_error mgp_map_item_key_size(struct mgp_map_item *item, size_t *result);
 
 /// Get the value of the mapped item.
 enum mgp_error mgp_map_item_value(struct mgp_map_item *item, struct mgp_value **result);
@@ -1000,6 +1024,12 @@ enum mgp_error mgp_edge_iter_properties(struct mgp_edge *e, struct mgp_memory *m
 /// Return mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE if unable to allocate the vertex.
 enum mgp_error mgp_graph_get_vertex_by_id(struct mgp_graph *g, struct mgp_vertex_id id, struct mgp_memory *memory,
                                           struct mgp_vertex **result);
+
+/// Get a string value identifying the database underlying `graph`.
+/// Resulting value must be freed using mgp_value_destroy.
+/// Return mgp_error::MGP_ERROR_UNABLE_TO_ALLOCATE if unable to allocate the string value.
+enum mgp_error mgp_graph_get_database_uuid(struct mgp_graph *graph, struct mgp_memory *memory,
+                                           struct mgp_value **result);
 
 /// Result is non-zero if the index with the given name exists.
 /// The current implementation always returns without errors.
@@ -1843,7 +1873,7 @@ MGP_ENUM_CLASS mgp_log_level{
 typedef void (*mgp_proc_cb)(struct mgp_list *, struct mgp_graph *, struct mgp_result *, struct mgp_memory *);
 
 /// Cleanup for a query module read procedure. Can't be invoked through OpenCypher. Cleans batched stream.
-typedef void (*mgp_proc_cleanup)();
+typedef void (*mgp_proc_cleanup)(void);
 
 /// Initializer for a query module batched read procedure. Can't be invoked through OpenCypher. Initializes batched
 /// stream.

@@ -33,6 +33,8 @@
 
 namespace memgraph::storage {
 
+class Storage;
+
 /// A sweep leaves entries at or past the oldest active start timestamp alone, so that a transaction
 /// which started before such an entry was written can still reach the version it names. Analytical
 /// keeps no versions to reach: a write is applied in place, and a delete removes the object from
@@ -169,11 +171,26 @@ inline bool AnyVersionIsVisible(Edge *edge, uint64_t timestamp) {
   });
 }
 
+template <typename TEntity, typename TStorage>
+inline bool EntityCurrentPropertyMatches(TEntity const &entity, PropertyId key, PropertyValue const &value,
+                                         TStorage const *storage) {
+  if (storage != nullptr &&
+      (!storage->indices_.vector_index_.Empty() || !storage->indices_.vector_edge_index_.Empty())) {
+    auto const current = entity.properties.GetProperty(
+        key,
+        IndexedPropertyDecoder<TEntity>{.indices = const_cast<Indices *>(&storage->indices_),
+                                        .name_id_mapper = storage->name_id_mapper_.get(),
+                                        .entity = const_cast<TEntity *>(&entity)});
+    return !current.IsNull() && current == value;
+  }
+  return entity.properties.IsPropertyEqual(key, value);
+}
+
 /// Helper function for edgetype-property index garbage collection. Returns true if
 /// there's a reachable version of the edge that has the given property value.
-template <typename TEntity>
-inline bool AnyVersionHasProperty(TEntity const &entity, PropertyId key, PropertyValue const &value,
-                                  uint64_t timestamp) {
+template <typename TEntity, typename TStorage = Storage>
+inline bool AnyVersionHasProperty(TEntity const &entity, PropertyId key, PropertyValue const &value, uint64_t timestamp,
+                                  TStorage const *storage = nullptr) {
   Delta const *delta;
   bool deleted;
   bool current_value_equal_to_value;
@@ -182,7 +199,7 @@ inline bool AnyVersionHasProperty(TEntity const &entity, PropertyId key, Propert
     delta = entity.delta();
     deleted = entity.deleted();
     if (delta == nullptr && deleted) return false;
-    current_value_equal_to_value = entity.properties.IsPropertyEqual(key, value);
+    current_value_equal_to_value = EntityCurrentPropertyMatches(entity, key, value, storage);
   }
 
   if (!deleted && current_value_equal_to_value) {
@@ -224,9 +241,9 @@ inline bool AnyVersionHasProperty(TEntity const &entity, PropertyId key, Propert
       });
 }
 
-template <typename TEntity>
+template <typename TEntity, typename TStorage = Storage>
 inline bool CurrentVersionHasProperty(TEntity const &entity, PropertyId key, PropertyValue const &value,
-                                      Transaction *transaction, View view) {
+                                      Transaction *transaction, View view, TStorage const *storage = nullptr) {
   bool exists = true;
   bool deleted = false;
   bool current_value_equal_to_value = value.IsNull();
@@ -234,7 +251,7 @@ inline bool CurrentVersionHasProperty(TEntity const &entity, PropertyId key, Pro
   {
     auto guard = std::shared_lock{entity.lock};
     deleted = entity.deleted();
-    current_value_equal_to_value = entity.properties.IsPropertyEqual(key, value);
+    current_value_equal_to_value = EntityCurrentPropertyMatches(entity, key, value, storage);
     delta = entity.delta();
   }
 
@@ -267,47 +284,58 @@ inline void PopulateIndexOnMultipleThreads(TVerticesAccessor &vertices, TSkipLis
             "creation!");
 
   std::atomic<uint64_t> batch_counter = 0;
-  // A cancel check throwing inside a worker would escape the thread function and terminate the process, so it is
-  // caught per worker and re-thrown from this thread once they have all joined. That keeps cancellation identical
-  // whether population ran on one thread or many.
+  // A cancel check or allocation failure throwing inside a worker would escape the thread function and terminate
+  // the process, so exceptions are caught per worker and re-thrown from this thread once they have all joined.
   std::atomic<bool> cancelled = false;
-
-  // TODO(composite_index): return std::optional<utils::OutOfMemoryException>, handle index cleanup from caller
-  auto maybe_error = utils::Synchronized<std::optional<utils::OutOfMemoryException>, utils::SpinLock>{};
+  std::atomic<bool> has_error = false;
+  auto maybe_oom = utils::Synchronized<std::optional<utils::OutOfMemoryException>, utils::SpinLock>{};
+  auto maybe_exception = utils::Synchronized<std::exception_ptr, utils::SpinLock>{};
   {
     std::vector<memory::DbAwareThread> threads;
     threads.reserve(thread_count);
 
     for (auto i{0U}; i < thread_count; ++i) {
       threads.emplace_back(parallel_exec_info.arena_pool, [&, func /*local copy incase there is local state*/]() {
-        auto acc = accessor_factory();
-        while (!maybe_error.Lock()->has_value() && !cancelled.load(std::memory_order_relaxed)) {
-          const auto batch_index = batch_counter++;
-          if (batch_index >= vertex_batches.size()) {
-            return;
-          }
-          const auto &batch = vertex_batches[batch_index];
-          auto it = vertices.find(batch.first);
-
-          try {
-            for (auto i{0U}; i < batch.second; ++i, ++it) {
+        utils::MemoryTracker::OutOfMemoryExceptionEnabler worker_oom_exception;
+        try {
+          auto acc = accessor_factory();
+          while (!has_error.load(std::memory_order_acquire) && !cancelled.load(std::memory_order_relaxed)) {
+            const auto batch_index = batch_counter++;
+            if (batch_index >= vertex_batches.size()) {
+              return;
+            }
+            const auto &batch = vertex_batches[batch_index];
+            auto it = vertices.find(batch.first);
+            for (uint64_t j = 0; j < batch.second; ++j, ++it) {
               func(*it, acc);
             }
-
-          } catch (utils::OutOfMemoryException &failure) {
-            utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_exception_blocker;
-            *maybe_error.Lock() = std::move(failure);
-          } catch (PopulateCancel const &) {
-            cancelled.store(true, std::memory_order_relaxed);
           }
+        } catch (utils::OutOfMemoryException &failure) {
+          utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_exception_blocker;
+          auto locked = maybe_oom.Lock();
+          if (!locked->has_value()) {
+            *locked = std::move(failure);
+          }
+          has_error.store(true, std::memory_order_release);
+        } catch (PopulateCancel const &) {
+          cancelled.store(true, std::memory_order_relaxed);
+        } catch (...) {
+          utils::MemoryTracker::OutOfMemoryExceptionBlocker oom_exception_blocker;
+          auto locked = maybe_exception.Lock();
+          if (!*locked) {
+            *locked = std::current_exception();
+          }
+          has_error.store(true, std::memory_order_release);
         }
       });
     }
   }
-  // Out of memory wins over cancellation: it is the more specific failure and the caller unwinds it differently.
-  auto error = maybe_error.Lock();
-  if (error->has_value()) {
-    throw *std::move(*error);
+  // Out of memory and allocation/runtime exceptions win over cancellation.
+  if (auto oom = maybe_oom.Lock(); oom->has_value()) {
+    throw *std::move(*oom);
+  }
+  if (auto exc = maybe_exception.Lock(); *exc) {
+    std::rethrow_exception(*exc);
   }
   if (cancelled.load(std::memory_order_relaxed)) {
     throw PopulateCancel{};
@@ -357,7 +385,7 @@ inline void PopulateIndexDispatch(TVerticesAccessor &vertices, TSkipListAccessor
 // of the graph entity
 inline bool CanSeeEntityWithTimestamp(uint64_t insertion_timestamp, Transaction *transaction, View view) {
   // Not enough information, need to rely on MVCC to fully check entry
-  if (transaction->command_id != 0) return true;
+  if (transaction->command_id != 0 || transaction->isolation_level != IsolationLevel::SNAPSHOT_ISOLATION) return true;
   auto const original_start_timestamp = transaction->original_start_timestamp;
   if (view == View::OLD) {
     return insertion_timestamp < original_start_timestamp;

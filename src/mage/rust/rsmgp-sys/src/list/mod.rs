@@ -22,8 +22,6 @@ use crate::value::*;
 use crate::mgp::ffi;
 use mockall_double::double;
 
-// NOTE: Not possible to implement [std::iter::IntoIterator] because the [ListIterator] holds the
-// [List] reference which needs the lifetime specifier.
 pub struct List {
     ptr: *mut mgp_list,
     memgraph: Memgraph,
@@ -74,16 +72,17 @@ impl List {
         }
     }
 
-    pub fn make_empty(capacity: usize, memgraph: &Memgraph) -> Result<List> {
+    pub fn make_empty<M: MemgraphMemory + ?Sized>(capacity: usize, memgraph: &M) -> Result<List> {
+        let mg = memgraph.sealed_as_memgraph(MemorySeal(()));
         unsafe {
             let mgp_ptr = invoke_mgp_func_with_res!(
                 *mut mgp_list,
                 Error::UnableToCreateEmptyList,
                 ffi::mgp_list_make_empty,
                 capacity,
-                memgraph.memory_ptr()
+                mg.memory_ptr()
             )?;
-            Ok(List::new(mgp_ptr, &memgraph))
+            Ok(List::new(mgp_ptr, &mg))
         }
     }
 

@@ -40,20 +40,25 @@ void Graph::Expand(const Path &path) {
 }
 
 void Graph::Expand(std::span<TypedValue const> const nodes, std::span<TypedValue const> const edges) {
-  auto actual_nodes = nodes | rv::filter([](auto const &each) { return each.type() == TypedValue::Type::Vertex; }) |
-                      rv::transform([](auto const &each) { return each.ValueVertex(); });
+  utils::pmr::unordered_set<VertexAccessor> node_set(vertices_.get_allocator().resource());
+  node_set.reserve(nodes.size());
+  for (auto const &each : nodes) {
+    if (each.type() == TypedValue::Type::Vertex) {
+      node_set.insert(each.ValueVertex());
+    }
+  }
 
   auto actual_edges = edges | rv::filter([](auto const &each) { return each.type() == TypedValue::Type::Edge; }) |
                       rv::transform([](auto const &each) { return each.ValueEdge(); });
 
   if (r::any_of(actual_edges, [&](auto const &edge) {
-        return !r::contains(actual_nodes, edge.From()) || !r::contains(actual_nodes, edge.To());
+        return !node_set.contains(edge.From()) || !node_set.contains(edge.To());
       })) {
     throw memgraph::query::QueryRuntimeException(
         "Cannot project graph with any projected relationships whose start or end nodes are not also projected.");
   }
 
-  vertices_.insert(actual_nodes.begin(), actual_nodes.end());
+  vertices_.insert(node_set.begin(), node_set.end());
   edges_.insert(actual_edges.begin(), actual_edges.end());
 }
 

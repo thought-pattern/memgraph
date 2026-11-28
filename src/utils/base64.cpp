@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace memgraph::utils {
@@ -93,7 +94,7 @@ std::string insert_linebreaks(std::string str, size_t distance) {
   return str;
 }
 
-template <typename String, unsigned int line_length>
+template <typename String, size_t line_length>
 std::string encode_with_line_breaks(String s) {
   return insert_linebreaks(base64_encode(s, false), line_length);
 }
@@ -115,35 +116,30 @@ std::string encode(String s, bool url) {
 }  // namespace
 
 std::string base64_encode(unsigned char const *bytes_to_encode, size_t in_len, bool url) {
-  size_t len_encoded = (in_len + 2) / 3 * 4;
+  const size_t groups = in_len / 3 + (in_len % 3 != 0 ? 1 : 0);
+  if (groups > std::numeric_limits<size_t>::max() / 4) {
+    throw std::length_error("Base64 output size overflows size_t.");
+  }
+  size_t len_encoded = groups * 4;
 
   unsigned char trailing_char = url ? '.' : '=';
 
-  //
-  // Choose set of base64 characters. They differ
-  // for the last two positions, depending on the url
-  // parameter.
-  // A bool (as is the parameter url) is guaranteed
-  // to evaluate to either 0 or 1 in C++ therefore,
-  // the correct character set is chosen by subscripting
-  // base64_chars with url.
-  //
   const char *base64_chars_ = base64_chars[url];
 
   std::string ret;
   ret.reserve(len_encoded);
 
-  unsigned int pos = 0;
+  size_t pos = 0;
 
   while (pos < in_len) {
     // NOLINTNEXTLINE(hicpp-signed-bitwise)
     ret.push_back(base64_chars_[(bytes_to_encode[pos + 0] & 0xfc) >> 2]);
 
-    if (pos + 1 < in_len) {
+    if (in_len - pos > 1) {
       // NOLINTNEXTLINE(hicpp-signed-bitwise)
       ret.push_back(base64_chars_[((bytes_to_encode[pos + 0] & 0x03) << 4) + ((bytes_to_encode[pos + 1] & 0xf0) >> 4)]);
 
-      if (pos + 2 < in_len) {
+      if (in_len - pos > 2) {
         ret.push_back(
             // NOLINTNEXTLINE(hicpp-signed-bitwise)
             base64_chars_[((bytes_to_encode[pos + 1] & 0x0f) << 2) + ((bytes_to_encode[pos + 2] & 0xc0) >> 6)]);
@@ -164,6 +160,9 @@ std::string base64_encode(unsigned char const *bytes_to_encode, size_t in_len, b
       ret.push_back(trailing_char);
     }
 
+    if (in_len - pos <= 3) {
+      break;
+    }
     pos += 3;
   }
 
@@ -172,78 +171,63 @@ std::string base64_encode(unsigned char const *bytes_to_encode, size_t in_len, b
 
 template <typename String>
 static std::string decode(String encoded_string, bool remove_linebreaks) {
-  //
-  // decode(…) is templated so that it can be used with String = const std::string&
-  // or std::string_view (requires at least C++17)
-  //
-
   if (encoded_string.empty()) return std::string();
 
   if (remove_linebreaks) {
     std::string copy(encoded_string);
-    std::erase(copy, '\n');
+    std::erase_if(copy, [](char c) { return c == '\n' || c == '\r'; });
     return base64_decode(copy, false);
   }
 
   size_t length_of_string = encoded_string.length();
   size_t pos = 0;
 
-  //
-  // The approximate length (bytes) of the decoded string might be one or
-  // two bytes smaller, depending on the amount of trailing equal signs
-  // in the encoded string. This approximation is needed to reserve
-  // enough space in the string to be returned.
-  //
   size_t approx_length_of_decoded_string = length_of_string / 4 * 3;
   std::string ret;
   ret.reserve(approx_length_of_decoded_string);
 
+  constexpr auto is_padding = [](char c) noexcept { return c == '=' || c == '.'; };
+
   while (pos < length_of_string) {
-    //
-    // Iterate over encoded input string in chunks. The size of all
-    // chunks except the last one is 4 bytes.
-    //
-    // The last chunk might be padded with equal signs or dots
-    // in order to make it 4 bytes in size as well, but this
-    // is not required as per RFC 2045.
-    //
-    // All chunks except the last one produce three output bytes.
-    //
-    // The last chunk produces at least one and up to three bytes.
-    //
+    if (length_of_string - pos < 2) {
+      throw std::runtime_error("Input is not valid base64-encoded data.");
+    }
 
-    size_t pos_of_char_1 = pos_of_char(encoded_string[pos + 1]);
+    size_t pos_of_char_0 = pos_of_char(static_cast<unsigned char>(encoded_string[pos + 0]));
+    size_t pos_of_char_1 = pos_of_char(static_cast<unsigned char>(encoded_string[pos + 1]));
 
-    //
-    // Emit the first output byte that is produced in each chunk:
-    //
     // NOLINTNEXTLINE(hicpp-signed-bitwise)
-    ret.push_back(static_cast<std::string::value_type>(((pos_of_char(encoded_string[pos + 0])) << 2) +
-                                                       ((pos_of_char_1 & 0x30) >> 4)));  // NOLINT(hicpp-signed-bitwise)
+    ret.push_back(static_cast<std::string::value_type>((pos_of_char_0 << 2) + ((pos_of_char_1 & 0x30) >> 4)));
 
-    if ((pos + 2 <
-         length_of_string) &&  // Check for data that is not padded with equal signs (which is allowed by RFC 2045)
-        encoded_string[pos + 2] != '=' &&
-        encoded_string[pos + 2] != '.'  // accept URL-safe base 64 strings, too, so check for '.' also.
-    ) {
-      //
-      // Emit a chunk's second byte (which might not be produced in the last chunk).
-      //
-      unsigned int pos_of_char_2 = pos_of_char(encoded_string[pos + 2]);
-      ret.push_back(
-          // NOLINTNEXTLINE(hicpp-signed-bitwise)
-          static_cast<std::string::value_type>(((pos_of_char_1 & 0x0f) << 4) + ((pos_of_char_2 & 0x3c) >> 2)));
-
-      if ((pos + 3 < length_of_string) && encoded_string[pos + 3] != '=' && encoded_string[pos + 3] != '.') {
-        //
-        // Emit a chunk's third byte (which might not be produced in the last chunk).
-        //
+    if (pos + 2 < length_of_string) {
+      if (is_padding(encoded_string[pos + 2])) {
+        if (pos + 3 >= length_of_string || !is_padding(encoded_string[pos + 3]) || pos + 4 < length_of_string) {
+          throw std::runtime_error("Input is not valid base64-encoded data.");
+        }
+      } else {
+        unsigned int pos_of_char_2 = pos_of_char(static_cast<unsigned char>(encoded_string[pos + 2]));
         ret.push_back(
             // NOLINTNEXTLINE(hicpp-signed-bitwise)
-            static_cast<std::string::value_type>(((pos_of_char_2 & 0x03) << 6) + pos_of_char(encoded_string[pos + 3])));
+            static_cast<std::string::value_type>(((pos_of_char_1 & 0x0f) << 4) + ((pos_of_char_2 & 0x3c) >> 2)));
+
+        if (pos + 3 < length_of_string) {
+          if (is_padding(encoded_string[pos + 3])) {
+            if (pos + 4 < length_of_string) {
+              throw std::runtime_error("Input is not valid base64-encoded data.");
+            }
+          } else {
+            ret.push_back(
+                // NOLINTNEXTLINE(hicpp-signed-bitwise)
+                static_cast<std::string::value_type>(((pos_of_char_2 & 0x03) << 6) +
+                                                     pos_of_char(static_cast<unsigned char>(encoded_string[pos + 3]))));
+          }
+        }
       }
     }
 
+    if (length_of_string - pos <= 4) {
+      break;
+    }
     pos += 4;
   }
 

@@ -336,18 +336,24 @@ class Writer {
   bool WriteTimezoneOffset(int64_t offset) { return InternalWriteInt<tz_offset_int>(offset); }
 
   bool WriteBytes(const uint8_t *data, uint64_t size) {
+    if (size > std::numeric_limits<uint64_t>::max() - pos_) return false;
     if (data_ && pos_ + size > size_) return false;
     if (data_) memcpy(data_ + pos_, data, size);
     pos_ += size;
     return true;
   }
 
-  bool WriteBytes(const char *data, uint32_t size) {
+  bool WriteBytes(const char *data, uint64_t size) {
     static_assert(std::is_same_v<uint8_t, unsigned char>);
     return WriteBytes(reinterpret_cast<const uint8_t *>(data), size);
   }
 
-  uint32_t Written() const { return pos_; }
+  uint32_t CheckedWritten32() const {
+    if (pos_ > std::numeric_limits<uint32_t>::max() - 8U) {
+      throw PropertyValueException("Encoded property store exceeds maximum 32-bit buffer size");
+    }
+    return static_cast<uint32_t>(pos_);
+  }
 
   template <typename T, typename V>
   static constexpr bool FitsInt(V value) {
@@ -388,18 +394,23 @@ class Writer {
 
  private:
   uint8_t *data_{nullptr};
-  uint32_t size_{0};
-  uint32_t pos_{0};
+  uint64_t size_{std::numeric_limits<uint64_t>::max()};
+  uint64_t pos_{0};
 };
 
 // Helper class used to read data from the binary stream.
 class Reader {
  public:
-  Reader(const uint8_t *data, uint32_t size) : data_(data), size_(size) {}
+  Reader(const uint8_t *data, uint32_t size, uint64_t resolution_bits = FloatingPointResolution())
+      : data_(data), size_(size), resolution_bits_(resolution_bits) {}
 
-  Reader(Reader const &other, uint32_t offset, uint32_t size) : data_(other.data_ + offset), size_(size) {
+  Reader(Reader const &other, uint32_t offset, uint32_t size)
+      : data_(other.data_ + offset), size_(size), resolution_bits_(other.resolution_bits_) {
     DMG_ASSERT(other.size_ - offset >= size);
   }
+
+  const uint8_t *Data() const { return data_; }
+  uint64_t ResolutionBits() const { return resolution_bits_; }
 
   std::optional<Metadata> ReadMetadata() {
     if (pos_ + 1 > size_) return std::nullopt;
@@ -571,6 +582,7 @@ class Reader {
   const uint8_t *data_;
   uint32_t size_ = 0;
   uint32_t pos_ = 0;
+  uint64_t resolution_bits_ = 64;
 };
 
 auto CrsToSize(CoordinateReferenceSystem value) -> Size {
@@ -603,18 +615,19 @@ auto SizeToCrs(Size value) -> CoordinateReferenceSystem {
   }
 }
 
-inline Size DoubleFixedSize() {
-  auto const res = FloatingPointResolution();
+inline Size DoubleFixedSize(uint64_t res = FloatingPointResolution()) {
   if (res == 16) return Size::INT16;
   if (res == 32) return Size::INT32;
   DMG_ASSERT(res == 64, "Invalid floating point resolution: {}", res);
   return Size::INT64;
 }
 
-inline uint32_t DoubleElementByteSize() { return SizeToByteSize(DoubleFixedSize()); }
+inline uint32_t DoubleElementByteSize(uint64_t res = FloatingPointResolution()) {
+  return SizeToByteSize(DoubleFixedSize(res));
+}
 
 std::optional<double> ReadDoubleAs(Reader *reader, Size size) {
-  auto const res = FloatingPointResolution();
+  auto const res = reader->ResolutionBits();
   if (res == 16) return reader->ReadHalf(size);
   if (res == 32) return reader->ReadFloat(size);
   DMG_ASSERT(res == 64, "Invalid floating point resolution: {}", res);
@@ -960,8 +973,9 @@ bool DecodeList(Reader *reader, ListType list_type, uint32_t size, PropertyValue
     case ListType::DOUBLE: {
       PropertyValue::double_list_t list;
       list.reserve(size);
+      const Size elem_size = DoubleFixedSize(reader->ResolutionBits());
       for (uint32_t i = 0; i < size; ++i) {
-        auto double_v = ReadDoubleAs(reader, DoubleFixedSize());
+        auto double_v = ReadDoubleAs(reader, elem_size);
         if (!double_v) return false;
         list.emplace_back(*double_v);
       }
@@ -1012,7 +1026,7 @@ bool SkipList(Reader *reader, ListType list_type, uint32_t size) {
       return true;
     }
     case ListType::DOUBLE: {
-      return reader->SkipBytes(size * DoubleElementByteSize());
+      return reader->SkipBytes(size * DoubleElementByteSize(reader->ResolutionBits()));
     }
     case ListType::NUMERIC: {
       for (uint32_t i = 0; i < size; ++i) {
@@ -1031,12 +1045,12 @@ bool SkipList(Reader *reader, ListType list_type, uint32_t size) {
 bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const PropertyValue &value) {
   // Helper to get numeric value from PropertyValue list at index
   auto get_numeric_value_from_list = [](const PropertyValue &val,
-                                        size_t idx) -> std::optional<std::variant<int, double>> {
+                                        size_t idx) -> std::optional<std::variant<int64_t, double>> {
     switch (val.type()) {
       case PropertyValueType::List: {
         const auto &list_val = val.ValueList();
         if (list_val[idx].IsInt()) {
-          return static_cast<int>(list_val[idx].ValueInt());
+          return list_val[idx].ValueInt();
         }
         if (list_val[idx].IsDouble()) {
           return list_val[idx].ValueDouble();
@@ -1045,15 +1059,18 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
       }
       case PropertyValueType::IntList: {
         const auto &list_val = val.ValueIntList();
-        return list_val[idx];
+        return static_cast<int64_t>(list_val[idx]);
       }
       case PropertyValueType::DoubleList: {
         const auto &list_val = val.ValueDoubleList();
         return list_val[idx];
       }
       case PropertyValueType::NumericList: {
-        const auto &list_val = val.ValueNumericList();
-        return list_val[idx];
+        const auto &elem = val.ValueNumericList()[idx];
+        if (const auto *as_int = std::get_if<int>(&elem)) {
+          return static_cast<int64_t>(*as_int);
+        }
+        return std::get<double>(elem);
       }
       default:
         throw PropertyValueException("Invalid list type");
@@ -1061,7 +1078,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
   };
 
   // Helper to read numeric value from reader based on list_type
-  auto read_numeric_value = [&reader, list_type]() -> std::optional<std::variant<int, double>> {
+  auto read_numeric_value = [&reader, list_type]() -> std::optional<std::variant<int64_t, double>> {
     switch (list_type) {
       case ListType::PROPERTY_VALUE: {
         auto metadata = reader->ReadMetadata();
@@ -1069,7 +1086,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
         if (metadata->type == Type::INT) {
           auto int_v = reader->ReadInt(metadata->payload_size);
           if (!int_v) return std::nullopt;
-          return static_cast<int>(*int_v);
+          return *int_v;
         }
         if (metadata->type == Type::DOUBLE) {
           auto double_v = ReadDoubleAs(reader, metadata->payload_size);
@@ -1081,10 +1098,10 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
       case ListType::INT: {
         auto int_v = reader->ReadInt(Size::INT32);
         if (!int_v) return std::nullopt;
-        return static_cast<int>(*int_v);
+        return *int_v;
       }
       case ListType::DOUBLE: {
-        auto double_v = ReadDoubleAs(reader, DoubleFixedSize());
+        auto double_v = ReadDoubleAs(reader, DoubleFixedSize(reader->ResolutionBits()));
         if (!double_v) return std::nullopt;
         return *double_v;
       }
@@ -1094,7 +1111,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
         if (metadata->type == Type::INT) {
           auto int_v = reader->ReadInt(metadata->payload_size);
           if (!int_v) return std::nullopt;
-          return static_cast<int>(*int_v);
+          return *int_v;
         }
         if (metadata->type == Type::DOUBLE) {
           auto double_v = ReadDoubleAs(reader, metadata->payload_size);
@@ -1252,7 +1269,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
         vector_index_ids.push_back(*id);
       }
       value = PropertyValue(
-          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<float>{}});
+          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<double>{}});
       return true;
     }
   }
@@ -1358,7 +1375,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
       }
       return std::optional<PropertyValue>{
           std::in_place,
-          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<float>{}}};
+          PropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = utils::small_vector<double>{}}};
     }
   }
   return std::nullopt;
@@ -1417,7 +1434,7 @@ bool CompareLists(Reader *reader, ListType list_type, uint32_t size, const Prope
           break;
         }
         case ListType::DOUBLE: {
-          auto total_bytes = *size * DoubleElementByteSize();
+          auto total_bytes = *size * DoubleElementByteSize(reader->ResolutionBits());
           if (!reader->SkipBytes(total_bytes)) return false;
           list_property_size += total_bytes;
           break;
@@ -2368,16 +2385,26 @@ std::optional<utils::DecompressedBuffer> DecompressBuffer(DecodedBufferConst con
   //                   |--- -> compressed data
   // 0  1  2  3  4  5  6  (positions)
 
+  auto const data_offset = sizeof(uint32_t) + 1;
+  auto buffer_size = buffer_info.view.size_bytes();
+  if (buffer_size < data_offset) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
+
   uint32_t original_size = 0;
   auto const *data = buffer_info.view.data();
   memcpy(&original_size, data, sizeof(uint32_t));
 
   // we have to restore the original size of the compressed buffer + the size of the original buffer
   auto modifier = data[sizeof(uint32_t)];
-  auto buffer_size = buffer_info.view.size_bytes();
+  if (modifier >= 8 || (modifier != 0 && buffer_size < 8)) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
   auto compressed_size = (modifier != 0) ? (buffer_size - 8 + modifier) : buffer_size;
+  if (compressed_size < data_offset || compressed_size > buffer_size) [[unlikely]] {
+    throw PropertyValueException("Failed to decompress buffer");
+  }
 
-  auto data_offset = sizeof(uint32_t) + 1;
   auto compressed_buffer = std::span(data + data_offset, compressed_size - data_offset);
   auto const *compressor = utils::Compressor::GetInstance();
   auto decompressed_buffer = compressor->Decompress(compressed_buffer, original_size);
@@ -2714,6 +2741,10 @@ class ReaderPropPositionHistory {
 };
 
 namespace {
+bool PathIsStrictPrefixOf(PropertyPath const &prefix, PropertyPath const &candidate) {
+  return candidate.size() > prefix.size() && std::equal(prefix.begin(), prefix.end(), candidate.begin());
+}
+
 // Single forward pass over `reader`, exploiting the PropertyId-sorted order of
 // `ordered_properties`, handing each extracted value (or nullopt for missing)
 // to `sink`. Shared by the vector-returning and into-buffer overloads.
@@ -2724,18 +2755,25 @@ void ForEachExtractedValueMissingAsNull(Reader &reader, std::span<PropertyPath c
   auto max_history_depth = r::max_element(ordered_properties, {}, std::mem_fn(&PropertyPath::size))->size() - 1;
   ReaderPropPositionHistory history{max_history_depth};
 
-  auto const get_value =
-      [&](Reader &reader, PropertyPath const &path) -> std::pair<ExpectedPropertyStatus, std::optional<PropertyValue>> {
+  auto const get_value = [&](Reader &reader, PropertyPath const &path, bool rewind_for_descendant)
+      -> std::pair<ExpectedPropertyStatus, std::optional<PropertyValue>> {
     auto result = history.ScanToPropertyPathParent(reader, path);
     if (result != ExpectedPropertyStatus::EQUAL) {
       return {result, std::nullopt};
     }
-    return MatchSpecificProperty(&reader, path.back(), history.CurrentLimit());
+    const uint32_t before_leaf_pos = reader.GetPosition();
+    auto matched = MatchSpecificProperty(&reader, path.back(), history.CurrentLimit());
+    if (rewind_for_descendant && matched.first != ExpectedPropertyStatus::MISSING_DATA) {
+      reader.SetPosition(before_leaf_pos);
+    }
+    return matched;
   };
 
   auto safe_reader = SafeReader{reader, get_value, std::move(sink), std::nullopt};
-  for (auto &&path : ordered_properties) {
-    safe_reader(std::forward_as_tuple(path), std::tuple{});
+  for (std::size_t idx = 0; idx < ordered_properties.size(); ++idx) {
+    const bool rewind_for_descendant =
+        (idx + 1 < ordered_properties.size()) && PathIsStrictPrefixOf(ordered_properties[idx], ordered_properties[idx + 1]);
+    safe_reader(std::forward_as_tuple(ordered_properties[idx], rewind_for_descendant), std::tuple{});
   }
 }
 }  // namespace
@@ -2789,7 +2827,10 @@ void PropertyStore::ArePropertiesEqual(OrderedPropertyPaths const &ordered_prope
   ReaderPropPositionHistory history{max_history_depth};
 
   auto properties_are_equal = [&](Reader &reader) {
-    auto const get_result = [&](Reader &reader, PropertyPath const &path, PropertyValue const &cmp_val) {
+    auto const get_result = [&](Reader &reader,
+                                PropertyPath const &path,
+                                PropertyValue const &cmp_val,
+                                bool rewind_for_descendant) {
       auto const orig_reader = reader;
 
       auto result = history.ScanToPropertyPathParent(reader, path);
@@ -2798,8 +2839,12 @@ void PropertyStore::ArePropertiesEqual(OrderedPropertyPaths const &ordered_prope
       }
 
       auto leaf_property_id = path.back();
+      const uint32_t before_leaf_pos = reader.GetPosition();
 
       auto info = FindSpecificPropertyAndBufferInfoMinimal(&reader, leaf_property_id, history.CurrentLimit());
+      if (rewind_for_descendant && info.status != ExpectedPropertyStatus::MISSING_DATA) {
+        reader.SetPosition(before_leaf_pos);
+      }
       auto property_size = info.property_size();
       if (property_size != 0) {
         auto prop_reader = Reader(orig_reader, info.property_begin, property_size);
@@ -2815,8 +2860,9 @@ void PropertyStore::ArePropertiesEqual(OrderedPropertyPaths const &ordered_prope
 
     auto safe_reader = SafeReader{reader, get_result, apply_result, std::nullopt};
     for (auto [pos, property] : ranges::views::enumerate(paths)) {
+      const bool rewind_for_descendant = (pos + 1 < paths.size()) && PathIsStrictPrefixOf(property, paths[pos + 1]);
       auto const &value = values[position_lookup[pos]];
-      safe_reader(std::tuple{property, std::cref(value)}, std::tuple{std::cref(value), pos});
+      safe_reader(std::tuple{property, std::cref(value), rewind_for_descendant}, std::tuple{std::cref(value), pos});
     }
   };
   WithReader(properties_are_equal);
@@ -2888,8 +2934,8 @@ bool PropertyStore::SetProperty(PropertyId property, const PropertyValue &value)
   uint32_t property_size = 0;
   if (!value.IsNull()) {
     Writer writer;
-    EncodeProperty(&writer, property, value);
-    property_size = writer.Written();
+    MG_ASSERT(EncodeProperty(&writer, property, value), "Invalid property encoding!");
+    property_size = writer.CheckedWritten32();
   }
 
   auto buffer_info = GetDecodedBuffer(buffer_);
@@ -2936,7 +2982,11 @@ bool PropertyStore::SetProperty(PropertyId property, const PropertyValue &value)
     auto reader = Reader(current_view.data(), current_view.size_bytes());
     auto info = FindSpecificPropertyAndBufferInfo(&reader, property);
     existed = info.property_size != 0;
-    auto new_size = info.all_size - info.property_size + property_size;
+    const uint64_t new_size64 = uint64_t{info.all_size} - info.property_size + property_size;
+    if (new_size64 > std::numeric_limits<uint32_t>::max() - 8U) {
+      throw PropertyValueException("Encoded property store exceeds maximum 32-bit buffer size");
+    }
+    auto new_size = static_cast<uint32_t>(new_size64);
     auto new_size_to_multiple_of_8 = ToMultipleOf8(new_size);
 
     if (new_size == 0) {
@@ -3029,9 +3079,13 @@ bool PropertyStore::DoInitProperties(const TContainer &properties) {
       if (value.IsNull()) {
         continue;
       }
-      EncodeProperty(&writer, property, value);
+      MG_ASSERT(EncodeProperty(&writer, property, value), "Invalid property encoding!");
     }
-    property_size = writer.Written();
+    property_size = writer.CheckedWritten32();
+  }
+
+  if (property_size == 0) {
+    return true;
   }
 
   auto const buffer_info = SetupBuffer(buffer_, property_size);
@@ -3094,8 +3148,9 @@ std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>> PropertyStore:
     }
   }
 
-  ClearProperties();
-  MG_ASSERT(InitProperties(properties));
+  PropertyStore replacement;
+  MG_ASSERT(replacement.InitProperties(properties));
+  *this = std::move(replacement);
   return id_old_new_change;
 }
 
@@ -3125,7 +3180,11 @@ bool PropertyStore::InitProperties(const std::map<storage::PropertyId, storage::
 }
 
 bool PropertyStore::InitProperties(std::vector<std::pair<storage::PropertyId, storage::PropertyValue>> properties) {
-  std::ranges::sort(properties);
+  std::ranges::sort(properties, {}, &std::pair<storage::PropertyId, storage::PropertyValue>::first);
+  if (std::ranges::adjacent_find(properties, {}, &std::pair<storage::PropertyId, storage::PropertyValue>::first) !=
+      properties.end()) {
+    return false;
+  }
 
   return DoInitProperties(properties);
 }
@@ -3140,27 +3199,176 @@ bool PropertyStore::ClearProperties() {
   return true;
 }
 
+namespace {
+constexpr uint8_t kSerializedHeaderTypeMask = 0xF0;
+constexpr uint8_t kSerializedHeaderMagic = 0xF0;
+
+uint8_t EncodeFloatingPointResolutionHeader(uint64_t resolution_bits) {
+  if (resolution_bits == 16) return static_cast<uint8_t>(kSerializedHeaderMagic | 0x01U);
+  if (resolution_bits == 32) return static_cast<uint8_t>(kSerializedHeaderMagic | 0x02U);
+  return static_cast<uint8_t>(kSerializedHeaderMagic | 0x03U);
+}
+
+uint64_t DecodeFloatingPointResolutionHeader(uint8_t header) {
+  switch (header & 0x0FU) {
+    case 0x01U:
+      return 16;
+    case 0x02U:
+      return 32;
+    case 0x03U:
+      return 64;
+    default:
+      throw PropertyValueException("Corrupted serialized property store header");
+  }
+}
+
+double QuantizeDoubleForResolution(double value, uint64_t resolution_bits) noexcept {
+  if (resolution_bits == 16) {
+    return HalfToDouble(DoubleToHalf(value));
+  }
+  if (resolution_bits == 32) {
+    return static_cast<double>(static_cast<float>(value));
+  }
+  return value;
+}
+}  // namespace
+
+bool PropertyStore::NeedsPrecisionNormalization() noexcept { return FloatingPointResolution() != 64; }
+
+PropertyValue PropertyStore::NormalizeForStorage(const PropertyValue &value) {
+  const uint64_t res = FloatingPointResolution();
+  if (res == 64) {
+    return value;
+  }
+  switch (value.type()) {
+    case PropertyValueType::Double:
+      return PropertyValue{QuantizeDoubleForResolution(value.ValueDouble(), res)};
+    case PropertyValueType::DoubleList: {
+      PropertyValue::double_list_t out;
+      const auto &src = value.ValueDoubleList();
+      out.reserve(src.size());
+      for (const double item : src) {
+        out.push_back(QuantizeDoubleForResolution(item, res));
+      }
+      return PropertyValue{std::move(out)};
+    }
+    case PropertyValueType::NumericList: {
+      PropertyValue::numeric_list_t out;
+      const auto &src = value.ValueNumericList();
+      out.reserve(src.size());
+      for (const auto &item : src) {
+        if (const auto *as_double = std::get_if<double>(&item)) {
+          out.emplace_back(QuantizeDoubleForResolution(*as_double, res));
+        } else {
+          out.push_back(item);
+        }
+      }
+      return PropertyValue{std::move(out)};
+    }
+    case PropertyValueType::List: {
+      PropertyValue::list_t out;
+      const auto &src = value.ValueList();
+      out.reserve(src.size());
+      for (const auto &item : src) {
+        out.push_back(NormalizeForStorage(item));
+      }
+      return PropertyValue{std::move(out)};
+    }
+    case PropertyValueType::Map: {
+      PropertyValue::map_t out;
+      for (const auto &[k, v] : value.ValueMap()) {
+        out.emplace(k, NormalizeForStorage(v));
+      }
+      return PropertyValue{std::move(out)};
+    }
+    default:
+      return value;
+  }
+}
+
 std::string PropertyStore::StringBuffer() const {
   auto buffer_info = GetDecodedBuffer(buffer_);
-  return {buffer_info.view.begin(), buffer_info.view.end()};
+  if (buffer_info.storage_mode == BufferMode::EMPTY) {
+    return {};
+  }
+  return WithReader([](Reader &reader) -> std::string {
+    const uint8_t *const start = reader.Data();
+    uint32_t live_size = 0;
+    while (true) {
+      auto metadata = reader.ReadMetadata();
+      if (!metadata || metadata->type == Type::EMPTY) {
+        break;
+      }
+      auto property_id = reader.ReadUint(metadata->id_size);
+      if (!property_id || !SkipPropertyValue(&reader, metadata->type, metadata->payload_size)) {
+        break;
+      }
+      live_size = reader.GetPosition();
+    }
+    if (live_size == 0) {
+      return {};
+    }
+    std::string out;
+    out.resize(1 + live_size);
+    out[0] = static_cast<char>(EncodeFloatingPointResolutionHeader(FloatingPointResolution()));
+    memcpy(out.data() + 1, start, live_size);
+    return out;
+  });
 }
 
 void PropertyStore::SetBuffer(const std::string_view buffer) {
+  ClearProperties();
   if (buffer.empty()) {
     return;
   }
 
-  auto size = buffer.size();
+  std::string_view payload = buffer;
+  uint64_t saved_resolution = FloatingPointResolution();
+  const auto first_byte = static_cast<uint8_t>(buffer[0]);
+  if ((first_byte & kSerializedHeaderTypeMask) == kSerializedHeaderMagic) {
+    saved_resolution = DecodeFloatingPointResolutionHeader(first_byte);
+    payload = buffer.substr(1);
+    if (payload.empty()) {
+      return;
+    }
+  }
+
+  if (saved_resolution != FloatingPointResolution()) {
+    if (payload.size() > std::numeric_limits<uint32_t>::max()) {
+      throw PropertyValueException("Encoded property store exceeds maximum 32-bit buffer size");
+    }
+    Reader reader(reinterpret_cast<const uint8_t *>(payload.data()),
+                  static_cast<uint32_t>(payload.size()),
+                  saved_resolution);
+    std::map<PropertyId, PropertyValue> decoded_props;
+    PropertyValue value;
+    while (true) {
+      auto prop = DecodeAnyProperty(&reader, value);
+      if (!prop) break;
+      decoded_props.emplace(*prop, std::move(value));
+    }
+    MG_ASSERT(InitProperties(decoded_props), "Failed to re-encode property store across floating-point precision!");
+    return;
+  }
+
+  if (payload.size() > std::numeric_limits<uint32_t>::max() - 8U) {
+    throw PropertyValueException("Encoded property store exceeds maximum 32-bit buffer size");
+  }
+  const auto size = static_cast<uint32_t>(payload.size());
   auto buffer_info = SetupBuffer(buffer_, size);
   auto view = buffer_info.view;
 
-  for (uint i = 0; i < size; ++i) {
-    view[i] = static_cast<uint8_t>(buffer[i]);
+  memcpy(view.data(), payload.data(), size);
+  if (view.size_bytes() > size) {
+    memset(view.data() + size, 0, view.size_bytes() - size);
   }
 
-  // Make buffer perminant
+  // Make buffer permanent
   if (buffer_info.storage_mode == BufferMode::BUFFER) {
     SetSizeData(buffer_, view.size_bytes(), view.data());
+  }
+  if (FLAGS_storage_property_store_compression_enabled) {
+    CompressBuffer(buffer_, buffer_info);
   }
 }
 

@@ -16,13 +16,13 @@ can develop procedures without setting Memgraph up for each run, and run them fr
 when they're implemented in full.
 """
 
+from collections import namedtuple
+from copy import deepcopy
 import datetime
+from functools import wraps
 import inspect
 import sys
 import typing
-from collections import namedtuple
-from copy import deepcopy
-from functools import wraps
 
 import _mgp_mock
 
@@ -38,6 +38,14 @@ class InvalidContextError(Exception):
 class UnknownError(Exception):
     """
     Signals unspecified failure.
+    """
+
+    pass
+
+
+class OutOfRangeError(Exception):
+    """
+    Signals that an index-like parameter has a value outside its valid range.
     """
 
     pass
@@ -124,13 +132,12 @@ Property = namedtuple("Property", ("name", "value"))
 class Properties:
     """Collection of the properties of a vertex or an edge."""
 
-    __slots__ = ("_vertex_or_edge", "_len")
+    __slots__ = ("_vertex_or_edge",)
 
     def __init__(self, vertex_or_edge):
         if not isinstance(vertex_or_edge, (_mgp_mock.Vertex, _mgp_mock.Edge)):
             raise TypeError(f"Expected _mgp_mock.Vertex or _mgp_mock.Edge, got {type(vertex_or_edge)}")
 
-        self._len = None
         self._vertex_or_edge = vertex_or_edge
 
     def __deepcopy__(self, memo):
@@ -295,10 +302,7 @@ class Properties:
         if not self._vertex_or_edge.is_valid():
             raise InvalidContextError()
 
-        if self._len is None:
-            self._len = sum(1 for _ in self.items())
-
-        return self._len
+        return sum(1 for _ in self.items())
 
     def __iter__(self) -> typing.Iterable[str]:
         """
@@ -416,6 +420,23 @@ class Properties:
             return True
         except KeyError:
             return False
+
+    def set_properties(self, properties: dict) -> None:
+        if not self._vertex_or_edge.is_valid():
+            raise InvalidContextError()
+
+        if not self._vertex_or_edge.underlying_graph_is_mutable():
+            raise ImmutableObjectError("Cannot modify immutable object.")
+
+        if self._vertex_or_edge.is_deleted():
+            raise DeletedObjectError("Accessing deleted object.")
+
+        for property_name, value in properties.items():
+            if isinstance(value, (Vertex, Edge, Path)):
+                raise ValueConversionError("Value conversion failed")
+
+        for property_name, value in properties.items():
+            self._vertex_or_edge.set_property(property_name, value)
 
 
 class EdgeType:
@@ -994,18 +1015,23 @@ class Path:
 
         return self._edges
 
+    @property
+    def length(self) -> int:
+        if not self.is_valid():
+            raise InvalidContextError()
+        return self._path.size()
+
 
 class Vertices:
     """An iterable structure of the vertices in a graph."""
 
-    __slots__ = ("_graph", "_len")
+    __slots__ = ("_graph",)
 
     def __init__(self, graph):
         if not isinstance(graph, _mgp_mock.Graph):
             raise TypeError(f"Expected '_mgp_mock.Graph', got '{type(graph)}'")
 
         self._graph = graph
-        self._len = None
 
     def __deepcopy__(self, memo):
         # In line with the Python API, this is the same as the shallow copy.
@@ -1084,10 +1110,7 @@ class Vertices:
         if not self.is_valid():
             raise InvalidContextError()
 
-        if not self._len:
-            self._len = sum(1 for _ in self)
-
-        return self._len
+        return sum(1 for _ in self)
 
 
 class Record:
@@ -1397,6 +1420,17 @@ class ProcCtx:
 
         return self._graph
 
+    def must_abort(self) -> bool:
+        """Return False in mock execution unless overridden."""
+        if not self.is_valid():
+            raise InvalidContextError()
+        return False
+
+    def check_must_abort(self) -> None:
+        """Raise AbortError if must_abort() is True."""
+        if self.must_abort():
+            raise AbortError()
+
 
 # Additional typing support
 
@@ -1434,6 +1468,16 @@ def raise_if_does_not_meet_requirements(func: typing.Callable[..., Record]):
         raise NotImplementedError("Generator functions are not supported")
 
 
+def _consume_proc_result(result_record):
+    if result_record is None or isinstance(result_record, (Record, list, tuple, str, bytes, bytearray, dict)):
+        return result_record
+    try:
+        iterator = iter(result_record)
+    except TypeError:
+        return result_record
+    return list(iterator)
+
+
 def _register_proc(func: typing.Callable[..., Record], is_write: bool):
     raise_if_does_not_meet_requirements(func)
 
@@ -1444,32 +1488,32 @@ def _register_proc(func: typing.Callable[..., Record], is_write: bool):
 
         @wraps(func)
         def wrapper(ctx, *args):
-            result_record = None
-
             if is_write:
                 ctx_copy = ProcCtx(deepcopy(ctx._graph._graph.nx))
-
-                result_record = func(ctx_copy, *args)
-
-                ctx._graph._graph = deepcopy(ctx_copy._graph._graph)
-
-                # Invalidate context after execution
-                ctx_copy._graph._graph.invalidate()
+                try:
+                    result_record = _consume_proc_result(func(ctx_copy, *args))
+                    committed_nx = ctx_copy._graph._graph.nx
+                    if not ctx._graph._graph.is_immutable():
+                        orig_nx = ctx._graph._graph.nx
+                        orig_nx.clear()
+                        orig_nx.add_nodes_from(deepcopy(list(committed_nx.nodes(data=True))))
+                        orig_nx.add_edges_from(deepcopy(list(committed_nx.edges(keys=True, data=True))))
+                    return result_record
+                finally:
+                    ctx_copy._graph._graph.invalidate()
+                    ctx._graph._graph.invalidate()
             else:
                 ctx._graph._graph.make_immutable()
-
-                result_record = func(ctx, *args)
-
-                # Invalidate context after execution
-                ctx._graph._graph.invalidate()
-
-            return result_record
+                try:
+                    return _consume_proc_result(func(ctx, *args))
+                finally:
+                    ctx._graph._graph.invalidate()
 
     else:
 
         @wraps(func)
         def wrapper(*args):
-            return func(*args)
+            return _consume_proc_result(func(*args))
 
     if sig.return_annotation is not sig.empty:
         record = sig.return_annotation
@@ -1628,13 +1672,10 @@ def function(func: typing.Callable):
         @wraps(func)
         def wrapper(ctx, *args):
             ctx._graph._graph.make_immutable()
-
-            result = func(ctx, *args)
-
-            # Invalidate context after execution
-            ctx._graph._graph.invalidate()
-
-            return result
+            try:
+                return func(ctx, *args)
+            finally:
+                ctx._graph._graph.invalidate()
 
     else:
 
@@ -1645,16 +1686,74 @@ def function(func: typing.Callable):
     return wrapper
 
 
+class Logger:
+    """Mock Logger mirroring mgp.Logger."""
+
+    def info(self, out: str) -> None:
+        pass
+
+    def warning(self, out: str) -> None:
+        pass
+
+    def critical(self, out: str) -> None:
+        pass
+
+    def error(self, out: str) -> None:
+        pass
+
+    def trace(self, out: str) -> None:
+        pass
+
+    def debug(self, out: str) -> None:
+        pass
+
+
 def _wrap_exceptions():
+    def _rethrow_mock_error(exc: Exception) -> None:
+        mapping = (
+            (_mgp_mock.LogicErrorError, LogicErrorError),
+            (_mgp_mock.ImmutableObjectError, ImmutableObjectError),
+            (_mgp_mock.DeletedObjectError, DeletedObjectError),
+            (_mgp_mock.InvalidArgumentError, InvalidArgumentError),
+            (_mgp_mock.OutOfRangeError, OutOfRangeError),
+        )
+        for native_cls, public_cls in mapping:
+            if isinstance(exc, native_cls):
+                if isinstance(exc, public_cls):
+                    raise exc
+                raise public_cls(exc)
+        raise exc
+
     def wrap_function(func):
+        if inspect.isgeneratorfunction(func):
+
+            @wraps(func)
+            def wrapped_gen(*args, **kwargs):
+                try:
+                    yield from func(*args, **kwargs)
+                except (
+                    _mgp_mock.LogicErrorError,
+                    _mgp_mock.ImmutableObjectError,
+                    _mgp_mock.DeletedObjectError,
+                    _mgp_mock.InvalidArgumentError,
+                    _mgp_mock.OutOfRangeError,
+                ) as e:
+                    _rethrow_mock_error(e)
+
+            return wrapped_gen
+
         @wraps(func)
         def wrapped_func(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
-            except _mgp_mock.LogicErrorError as e:
-                raise LogicErrorError(e)
-            except _mgp_mock.ImmutableObjectError as e:
-                raise ImmutableObjectError(e)
+            except (
+                _mgp_mock.LogicErrorError,
+                _mgp_mock.ImmutableObjectError,
+                _mgp_mock.DeletedObjectError,
+                _mgp_mock.InvalidArgumentError,
+                _mgp_mock.OutOfRangeError,
+            ) as e:
+                _rethrow_mock_error(e)
 
         return wrapped_func
 

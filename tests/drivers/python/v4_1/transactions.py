@@ -15,6 +15,7 @@
 from neo4j import GraphDatabase, basic_auth
 from neo4j.exceptions import ClientError, TransientError
 
+
 def tx_error(tx, name, name2):
     a = tx.run("CREATE (a:Person {name: $name}) RETURN a", name=name).value()
     print(a[0])

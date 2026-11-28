@@ -14,11 +14,11 @@ import shutil
 import sys
 import time
 
+from common import execute_and_fetch_all, get_data_path, get_logs_path
 import interactive_mg_runner
+from mg_utils import mg_sleep_and_assert_collection
 import mgclient
 import pytest
-from common import execute_and_fetch_all, get_data_path, get_logs_path
-from mg_utils import mg_sleep_and_assert_collection
 
 interactive_mg_runner.SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 interactive_mg_runner.PROJECT_DIR = os.path.normpath(

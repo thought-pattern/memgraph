@@ -12,8 +12,8 @@
 import datetime
 import sys
 
-import pytest
 from common import memgraph
+import pytest
 
 
 def test_datetime_with_timezone_only(memgraph):

@@ -80,7 +80,7 @@ class Telemetry final {
   void Stop();
 
  private:
-  void StoreData(const nlohmann::json &event, const nlohmann::json &data);
+  bool StoreData(const nlohmann::json &event, const nlohmann::json &data);
   void SendData(int timeout_seconds = 2 * 60);
   /// Iterates over all collectors and calls associated functions synchronously.
   void CollectData(const std::string &event = "");

@@ -18,12 +18,17 @@ STAGING_BRANCH="$4"
 REPO_URL="$5"
 REPO_OWNER="$6"
 
-# Fetch the PR branch or commit (handles both internal and external PRs)
-echo "Fetching feature branch: $BRANCH_NAME"
+# Fetch the recorded PR commit (handles both internal and external PRs without
+# drifting if BRANCH_NAME advances after get_pr_info.sh ran)
+echo "Fetching commit $COMMIT_SHA from $BRANCH_NAME"
 if [ "$REPO_OWNER" = "memgraph" ]; then
-    git fetch origin "$BRANCH_NAME"
+    git fetch origin "$COMMIT_SHA" || git fetch origin "$BRANCH_NAME"
 else
-    git fetch "$REPO_URL" "$BRANCH_NAME:$BRANCH_NAME"
+    git fetch "$REPO_URL" "$COMMIT_SHA" || git fetch "$REPO_URL" "$BRANCH_NAME"
+fi
+if ! git cat-file -e "${COMMIT_SHA}^{commit}" 2>/dev/null; then
+    echo "Error: Recorded commit $COMMIT_SHA is not reachable after fetching '$BRANCH_NAME'" >&2
+    exit 1
 fi
 
 # Check existence of staging branch (local / remote)
@@ -62,14 +67,10 @@ if [ "$BASE_MASTER" = "true" ]; then
     git pull origin master
     git checkout -b "$STAGING_BRANCH"
 
-    # Merge the feature branch into staging
-    if [ "$REPO_OWNER" = "memgraph" ]; then
-        git merge "$COMMIT_SHA" --no-edit
-    else
-        git merge "$BRANCH_NAME" --no-edit
-    fi
+    # Merge the exact recorded commit SHA into staging regardless of repo owner
+    git merge "$COMMIT_SHA" --no-edit
 
-    echo "Created staging branch from master and merged feature branch"
+    echo "Created staging branch from master and merged commit $COMMIT_SHA"
 else
     echo "Creating direct copy of feature branch..."
 

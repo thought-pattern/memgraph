@@ -1,5 +1,5 @@
-import pytest
 from gqlalchemy import Memgraph
+import pytest
 
 
 def test_flatten_e2e():

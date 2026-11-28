@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import get_bytes, memgraph
+import pytest
 
 
 def test_property_size_on_null_prop(memgraph):

@@ -13,8 +13,11 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <tuple>
+#include <variant>
+#include <vector>
 
 #include "storage/v2/durability/marker.hpp"
 #include "storage/v2/durability/serialization.hpp"
@@ -42,7 +45,7 @@ template <typename FileType>
 std::expected<void, utils::FileWriteError> Encoder<FileType>::Initialize(const std::filesystem::path &path) {
   logical_position_ = 0;
   logical_size_ = 0;
-  return file_.Open(path, FileType::Mode::OVERWRITE_EXISTING);
+  return file_.Open(path, FileType::Mode::TRUNCATE_EXISTING);
 }
 
 template <typename FileType>
@@ -57,6 +60,19 @@ std::expected<void, utils::FileWriteError> Encoder<FileType>::Initialize(const s
 }
 
 template <typename FileType>
+std::expected<void, utils::FileWriteError> Encoder<FileType>::InitializeNew(const std::filesystem::path &path,
+                                                                            const std::string_view magic,
+                                                                            uint64_t version) {
+  logical_position_ = 0;
+  logical_size_ = 0;
+  if (auto opened = file_.Open(path, FileType::Mode::CREATE_NEW); !opened) return opened;
+  Write(reinterpret_cast<const uint8_t *>(magic.data()), magic.size());
+  auto version_encoded = utils::HostToLittleEndian(version);
+  Write(reinterpret_cast<const uint8_t *>(&version_encoded), sizeof(version_encoded));
+  return {};
+}
+
+template <typename FileType>
 bool Encoder<FileType>::OpenExisting(const std::filesystem::path &path) {
   if (!file_.Open(path, FileType::Mode::APPEND_TO_EXISTING)) {
     return false;
@@ -64,6 +80,16 @@ bool Encoder<FileType>::OpenExisting(const std::filesystem::path &path) {
   // The file is opened for appending, so writing continues from the current end of the file.
   logical_position_ = file_.GetSize();
   logical_size_ = logical_position_;
+  return true;
+}
+
+template <typename FileType>
+bool Encoder<FileType>::OpenForPatch(const std::filesystem::path &path) {
+  if (!file_.Open(path, FileType::Mode::PATCH_EXISTING)) {
+    return false;
+  }
+  logical_position_ = 0;
+  logical_size_ = file_.GetSize();
   return true;
 }
 
@@ -386,12 +412,19 @@ std::optional<Marker> CastToMarker(uint8_t value) {
   return std::nullopt;
 }
 
-std::optional<uint64_t> ReadSize(Decoder *decoder) {
+uint64_t RemainingBytes(Decoder *decoder) {
+  auto const file_size = decoder->GetSize();
+  auto const pos = decoder->GetPosition();
+  return pos <= file_size ? (file_size - pos) : 0;
+}
+
+std::optional<uint64_t> ReadSize(Decoder *decoder, uint64_t min_bytes_per_element = 1) {
   uint64_t size;
   if (!decoder->Read(reinterpret_cast<uint8_t *>(&size), sizeof(size))) return std::nullopt;
   size = utils::LittleEndianToHost(size);
-  // Bound check
-  if (auto const file_size = decoder->GetSize(); size >= file_size) {
+  auto const remaining = RemainingBytes(decoder);
+  if (min_bytes_per_element == 0 || size > (remaining / min_bytes_per_element)) {
+    decoder->MarkTruncatedRead();
     return std::nullopt;
   }
   return size;
@@ -399,6 +432,7 @@ std::optional<uint64_t> ReadSize(Decoder *decoder) {
 }  // namespace
 
 std::optional<uint64_t> Decoder::Initialize(const std::filesystem::path &path, const std::string &magic) {
+  truncated_read_ = false;
   if (!file_.Open(path)) return std::nullopt;
   std::string file_magic(magic.size(), '\0');
   if (!Read(reinterpret_cast<uint8_t *>(file_magic.data()), file_magic.size())) return std::nullopt;
@@ -408,9 +442,21 @@ std::optional<uint64_t> Decoder::Initialize(const std::filesystem::path &path, c
   return utils::LittleEndianToHost(version_encoded);
 }
 
-bool Decoder::Read(uint8_t *data, size_t size) { return file_.Read(data, size); }
+bool Decoder::Read(uint8_t *data, size_t size) {
+  if (!file_.Read(data, size)) {
+    truncated_read_ = true;
+    return false;
+  }
+  return true;
+}
 
-bool Decoder::Peek(uint8_t *data, size_t size) { return file_.Peek(data, size); }
+bool Decoder::Peek(uint8_t *data, size_t size) {
+  if (!file_.Peek(data, size)) {
+    truncated_read_ = true;
+    return false;
+  }
+  return true;
+}
 
 std::optional<Marker> Decoder::PeekMarker() {
   uint8_t value;
@@ -522,7 +568,7 @@ std::optional<TemporalData> ReadTemporalData(Decoder &decoder) {
   if (!inner_marker || *inner_marker != Marker::TYPE_TEMPORAL_DATA) return std::nullopt;
 
   const auto type = decoder.ReadUint();
-  if (!type) return std::nullopt;
+  if (!type || *type > static_cast<uint64_t>(TemporalType::Duration)) return std::nullopt;
 
   const auto microseconds = decoder.ReadUint();
   if (!microseconds) return std::nullopt;
@@ -535,229 +581,298 @@ std::optional<ZonedTemporalData> ReadZonedTemporalData(Decoder &decoder) {
   if (!inner_marker || *inner_marker != Marker::TYPE_ZONED_TEMPORAL_DATA) return std::nullopt;
 
   const auto type = decoder.ReadUint();
-  if (!type) return std::nullopt;
+  if (!type || *type > static_cast<uint64_t>(ZonedTemporalType::ZonedDateTime)) return std::nullopt;
 
   const auto microseconds = decoder.ReadUint();
   if (!microseconds) return std::nullopt;
 
   auto marker = decoder.PeekMarker();
   if (!marker) return std::nullopt;
-  switch (*marker) {
-    case Marker::TYPE_STRING: {
-      auto timezone_name = decoder.ReadString();
-      if (!timezone_name) return std::nullopt;
-      return ZonedTemporalData{static_cast<ZonedTemporalType>(*type),
-                               utils::AsSysTime(std::bit_cast<int64_t>(*microseconds)),
-                               utils::Timezone(*timezone_name)};
+  try {
+    switch (*marker) {
+      case Marker::TYPE_STRING: {
+        auto timezone_name = decoder.ReadString();
+        if (!timezone_name) return std::nullopt;
+        return ZonedTemporalData{static_cast<ZonedTemporalType>(*type),
+                                 utils::AsSysTime(std::bit_cast<int64_t>(*microseconds)),
+                                 utils::Timezone(*timezone_name)};
+      }
+      case Marker::TYPE_INT: {
+        auto offset_minutes = decoder.ReadUint();
+        if (!offset_minutes) return std::nullopt;
+        return ZonedTemporalData{static_cast<ZonedTemporalType>(*type),
+                                 utils::AsSysTime(std::bit_cast<int64_t>(*microseconds)),
+                                 utils::Timezone(std::chrono::minutes{std::bit_cast<int64_t>(*offset_minutes)})};
+      }
+      default:
+        break;
     }
-    case Marker::TYPE_INT: {
-      auto offset_minutes = decoder.ReadUint();
-      if (!offset_minutes) return std::nullopt;
-      return ZonedTemporalData{static_cast<ZonedTemporalType>(*type),
-                               utils::AsSysTime(std::bit_cast<int64_t>(*microseconds)),
-                               utils::Timezone(std::chrono::minutes{*offset_minutes})};
-    }
-    default:
-      break;
+  } catch (const std::exception &) {
+    return std::nullopt;
   }
   return std::nullopt;
 }
 }  // namespace
 
 std::optional<ExternalPropertyValue> Decoder::ReadExternalPropertyValue() {
-  auto pv_marker = ReadMarker();
-  if (!pv_marker || *pv_marker != Marker::TYPE_PROPERTY_VALUE) return std::nullopt;
+  struct ListFrame {
+    uint64_t remaining{0};
+    ExternalPropertyValue::list_t list;
+    bool all_ints{true};
+    bool all_doubles{true};
+    bool all_numeric{true};
+  };
+  struct MapFrame {
+    uint64_t remaining{0};
+    std::string pending_key;
+    ExternalPropertyValue::map_t map;
+  };
+  using ContainerFrame = std::variant<ListFrame, MapFrame>;
 
-  auto marker = PeekMarker();
-  if (!marker) return std::nullopt;
-  switch (*marker) {
-    case Marker::TYPE_NULL: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_NULL) return std::nullopt;
-      return ExternalPropertyValue();
+  auto finalize_list = [](ListFrame &&lf) -> ExternalPropertyValue {
+    if (lf.all_ints) {
+      return ExternalPropertyValue(IntListTag{}, std::move(lf.list));
     }
-    case Marker::TYPE_BOOL: {
-      auto value = ReadBool();
-      if (!value) return std::nullopt;
-      return ExternalPropertyValue(*value);
+    if (lf.all_doubles) {
+      return ExternalPropertyValue(DoubleListTag{}, std::move(lf.list));
     }
-    case Marker::TYPE_INT: {
-      auto value = ReadUint();
-      if (!value) return std::nullopt;
-      return ExternalPropertyValue(std::bit_cast<int64_t>(*value));
+    if (lf.all_numeric) {
+      return ExternalPropertyValue(NumericListTag{}, std::move(lf.list));
     }
-    case Marker::TYPE_DOUBLE: {
-      auto value = ReadDouble();
-      if (!value) return std::nullopt;
-      return ExternalPropertyValue(*value);
-    }
-    case Marker::TYPE_STRING: {
-      auto value = ReadString();
-      if (!value) return std::nullopt;
-      return ExternalPropertyValue(std::move(*value));
-    }
-    case Marker::TYPE_LIST: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_LIST) return std::nullopt;
-      auto size = ReadSize(this);
-      if (!size) return std::nullopt;
+    return ExternalPropertyValue(std::move(lf.list));
+  };
 
-      ExternalPropertyValue::list_t list;
-      bool all_ints = true;
-      bool all_doubles = true;
-      bool all_numeric = true;
-      list.reserve(*size);
-      for (uint64_t i = 0; i < *size; ++i) {
-        auto item = ReadExternalPropertyValue();
-        if (!item) return std::nullopt;
-        // An integer too wide for the packed form leaves the list boxed, which
-        // is the only representation that holds it at the width it was given.
-        auto const packable_int = item->IsInt() && FitsAPackedList(item->ValueInt());
-        all_ints &= packable_int;
-        all_doubles &= item->IsDouble();
-        all_numeric &= packable_int || item->IsDouble();
-        list.emplace_back(std::move(*item));
+  std::vector<ContainerFrame> stack;
+
+  while (true) {
+    auto pv_marker = ReadMarker();
+    if (!pv_marker || *pv_marker != Marker::TYPE_PROPERTY_VALUE) return std::nullopt;
+
+    auto marker = PeekMarker();
+    if (!marker) return std::nullopt;
+
+    std::optional<ExternalPropertyValue> completed;
+    switch (*marker) {
+      case Marker::TYPE_NULL: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_NULL) return std::nullopt;
+        completed.emplace();
+        break;
       }
-      if (all_ints) {
-        return ExternalPropertyValue(IntListTag{}, std::move(list));
+      case Marker::TYPE_BOOL: {
+        auto value = ReadBool();
+        if (!value) return std::nullopt;
+        completed.emplace(*value);
+        break;
       }
-      if (all_doubles) {
-        return ExternalPropertyValue(DoubleListTag{}, std::move(list));
+      case Marker::TYPE_INT: {
+        auto value = ReadUint();
+        if (!value) return std::nullopt;
+        completed.emplace(std::bit_cast<int64_t>(*value));
+        break;
       }
-      if (all_numeric) {
-        return ExternalPropertyValue(NumericListTag{}, std::move(list));
+      case Marker::TYPE_DOUBLE: {
+        auto value = ReadDouble();
+        if (!value) return std::nullopt;
+        completed.emplace(*value);
+        break;
       }
-      return ExternalPropertyValue(std::move(list));
-    }
-    case Marker::TYPE_MAP: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_MAP) return std::nullopt;
-      auto size = ReadSize(this);
-      if (!size) return std::nullopt;
-      auto value = ExternalPropertyValue::map_t{};
-      do_reserve(value, *size);
-      for (uint64_t i = 0; i < *size; ++i) {
-        auto key = ReadString();
-        if (!key) return std::nullopt;
-        auto item = ReadExternalPropertyValue();
-        if (!item) return std::nullopt;
-        value.emplace(std::move(*key), std::move(*item));
+      case Marker::TYPE_STRING: {
+        auto value = ReadString();
+        if (!value) return std::nullopt;
+        completed.emplace(std::move(*value));
+        break;
       }
-      return ExternalPropertyValue(std::move(value));
-    }
-    case Marker::TYPE_TEMPORAL_DATA: {
-      const auto maybe_temporal_data = ReadTemporalData(*this);
-      if (!maybe_temporal_data) return std::nullopt;
-      return ExternalPropertyValue(*maybe_temporal_data);
-    }
-    case Marker::TYPE_ZONED_TEMPORAL_DATA: {
-      const auto maybe_zoned_temporal_data = ReadZonedTemporalData(*this);
-      if (!maybe_zoned_temporal_data) return std::nullopt;
-      return ExternalPropertyValue(*maybe_zoned_temporal_data);
-    }
-    case Marker::TYPE_ENUM: {
-      const auto maybe_enum_value = ReadEnumValue();
-      if (!maybe_enum_value) return std::nullopt;
-      return ExternalPropertyValue(*maybe_enum_value);
-    }
-    case Marker::TYPE_POINT_2D: {
-      const auto maybe_point_2d_value = ReadPoint2dValue();
-      if (!maybe_point_2d_value) return std::nullopt;
-      return ExternalPropertyValue(*maybe_point_2d_value);
-    }
-    case Marker::TYPE_POINT_3D: {
-      const auto maybe_point_3d_value = ReadPoint3dValue();
-      if (!maybe_point_3d_value) return std::nullopt;
-      return ExternalPropertyValue(*maybe_point_3d_value);
-    }
-    case Marker::TYPE_VECTOR_INDEX_ID: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_VECTOR_INDEX_ID) return std::nullopt;
-      auto size = ReadSize(this);
-      if (!size) return std::nullopt;
-      utils::small_vector<std::string> vector_index_ids;
-      vector_index_ids.reserve(*size);
-      for (uint64_t i = 0; i < *size; ++i) {
-        auto index_name = ReadString();
-        if (!index_name) return std::nullopt;
-        vector_index_ids.emplace_back(std::move(*index_name));
+      case Marker::TYPE_LIST: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_LIST) return std::nullopt;
+        auto size = ReadSize(this, 2);
+        if (!size) return std::nullopt;
+        if (*size == 0) {
+          completed.emplace(IntListTag{}, ExternalPropertyValue::list_t{});
+          break;
+        }
+        ListFrame lf;
+        lf.remaining = *size;
+        lf.list.reserve(*size);
+        stack.emplace_back(std::move(lf));
+        continue;
       }
-      size = ReadSize(this);
-      if (!size) return std::nullopt;
-      utils::small_vector<float> list;
-      list.reserve(*size);
-      for (uint64_t i = 0; i < *size; ++i) {
-        auto item = ReadDouble();
-        if (!item) return std::nullopt;
-        list.push_back(static_cast<float>(*item));
+      case Marker::TYPE_MAP: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_MAP) return std::nullopt;
+        auto size = ReadSize(this, 11);
+        if (!size) return std::nullopt;
+        if (*size == 0) {
+          completed.emplace(ExternalPropertyValue::map_t{});
+          break;
+        }
+        auto first_key = ReadString();
+        if (!first_key) return std::nullopt;
+        MapFrame mf;
+        mf.remaining = *size;
+        mf.pending_key = std::move(*first_key);
+        do_reserve(mf.map, *size);
+        stack.emplace_back(std::move(mf));
+        continue;
       }
-      return ExternalPropertyValue(
-          ExternalPropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = std::move(list)});
+      case Marker::TYPE_TEMPORAL_DATA: {
+        const auto maybe_temporal_data = ReadTemporalData(*this);
+        if (!maybe_temporal_data) return std::nullopt;
+        completed.emplace(*maybe_temporal_data);
+        break;
+      }
+      case Marker::TYPE_ZONED_TEMPORAL_DATA: {
+        const auto maybe_zoned_temporal_data = ReadZonedTemporalData(*this);
+        if (!maybe_zoned_temporal_data) return std::nullopt;
+        completed.emplace(*maybe_zoned_temporal_data);
+        break;
+      }
+      case Marker::TYPE_ENUM: {
+        const auto maybe_enum_value = ReadEnumValue();
+        if (!maybe_enum_value) return std::nullopt;
+        completed.emplace(*maybe_enum_value);
+        break;
+      }
+      case Marker::TYPE_POINT_2D: {
+        const auto maybe_point_2d_value = ReadPoint2dValue();
+        if (!maybe_point_2d_value) return std::nullopt;
+        completed.emplace(*maybe_point_2d_value);
+        break;
+      }
+      case Marker::TYPE_POINT_3D: {
+        const auto maybe_point_3d_value = ReadPoint3dValue();
+        if (!maybe_point_3d_value) return std::nullopt;
+        completed.emplace(*maybe_point_3d_value);
+        break;
+      }
+      case Marker::TYPE_VECTOR_INDEX_ID: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_VECTOR_INDEX_ID) return std::nullopt;
+        auto size = ReadSize(this, 9);
+        if (!size) return std::nullopt;
+        utils::small_vector<std::string> vector_index_ids;
+        vector_index_ids.reserve(*size);
+        for (uint64_t i = 0; i < *size; ++i) {
+          auto index_name = ReadString();
+          if (!index_name) return std::nullopt;
+          vector_index_ids.emplace_back(std::move(*index_name));
+        }
+        size = ReadSize(this, 9);
+        if (!size) return std::nullopt;
+        utils::small_vector<double> list;
+        list.reserve(*size);
+        for (uint64_t i = 0; i < *size; ++i) {
+          auto item = ReadDouble();
+          if (!item) return std::nullopt;
+          list.push_back(*item);
+        }
+        completed.emplace(
+            ExternalPropertyValue::VectorIndexIdData{.ids = std::move(vector_index_ids), .vector = std::move(list)});
+        break;
+      }
+
+      case Marker::TYPE_PROPERTY_VALUE:
+      case Marker::SECTION_VERTEX:
+      case Marker::SECTION_EDGE:
+      case Marker::SECTION_MAPPER:
+      case Marker::SECTION_METADATA:
+      case Marker::SECTION_INDICES:
+      case Marker::SECTION_CONSTRAINTS:
+      case Marker::SECTION_DELTA:
+      case Marker::SECTION_EPOCH_HISTORY:
+      case Marker::SECTION_EDGE_INDICES:
+      case Marker::SECTION_OFFSETS:
+      case Marker::SECTION_ENUMS:
+      case Marker::SECTION_TTL:
+      case Marker::DELTA_VERTEX_CREATE:
+      case Marker::DELTA_VERTEX_DELETE:
+      case Marker::DELTA_VERTEX_ADD_LABEL:
+      case Marker::DELTA_VERTEX_REMOVE_LABEL:
+      case Marker::DELTA_VERTEX_SET_PROPERTY:
+      case Marker::DELTA_EDGE_CREATE:
+      case Marker::DELTA_EDGE_DELETE:
+      case Marker::DELTA_EDGE_SET_PROPERTY:
+      case Marker::DELTA_TRANSACTION_START:
+      case Marker::DELTA_TRANSACTION_END:
+      case Marker::DELTA_LABEL_INDEX_CREATE:
+      case Marker::DELTA_LABEL_INDEX_DROP:
+      case Marker::DELTA_LABEL_INDEX_STATS_SET:
+      case Marker::DELTA_LABEL_INDEX_STATS_CLEAR:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_SET:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_CLEAR:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_CREATE:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_DROP:
+      case Marker::DELTA_EDGE_INDEX_CREATE:
+      case Marker::DELTA_EDGE_INDEX_DROP:
+      case Marker::DELTA_EDGE_PROPERTY_INDEX_CREATE:
+      case Marker::DELTA_EDGE_PROPERTY_INDEX_DROP:
+      case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_CREATE:
+      case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_DROP:
+      case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_CREATE:
+      case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_DROP:
+      case Marker::DELTA_TEXT_INDEX_CREATE:
+      case Marker::DELTA_TEXT_EDGE_INDEX_CREATE:
+      case Marker::DELTA_TEXT_INDEX_DROP:
+      case Marker::DELTA_EXISTENCE_CONSTRAINT_CREATE:
+      case Marker::DELTA_EXISTENCE_CONSTRAINT_DROP:
+      case Marker::DELTA_UNIQUE_CONSTRAINT_CREATE:
+      case Marker::DELTA_UNIQUE_CONSTRAINT_DROP:
+      case Marker::DELTA_ENUM_CREATE:
+      case Marker::DELTA_ENUM_ALTER_ADD:
+      case Marker::DELTA_ENUM_ALTER_UPDATE:
+      case Marker::DELTA_POINT_INDEX_CREATE:
+      case Marker::DELTA_POINT_INDEX_DROP:
+      case Marker::DELTA_VECTOR_INDEX_CREATE:
+      case Marker::DELTA_VECTOR_EDGE_INDEX_CREATE:
+      case Marker::DELTA_VECTOR_INDEX_DROP:
+      case Marker::DELTA_TTL_OPERATION:
+      case Marker::DELTA_TYPE_CONSTRAINT_CREATE:
+      case Marker::DELTA_TYPE_CONSTRAINT_DROP:
+      case Marker::SECTION_DESCRIPTIONS:
+      case Marker::DELTA_DESCRIPTION_SET:
+      case Marker::DELTA_DESCRIPTION_DELETE:
+      case Marker::VALUE_FALSE:
+      case Marker::VALUE_TRUE:
+        return std::nullopt;
     }
 
-    case Marker::TYPE_PROPERTY_VALUE:
-    case Marker::SECTION_VERTEX:
-    case Marker::SECTION_EDGE:
-    case Marker::SECTION_MAPPER:
-    case Marker::SECTION_METADATA:
-    case Marker::SECTION_INDICES:
-    case Marker::SECTION_CONSTRAINTS:
-    case Marker::SECTION_DELTA:
-    case Marker::SECTION_EPOCH_HISTORY:
-    case Marker::SECTION_EDGE_INDICES:
-    case Marker::SECTION_OFFSETS:
-    case Marker::SECTION_ENUMS:
-    case Marker::SECTION_TTL:
-    case Marker::DELTA_VERTEX_CREATE:
-    case Marker::DELTA_VERTEX_DELETE:
-    case Marker::DELTA_VERTEX_ADD_LABEL:
-    case Marker::DELTA_VERTEX_REMOVE_LABEL:
-    case Marker::DELTA_VERTEX_SET_PROPERTY:
-    case Marker::DELTA_EDGE_CREATE:
-    case Marker::DELTA_EDGE_DELETE:
-    case Marker::DELTA_EDGE_SET_PROPERTY:
-    case Marker::DELTA_TRANSACTION_START:
-    case Marker::DELTA_TRANSACTION_END:
-    case Marker::DELTA_LABEL_INDEX_CREATE:
-    case Marker::DELTA_LABEL_INDEX_DROP:
-    case Marker::DELTA_LABEL_INDEX_STATS_SET:
-    case Marker::DELTA_LABEL_INDEX_STATS_CLEAR:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_SET:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_CLEAR:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_CREATE:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_DROP:
-    case Marker::DELTA_EDGE_INDEX_CREATE:
-    case Marker::DELTA_EDGE_INDEX_DROP:
-    case Marker::DELTA_EDGE_PROPERTY_INDEX_CREATE:
-    case Marker::DELTA_EDGE_PROPERTY_INDEX_DROP:
-    case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_CREATE:
-    case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_DROP:
-    case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_CREATE:
-    case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_DROP:
-    case Marker::DELTA_TEXT_INDEX_CREATE:
-    case Marker::DELTA_TEXT_EDGE_INDEX_CREATE:
-    case Marker::DELTA_TEXT_INDEX_DROP:
-    case Marker::DELTA_EXISTENCE_CONSTRAINT_CREATE:
-    case Marker::DELTA_EXISTENCE_CONSTRAINT_DROP:
-    case Marker::DELTA_UNIQUE_CONSTRAINT_CREATE:
-    case Marker::DELTA_UNIQUE_CONSTRAINT_DROP:
-    case Marker::DELTA_ENUM_CREATE:
-    case Marker::DELTA_ENUM_ALTER_ADD:
-    case Marker::DELTA_ENUM_ALTER_UPDATE:
-    case Marker::DELTA_POINT_INDEX_CREATE:
-    case Marker::DELTA_POINT_INDEX_DROP:
-    case Marker::DELTA_VECTOR_INDEX_CREATE:
-    case Marker::DELTA_VECTOR_EDGE_INDEX_CREATE:
-    case Marker::DELTA_VECTOR_INDEX_DROP:
-    case Marker::DELTA_TTL_OPERATION:
-    case Marker::DELTA_TYPE_CONSTRAINT_CREATE:
-    case Marker::DELTA_TYPE_CONSTRAINT_DROP:
-    case Marker::SECTION_DESCRIPTIONS:
-    case Marker::DELTA_DESCRIPTION_SET:
-    case Marker::DELTA_DESCRIPTION_DELETE:
-    case Marker::VALUE_FALSE:
-    case Marker::VALUE_TRUE:
-      return std::nullopt;
+    while (!stack.empty() && completed.has_value()) {
+      if (auto *lf = std::get_if<ListFrame>(&stack.back())) {
+        auto const packable_int = completed->IsInt() && FitsAPackedList(completed->ValueInt());
+        lf->all_ints &= packable_int;
+        lf->all_doubles &= completed->IsDouble();
+        lf->all_numeric &= packable_int || completed->IsDouble();
+        lf->list.emplace_back(std::move(*completed));
+        --lf->remaining;
+        if (lf->remaining > 0) {
+          completed.reset();
+        } else {
+          auto finished = finalize_list(std::move(*lf));
+          stack.pop_back();
+          completed.emplace(std::move(finished));
+        }
+      } else {
+        auto &mf = std::get<MapFrame>(stack.back());
+        auto [_, inserted] = mf.map.emplace(std::move(mf.pending_key), std::move(*completed));
+        if (!inserted) return std::nullopt;
+        --mf.remaining;
+        if (mf.remaining > 0) {
+          auto next_key = ReadString();
+          if (!next_key) return std::nullopt;
+          mf.pending_key = std::move(*next_key);
+          completed.reset();
+        } else {
+          auto finished = ExternalPropertyValue(std::move(mf.map));
+          stack.pop_back();
+          completed.emplace(std::move(finished));
+        }
+      }
+    }
+
+    if (completed.has_value()) {
+      return completed;
+    }
   }
 }
 
@@ -780,144 +895,184 @@ bool Decoder::SkipString() {
 }
 
 bool Decoder::SkipExternalPropertyValue() {
-  auto pv_marker = ReadMarker();
-  if (!pv_marker || *pv_marker != Marker::TYPE_PROPERTY_VALUE) return false;
+  enum class SkipKind : uint8_t { kValue, kListItems, kMapEntries };
+  struct SkipFrame {
+    SkipKind kind;
+    uint64_t remaining;
+  };
 
-  auto marker = PeekMarker();
-  if (!marker) return false;
-  switch (*marker) {
-    case Marker::TYPE_NULL: {
-      auto inner_marker = ReadMarker();
-      return inner_marker && *inner_marker == Marker::TYPE_NULL;
+  std::vector<SkipFrame> stack;
+  stack.push_back({SkipKind::kValue, 1});
+
+  while (!stack.empty()) {
+    auto &top = stack.back();
+    if (top.remaining == 0) {
+      stack.pop_back();
+      continue;
     }
-    case Marker::TYPE_BOOL: {
-      return !!ReadBool();
+    if (top.kind == SkipKind::kListItems) {
+      --top.remaining;
+      stack.push_back({SkipKind::kValue, 1});
+      continue;
     }
-    case Marker::TYPE_INT: {
-      return !!ReadUint();
+    if (top.kind == SkipKind::kMapEntries) {
+      --top.remaining;
+      if (!SkipString()) return false;
+      stack.push_back({SkipKind::kValue, 1});
+      continue;
     }
-    case Marker::TYPE_DOUBLE: {
-      return !!ReadDouble();
-    }
-    case Marker::TYPE_STRING: {
-      return SkipString();
-    }
-    case Marker::TYPE_LIST: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_LIST) return false;
-      auto size = ReadSize(this);
-      if (!size) return false;
-      for (uint64_t i = 0; i < *size; ++i) {
-        if (!SkipExternalPropertyValue()) return false;
+
+    stack.pop_back();
+    auto pv_marker = ReadMarker();
+    if (!pv_marker || *pv_marker != Marker::TYPE_PROPERTY_VALUE) return false;
+
+    auto marker = PeekMarker();
+    if (!marker) return false;
+    switch (*marker) {
+      case Marker::TYPE_NULL: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_NULL) return false;
+        break;
       }
-      return true;
-    }
-    case Marker::TYPE_MAP: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_MAP) return false;
-      auto size = ReadSize(this);
-      if (!size) return false;
-      for (uint64_t i = 0; i < *size; ++i) {
-        if (!SkipString()) return false;
-        if (!SkipExternalPropertyValue()) return false;
+      case Marker::TYPE_BOOL: {
+        if (!ReadBool()) return false;
+        break;
       }
-      return true;
-    }
-    case Marker::TYPE_TEMPORAL_DATA: {
-      return !!ReadTemporalData(*this);
-    }
-    case Marker::TYPE_ZONED_TEMPORAL_DATA: {
-      return !!ReadZonedTemporalData(*this);
-    }
-    case Marker::TYPE_ENUM: {
-      return !!ReadEnumValue();
-    }
-    case Marker::TYPE_POINT_2D: {
-      return !!ReadPoint2dValue();
-    }
-    case Marker::TYPE_POINT_3D: {
-      return !!ReadPoint3dValue();
-    }
-    case Marker::TYPE_VECTOR_INDEX_ID: {
-      auto inner_marker = ReadMarker();
-      if (!inner_marker || *inner_marker != Marker::TYPE_VECTOR_INDEX_ID) return false;
-      auto size = ReadSize(this);
-      if (!size) return false;
-      for (uint64_t i = 0; i < *size; ++i) {
-        if (!SkipString()) return false;
+      case Marker::TYPE_INT: {
+        if (!ReadUint()) return false;
+        break;
       }
-      size = ReadSize(this);
-      if (!size) return false;
-      for (uint64_t i = 0; i < *size; ++i) {
+      case Marker::TYPE_DOUBLE: {
         if (!ReadDouble()) return false;
+        break;
       }
-      return true;
-    }
+      case Marker::TYPE_STRING: {
+        if (!SkipString()) return false;
+        break;
+      }
+      case Marker::TYPE_LIST: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_LIST) return false;
+        auto size = ReadSize(this, 2);
+        if (!size) return false;
+        if (*size > 0) {
+          stack.push_back({SkipKind::kListItems, *size});
+        }
+        break;
+      }
+      case Marker::TYPE_MAP: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_MAP) return false;
+        auto size = ReadSize(this, 11);
+        if (!size) return false;
+        if (*size > 0) {
+          stack.push_back({SkipKind::kMapEntries, *size});
+        }
+        break;
+      }
+      case Marker::TYPE_TEMPORAL_DATA: {
+        if (!ReadTemporalData(*this)) return false;
+        break;
+      }
+      case Marker::TYPE_ZONED_TEMPORAL_DATA: {
+        if (!ReadZonedTemporalData(*this)) return false;
+        break;
+      }
+      case Marker::TYPE_ENUM: {
+        if (!ReadEnumValue()) return false;
+        break;
+      }
+      case Marker::TYPE_POINT_2D: {
+        if (!ReadPoint2dValue()) return false;
+        break;
+      }
+      case Marker::TYPE_POINT_3D: {
+        if (!ReadPoint3dValue()) return false;
+        break;
+      }
+      case Marker::TYPE_VECTOR_INDEX_ID: {
+        auto inner_marker = ReadMarker();
+        if (!inner_marker || *inner_marker != Marker::TYPE_VECTOR_INDEX_ID) return false;
+        auto size = ReadSize(this, 9);
+        if (!size) return false;
+        for (uint64_t i = 0; i < *size; ++i) {
+          if (!SkipString()) return false;
+        }
+        size = ReadSize(this, 9);
+        if (!size) return false;
+        for (uint64_t i = 0; i < *size; ++i) {
+          if (!ReadDouble()) return false;
+        }
+        break;
+      }
 
-    case Marker::TYPE_PROPERTY_VALUE:
-    case Marker::SECTION_VERTEX:
-    case Marker::SECTION_EDGE:
-    case Marker::SECTION_MAPPER:
-    case Marker::SECTION_METADATA:
-    case Marker::SECTION_INDICES:
-    case Marker::SECTION_CONSTRAINTS:
-    case Marker::SECTION_DELTA:
-    case Marker::SECTION_EPOCH_HISTORY:
-    case Marker::SECTION_EDGE_INDICES:
-    case Marker::SECTION_OFFSETS:
-    case Marker::SECTION_ENUMS:
-    case Marker::SECTION_TTL:
-    case Marker::DELTA_VERTEX_CREATE:
-    case Marker::DELTA_VERTEX_DELETE:
-    case Marker::DELTA_VERTEX_ADD_LABEL:
-    case Marker::DELTA_VERTEX_REMOVE_LABEL:
-    case Marker::DELTA_VERTEX_SET_PROPERTY:
-    case Marker::DELTA_EDGE_CREATE:
-    case Marker::DELTA_EDGE_DELETE:
-    case Marker::DELTA_EDGE_SET_PROPERTY:
-    case Marker::DELTA_TRANSACTION_START:
-    case Marker::DELTA_TRANSACTION_END:
-    case Marker::DELTA_LABEL_INDEX_CREATE:
-    case Marker::DELTA_LABEL_INDEX_DROP:
-    case Marker::DELTA_LABEL_INDEX_STATS_SET:
-    case Marker::DELTA_LABEL_INDEX_STATS_CLEAR:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_SET:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_CLEAR:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_CREATE:
-    case Marker::DELTA_LABEL_PROPERTIES_INDEX_DROP:
-    case Marker::DELTA_EDGE_INDEX_CREATE:
-    case Marker::DELTA_EDGE_INDEX_DROP:
-    case Marker::DELTA_EDGE_PROPERTY_INDEX_CREATE:
-    case Marker::DELTA_EDGE_PROPERTY_INDEX_DROP:
-    case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_CREATE:
-    case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_DROP:
-    case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_CREATE:
-    case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_DROP:
-    case Marker::DELTA_TEXT_INDEX_CREATE:
-    case Marker::DELTA_TEXT_EDGE_INDEX_CREATE:
-    case Marker::DELTA_TEXT_INDEX_DROP:
-    case Marker::DELTA_EXISTENCE_CONSTRAINT_CREATE:
-    case Marker::DELTA_EXISTENCE_CONSTRAINT_DROP:
-    case Marker::DELTA_UNIQUE_CONSTRAINT_CREATE:
-    case Marker::DELTA_UNIQUE_CONSTRAINT_DROP:
-    case Marker::DELTA_ENUM_CREATE:
-    case Marker::DELTA_ENUM_ALTER_ADD:
-    case Marker::DELTA_ENUM_ALTER_UPDATE:
-    case Marker::DELTA_POINT_INDEX_CREATE:
-    case Marker::DELTA_POINT_INDEX_DROP:
-    case Marker::DELTA_VECTOR_INDEX_CREATE:
-    case Marker::DELTA_VECTOR_EDGE_INDEX_CREATE:
-    case Marker::DELTA_VECTOR_INDEX_DROP:
-    case Marker::DELTA_TTL_OPERATION:
-    case Marker::DELTA_TYPE_CONSTRAINT_CREATE:
-    case Marker::DELTA_TYPE_CONSTRAINT_DROP:
-    case Marker::SECTION_DESCRIPTIONS:
-    case Marker::DELTA_DESCRIPTION_SET:
-    case Marker::DELTA_DESCRIPTION_DELETE:
-    case Marker::VALUE_FALSE:
-    case Marker::VALUE_TRUE:
-      return false;
+      case Marker::TYPE_PROPERTY_VALUE:
+      case Marker::SECTION_VERTEX:
+      case Marker::SECTION_EDGE:
+      case Marker::SECTION_MAPPER:
+      case Marker::SECTION_METADATA:
+      case Marker::SECTION_INDICES:
+      case Marker::SECTION_CONSTRAINTS:
+      case Marker::SECTION_DELTA:
+      case Marker::SECTION_EPOCH_HISTORY:
+      case Marker::SECTION_EDGE_INDICES:
+      case Marker::SECTION_OFFSETS:
+      case Marker::SECTION_ENUMS:
+      case Marker::SECTION_TTL:
+      case Marker::DELTA_VERTEX_CREATE:
+      case Marker::DELTA_VERTEX_DELETE:
+      case Marker::DELTA_VERTEX_ADD_LABEL:
+      case Marker::DELTA_VERTEX_REMOVE_LABEL:
+      case Marker::DELTA_VERTEX_SET_PROPERTY:
+      case Marker::DELTA_EDGE_CREATE:
+      case Marker::DELTA_EDGE_DELETE:
+      case Marker::DELTA_EDGE_SET_PROPERTY:
+      case Marker::DELTA_TRANSACTION_START:
+      case Marker::DELTA_TRANSACTION_END:
+      case Marker::DELTA_LABEL_INDEX_CREATE:
+      case Marker::DELTA_LABEL_INDEX_DROP:
+      case Marker::DELTA_LABEL_INDEX_STATS_SET:
+      case Marker::DELTA_LABEL_INDEX_STATS_CLEAR:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_SET:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_STATS_CLEAR:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_CREATE:
+      case Marker::DELTA_LABEL_PROPERTIES_INDEX_DROP:
+      case Marker::DELTA_EDGE_INDEX_CREATE:
+      case Marker::DELTA_EDGE_INDEX_DROP:
+      case Marker::DELTA_EDGE_PROPERTY_INDEX_CREATE:
+      case Marker::DELTA_EDGE_PROPERTY_INDEX_DROP:
+      case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_CREATE:
+      case Marker::DELTA_GLOBAL_EDGE_PROPERTY_INDEX_DROP:
+      case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_CREATE:
+      case Marker::DELTA_GLOBAL_VERTEX_PROPERTY_INDEX_DROP:
+      case Marker::DELTA_TEXT_INDEX_CREATE:
+      case Marker::DELTA_TEXT_EDGE_INDEX_CREATE:
+      case Marker::DELTA_TEXT_INDEX_DROP:
+      case Marker::DELTA_EXISTENCE_CONSTRAINT_CREATE:
+      case Marker::DELTA_EXISTENCE_CONSTRAINT_DROP:
+      case Marker::DELTA_UNIQUE_CONSTRAINT_CREATE:
+      case Marker::DELTA_UNIQUE_CONSTRAINT_DROP:
+      case Marker::DELTA_ENUM_CREATE:
+      case Marker::DELTA_ENUM_ALTER_ADD:
+      case Marker::DELTA_ENUM_ALTER_UPDATE:
+      case Marker::DELTA_POINT_INDEX_CREATE:
+      case Marker::DELTA_POINT_INDEX_DROP:
+      case Marker::DELTA_VECTOR_INDEX_CREATE:
+      case Marker::DELTA_VECTOR_EDGE_INDEX_CREATE:
+      case Marker::DELTA_VECTOR_INDEX_DROP:
+      case Marker::DELTA_TTL_OPERATION:
+      case Marker::DELTA_TYPE_CONSTRAINT_CREATE:
+      case Marker::DELTA_TYPE_CONSTRAINT_DROP:
+      case Marker::SECTION_DESCRIPTIONS:
+      case Marker::DELTA_DESCRIPTION_SET:
+      case Marker::DELTA_DESCRIPTION_DELETE:
+      case Marker::VALUE_FALSE:
+      case Marker::VALUE_TRUE:
+        return false;
+    }
   }
+
+  return true;
 }
 
 uint64_t Decoder::GetSize() { return file_.GetSize(); }

@@ -148,6 +148,7 @@ enum class RemoveCoordinatorInstanceStatus : uint8_t {
   RAFT_TERM_MISMATCH,
   RAFT_RESULT_NOT_EXIST_YET,
   RAFT_FAILED,
+  RAFT_LOG_ERROR,
 };
 
 enum class UpdateConfigStatus : uint8_t {

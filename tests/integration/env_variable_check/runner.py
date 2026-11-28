@@ -13,11 +13,11 @@
 
 import argparse
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
 from typing import List
 
 SCRIPT_DIR = Path(__file__).absolute()

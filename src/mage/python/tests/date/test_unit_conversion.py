@@ -1,4 +1,5 @@
 import pytest
+
 from mage.date.constants import Units
 from mage.date.unit_conversion import to_int, to_timedelta
 

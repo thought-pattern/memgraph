@@ -121,6 +121,21 @@ if [[ ! -d $PREFIX ]] || [[ ! -w $PREFIX ]]; then
         fi
     done
 fi
+prev_stdcxx=""
+if [[ -f "$PREFIX/.toolchain-stdcxx" ]]; then
+    prev_stdcxx="$(cat "$PREFIX/.toolchain-stdcxx")"
+elif [[ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]]; then
+    if [[ -d "$PREFIX/include/c++/v1" ]]; then
+        prev_stdcxx="libc++"
+    else
+        prev_stdcxx="libstdc++"
+    fi
+fi
+if [[ -n "$prev_stdcxx" && "$prev_stdcxx" != "$TOOLCHAIN_STDCXX" ]]; then
+    echo "TOOLCHAIN_STDCXX changed ($prev_stdcxx -> $TOOLCHAIN_STDCXX); cleaning $PREFIX..."
+    find "$PREFIX" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+printf '%s\n' "$TOOLCHAIN_STDCXX" > "$PREFIX/.toolchain-stdcxx"
 
 # create archives directory
 # Host deps (apt): curl, gnupg, ca-certificates, git (LLVM/mgconsole/heaptrack
@@ -128,97 +143,102 @@ fi
 mkdir -p archives && pushd archives
 # download all archives, refusing anything but HTTPS (redirects included)
 download () { curl -fL --proto '=https' --proto-redir '=https' "$@"; }
-if [[ ! -f gcc-$GCC_VERSION.tar.gz ]]; then
-    download -O https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz
-    download -O https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz.sig
-    gpg --keyserver keyserver.ubuntu.com --recv-keys 6C35B99309B5FA62 7F74F97C103468EE5D750B583AB00996FC26A641
-    gpg --verify gcc-$GCC_VERSION.tar.gz.sig gcc-$GCC_VERSION.tar.gz
-fi
-if [[ ! -f binutils-$BINUTILS_VERSION.tar.gz ]]; then
-    download -O https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz
-    download -O https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz.sig
-    gpg --keyserver keyserver.ubuntu.com --recv-keys 3A24BC1E8FB409FA9F14371813FCEF89DD9E3C4F
-    gpg --verify binutils-$BINUTILS_VERSION.tar.gz.sig binutils-$BINUTILS_VERSION.tar.gz
-fi
-if [[ ! -f gdb-$GDB_VERSION.tar.gz ]]; then
-    download -O https://sourceware.org/pub/gdb/releases/gdb-$GDB_VERSION.tar.gz
-    download -O https://sourceware.org/pub/gdb/releases/sha512.sum
-    # sourceware's sha512.sum lists every gdb release. Feed only our line into
-    # sha512sum -c — otherwise it exits non-zero on the missing-file entries
-    # for the other releases and pipefail kills the script.
-    grep " gdb-$GDB_VERSION.tar.gz\$" sha512.sum | sha512sum -c -
-fi
-if [[ ! -f cmake-$CMAKE_VERSION.tar.gz ]]; then
-    download -O https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION.tar.gz
-    CMAKE_SHA256="95d4721f3625fb0d9d6ca480dd59a46c84b4c157f7fadd2e9b179ef9c871174d"
-    echo "$CMAKE_SHA256  cmake-$CMAKE_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f cppcheck-$CPPCHECK_VERSION.tar.gz ]]; then
-    download https://github.com/cppcheck-opensource/cppcheck/archive/refs/tags/$CPPCHECK_VERSION.tar.gz -o cppcheck-$CPPCHECK_VERSION.tar.gz
-    CPPCHECK_SHA256="ba750bd872ad7c01f951ff2d9dc8c68ea5852654545ec7a62a4c318d690c8e22"
-    echo "$CPPCHECK_SHA256  cppcheck-$CPPCHECK_VERSION.tar.gz" | sha256sum -c -
-fi
+download_if_missing () {
+    local out_file="$1"
+    local url="$2"
+    if [[ ! -f "$out_file" ]]; then
+        rm -f "$out_file.part."*
+        download "$url" -o "$out_file.part.$$" || {
+            rm -f "$out_file.part.$$"
+            exit 1
+        }
+        mv -f "$out_file.part.$$" "$out_file"
+    fi
+}
+verify_or_purge () {
+    local target_file="$1"
+    shift
+    if ! "$@"; then
+        echo "Integrity verification failed for '$target_file'; removing cached file." >&2
+        rm -f "$target_file"
+        exit 1
+    fi
+}
+
+download_if_missing "gcc-$GCC_VERSION.tar.gz" "https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz"
+download_if_missing "gcc-$GCC_VERSION.tar.gz.sig" "https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-$GCC_VERSION/gcc-$GCC_VERSION.tar.gz.sig"
+gpg --keyserver keyserver.ubuntu.com --recv-keys 6C35B99309B5FA62 7F74F97C103468EE5D750B583AB00996FC26A641
+verify_or_purge "gcc-$GCC_VERSION.tar.gz" gpg --verify "gcc-$GCC_VERSION.tar.gz.sig" "gcc-$GCC_VERSION.tar.gz"
+
+download_if_missing "binutils-$BINUTILS_VERSION.tar.gz" "https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz"
+download_if_missing "binutils-$BINUTILS_VERSION.tar.gz.sig" "https://sourceware.org/pub/binutils/releases/binutils-$BINUTILS_VERSION.tar.gz.sig"
+gpg --keyserver keyserver.ubuntu.com --recv-keys 3A24BC1E8FB409FA9F14371813FCEF89DD9E3C4F
+verify_or_purge "binutils-$BINUTILS_VERSION.tar.gz" gpg --verify "binutils-$BINUTILS_VERSION.tar.gz.sig" "binutils-$BINUTILS_VERSION.tar.gz"
+
+download_if_missing "gdb-$GDB_VERSION.tar.gz" "https://sourceware.org/pub/gdb/releases/gdb-$GDB_VERSION.tar.gz"
+download_if_missing "sha512.sum" "https://sourceware.org/pub/gdb/releases/sha512.sum"
+# sourceware's sha512.sum lists every gdb release. Feed only our line into
+# sha512sum -c — otherwise it exits non-zero on the missing-file entries
+# for the other releases and pipefail kills the script.
+verify_or_purge "gdb-$GDB_VERSION.tar.gz" bash -o pipefail -c "grep ' gdb-$GDB_VERSION\\.tar\\.gz\$' sha512.sum | sha512sum -c -"
+
+download_if_missing "cmake-$CMAKE_VERSION.tar.gz" "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION.tar.gz"
+CMAKE_SHA256="95d4721f3625fb0d9d6ca480dd59a46c84b4c157f7fadd2e9b179ef9c871174d"
+verify_or_purge "cmake-$CMAKE_VERSION.tar.gz" bash -o pipefail -c "echo '$CMAKE_SHA256  cmake-$CMAKE_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "cppcheck-$CPPCHECK_VERSION.tar.gz" "https://github.com/cppcheck-opensource/cppcheck/archive/refs/tags/$CPPCHECK_VERSION.tar.gz"
+CPPCHECK_SHA256="ba750bd872ad7c01f951ff2d9dc8c68ea5852654545ec7a62a4c318d690c8e22"
+verify_or_purge "cppcheck-$CPPCHECK_VERSION.tar.gz" bash -o pipefail -c "echo '$CPPCHECK_SHA256  cppcheck-$CPPCHECK_VERSION.tar.gz' | sha256sum -c -"
+
 if [[ ! -d llvmorg-$LLVM_VERSION ]]; then
     git clone --depth 1 --branch llvmorg-$LLVM_VERSION https://github.com/llvm/llvm-project.git llvmorg-$LLVM_VERSION
 fi
-if [[ ! -f pahole-gdb-master.zip ]]; then
-    download https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip -o pahole-gdb-master.zip
-    echo "$PAHOLE_SHA256 pahole-gdb-master.zip" | sha256sum -c -
-fi
-if [[ ! -f swig-$SWIG_VERSION.tar.gz ]]; then
-    download https://github.com/swig/swig/archive/refs/tags/v$SWIG_VERSION.tar.gz -o swig-$SWIG_VERSION.tar.gz
-    echo "$SWIG_SHA256 swig-$SWIG_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f pcre2-$PCRE2_VERSION.tar.gz ]]; then
-    download -O https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$PCRE2_VERSION/pcre2-$PCRE2_VERSION.tar.gz
-    PCRE2_SHA256="c08ae2388ef333e8403e670ad70c0a11f1eed021fd88308d7e02f596fcd9dc16"
-    echo "$PCRE2_SHA256  pcre2-$PCRE2_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f linux-$LINUX_HEADERS_VERSION.tar.xz ]]; then
-    download -O https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-$LINUX_HEADERS_VERSION.tar.xz
-    LINUX_HEADERS_SHA256="ae6a3207f12aa4d6cfb0fa793ec9da4a6fcdfdcb57d869d63d6b77e3a8c1423d"
-    echo "$LINUX_HEADERS_SHA256  linux-$LINUX_HEADERS_VERSION.tar.xz" | sha256sum -c -
-fi
-if [[ ! -f glibc-$GLIBC_VERSION.tar.xz ]]; then
-    download -O https://ftp.gnu.org/gnu/glibc/glibc-$GLIBC_VERSION.tar.xz
-    GLIBC_SHA256="9246fe44f68feeec8c666bb87973d590ce0137cca145df014c72ec95be9ffd17"
-    echo "$GLIBC_SHA256  glibc-$GLIBC_VERSION.tar.xz" | sha256sum -c -
-fi
-if [[ ! -f zlib-$ZLIB_VERSION.tar.gz ]]; then
-    download -O https://zlib.net/zlib-$ZLIB_VERSION.tar.gz
-    ZLIB_SHA256="bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
-    echo "$ZLIB_SHA256  zlib-$ZLIB_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f ncurses-$NCURSES_VERSION.tar.gz ]]; then
-    download -O https://invisible-island.net/archives/ncurses/ncurses-$NCURSES_VERSION.tar.gz
-    NCURSES_SHA256="355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
-    echo "$NCURSES_SHA256  ncurses-$NCURSES_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f curl-$CURL_VERSION.tar.gz ]]; then
-    download -O https://curl.se/download/curl-$CURL_VERSION.tar.gz
-    CURL_SHA256="d9b327997999045a24cda50f3983e69e51c516bd8be6ef9842fc7f99135e33bb"
-    echo "$CURL_SHA256  curl-$CURL_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f openssl-$OPENSSL_VERSION.tar.gz ]]; then
-    download -O https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz
-    OPENSSL_SHA256="243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
-    echo "$OPENSSL_SHA256  openssl-$OPENSSL_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f libffi-$LIBFFI_VERSION.tar.gz ]]; then
-    download -O https://github.com/libffi/libffi/releases/download/v$LIBFFI_VERSION/libffi-$LIBFFI_VERSION.tar.gz
-    LIBFFI_SHA256="d5e9a6638ddbd2513ddb54518eb67e4bbe6fa707bcc01c10f6212f0a088d819d"
-    echo "$LIBFFI_SHA256  libffi-$LIBFFI_VERSION.tar.gz" | sha256sum -c -
-fi
-if [[ ! -f Python-$PYTHON_VERSION.tgz ]]; then
-    download -O https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz
-    PYTHON_SHA256="73ac8fe780227bf371add8373c3079f42a0dc62deff8d612cd15a618082ab623"
-    echo "$PYTHON_SHA256  Python-$PYTHON_VERSION.tgz" | sha256sum -c -
-fi
-if [[ ! -f libipt-$LIBIPT_VERSION.tar.gz ]]; then
-    download https://github.com/intel/libipt/archive/refs/tags/v$LIBIPT_VERSION.tar.gz -o libipt-$LIBIPT_VERSION.tar.gz
-    LIBIPT_SHA256="f09a18fefba81d4fc2530d90858789e0c596f1b634e5777e6ccaf492966e9845"
-    echo "$LIBIPT_SHA256  libipt-$LIBIPT_VERSION.tar.gz" | sha256sum -c -
-fi
+
+download_if_missing "pahole-gdb-master.zip" "https://github.com/PhilArmstrong/pahole-gdb/archive/master.zip"
+verify_or_purge "pahole-gdb-master.zip" bash -o pipefail -c "echo '$PAHOLE_SHA256  pahole-gdb-master.zip' | sha256sum -c -"
+
+download_if_missing "swig-$SWIG_VERSION.tar.gz" "https://github.com/swig/swig/archive/refs/tags/v$SWIG_VERSION.tar.gz"
+verify_or_purge "swig-$SWIG_VERSION.tar.gz" bash -o pipefail -c "echo '$SWIG_SHA256  swig-$SWIG_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "pcre2-$PCRE2_VERSION.tar.gz" "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$PCRE2_VERSION/pcre2-$PCRE2_VERSION.tar.gz"
+PCRE2_SHA256="c08ae2388ef333e8403e670ad70c0a11f1eed021fd88308d7e02f596fcd9dc16"
+verify_or_purge "pcre2-$PCRE2_VERSION.tar.gz" bash -o pipefail -c "echo '$PCRE2_SHA256  pcre2-$PCRE2_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "linux-$LINUX_HEADERS_VERSION.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-$LINUX_HEADERS_VERSION.tar.xz"
+LINUX_HEADERS_SHA256="ae6a3207f12aa4d6cfb0fa793ec9da4a6fcdfdcb57d869d63d6b77e3a8c1423d"
+verify_or_purge "linux-$LINUX_HEADERS_VERSION.tar.xz" bash -o pipefail -c "echo '$LINUX_HEADERS_SHA256  linux-$LINUX_HEADERS_VERSION.tar.xz' | sha256sum -c -"
+
+download_if_missing "glibc-$GLIBC_VERSION.tar.xz" "https://ftp.gnu.org/gnu/glibc/glibc-$GLIBC_VERSION.tar.xz"
+GLIBC_SHA256="9246fe44f68feeec8c666bb87973d590ce0137cca145df014c72ec95be9ffd17"
+verify_or_purge "glibc-$GLIBC_VERSION.tar.xz" bash -o pipefail -c "echo '$GLIBC_SHA256  glibc-$GLIBC_VERSION.tar.xz' | sha256sum -c -"
+
+download_if_missing "zlib-$ZLIB_VERSION.tar.gz" "https://zlib.net/zlib-$ZLIB_VERSION.tar.gz"
+ZLIB_SHA256="bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+verify_or_purge "zlib-$ZLIB_VERSION.tar.gz" bash -o pipefail -c "echo '$ZLIB_SHA256  zlib-$ZLIB_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "ncurses-$NCURSES_VERSION.tar.gz" "https://invisible-island.net/archives/ncurses/ncurses-$NCURSES_VERSION.tar.gz"
+NCURSES_SHA256="355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
+verify_or_purge "ncurses-$NCURSES_VERSION.tar.gz" bash -o pipefail -c "echo '$NCURSES_SHA256  ncurses-$NCURSES_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "curl-$CURL_VERSION.tar.gz" "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
+CURL_SHA256="d9b327997999045a24cda50f3983e69e51c516bd8be6ef9842fc7f99135e33bb"
+verify_or_purge "curl-$CURL_VERSION.tar.gz" bash -o pipefail -c "echo '$CURL_SHA256  curl-$CURL_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "openssl-$OPENSSL_VERSION.tar.gz" "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
+OPENSSL_SHA256="243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1"
+verify_or_purge "openssl-$OPENSSL_VERSION.tar.gz" bash -o pipefail -c "echo '$OPENSSL_SHA256  openssl-$OPENSSL_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "libffi-$LIBFFI_VERSION.tar.gz" "https://github.com/libffi/libffi/releases/download/v$LIBFFI_VERSION/libffi-$LIBFFI_VERSION.tar.gz"
+LIBFFI_SHA256="d5e9a6638ddbd2513ddb54518eb67e4bbe6fa707bcc01c10f6212f0a088d819d"
+verify_or_purge "libffi-$LIBFFI_VERSION.tar.gz" bash -o pipefail -c "echo '$LIBFFI_SHA256  libffi-$LIBFFI_VERSION.tar.gz' | sha256sum -c -"
+
+download_if_missing "Python-$PYTHON_VERSION.tgz" "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz"
+PYTHON_SHA256="73ac8fe780227bf371add8373c3079f42a0dc62deff8d612cd15a618082ab623"
+verify_or_purge "Python-$PYTHON_VERSION.tgz" bash -o pipefail -c "echo '$PYTHON_SHA256  Python-$PYTHON_VERSION.tgz' | sha256sum -c -"
+
+download_if_missing "libipt-$LIBIPT_VERSION.tar.gz" "https://github.com/intel/libipt/archive/refs/tags/v$LIBIPT_VERSION.tar.gz"
+LIBIPT_SHA256="f09a18fefba81d4fc2530d90858789e0c596f1b634e5777e6ccaf492966e9845"
+verify_or_purge "libipt-$LIBIPT_VERSION.tar.gz" bash -o pipefail -c "echo '$LIBIPT_SHA256  libipt-$LIBIPT_VERSION.tar.gz' | sha256sum -c -"
 
 # verify all archives
 GPG="gpg --homedir .gnupg"
@@ -921,7 +941,7 @@ fi
 # Host deps (apt): make, python3 — cmake/gcc/binutils come from $PREFIX, swig
 # from the stage above, zlib/libffi from the sysroot (FIND_ROOT_PATH=ONLY).
 log_tool_name "LLVM $LLVM_VERSION"
-if [[ ! -f "$PREFIX/bin/clang" ]]; then
+if [[ ! -f "$PREFIX/bin/clang" || ( "$TOOLCHAIN_STDCXX" = "libc++" && ! -d "$PREFIX/include/c++/v1" ) ]]; then
     if [[ -d llvmorg-$LLVM_VERSION ]]; then
         rm -rf llvmorg-$LLVM_VERSION
     fi
@@ -1173,19 +1193,28 @@ cp -v $DIR/toolchain.cmake $PREFIX/
 mkdir -p output
 pushd output
 # Create the toolchain archive.
-if [[ ! -f "$NAME-binaries-$ARCHIVE_ARCH_TAG.tar.gz" ]]; then
-    tar --owner=root --group=root -cpvzf "$NAME-binaries-$ARCHIVE_ARCH_TAG.tar.gz" -C /opt $NAME
+ARCHIVE_FILE="$NAME-binaries-$ARCHIVE_ARCH_TAG.tar.gz"
+if [[ -f "$ARCHIVE_FILE" ]] && ! (gzip -t "$ARCHIVE_FILE" >/dev/null 2>&1 && tar -tzf "$ARCHIVE_FILE" >/dev/null 2>&1); then
+    echo "Removing unreadable toolchain archive '$ARCHIVE_FILE' before rebuilding..."
+    rm -f "$ARCHIVE_FILE"
+fi
+if [[ ! -f "$ARCHIVE_FILE" ]]; then
+    rm -f "$ARCHIVE_FILE.tmp."*
+    tar --owner=root --group=root -cpvzf "$ARCHIVE_FILE.tmp.$$" -C /opt "$NAME"
+    gzip -t "$ARCHIVE_FILE.tmp.$$"
+    tar -tzf "$ARCHIVE_FILE.tmp.$$" >/dev/null
+    mv -f "$ARCHIVE_FILE.tmp.$$" "$ARCHIVE_FILE"
 else
-  echo "NOTE: Skipping archiving because the file already exists"
+    echo "NOTE: Skipping archiving because the file already exists"
 fi
 
 # output final instructions
 echo -e "\n\n"
 echo "All tools have been built. They are installed in '$PREFIX'."
-echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'build' directory."
+echo "In order to distribute the tools to someone else, an archive with the toolchain was created in the 'output' directory."
 echo "If you want to install the packed tools you should execute the following command:"
 echo
-echo "    tar -xvzf output/$NAME-binaries.tar.gz -C /opt"
+echo "    tar -xvzf output/$ARCHIVE_FILE -C /opt"
 echo
 echo "Because the tools were built on this machine, you should probably change the permissions of the installation directory using:"
 echo

@@ -16,6 +16,8 @@
 #include "auth/auth.hpp"
 #include "auth/models.hpp"
 #include "auth/profiles/user_profiles.hpp"
+#include "dbms/rpc.hpp"
+#include "dbms/tenant_profiles.hpp"
 #include "parameters/parameters.hpp"
 #include "rpc/messages.hpp"
 #include "storage/v2/config.hpp"
@@ -151,20 +153,20 @@ struct SystemRecoveryReqV3 {
 
 // V4: says whether the auth data and database list are MAIN's full state. An unlicensed MAIN does not replicate
 // them, and a replica must keep its own instead of reading the empty lists as "none exist".
-struct SystemRecoveryReq {
-  static constexpr utils::TypeInfo kType{.id = utils::TypeId::REP_SYSTEM_RECOVERY_REQ, .name = "SystemRecoveryReq"};
+struct SystemRecoveryReqV4 {
+  static constexpr utils::TypeInfo kType{.id = utils::TypeId::REP_SYSTEM_RECOVERY_REQ, .name = "SystemRecoveryReqV4"};
   static constexpr uint64_t kVersion{4};
 
-  static void Load(SystemRecoveryReq *self, memgraph::slk::Reader *reader);
-  static void Save(const SystemRecoveryReq &self, memgraph::slk::Builder *builder);
-  SystemRecoveryReq() = default;
+  static void Load(SystemRecoveryReqV4 *self, memgraph::slk::Reader *reader);
+  static void Save(const SystemRecoveryReqV4 &self, memgraph::slk::Builder *builder);
+  SystemRecoveryReqV4() = default;
 
-  SystemRecoveryReq(const utils::UUID &main_uuid, uint64_t forced_group_timestamp,
-                    std::vector<storage::SalientConfig> database_configs, auth::Auth::Config auth_config,
-                    std::vector<auth::User> users, std::vector<auth::Role> roles,
-                    std::vector<auth::UserProfiles::Profile> profiles,
-                    std::vector<parameters::ParameterInfo> parameters,
-                    std::vector<storage::ColdTenantRecovery> cold_databases, bool includes_auth_and_databases)
+  SystemRecoveryReqV4(const utils::UUID &main_uuid, uint64_t forced_group_timestamp,
+                      std::vector<storage::SalientConfig> database_configs, auth::Auth::Config auth_config,
+                      std::vector<auth::User> users, std::vector<auth::Role> roles,
+                      std::vector<auth::UserProfiles::Profile> profiles,
+                      std::vector<parameters::ParameterInfo> parameters,
+                      std::vector<storage::ColdTenantRecovery> cold_databases, bool includes_auth_and_databases)
       : main_uuid(main_uuid),
         forced_group_timestamp{forced_group_timestamp},
         database_configs(std::move(database_configs)),
@@ -177,17 +179,17 @@ struct SystemRecoveryReq {
         includes_auth_and_databases{includes_auth_and_databases} {}
 
   /// An older MAIN sends empty lists when unlicensed; they cannot be told apart from its full state.
-  static SystemRecoveryReq Upgrade(SystemRecoveryReqV3 const &v3) {
-    return SystemRecoveryReq{v3.main_uuid,
-                             v3.forced_group_timestamp,
-                             v3.database_configs,
-                             v3.auth_config,
-                             v3.users,
-                             v3.roles,
-                             v3.profiles,
-                             v3.parameters,
-                             v3.cold_databases,
-                             true};
+  static SystemRecoveryReqV4 Upgrade(SystemRecoveryReqV3 const &v3) {
+    return SystemRecoveryReqV4{v3.main_uuid,
+                               v3.forced_group_timestamp,
+                               v3.database_configs,
+                               v3.auth_config,
+                               v3.users,
+                               v3.roles,
+                               v3.profiles,
+                               v3.parameters,
+                               v3.cold_databases,
+                               true};
   }
 
   utils::UUID main_uuid;
@@ -200,6 +202,65 @@ struct SystemRecoveryReq {
   std::vector<parameters::ParameterInfo> parameters;
   std::vector<storage::ColdTenantRecovery> cold_databases;
   bool includes_auth_and_databases{true};
+};
+
+// V5: includes tenant memory profiles and their database memberships alongside full system recovery.
+struct SystemRecoveryReq {
+  static constexpr utils::TypeInfo kType{.id = utils::TypeId::REP_SYSTEM_RECOVERY_REQ, .name = "SystemRecoveryReq"};
+  static constexpr uint64_t kVersion{5};
+
+  static void Load(SystemRecoveryReq *self, memgraph::slk::Reader *reader);
+  static void Save(const SystemRecoveryReq &self, memgraph::slk::Builder *builder);
+  SystemRecoveryReq() = default;
+
+  SystemRecoveryReq(const utils::UUID &main_uuid, uint64_t forced_group_timestamp,
+                    std::vector<storage::SalientConfig> database_configs, auth::Auth::Config auth_config,
+                    std::vector<auth::User> users, std::vector<auth::Role> roles,
+                    std::vector<auth::UserProfiles::Profile> profiles,
+                    std::vector<parameters::ParameterInfo> parameters,
+                    std::vector<storage::ColdTenantRecovery> cold_databases, bool includes_auth_and_databases,
+                    std::vector<dbms::TenantProfiles::Profile> tenant_profiles = {},
+                    bool includes_tenant_profiles = false)
+      : main_uuid(main_uuid),
+        forced_group_timestamp{forced_group_timestamp},
+        database_configs(std::move(database_configs)),
+        auth_config(std::move(auth_config)),
+        users{std::move(users)},
+        roles{std::move(roles)},
+        profiles{std::move(profiles)},
+        parameters{std::move(parameters)},
+        cold_databases{std::move(cold_databases)},
+        includes_auth_and_databases{includes_auth_and_databases},
+        tenant_profiles{std::move(tenant_profiles)},
+        includes_tenant_profiles{includes_tenant_profiles} {}
+
+  static SystemRecoveryReq Upgrade(SystemRecoveryReqV4 const &v4) {
+    return SystemRecoveryReq{v4.main_uuid,
+                             v4.forced_group_timestamp,
+                             v4.database_configs,
+                             v4.auth_config,
+                             v4.users,
+                             v4.roles,
+                             v4.profiles,
+                             v4.parameters,
+                             v4.cold_databases,
+                             v4.includes_auth_and_databases,
+                             {},
+                             false};
+  }
+
+  utils::UUID main_uuid;
+  uint64_t forced_group_timestamp;
+  std::vector<storage::SalientConfig> database_configs;
+  auth::Auth::Config auth_config;
+  std::vector<auth::User> users;
+  std::vector<auth::Role> roles;
+  std::vector<auth::UserProfiles::Profile> profiles;
+  std::vector<parameters::ParameterInfo> parameters;
+  std::vector<storage::ColdTenantRecovery> cold_databases;
+  bool includes_auth_and_databases{true};
+  std::vector<dbms::TenantProfiles::Profile> tenant_profiles;
+  bool includes_tenant_profiles{false};
 };
 
 struct SystemRecoveryResV1 {
@@ -258,10 +319,30 @@ struct SystemRecoveryResV3 {
   Result result;
 };
 
-// V4 response: content identical to V3, bumped to match SystemRecoveryReq V4.
+// V4 response: content identical to V3, bumped to match SystemRecoveryReqV4.
+struct SystemRecoveryResV4 {
+  static constexpr utils::TypeInfo kType{.id = utils::TypeId::REP_SYSTEM_RECOVERY_RES, .name = "SystemRecoveryResV4"};
+  static constexpr uint64_t kVersion{4};
+
+  enum class Result : uint8_t { SUCCESS, NO_NEED, FAILURE, /* Leave at end */ N };
+
+  static void Load(SystemRecoveryResV4 *self, memgraph::slk::Reader *reader);
+  static void Save(const SystemRecoveryResV4 &self, memgraph::slk::Builder *builder);
+  SystemRecoveryResV4() = default;
+
+  explicit SystemRecoveryResV4(Result res) : result(res) {}
+
+  SystemRecoveryResV3 Downgrade() const {
+    return SystemRecoveryResV3{static_cast<SystemRecoveryResV3::Result>(result)};
+  }
+
+  Result result;
+};
+
+// V5 response: content identical to V4, bumped to match SystemRecoveryReq V5.
 struct SystemRecoveryRes {
   static constexpr utils::TypeInfo kType{.id = utils::TypeId::REP_SYSTEM_RECOVERY_RES, .name = "SystemRecoveryRes"};
-  static constexpr uint64_t kVersion{4};
+  static constexpr uint64_t kVersion{5};
 
   enum class Result : uint8_t { SUCCESS, NO_NEED, FAILURE, /* Leave at end */ N };
 
@@ -271,8 +352,8 @@ struct SystemRecoveryRes {
 
   explicit SystemRecoveryRes(Result res) : result(res) {}
 
-  SystemRecoveryResV3 Downgrade() const {
-    return SystemRecoveryResV3{static_cast<SystemRecoveryResV3::Result>(result)};
+  SystemRecoveryResV4 Downgrade() const {
+    return SystemRecoveryResV4{static_cast<SystemRecoveryResV4::Result>(result)};
   }
 
   Result result;
@@ -292,6 +373,8 @@ void Save(const memgraph::replication::SystemRecoveryReqV2 &self, memgraph::slk:
 void Load(memgraph::replication::SystemRecoveryReqV2 *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::replication::SystemRecoveryReqV3 &self, memgraph::slk::Builder *builder);
 void Load(memgraph::replication::SystemRecoveryReqV3 *self, memgraph::slk::Reader *reader);
+void Save(const memgraph::replication::SystemRecoveryReqV4 &self, memgraph::slk::Builder *builder);
+void Load(memgraph::replication::SystemRecoveryReqV4 *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::replication::SystemRecoveryReq &self, memgraph::slk::Builder *builder);
 void Load(memgraph::replication::SystemRecoveryReq *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::replication::SystemRecoveryResV1 &self, memgraph::slk::Builder *builder);
@@ -300,6 +383,8 @@ void Save(const memgraph::replication::SystemRecoveryResV2 &self, memgraph::slk:
 void Load(memgraph::replication::SystemRecoveryResV2 *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::replication::SystemRecoveryResV3 &self, memgraph::slk::Builder *builder);
 void Load(memgraph::replication::SystemRecoveryResV3 *self, memgraph::slk::Reader *reader);
+void Save(const memgraph::replication::SystemRecoveryResV4 &self, memgraph::slk::Builder *builder);
+void Load(memgraph::replication::SystemRecoveryResV4 *self, memgraph::slk::Reader *reader);
 void Save(const memgraph::replication::SystemRecoveryRes &self, memgraph::slk::Builder *builder);
 void Load(memgraph::replication::SystemRecoveryRes *self, memgraph::slk::Reader *reader);
 }  // namespace memgraph::slk

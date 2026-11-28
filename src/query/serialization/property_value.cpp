@@ -10,7 +10,9 @@
 // licenses/APL.txt.
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -34,7 +36,31 @@ enum class ObjectType : uint8_t {
   POINT_2D,
   POINT_3D,
   VECTOR_INDEX_ID,
+  NON_FINITE_DOUBLE,
 };
+
+nlohmann::json SerializeDoubleJson(double val) {
+  if (std::isfinite(val)) {
+    return val;
+  }
+  nlohmann::json data = nlohmann::json::object();
+  data.emplace("type", static_cast<uint64_t>(ObjectType::NON_FINITE_DOUBLE));
+  data.emplace("value", std::isnan(val) ? "nan" : (std::signbit(val) ? "-inf" : "inf"));
+  return data;
+}
+
+double DeserializeDoubleJson(const nlohmann::json &val) {
+  if (val.is_number()) {
+    return val.get<double>();
+  }
+  MG_ASSERT(val.is_object() && val.at("type").get<ObjectType>() == ObjectType::NON_FINITE_DOUBLE,
+            "Invalid double serialization");
+  const auto &tag = val.at("value").get_ref<const std::string &>();
+  if (tag == "nan") return std::numeric_limits<double>::quiet_NaN();
+  if (tag == "-inf") return -std::numeric_limits<double>::infinity();
+  MG_ASSERT(tag == "inf", "Unknown non-finite double tag");
+  return std::numeric_limits<double>::infinity();
+}
 }  // namespace
 
 nlohmann::json SerializeExternalPropertyValue(const storage::ExternalPropertyValue &property_value,
@@ -48,7 +74,7 @@ nlohmann::json SerializeExternalPropertyValue(const storage::ExternalPropertyVal
     case Type::Int:
       return property_value.ValueInt();
     case Type::Double:
-      return property_value.ValueDouble();
+      return SerializeDoubleJson(property_value.ValueDouble());
     case Type::String:
       return property_value.ValueString();
     case Type::List:
@@ -60,7 +86,7 @@ nlohmann::json SerializeExternalPropertyValue(const storage::ExternalPropertyVal
         if (std::holds_alternative<int>(item)) {
           ret.push_back(std::get<int>(item));
         } else {
-          ret.push_back(std::get<double>(item));
+          ret.push_back(SerializeDoubleJson(std::get<double>(item)));
         }
       }
       return ret;
@@ -77,7 +103,7 @@ nlohmann::json SerializeExternalPropertyValue(const storage::ExternalPropertyVal
       nlohmann::json ret = nlohmann::json::array();
       const auto &list = property_value.ValueDoubleList();
       for (const auto &item : list) {
-        ret.push_back(item);
+        ret.push_back(SerializeDoubleJson(item));
       }
       return ret;
     }
@@ -121,8 +147,8 @@ nlohmann::json SerializeExternalPropertyValue(const storage::ExternalPropertyVal
       data.emplace("type", static_cast<uint64_t>(ObjectType::POINT_2D));
       auto const &point_2d = property_value.ValuePoint2d();
       data.emplace("srid", storage::CrsToSrid(point_2d.crs()).value_of());
-      data.emplace("x", point_2d.x());
-      data.emplace("y", point_2d.y());
+      data.emplace("x", SerializeDoubleJson(point_2d.x()));
+      data.emplace("y", SerializeDoubleJson(point_2d.y()));
       return data;
     }
     case storage::ExternalPropertyValue::Type::Point3d: {
@@ -130,9 +156,9 @@ nlohmann::json SerializeExternalPropertyValue(const storage::ExternalPropertyVal
       data.emplace("type", static_cast<uint64_t>(ObjectType::POINT_3D));
       auto const &point_3d = property_value.ValuePoint3d();
       data.emplace("srid", storage::CrsToSrid(point_3d.crs()).value_of());
-      data.emplace("x", point_3d.x());
-      data.emplace("y", point_3d.y());
-      data.emplace("z", point_3d.z());
+      data.emplace("x", SerializeDoubleJson(point_3d.x()));
+      data.emplace("y", SerializeDoubleJson(point_3d.y()));
+      data.emplace("z", SerializeDoubleJson(point_3d.z()));
       return data;
     }
     case storage::ExternalPropertyValue::Type::VectorIndexId: {
@@ -216,16 +242,20 @@ storage::ExternalPropertyValue DeserializeExternalPropertyValue(const nlohmann::
       auto crs_opt = storage::SridToCrs(storage::Srid{data["srid"].get<uint16_t>()});
       MG_ASSERT(crs_opt.has_value(), "Unknown srid");
       return storage::ExternalPropertyValue(
-          storage::Point2d{*crs_opt, data["x"].get<double>(), data["y"].get<double>()});
+          storage::Point2d{*crs_opt, DeserializeDoubleJson(data["x"]), DeserializeDoubleJson(data["y"])});
     }
     case ObjectType::POINT_3D: {
       auto crs_opt = storage::SridToCrs(storage::Srid{data["srid"].get<uint16_t>()});
       MG_ASSERT(crs_opt.has_value(), "Unknown srid");
-      return storage::ExternalPropertyValue(
-          storage::Point3d{*crs_opt, data["x"].get<double>(), data["y"].get<double>(), data["z"].get<double>()});
+      return storage::ExternalPropertyValue(storage::Point3d{*crs_opt,
+                                                             DeserializeDoubleJson(data["x"]),
+                                                             DeserializeDoubleJson(data["y"]),
+                                                             DeserializeDoubleJson(data["z"])});
     }
     case ObjectType::VECTOR_INDEX_ID:
       throw std::runtime_error("VectorIndexId should be used only in storage layer!");
+    case ObjectType::NON_FINITE_DOUBLE:
+      return storage::ExternalPropertyValue(DeserializeDoubleJson(data));
   }
 }
 

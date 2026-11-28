@@ -8,6 +8,7 @@ using Neo4j.Driver;
 public class ParallelEdgeImport {
   public static async Task Main(string[] args) {
     var nodeCount = 100;
+    var expectedEdgeCount = nodeCount - 1;
     using (var driver = GraphDatabase.Driver(
                "bolt://localhost:7687", AuthTokens.None,
                (builder) => builder.WithEncryptionLevel(EncryptionLevel.None)
@@ -22,17 +23,28 @@ public class ParallelEdgeImport {
         });
       }
 
-      Trace.Assert(CountNodes(driver) == 1, "Node count after root creation is not correct!.");
+      var initialNodes = CountNodes(driver);
+      Trace.Assert(initialNodes == 1, "Node count after root creation is not correct!.");
+      if (initialNodes != 1) {
+        throw new InvalidOperationException($"Expected 1 root node, got {initialNodes}.");
+      }
 
       // Importing edges asynchronously
       var tasks = new List<Task>();
-      for (int i = 0; i < nodeCount - 1; i++) {
+      for (int i = 0; i < expectedEdgeCount; i++) {
         tasks.Add(ImportEdgeAsync(driver));
       }
 
       await Task.WhenAll(tasks);
 
-      Trace.Assert(CountNodes(driver) == nodeCount);
+      var finalNodes = CountNodes(driver);
+      var finalEdges = CountEdges(driver);
+      Trace.Assert(finalNodes == nodeCount);
+      Trace.Assert(finalEdges == expectedEdgeCount);
+      if (finalNodes != nodeCount || finalEdges != expectedEdgeCount) {
+        throw new InvalidOperationException(
+            $"Expected {nodeCount} nodes and {expectedEdgeCount} edges, got {finalNodes} nodes and {finalEdges} edges.");
+      }
     }
 
     Console.WriteLine("All ok!");
@@ -57,6 +69,13 @@ public class ParallelEdgeImport {
   private static int CountNodes(IDriver driver) {
     using (var session = driver.Session()) {
       var result = session.Run("MATCH (n) RETURN COUNT(*) AS cnt");
+      return Convert.ToInt32(result.First()["cnt"]);
+    }
+  }
+
+  private static int CountEdges(IDriver driver) {
+    using (var session = driver.Session()) {
+      var result = session.Run("MATCH (:Node)-[r:TROUBLING_EDGE]->(:Root) RETURN COUNT(r) AS cnt");
       return Convert.ToInt32(result.First()["cnt"]);
     }
   }

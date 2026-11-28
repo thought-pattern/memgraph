@@ -60,6 +60,9 @@ void EdgesChunkedIterable::Destroy() noexcept {
 }
 
 EdgesChunkedIterable &EdgesChunkedIterable::operator=(EdgesChunkedIterable &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
   Destroy();
   type_ = other.type_;
   switch (other.type_) {
@@ -79,19 +82,7 @@ EdgesChunkedIterable &EdgesChunkedIterable::operator=(EdgesChunkedIterable &&oth
   return *this;
 }
 
-EdgesChunkedIterable::~EdgesChunkedIterable() {
-  switch (type_) {
-    case Type::BY_EDGE_TYPE_IN_MEMORY_CHUNKED:
-      in_memory_chunked_edges_by_type_.InMemoryEdgeTypeIndex::ChunkedIterable::~ChunkedIterable();
-      break;
-    case Type::BY_EDGE_TYPE_PROPERTY_IN_MEMORY_CHUNKED:
-      in_memory_chunked_edges_by_type_property_.InMemoryEdgeTypePropertyIndex::ChunkedIterable::~ChunkedIterable();
-      break;
-    case Type::BY_EDGE_PROPERTY_IN_MEMORY_CHUNKED:
-      in_memory_chunked_edges_by_property_.InMemoryEdgePropertyIndex::ChunkedIterable::~ChunkedIterable();
-      break;
-  }
-}
+EdgesChunkedIterable::~EdgesChunkedIterable() { Destroy(); }
 
 EdgesChunkedIterable::Chunk EdgesChunkedIterable::get_chunk(size_t id) {
   switch (type_) {

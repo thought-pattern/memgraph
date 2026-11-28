@@ -1338,7 +1338,7 @@ TEST(DeltaVectorBeforeImage, CoordinatesLiveInThePinnedDbArena) {
                       PropertyId::FromUint(1),
                       PropertyValue(PropertyValue::VectorIndexIdData{
                           .ids = memgraph::utils::small_vector<uint64_t>{1},
-                          .vector = memgraph::utils::small_vector<float>(static_cast<uint32_t>(kDims))}),
+                          .vector = memgraph::utils::small_vector<double>(static_cast<uint32_t>(kDims))}),
                       static_cast<CommitInfo *>(nullptr),
                       0);
   };

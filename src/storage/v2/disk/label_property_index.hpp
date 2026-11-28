@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "storage/v2/disk/rocksdb_storage.hpp"
 #include "storage/v2/indices/label_property_index.hpp"
 #include "utils/synchronized.hpp"
@@ -29,6 +31,7 @@ class DiskLabelPropertyIndex : public storage::LabelPropertyIndex {
   };
 
   using EntriesForDeletion = std::map<Gid, std::vector<LabelProperty>>;
+  using PerTxEntriesForDeletion = std::map<uint64_t, EntriesForDeletion>;
 
   struct ActiveIndices : LabelPropertyIndex::ActiveIndices {
     explicit ActiveIndices(std::set<LabelProperty> index) : index_(std::move(index)) {}
@@ -44,6 +47,8 @@ class DiskLabelPropertyIndex : public storage::LabelPropertyIndex {
     bool IndexExists(LabelId label, std::span<PropertyPath const> properties) const override;
 
     bool IndexReady(LabelId label, std::span<PropertyPath const> properties) const override;
+
+    bool IndexReady(LabelId label, std::span<PropertyPath const> properties, IndexOrder order) const override;
 
     auto RelevantLabelPropertiesIndicesInfo(std::span<LabelId const> labels,
                                             std::span<PropertyPath const> properties) const
@@ -63,18 +68,33 @@ class DiskLabelPropertyIndex : public storage::LabelPropertyIndex {
 
     auto GetAbortProcessor() const -> AbortProcessor override;
 
+    EntriesForDeletion ExtractEntriesForTransaction(uint64_t start_timestamp);
+
+    void ClearEntriesForTransaction(uint64_t start_timestamp);
+
     std::set<LabelProperty> index_;
-    EntriesForDeletion entries_for_deletion_;
+    mutable std::mutex deletion_mutex_;
+    PerTxEntriesForDeletion entries_for_deletion_;
   };
 
   explicit DiskLabelPropertyIndex(const Config &config);
 
-  bool CreateIndex(LabelId label, PropertyId property,
-                   const std::vector<std::pair<std::string, std::string>> &vertices);
+  [[nodiscard]] bool CreateIndex(LabelId label, PropertyId property,
+                                 const std::vector<std::pair<std::string, std::string>> &vertices,
+                                 uint64_t commit_timestamp = 0);
 
   std::unique_ptr<rocksdb::Transaction> CreateRocksDBTransaction() const;
 
   std::unique_ptr<rocksdb::Transaction> CreateAllReadingRocksDBTransaction() const;
+
+  [[nodiscard]] bool StageSyncVertex(rocksdb::Transaction &disk_transaction, const Vertex &vertex) const;
+
+  [[nodiscard]] bool StageClearDeletedVertex(rocksdb::Transaction &disk_transaction, std::string_view gid) const;
+
+  [[nodiscard]] bool StageDeleteRemovedLabels(rocksdb::Transaction &disk_transaction,
+                                              EntriesForDeletion const &entries_for_deletion) const;
+
+  [[nodiscard]] static bool CommitTransaction(rocksdb::Transaction *disk_transaction, uint64_t commit_timestamp);
 
   [[nodiscard]] bool SyncVertexToLabelPropertyIndexStorage(const Vertex &vertex, uint64_t commit_timestamp) const;
 
@@ -85,7 +105,7 @@ class DiskLabelPropertyIndex : public storage::LabelPropertyIndex {
                                                             EntriesForDeletion const &entries_for_deletion);
 
   DropResult DropIndex(LabelId label, std::vector<PropertyPath> const &properties, ActiveIndicesUpdater const &updater,
-                       std::optional<IndexOrder> order = std::nullopt);
+                       std::optional<IndexOrder> order = std::nullopt, uint64_t commit_timestamp = 0);
 
   RocksDBStorage *GetRocksDBStorage() const;
 

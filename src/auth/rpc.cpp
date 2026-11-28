@@ -197,7 +197,7 @@ void Save(const memgraph::replication::UpdateAuthDataReq &self, memgraph::slk::B
   for (auto const &op : self.ops) {
     // Saved by hand rather than through slk's generic variant overload: that one resolves `slk::Save` for the
     // alternatives at its own definition, so it only reaches types declared inside slk itself.
-    memgraph::slk::Save(op.index(), builder);
+    memgraph::slk::Save(static_cast<uint64_t>(op.index()), builder);
     std::visit([builder](auto const &held) { memgraph::slk::Save(held, builder); }, op);
   }
 }
@@ -210,7 +210,7 @@ void Load(memgraph::replication::UpdateAuthDataReq *self, memgraph::slk::Reader 
   memgraph::slk::Load(&size, reader);
   self->ops.clear();
   for (uint64_t i = 0; i < size; ++i) {
-    std::size_t index{};
+    uint64_t index{};
     memgraph::slk::Load(&index, reader);
     switch (index) {
       case 0: {

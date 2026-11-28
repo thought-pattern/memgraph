@@ -184,7 +184,7 @@ auto InMemoryLabelIndex::PopulateIndex(
   } catch (const PopulateCancel &) {
     (void)DropIndex(label, updater);
     return std::unexpected{IndexPopulateError::Cancellation};
-  } catch (const utils::OutOfMemoryException &) {
+  } catch (...) {
     (void)DropIndex(label, updater);
     throw;
   }
@@ -267,6 +267,8 @@ uint64_t InMemoryLabelIndex::RemoveObsoleteEntries(Storage *storage, uint64_t ol
   auto const vertex_pin = static_cast<InMemoryStorage const *>(storage)->MakeVertexPin();
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
+  auto const duplicate_horizon =
+      static_cast<InMemoryStorage const *>(storage)->IndexDuplicateHorizon(oldest_active_start_timestamp);
 
   return SweepArmedIndexes(
       arming,
@@ -291,7 +293,7 @@ uint64_t InMemoryLabelIndex::RemoveObsoleteEntries(Storage *storage, uint64_t ol
           // The older of two entries for a vertex is redundant only once the newer one is visible to
           // every reader; before that a reader older than the newer entry sees neither.
           if ((next_it != vertices_acc.end() && it->vertex == next_it->vertex &&
-               (!preserve_recent_entries || next_it->timestamp < oldest_active_start_timestamp)) ||
+               (!preserve_recent_entries || next_it->timestamp < duplicate_horizon)) ||
               !AnyVersionHasLabel(*it->vertex, label, oldest_active_start_timestamp)) {
             vertices_acc.remove(*it);
           }
@@ -460,10 +462,8 @@ void InMemoryLabelIndex::CleanupAllIndices() {
 }
 
 void InMemoryLabelIndex::ChunkedIterable::Iterator::AdvanceUntilValid() {
-  // NOTE: Using the skiplist end here to not store the end iterator in the class
-  // The higher level != end will still be correct
   AdvanceUntilValid_(index_iterator_,
-                     utils::SkipListDb<InMemoryLabelIndex::Entry>::ChunkedIterator{},
+                     chunk_end_,
                      current_vertex_,
                      current_vertex_accessor_,
                      self_->storage_,

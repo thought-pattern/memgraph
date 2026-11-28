@@ -71,11 +71,18 @@ void CreateAndLinkDeltaForEdgeSetProperty(Transaction *transaction, const Config
 std::optional<EdgeAccessor> EdgeAccessor::Create(EdgeRef edge, EdgeTypeId edge_type, Vertex *from_vertex,
                                                  Vertex *to_vertex, Storage *storage, Transaction *transaction,
                                                  View view, bool for_deleted) {
-  if (!IsEdgeVisible(edge.ptr, transaction, view)) {
-    return std::nullopt;
+  if (storage->config_.salient.items.properties_on_edges) {
+    if (!IsEdgeVisible(edge.ptr, transaction, view)) {
+      return std::nullopt;
+    }
+    return EdgeAccessor(edge, edge_type, from_vertex, to_vertex, storage, transaction, for_deleted);
   }
 
-  return EdgeAccessor(edge, edge_type, from_vertex, to_vertex, storage, transaction, for_deleted);
+  EdgeAccessor accessor(edge, edge_type, from_vertex, to_vertex, storage, transaction, for_deleted);
+  if (!accessor.IsVisible(view)) {
+    return std::nullopt;
+  }
+  return accessor;
 }
 
 bool EdgeAccessor::IsDeleted() const {
@@ -202,7 +209,7 @@ Result<storage::PropertyValue> EdgeAccessor::SetProperty(PropertyId property, co
   if (edge_.ptr->deleted()) return std::unexpected{Error::DELETED_OBJECT};
   using ReturnType = decltype(edge_.ptr->properties.GetProperty(property));
   std::optional<ReturnType> current_value;
-  const bool skip_duplicate_write = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_write = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   utils::AtomicMemoryBlock([this, &current_value, &property, &value, skip_duplicate_write, &schema_acc]() {
     current_value.emplace(edge_.ptr->properties.GetProperty(
         property,
@@ -221,6 +228,9 @@ Result<storage::PropertyValue> EdgeAccessor::SetProperty(PropertyId property, co
     CreateAndLinkDeltaForEdgeSetProperty(
         transaction_, storage_->config_, edge_.ptr, from_vertex_, to_vertex_, edge_type_, property, *current_value);
     auto maybe_vector_index_value = TryConvertToVectorEdgeIndexProperty(storage_, edge_type_, property, value);
+    if (!maybe_vector_index_value && PropertyStore::NeedsPrecisionNormalization()) {
+      maybe_vector_index_value = PropertyStore::NormalizeForStorage(value);
+    }
     const auto &value_to_store = maybe_vector_index_value.has_value() ? *maybe_vector_index_value : value;
     edge_.ptr->properties.SetProperty(property, value_to_store);
     storage_->indices_.UpdateOnSetProperty(
@@ -252,7 +262,13 @@ Result<bool> EdgeAccessor::InitProperties(std::map<storage::PropertyId, storage:
     for (auto &[property_id, property_value] : properties) {
       if (auto converted = TryConvertToVectorEdgeIndexProperty(storage_, edge_type_, property_id, property_value)) {
         property_value = std::move(*converted);
+      } else if (PropertyStore::NeedsPrecisionNormalization()) {
+        property_value = PropertyStore::NormalizeForStorage(property_value);
       }
+    }
+  } else if (PropertyStore::NeedsPrecisionNormalization()) {
+    for (auto &[property_id, property_value] : properties) {
+      property_value = PropertyStore::NormalizeForStorage(property_value);
     }
   }
 
@@ -306,7 +322,13 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> EdgeAc
     for (auto &[property_id, property_value] : properties) {
       if (auto converted = TryConvertToVectorEdgeIndexProperty(storage_, edge_type_, property_id, property_value)) {
         property_value = std::move(*converted);
+      } else if (PropertyStore::NeedsPrecisionNormalization()) {
+        property_value = PropertyStore::NormalizeForStorage(property_value);
       }
+    }
+  } else if (PropertyStore::NeedsPrecisionNormalization()) {
+    for (auto &[property_id, property_value] : properties) {
+      property_value = PropertyStore::NormalizeForStorage(property_value);
     }
   }
 
@@ -322,7 +344,7 @@ Result<std::vector<std::tuple<PropertyId, PropertyValue, PropertyValue>>> EdgeAc
 
   if (edge_.ptr->deleted()) return std::unexpected{Error::DELETED_OBJECT};
 
-  const bool skip_duplicate_write = !storage_->config_.salient.items.delta_on_identical_property_update;
+  const bool skip_duplicate_write = storage_->config_.salient.items.ShouldSkipDuplicatePropertyUpdate();
   using ReturnType = decltype(edge_.ptr->properties.UpdateProperties(properties));
   std::optional<ReturnType> id_old_new_change;
   utils::AtomicMemoryBlock([this, &properties, &id_old_new_change, skip_duplicate_write, &schema_acc]() {
@@ -477,6 +499,7 @@ Result<uint64_t> EdgeAccessor::GetPropertySize(PropertyId property, View view) c
   {
     auto guard = std::shared_lock{edge_.ptr->lock};
     if (!edge_.ptr->delta()) {
+      if (!for_deleted_ && edge_.ptr->deleted()) return std::unexpected{Error::DELETED_OBJECT};
       return edge_.ptr->properties.PropertySize(property);
     }
   }

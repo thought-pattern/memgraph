@@ -18,11 +18,11 @@ integration tests in python.
 Only Bolt communication protocol is supported.
 """
 
+from argparse import ArgumentParser
 import contextlib
 import os
-import time
-from argparse import ArgumentParser
 from threading import Thread
+import time
 
 from neo4j import TRUST_ALL_CERTIFICATES, GraphDatabase
 

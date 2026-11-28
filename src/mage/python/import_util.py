@@ -1,256 +1,223 @@
-import ast
-import json as js
-from dataclasses import dataclass
+"""Utilities for import util."""
+
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Union
+from json import load as js_load, loads as js_loads
+from re import compile as re_compile
 
-import defusedxml.ElementTree as ET
-import gqlalchemy
-import mgp
+from defusedxml import ElementTree as ET
+from gqlalchemy.memgraph_constants import (
+    MG_ENCRYPTED,
+    MG_HOST,
+    MG_PASSWORD,
+    MG_PORT,
+    MG_USERNAME,
+)
+from mgclient import (
+    MG_SSLMODE_DISABLE,
+    MG_SSLMODE_REQUIRE,
+    Error as mgclient_Error,
+    connect as mgclient_connect,
+)
+from mgp import (
+    EdgeType as mgp_EdgeType,
+    Map as mgp_Map,
+    Nullable as mgp_Nullable,
+    ProcCtx as mgp_ProcCtx,
+    Record as mgp_Record,
+    write_proc as mgp_write_proc,
+)
+
 from mage.export_import_util.parameters import Parameter
+from mage.export_import_util.temporal import (
+    convert_to_isoformat,
+    convert_to_isoformat_graphML,
+)
+
+# Exact body of str(timedelta), which convert_to_isoformat writes inside duration(...): "[-]D day[s], H:MM:SS[.ffffff]".
+TIMEDELTA_TEXT = re_compile(r"(?:(-?\d+) days?, )?(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{6}))?")
+
+DEFAULT_CYPHER_IMPORT_CONFIG = {}
+
+# Admitted cypher import settings. The target keys mirror gqlalchemy.Memgraph's connection arguments.
+CYPHER_IMPORT_CONFIG_TYPES = {
+    "host": str,
+    "port": int,
+    "username": str,
+    "password": str,
+    "encrypted": bool,
+    "database": str,
+    "db": str,
+    "startLine": int,
+}
+
+# GraphML boolean data: the XML Schema lexical forms plus the exporter's str(bool) spelling.
+GRAPHML_TRUE_TOKENS = {"true", "True", "1"}
+GRAPHML_FALSE_TOKENS = {"false", "False", "0"}
 
 
-@dataclass
-class Node:
-    id: int
-    labels: list
-    properties: dict
-
-    def get_dict(self) -> dict:
-        return {
-            Parameter.ID.value: self.id,
-            Parameter.LABELS.value: self.labels,
-            Parameter.PROPERTIES.value: self.properties,
-            Parameter.TYPE.value: Parameter.NODE.value,
-        }
+def cypher_identifier(name: str) -> str:
+    """Backtick-quotes an identifier; embedded backticks are doubled."""
+    escaped = name.replace("`", "``")
+    return f"`{escaped}`"
 
 
-@dataclass
-class Relationship:
-    end: int
-    id: int
-    label: str
-    properties: dict
-    start: int
-    id: int
-
-    def get_dict(self) -> dict:
-        return {
-            Parameter.END.value: self.end,
-            Parameter.ID.value: self.id,
-            Parameter.LABEL.value: self.label,
-            Parameter.PROPERTIES.value: self.properties,
-            Parameter.START.value: self.start,
-            Parameter.TYPE.value: Parameter.RELATIONSHIP.value,
-        }
-
-
-@dataclass
-class KeyObjectGraphML:
-    name: str
-    is_for: str
-    type: str
-    type_is_list: bool
-    default_value: str
-    id: str = None
-
-    def __init__(
-        self,
-        name: str,
-        is_for: str,
-        type: str = "",
-        type_is_list: str = False,
-        default_value: str = "",
-    ):
-        self.name = name
-        self.is_for = is_for
-        self.type = type
-        self.type_is_list = type_is_list
-        self.default_value = default_value
-
-    def __hash__(self):
-        return hash(
-            (
-                self.name,
-                self.is_for,
-                self.type,
-                self.type_is_list,
-                self.default_value,
-            )
-        )
-
-    def __eq__(self, other):
-        if not isinstance(other, type(self)):
-            return NotImplemented
-        return (
-            self.name == other.name
-            and self.is_for == other.is_for
-            and self.type == other.type
-            and self.type_is_list == other.type_is_list
-            and self.default_value == other.default_value
-        )
-
-
-def convert_to_isoformat(
-    property: Union[
-        None,
-        str,
-        bool,
-        int,
-        float,
-        List[Any],
-        Dict[str, Any],
-        timedelta,
-        time,
-        datetime,
-        date,
-    ]
-):
-    if isinstance(property, timedelta):
-        return Parameter.DURATION.value + str(property) + ")"
-
-    elif isinstance(property, time):
-        return Parameter.LOCALTIME.value + property.isoformat() + ")"
-
-    elif isinstance(property, datetime):
-        return Parameter.LOCALDATETIME.value + property.isoformat() + ")"
-
-    elif isinstance(property, date):
-        return Parameter.DATE.value + property.isoformat() + ")"
-
-    else:
-        return property
-
-
-def to_duration_isoformat(value: timedelta) -> str:
-    """Converts timedelta to ISO-8601 duration: P<date>T<time>"""
-    date_parts: List[str] = []
-    time_parts: List[str] = []
-
-    if value.days != 0:
-        date_parts.append(f"{abs(value.days)}D")
-
-    if value.seconds != 0 or value.microseconds != 0:
-        abs_seconds = abs(value.seconds)
-        minutes, seconds = divmod(abs_seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        microseconds = value.microseconds
-
-        if hours > 0:
-            time_parts.append(f"{hours}H")
-        if minutes > 0:
-            time_parts.append(f"{minutes}M")
-        if seconds > 0 or microseconds > 0:
-            microseconds_part = f".{abs(value.microseconds)}" if value.microseconds != 0 else ""
-            time_parts.append(f"{seconds}{microseconds_part}S")
-
-    date_duration_str = "".join(date_parts)
-    time_duration_str = f'T{"".join(time_parts)}' if time_parts else ""
-
-    return f"P{date_duration_str}{time_duration_str}"
-
-
-def convert_to_isoformat_graphML(
-    property: Union[
-        None,
-        str,
-        bool,
-        int,
-        float,
-        List[Any],
-        Dict[str, Any],
-        timedelta,
-        time,
-        datetime,
-        date,
-    ]
-):
-    if isinstance(property, timedelta):
-        return to_duration_isoformat(property)
-
-    if isinstance(property, (time, date, datetime)):
-        return property.isoformat()
-
-    else:
-        return property
-
-
-def get_graph(
-    ctx: mgp.ProcCtx,
-    config: Union[mgp.Map, None] = {
-        "graphML": False,
-        "leaveOutLabels": False,
-        "leaveOutProperties": False,
-    },
-) -> List[Union[Node, Relationship]]:
+def split_cypher_statements(script: str) -> list[tuple[int, str]]:
     """
-    config : Map
-        - graphML: bool
-        - leaveOutLabels: bool
-        - leaveOutProperties: bool
-
+    Splits a Cypher script into (start_line, statement) pairs on top-level semicolons while preserving semicolons and
+    newlines inside single-quoted strings, double-quoted strings, backtick identifiers, and -- / // / /* */ comments.
     """
-    nodes = list()
-    relationships = list()
+    statements: list[tuple[int, str]] = []
+    buf: list[str] = []
+    state = "normal"
+    line_num = 1
+    stmt_start_line = 0
+    idx = 0
+    length = len(script)
 
-    for vertex in ctx.graph.vertices:
-        labels = []
-        properties = dict()
-        if not config.get("leaveOutLabels"):
-            labels = [label.name for label in vertex.labels]
-        if config.get("graphML") and not config.get("leaveOutProperties"):
-            properties = {
-                key: convert_to_isoformat_graphML(vertex.properties.get(key)) for key in vertex.properties.keys()
-            }
-        elif not config.get("leaveOutProperties"):
-            properties = {key: convert_to_isoformat(vertex.properties.get(key)) for key in vertex.properties.keys()}
+    while idx < length:
+        ch = script[idx]
+        nxt = script[idx + 1] if idx + 1 < length else ""
 
-        nodes.append(Node(vertex.id, labels, properties).get_dict())
+        if state == "normal":
+            if ch.isspace():
+                if stmt_start_line > 0:
+                    buf.append(ch)
+                if ch == "\n":
+                    line_num += 1
+                idx += 1
+                continue
+            if (ch == "-" and nxt == "-") or (ch == "/" and nxt == "/"):
+                state = "line_comment"
+                idx += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                if stmt_start_line > 0:
+                    buf.append(" ")
+                idx += 2
+                continue
+            if ch == ";":
+                text = "".join(buf).strip()
+                if text:
+                    statements.append((stmt_start_line or line_num, f"{text};"))
+                buf = []
+                stmt_start_line = 0
+                idx += 1
+                continue
+            if stmt_start_line == 0:
+                stmt_start_line = line_num
+            buf.append(ch)
+            if ch == "'":
+                state = "single_quote"
+            elif ch == '"':
+                state = "double_quote"
+            elif ch == "`":
+                state = "backtick"
+            idx += 1
+            continue
 
-        for edge in vertex.out_edges:
-            if not config.get("leaveOutProperties"):
-                properties = {key: convert_to_isoformat(edge.properties.get(key)) for key in edge.properties.keys()}
+        if state == "line_comment":
+            if ch == "\n":
+                line_num += 1
+                if stmt_start_line > 0:
+                    buf.append("\n")
+                state = "normal"
+            idx += 1
+            continue
 
-            relationships.append(
-                Relationship(
-                    edge.to_vertex.id,
-                    edge.id,
-                    edge.type.name,
-                    properties,
-                    edge.from_vertex.id,
-                ).get_dict()
-            )
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "normal"
+                idx += 2
+                continue
+            if ch == "\n":
+                line_num += 1
+                if stmt_start_line > 0:
+                    buf.append("\n")
+            idx += 1
+            continue
 
-    return nodes + relationships
+        if state in ("single_quote", "double_quote"):
+            quote_char = "'" if state == "single_quote" else '"'
+            buf.append(ch)
+            if ch == "\n":
+                line_num += 1
+            if ch == "\\" and idx + 1 < length:
+                esc = script[idx + 1]
+                buf.append(esc)
+                if esc == "\n":
+                    line_num += 1
+                idx += 2
+                continue
+            if ch == quote_char:
+                state = "normal"
+            idx += 1
+            continue
+
+        buf.append(ch)
+        if ch == "\n":
+            line_num += 1
+        if ch == "`":
+            if nxt == "`":
+                buf.append(nxt)
+                idx += 2
+                continue
+            state = "normal"
+        idx += 1
+
+    trailing = "".join(buf).strip()
+    if trailing:
+        statements.append((stmt_start_line or line_num, trailing))
+    return statements
 
 
-def convert_from_isoformat(property: Union[None, str, bool, int, float, List[Any], Dict[str, Any]]):
-    if not isinstance(property, str):
-        return property
-
-    if str.startswith(property, Parameter.DURATION.value):
-        duration_iso = property.split("(")[-1].split(")")[0]
-        parsed_time = datetime.strptime(duration_iso, "%H:%M:%S.%f")
-        return timedelta(
-            hours=parsed_time.hour,
-            minutes=parsed_time.minute,
-            seconds=parsed_time.second,
-            microseconds=parsed_time.microsecond,
-        )
-    elif str.startswith(property, Parameter.LOCALTIME.value):
-        local_time_iso = property.split("(")[-1].split(")")[0]
-        return time.fromisoformat(local_time_iso)
-    elif str.startswith(property, Parameter.LOCALDATETIME.value):
-        local_datetime_iso = property.split("(")[-1].split(")")[0]
-        return datetime.fromisoformat(local_datetime_iso)
-    elif str.startswith(property, Parameter.DATE.value):
-        date_iso = property.split("(")[-1].split(")")[0]
-        return date.fromisoformat(date_iso)
-    else:
-        return property
+def parse_timedelta_text(text: str) -> timedelta:
+    """Inverse of str(timedelta): signed days, whole seconds, zero and fractions all round-trip."""
+    match = TIMEDELTA_TEXT.fullmatch(text)
+    if not match:
+        raise ValueError(f"not a duration body: {text!r}")
+    days, hours, minutes, seconds, microseconds = (int(group) for group in match.groups(default="0"))
+    value = timedelta(
+        days=days,
+        hours=hours,
+        minutes=minutes,
+        seconds=seconds,
+        microseconds=microseconds,
+    )
+    return value
 
 
-def create_vertex(ctx: mgp.ProcCtx, properties: Dict[str, Any], labels: List[str]):
+TEMPORAL_DECODERS = (
+    (Parameter.DURATION.value, parse_timedelta_text),
+    (Parameter.LOCALTIME.value, time.fromisoformat),
+    (Parameter.LOCALDATETIME.value, datetime.fromisoformat),
+    (Parameter.DATE.value, date.fromisoformat),
+)
+
+
+def convert_from_isoformat(encoded: object):
+    """
+    Decodes the typed temporal wrappers convert_to_isoformat writes. A value is decoded only when re-encoding it
+    reproduces the string exactly; any other string, including one that merely starts with a wrapper name, stays an
+    ordinary string.
+    """
+    if not isinstance(encoded, str) or not encoded.endswith(")"):
+        return encoded
+    for prefix, decode in TEMPORAL_DECODERS:
+        if not encoded.startswith(prefix):
+            continue
+        try:
+            value = decode(encoded[len(prefix) : -1])
+        except ValueError:
+            return encoded
+        if convert_to_isoformat(value) != encoded:
+            return encoded
+        return value
+    return encoded
+
+
+def import_vertex(ctx: mgp_ProcCtx, properties: dict[str, object], labels: list[str]):
+    """Writes one imported node into the graph, decoding its temporal property wrappers, and returns its vertex id."""
     vertex = ctx.graph.create_vertex()
     vertex_properties = vertex.properties
 
@@ -263,52 +230,154 @@ def create_vertex(ctx: mgp.ProcCtx, properties: Dict[str, Any], labels: List[str
     return vertex.id
 
 
-def create_edge(
-    ctx: mgp.ProcCtx,
-    properties: Dict[str, Any],
-    start_node_id: Union[int, str],
-    end_node_id: Union[int, str],
-    type: str,
-    vertex_ids: Dict[Union[int, str], int],
+def import_edge(
+    ctx: mgp_ProcCtx,
+    properties: dict[str, object],
+    start_node_id: object,
+    end_node_id: object,
+    edge_type: str,
+    vertex_ids: dict[object, int],
 ):
-    vertex_from = ctx.graph.get_vertex_by_id(vertex_ids[start_node_id])
-    vertex_to = ctx.graph.get_vertex_by_id(vertex_ids[end_node_id])
-    edge = ctx.graph.create_edge(vertex_from, vertex_to, mgp.EdgeType(type))
+    # Memgraph vertex ids are non-negative, so -1 marks an endpoint this import never resolved; it must not
+    # fall through to a real vertex such as id 0.
+    start_vertex_id = vertex_ids.get(start_node_id, -1)
+    end_vertex_id = vertex_ids.get(end_node_id, -1)
+    if start_vertex_id < 0 or end_vertex_id < 0:
+        endpoints = ((start_node_id, start_vertex_id), (end_node_id, end_vertex_id))
+        unresolved = [node_id for node_id, vertex_id in endpoints if vertex_id < 0]
+        raise KeyError(f"Relationship endpoint(s) {unresolved!r} do not identify an imported or explicitly matched node")
+    vertex_from = ctx.graph.get_vertex_by_id(start_vertex_id)
+    vertex_to = ctx.graph.get_vertex_by_id(end_vertex_id)
+    edge = ctx.graph.create_edge(vertex_from, vertex_to, mgp_EdgeType(edge_type))
     edge_properties = edge.properties
 
     for key, value in properties.items():
         edge_properties[key] = convert_from_isoformat(value)
+    return False
 
 
-@mgp.write_proc
-def cypher(ctx: mgp.ProcCtx, path: str) -> mgp.Record():
+def admit_cypher_import_config(config: mgp_Map, ctx: object = None) -> dict:
     """
-    Procedure to import the Cypher created by the export_util.json procedure.
+    Validates the cypher import target, database and resume line. An omitted target is GQLAlchemy's
+    environment-configured endpoint (MG_HOST, MG_PORT, MG_USERNAME, MG_PASSWORD, MG_ENCRYPT), the same one
+    export_util.cypher_all reads.
+    """
+    raw_cfg = dict(config) if config is not None else {}
+    settings = {
+        "host": MG_HOST,
+        "port": MG_PORT,
+        "username": MG_USERNAME,
+        "password": MG_PASSWORD,
+        "encrypted": MG_ENCRYPTED,
+        "database": "",
+        "startLine": 1,
+    }
+    for key, value in raw_cfg.items():
+        if key not in CYPHER_IMPORT_CONFIG_TYPES:
+            raise KeyError(f"Unknown cypher import config key {key!r}; expected one of {sorted(CYPHER_IMPORT_CONFIG_TYPES)}.")
+        expected_type = CYPHER_IMPORT_CONFIG_TYPES.get(key, object)
+        if not isinstance(value, expected_type) or (expected_type is int and isinstance(value, bool)):
+            raise TypeError(f"Cypher import config {key!r} must be {expected_type.__name__}, received {value!r}.")
+        settings[key] = value
+    if "database" in raw_cfg and "db" in raw_cfg and raw_cfg.get("database") != raw_cfg.get("db"):
+        raise ValueError("Cypher import config 'database' and 'db' must match when both are supplied.")
+    if "database" not in raw_cfg and "db" in raw_cfg:
+        settings["database"] = raw_cfg.get("db", "")
+    elif "database" not in raw_cfg and ctx is not None:
+        ctx_db = getattr(ctx, "database", None) or getattr(getattr(ctx, "graph", None), "database", None)
+        if isinstance(ctx_db, str) and ctx_db:
+            settings["database"] = ctx_db
+    if not settings.get("host", ""):
+        raise ValueError("Cypher import config 'host' must name the Memgraph instance that receives the statements.")
+    if not 0 < settings.get("port", 0) < 65536:
+        raise ValueError(f"Cypher import config 'port' must be a TCP port, received {settings.get('port', 0)!r}.")
+    if settings.get("startLine", 1) < 1:
+        raise ValueError(f"Cypher import config 'startLine' must be at least 1, received {settings.get('startLine', 1)!r}.")
+    return settings
+
+
+def cypher(ctx: mgp_ProcCtx, path: str, config: mgp_Map = DEFAULT_CYPHER_IMPORT_CONFIG) -> mgp_Record:
+    """
+    Procedure to import Cypher statements created by export_util.cypher_all or written across multiple lines.
     The lab import feature should be prefered.
+
+    A procedure cannot run Cypher inside its calling transaction, so the statements run on a separate Bolt connection
+    to the configured target and each commits on its own (index, constraint and trigger statements cannot share a
+    transaction with data). The calling transaction does not own or roll back those writes. If a statement fails, the
+    error reports how many statements were committed and the line to resume from; the connection is always closed.
 
     Parameters
     ----------
     path : str
-        Path to the JSON file that is being imported.
+        Path to the Cypher file that is being imported.
+    config : Map
+        host, port, username, password, encrypted, database: the receiving Memgraph instance and optional database;
+            omitted keys use GQLAlchemy's MG_HOST/MG_PORT/MG_USERNAME/MG_PASSWORD/MG_ENCRYPT environment configuration.
+        startLine (int) = 1: first statement start line to execute, for resuming after a reported failure.
     """
+    if config is DEFAULT_CYPHER_IMPORT_CONFIG:
+        config = DEFAULT_CYPHER_IMPORT_CONFIG.copy()
+    settings = admit_cypher_import_config(config, ctx=ctx)
+    target = f"{settings.get('host', '')}:{settings.get('port', 0)}"
+    database = settings.get("database", "")
+    start_line = settings.get("startLine", 1)
 
-    memgraph = gqlalchemy.Memgraph()
     try:
-        with open(path, "r") as file:
-            for query in file.readlines():
-                stripped_query = query.strip()
-                if stripped_query:
-                    memgraph.execute(stripped_query)
-    except OSError:
-        raise OSError("Could not open/read file.")
-    except Exception:
-        raise Exception("Unable to execute the given queries")
+        with open(path, "r", encoding="utf-8") as file:
+            script = file.read()
+    except OSError as err:
+        raise OSError("Could not open/read file.") from err
 
-    return mgp.Record()
+    statements = split_cypher_statements(script)
+
+    try:
+        connection = mgclient_connect(
+            host=settings.get("host", ""),
+            port=settings.get("port", 0),
+            username=settings.get("username", ""),
+            password=settings.get("password", ""),
+            sslmode=(MG_SSLMODE_REQUIRE if settings.get("encrypted", False) else MG_SSLMODE_DISABLE),
+        )
+    except mgclient_Error as err:
+        raise ConnectionError(f"Cypher import could not connect to {target}: {err}") from err
+
+    committed = 0
+    try:
+        connection.autocommit = True
+        if database:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(f"USE DATABASE {cypher_identifier(database)};")
+                cursor.fetchall()
+            except mgclient_Error as err:
+                raise RuntimeError(f"Cypher import could not select database {database!r} on {target}: {err}") from err
+        for line_number, statement in statements:
+            if line_number < start_line:
+                continue
+            ctx.check_must_abort()
+            cursor = connection.cursor()
+            try:
+                cursor.execute(statement)
+                cursor.fetchall()
+            except mgclient_Error as err:
+                raise RuntimeError(
+                    f"Cypher import into {target} failed at line {line_number}: {err}. {committed} statement(s) from line "
+                    f"{start_line} were already committed and remain; fix the statement and rerun with config "
+                    f"{{startLine: {line_number}}} to resume."
+                ) from err
+            committed += 1
+    finally:
+        connection.close()
+
+    computed_return_value = mgp_Record()
+    return computed_return_value
 
 
-@mgp.write_proc
-def json(ctx: mgp.ProcCtx, path: str) -> mgp.Record():
+cypher.__annotations__["return"] = mgp_Record()
+cypher = mgp_write_proc(cypher)
+
+
+def json(ctx: mgp_ProcCtx, path: str) -> mgp_Record:
     """
     Procedure to import the JSON created by the export_util.json procedure.
 
@@ -318,58 +387,56 @@ def json(ctx: mgp.ProcCtx, path: str) -> mgp.Record():
         Path to the JSON file that is being imported.
     """
     try:
-        with open(path, "r") as file:
-            graph_objects = js.load(file)
-    except Exception:
-        raise OSError("Could not open/read file.")
+        with open(path, "r", encoding="utf-8") as file:
+            graph_objects = js_load(file)
+    except Exception as err:
+        raise OSError("Could not open/read file.") from err
 
     vertex_ids = dict()
 
-    for object in graph_objects:
+    for graph_object in graph_objects:
         if all(
-            key in object
+            key in graph_object
             for key in (
                 Parameter.TYPE.value,
                 Parameter.PROPERTIES.value,
                 Parameter.ID.value,
             )
         ):
-            type_value = object[Parameter.TYPE.value]
-            properties_value = object[Parameter.PROPERTIES.value]
-            id_value = object[Parameter.ID.value]
+            type_value = graph_object.get(Parameter.TYPE.value, "")
+            properties_value = graph_object.get(Parameter.PROPERTIES.value, {})
+            id_value = graph_object.get(Parameter.ID.value, 0)
         else:
-            raise KeyError(
-                "Each graph object needs to have 'type', \
-                 'properties' and 'id' keys."
-            )
+            raise KeyError("Each graph object needs to have 'type', \
+                 'properties' and 'id' keys.")
 
         if type_value == Parameter.NODE.value:
-            if Parameter.LABELS.value in object:
-                labels_value = object[Parameter.LABELS.value]
+            if Parameter.LABELS.value in graph_object:
+                labels_value = graph_object.get(Parameter.LABELS.value, [])
             else:
                 raise KeyError("Each node object needs to have 'labels' key.")
 
-            vertex_ids[id_value] = create_vertex(ctx, properties_value, labels_value)
+            if id_value in vertex_ids:
+                raise ValueError(f"Node id {id_value!r} appears more than once, so relationships to it are ambiguous.")
+            vertex_ids[id_value] = import_vertex(ctx, properties_value, labels_value)
 
         elif type_value == Parameter.RELATIONSHIP.value:
             if all(
-                key in object
+                key in graph_object
                 for key in (
                     Parameter.START.value,
                     Parameter.END.value,
                     Parameter.LABEL.value,
                 )
             ):
-                start_node_id = object[Parameter.START.value]
-                end_node_id = object[Parameter.END.value]
-                edge_type = object[Parameter.LABEL.value]
+                start_node_id = graph_object.get(Parameter.START.value, 0)
+                end_node_id = graph_object.get(Parameter.END.value, 0)
+                edge_type = graph_object.get(Parameter.LABEL.value, "")
             else:
-                raise KeyError(
-                    "Each relationship object needs to have 'start', \
-                     'end' and 'label' keys."
-                )
+                raise KeyError("Each relationship object needs to have 'start', \
+                     'end' and 'label' keys.")
 
-            create_edge(
+            import_edge(
                 ctx,
                 properties_value,
                 start_node_id,
@@ -380,93 +447,155 @@ def json(ctx: mgp.ProcCtx, path: str) -> mgp.Record():
         else:
             raise KeyError("The provided file does not match the correct JSON format.")
 
-    return mgp.Record()
+    computed_return_value = mgp_Record()
+    return computed_return_value
 
 
-def find_node(ctx: mgp.ProcCtx, label: str, prop_key: str, prop_value: str) -> Union[int, None]:
-    for vertex in ctx.graph.vertices:
-        if (
-            label in [label.name for label in vertex.labels]
-            and prop_key in vertex.properties.keys()
-            and str(convert_to_isoformat_graphML(vertex.properties.get(prop_key))) == prop_value
-        ):
-            return vertex.id
-    return None
+json.__annotations__["return"] = mgp_Record()
+json = mgp_write_proc(json)
 
 
-def cast_element(text: str, type: str) -> Union[List[Any], str, int, bool, float]:
+def find_node(ctx: mgp_ProcCtx, label: str, prop_key: str, prop_value: object) -> int:
+    """Returns the id of the one existing vertex with `label` whose `prop_key` renders as `prop_value`."""
+    matches = [
+        vertex.id
+        for vertex in ctx.graph.vertices
+        if label in [vertex_label.name for vertex_label in vertex.labels]
+        and prop_key in vertex.properties.keys()
+        and str(convert_to_isoformat_graphML(vertex.properties.get(prop_key, ""))) == prop_value
+    ]
+    if len(matches) != 1:
+        raise KeyError(
+            f"GraphML edge endpoint {prop_value!r} matches {len(matches)} vertices labelled {label!r} by property "
+            f"{prop_key!r}; exactly one is required."
+        )
+    vertex_id = matches[0]
+    return vertex_id
+
+
+def resolve_graphml_endpoint(ctx: mgp_ProcCtx, endpoint: str, lookup: dict, real_ids: dict) -> int:
+    """
+    Resolves a GraphML edge endpoint to a Memgraph vertex id: a node of this document, else the one existing vertex
+    the configured source/target lookup selects, else (no lookup configured) an explicitly written internal vertex id.
+    """
+    vertex_id = real_ids.get(endpoint, -1)
+    if vertex_id >= 0:
+        return vertex_id
+    if lookup:
+        vertex_id = find_node(ctx, lookup.get("label", ""), lookup.get("id", "id"), endpoint)
+    elif endpoint.isascii() and endpoint.isdigit():
+        vertex_id = int(endpoint)
+    else:
+        raise KeyError(f"GraphML edge endpoint {endpoint!r} is neither a node of this document nor an internal vertex id.")
+    real_ids[endpoint] = vertex_id
+    return vertex_id
+
+
+def cast_element(text: str, type_name: str) -> object:
     if text == "":
         return ""
-    if type == "string":
-        return str(text)
-    if type == "int" or type == "long":
-        return int(text)
-    if type == "boolean":
-        return bool(text)
-    if type == "float" or type == "double":
-        return float(text)
-    if type == "":
+    if type_name == "string":
+        computed_return_value = str(text)
+        return computed_return_value
+    if type_name == "int" or type_name == "long":
+        computed_return_value = int(text)
+        return computed_return_value
+    if type_name == "boolean":
+        token = text.strip()
+        if token in GRAPHML_TRUE_TOKENS:
+            return True
+        if token in GRAPHML_FALSE_TOKENS:
+            return False
+        raise ValueError(f"GraphML boolean data must be true, false, 1 or 0, received {text!r}")
+    if type_name == "float" or type_name == "double":
+        computed_return_value = float(text)
+        return computed_return_value
+    if type_name == "":
         return text
+    return False
 
 
-def cast(text: str, type: str, is_list: bool) -> Union[List[Any], str, int, bool, float]:
+def cast_list_member(value: object, type_name: str) -> object:
+    """Admits one decoded JSON array member against the key's declared GraphML element type."""
+    if type_name in ("string", "") and isinstance(value, str):
+        return value
+    if type_name == "boolean" and isinstance(value, bool):
+        return value
+    if type_name in ("int", "long") and isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if type_name in ("float", "double") and isinstance(value, (int, float)) and not isinstance(value, bool):
+        member = float(value)
+        return member
+    if type_name == "" and isinstance(value, (bool, int, float)):
+        return value
+    raise ValueError(f"GraphML list member {value!r} does not match the declared element type {type_name!r}")
+
+
+def cast(text: str, type_name: str, is_list: bool) -> object:
     if is_list:
-        casted_list = list()
-        for element in ast.literal_eval(text):
-            casted_list.append(cast_element(element, type))
+        # export_util writes list data as a JSON array (get_value_string), so it is decoded as JSON, not Python.
+        try:
+            values = js_loads(text)
+        except (ValueError, RecursionError) as err:
+            raise ValueError(f"GraphML list data is not a JSON array: {text!r}") from err
+        if not isinstance(values, list):
+            raise ValueError(f"GraphML list data is not a JSON array: {text!r}")
+        casted_list = [cast_list_member(value, type_name) for value in values]
         return casted_list
-    return cast_element(text, type)
+    computed_return_value = cast_element(text, type_name)
+    return computed_return_value
 
 
-def set_default_keys(key_dict: Dict[str, Any], properties: Dict[str, Any], is_for: str):
+def set_default_keys(key_dict: dict, properties: dict[str, object], is_for: str):
     for key_object in key_dict.values():
-        if key_object.default_value != "" and key_object.is_for == is_for:
+        if key_object.get("default_value", "") != "" and key_object.get("is_for", "") == is_for:
             properties.update(
                 {
-                    key_object.name: cast(
-                        key_object.default_value,
-                        key_object.type,
-                        key_object.type_is_list,
+                    key_object.get("name", ""): cast(
+                        key_object.get("default_value", ""),
+                        key_object.get("type", ""),
+                        key_object.get("type_is_list", False),
                     )
                 }
             )
+    return False
 
 
-def set_default_config(config: mgp.Map) -> mgp.Map:
+def set_default_config(config: mgp_Map) -> mgp_Map:
     if config is None:
         config = dict()
-    if not config.get("readLabels"):
-        config.update({"readLabels": False})
-    if not config.get("defaultRelationshipType"):
-        config.update({"defaultRelationshipType": "RELATED"})
-    if not config.get("storeNodeIds"):
-        config.update({"storeNodeIds": False})
-    if not config.get("source"):
-        config.update({"source": {}})
-    if not config.get("target"):
-        config.update({"target": {}})
+    else:
+        config = dict(config)
+    defaults = {
+        "readLabels": False,
+        "defaultRelationshipType": "RELATED",
+        "storeNodeIds": False,
+        "source": {},
+        "target": {},
+    }
+    for key, default_val in defaults.items():
+        if config.get(key) is None:
+            config[key] = default_val
+    if config.get("defaultRelationshipType") == "":
+        config["defaultRelationshipType"] = "RELATED"
     if (
-        not isinstance(config.get("readLabels"), bool)
-        or not isinstance(config.get("defaultRelationshipType"), str)
-        or not isinstance(config.get("storeNodeIds"), bool)
-        or not isinstance(config.get("source"), dict)
-        or not isinstance(config.get("target"), dict)
-        or (config.get("source") and "label" not in config.get("source").keys())
-        or (config.get("target") and "label" not in config.get("target").keys())
+        not isinstance(config.get("readLabels", False), bool)
+        or not isinstance(config.get("defaultRelationshipType", ""), str)
+        or not isinstance(config.get("storeNodeIds", False), bool)
+        or not isinstance(config.get("source", {}), dict)
+        or not isinstance(config.get("target", {}), dict)
+        or (config.get("source", {}) and "label" not in config.get("source", {}).keys())
+        or (config.get("target", {}) and "label" not in config.get("target", {}).keys())
     ):
-        raise TypeError(
-            "Config parameter must be a map with specific \
-             keys and values described in documentation."
-        )
+        raise TypeError("Config parameter must be a map with specific keys and values described in documentation.")
     return config
 
 
-@mgp.write_proc
-def graphml(  # noqa: C901
-    ctx: mgp.ProcCtx,
+def graphml(
+    ctx: mgp_ProcCtx,
     path: str = "",
-    config: Union[mgp.Map, None] = None,
-) -> mgp.Record(status=str):
+    config: mgp_Nullable[mgp_Map] = None,
+) -> mgp_Record:
     """
     Procedure to export the whole database to a graphML file.
 
@@ -482,126 +611,128 @@ def graphml(  # noqa: C901
 
     try:
         tree = ET.parse(path)
-    except Exception:
-        raise OSError("Could not open/read file.")
+    except Exception as err:
+        raise OSError("Could not open/read file.") from err
 
     root = tree.getroot()
+    if root is None:
+        raise ValueError("GraphML document has no root element")
     graphml_ns = root.tag.split("}")[0].strip("{")
     namespace = {"graphml": graphml_ns}
 
-    keys = dict()
+    # Each declared key, by its id: the property name, the element kind it is for, its type and list flag, and default.
+    keys = {}
 
     for key in root.findall(".//graphml:key", namespace):
-        working_key = KeyObjectGraphML(key.attrib["attr.name"], key.attrib["for"])
+        working_key = {
+            "name": key.attrib.get("attr.name", ""),
+            "is_for": key.attrib.get("for", ""),
+            "type": "",
+            "type_is_list": False,
+            "default_value": "",
+        }
         if "attr.list" in key.attrib.keys():
-            working_key.type_is_list = True
-            working_key.type = key.attrib["attr.list"]
+            working_key["type_is_list"] = True
+            working_key["type"] = key.attrib.get("attr.list", "")
         elif "attr.type" in key.attrib.keys():
-            working_key.type = key.attrib["attr.type"]
+            working_key["type"] = key.attrib.get("attr.type", "")
         child = key.findall(".//graphml:default", namespace)
         if child:
-            working_key.default_value = child[0].text
-        working_key.id = key.attrib["id"]
-        keys.update({key.attrib["id"]: working_key})
+            working_key["default_value"] = child[0].text or ""
+        keys.update({key.attrib.get("id", ""): working_key})
 
     real_ids = dict()
 
     for node in root.findall(".//graphml:node", namespace):
         labels = []
         properties = dict()
-        if config.get("readLabels"):
-            labels = node.attrib["labels"].split(":")
-            labels.pop(0)
-        if config.get("storeNodeIds"):
-            properties.update({"id": node.attrib["id"]})
+        if config.get("readLabels", False):
+            labels = [lbl for lbl in node.attrib.get("labels", "").split(":") if lbl]
+        if config.get("storeNodeIds", False):
+            properties.update({"id": node.attrib.get("id", "")})
 
         set_default_keys(keys, properties, "node")
 
         for data in node.findall("graphml:data", namespace):
-            working_key = keys.get(data.attrib["key"])
-            if key is None:
-                working_key = KeyObjectGraphML(data.attrib["key"], "node", "string")
-            if config.get("readLabels") and working_key.name == "labels":
-                new_labels = data.text.split(":")
-                new_labels.pop(0)
-                if new_labels != labels:
-                    labels = labels + new_labels
+            working_key = keys.get(data.attrib.get("key", ""), {})
+            if not working_key:
+                # Data under an undeclared key is a string property named by that key.
+                working_key = {
+                    "name": data.attrib.get("key", ""),
+                    "is_for": "node",
+                    "type": "string",
+                    "type_is_list": False,
+                    "default_value": "",
+                }
+            if config.get("readLabels", False) and working_key.get("name", "") == "labels":
+                new_labels = [lbl for lbl in (data.text or "").split(":") if lbl]
+                for lbl in new_labels:
+                    if lbl not in labels:
+                        labels.append(lbl)
             else:
                 properties.update(
                     {
-                        working_key.name: cast(
-                            data.text,
-                            working_key.type,
-                            working_key.type_is_list,
+                        working_key.get("name", ""): cast(
+                            data.text or "",
+                            working_key.get("type", ""),
+                            working_key.get("type_is_list", False),
                         )
                     }
                 )
 
-        real_ids.update({node.attrib["id"]: create_vertex(ctx, properties, labels)})
+        node_id = node.attrib.get("id", "")
+        if node_id in real_ids:
+            raise ValueError(f"GraphML node id {node_id!r} appears more than once, so edges to it are ambiguous.")
+        real_ids[node_id] = import_vertex(ctx, properties, labels)
 
     for rel in root.findall(".//graphml:edge", namespace):
         if "label" in rel.attrib.keys():
-            rel_type = rel.attrib["label"]
+            rel_type = rel.attrib.get("label", "")
         else:
-            rel_type = config.get("defaultRelationshipType")
+            rel_type = config.get("defaultRelationshipType", "")
 
         properties = dict()
         set_default_keys(keys, properties, "edge")
 
         for data in rel.findall("graphml:data", namespace):
-            working_key = keys.get(data.attrib["key"])
-            if working_key is None:
-                working_key = KeyObjectGraphML(data.attrib["key"], "edge", "string")
-            if not working_key.name == "label":  # Tinkerpop???
+            working_key = keys.get(data.attrib.get("key", ""), {})
+            if not working_key:
+                # Data under an undeclared key is a string property named by that key.
+                working_key = {
+                    "name": data.attrib.get("key", ""),
+                    "is_for": "edge",
+                    "type": "string",
+                    "type_is_list": False,
+                    "default_value": "",
+                }
+            if not working_key.get("name", "") == "label":  # Tinkerpop???
                 properties.update(
                     {
-                        working_key.name: cast(
-                            data.text,
-                            working_key.type,
-                            working_key.type_is_list,
+                        working_key.get("name", ""): cast(
+                            data.text or "",
+                            working_key.get("type", ""),
+                            working_key.get("type_is_list", False),
                         )
                     }
                 )
 
-        if rel.attrib["source"] not in real_ids.keys():
-            if not config.get("source"):
-                # without source/target config, we try with the internal id
-                real_ids.update({rel.attrib["source"]: int(rel.attrib["source"])})
-            else:
-                source_config = config.get("source")
-                if "id" not in source_config.keys():
-                    source_config.update({"id": "id"})
-                node_id = find_node(
-                    ctx,
-                    source_config["label"],
-                    source_config["id"],
-                    rel.attrib["source"],
-                )
-                real_ids.update({rel.attrib["source"]: node_id})
+        source = rel.attrib.get("source", "")
+        target = rel.attrib.get("target", "")
+        resolve_graphml_endpoint(ctx, source, config.get("source", {}), real_ids)
+        resolve_graphml_endpoint(ctx, target, config.get("target", {}), real_ids)
 
-        if rel.attrib["target"] not in real_ids.keys():
-            if not config.get("target"):
-                # without source/target config, we look for the internal id
-                real_ids.update({rel.attrib["target"]: int(rel.attrib["target"])})
-            else:
-                target_config = config.get("target")
-                if "id" not in target_config.keys():
-                    target_config.update({"id": "id"})
-                node_id = find_node(
-                    ctx,
-                    target_config["label"],
-                    target_config["id"],
-                    rel.attrib["target"],
-                )
-                real_ids.update({rel.attrib["target"]: node_id})
-
-        create_edge(
+        import_edge(
             ctx,
             properties,
-            rel.attrib["source"],
-            rel.attrib["target"],
+            source,
+            target,
             rel_type,
             real_ids,
         )
 
-    return mgp.Record(status="success")
+    computed_return_value = mgp_Record(status="success")
+    return computed_return_value
+
+
+graphml.__annotations__["return"] = mgp_Record(status=str)
+graphml = mgp_write_proc(graphml)

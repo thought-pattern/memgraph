@@ -12,14 +12,17 @@
 #include "query/typed_value.hpp"
 
 #include <fmt/format.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iosfwd>
+#include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string_view>
 #include <utility>
 
+#include "query/exceptions.hpp"
 #include "query/fmt.hpp"
 #include "query/graph.hpp"
 #include "query/relations/comparability.hpp"
@@ -125,56 +128,65 @@ TypedValue::TypedValue(const storage::PropertyValue &value, storage::NameIdMappe
       alloc_trait::construct(alloc_, &string_v, value.ValueString());
       return;
     case storage::PropertyValue::Type::List: {
-      type_ = Type::List;
       const auto &vec = value.ValueList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v, name_id_mapper);
+        local_list.emplace_back(v, name_id_mapper);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::NumericList: {
-      type_ = Type::List;
       const auto &vec = value.ValueNumericList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
         if (std::holds_alternative<int>(v)) {
-          list_v.emplace_back(std::get<int>(v));
+          local_list.emplace_back(std::get<int>(v));
         } else {
-          list_v.emplace_back(std::get<double>(v));
+          local_list.emplace_back(std::get<double>(v));
         }
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::IntList: {
-      type_ = Type::List;
       const auto &vec = value.ValueIntList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::DoubleList: {
-      type_ = Type::List;
       const auto &vec = value.ValueDoubleList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::Map: {
       if (!name_id_mapper) {
         throw std::runtime_error("NameIdMapper is required for TypedValue::Map");
       }
-      type_ = Type::Map;
       const auto &map = value.ValueMap();
-      alloc_trait::construct(alloc, &map_v);
+      TMap local_map(alloc_);
       for (const auto &kv : map) {
         auto key = name_id_mapper->IdToName(kv.first.AsUint());
-        map_v.emplace(TString(key, alloc), TypedValue(kv.second, name_id_mapper, alloc));
+        local_map.emplace(TString(key, alloc_), TypedValue(kv.second, name_id_mapper, alloc_));
       }
+      type_ = Type::Map;
+      alloc_trait::construct(alloc_, &map_v, std::move(local_map));
       return;
     }
     case storage::PropertyValue::Type::TemporalData: {
@@ -269,58 +281,65 @@ TypedValue::TypedValue(storage::PropertyValue &&other, storage::NameIdMapper *na
       alloc_trait::construct(alloc_, &string_v, other.ValueString());
       break;
     case storage::PropertyValue::Type::List: {
-      type_ = Type::List;
       auto &vec = other.ValueList();
-      // PropertyValue uses std::allocator, hence copy here
-      alloc_trait::construct(alloc_, &list_v);
-      for (const auto &v : vec) {
-        list_v.emplace_back(v, name_id_mapper);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
+      for (auto &v : vec) {
+        local_list.emplace_back(std::move(v), name_id_mapper);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::NumericList: {
-      type_ = Type::List;
       auto &vec = other.ValueNumericList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
         if (std::holds_alternative<int>(v)) {
-          list_v.emplace_back(std::get<int>(v));
+          local_list.emplace_back(std::get<int>(v));
         } else {
-          list_v.emplace_back(std::get<double>(v));
+          local_list.emplace_back(std::get<double>(v));
         }
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::IntList: {
-      type_ = Type::List;
       auto &vec = other.ValueIntList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::DoubleList: {
-      type_ = Type::List;
       auto &vec = other.ValueDoubleList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::Map: {
       if (!name_id_mapper) {
         throw TypedValueException("NameIdMapper is required for TypedValue::Map");
       }
-      type_ = Type::Map;
       auto &map = other.ValueMap();
-      alloc_trait::construct(alloc_, &map_v);
-      // PropertyValue uses std::allocator, hence copy here
-      for (const auto &kv : map) {
+      TMap local_map(alloc_);
+      for (auto &kv : map) {
         auto key = name_id_mapper->IdToName(kv.first.AsUint());
-        map_v.emplace(TString(key, alloc), TypedValue(kv.second, name_id_mapper, alloc));
+        local_map.emplace(TString(key, alloc_), TypedValue(std::move(kv.second), name_id_mapper, alloc_));
       }
+      type_ = Type::Map;
+      alloc_trait::construct(alloc_, &map_v, std::move(local_map));
       break;
     }
     case storage::PropertyValue::Type::TemporalData: {
@@ -414,46 +433,61 @@ TypedValue::TypedValue(const storage::ExternalPropertyValue &value, allocator_ty
       alloc_trait::construct(alloc_, &string_v, value.ValueString());
       return;
     case storage::PropertyValue::Type::List: {
-      type_ = Type::List;
       const auto &vec = value.ValueList();
-      alloc_trait::construct(alloc_, &list_v, vec.cbegin(), vec.cend());
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
+      for (const auto &v : vec) {
+        local_list.emplace_back(v);
+      }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::NumericList: {
-      type_ = Type::List;
       const auto &vec = value.ValueNumericList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
         if (std::holds_alternative<int>(v)) {
-          list_v.emplace_back(std::get<int>(v));
+          local_list.emplace_back(std::get<int>(v));
         } else {
-          list_v.emplace_back(std::get<double>(v));
+          local_list.emplace_back(std::get<double>(v));
         }
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::IntList: {
-      type_ = Type::List;
       const auto &vec = value.ValueIntList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::DoubleList: {
-      type_ = Type::List;
       const auto &vec = value.ValueDoubleList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       return;
     }
     case storage::PropertyValue::Type::Map: {
-      type_ = Type::Map;
       const auto &map = value.ValueMap();
-      alloc_trait::construct(alloc_, &map_v, map.cbegin(), map.cend());
+      TMap local_map(alloc_);
+      for (const auto &kv : map) {
+        local_map.emplace(TString(kv.first, alloc_), TypedValue(kv.second, alloc_));
+      }
+      type_ = Type::Map;
+      alloc_trait::construct(alloc_, &map_v, std::move(local_map));
       return;
     }
     case storage::PropertyValue::Type::TemporalData: {
@@ -546,48 +580,61 @@ TypedValue::TypedValue(storage::ExternalPropertyValue &&other, allocator_type al
       alloc_trait::construct(alloc_, &string_v, other.ValueString());
       break;
     case storage::PropertyValue::Type::List: {
-      type_ = Type::List;
       auto &vec = other.ValueList();
-      // PropertyValue uses std::allocator, hence copy here
-      alloc_trait::construct(alloc_, &list_v, vec.cbegin(), vec.cend());
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
+      for (auto &v : vec) {
+        local_list.emplace_back(std::move(v));
+      }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::NumericList: {
-      type_ = Type::List;
       auto &vec = other.ValueNumericList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
         if (std::holds_alternative<int>(v)) {
-          list_v.emplace_back(std::get<int>(v));
+          local_list.emplace_back(std::get<int>(v));
         } else {
-          list_v.emplace_back(std::get<double>(v));
+          local_list.emplace_back(std::get<double>(v));
         }
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::IntList: {
-      type_ = Type::List;
       auto &vec = other.ValueIntList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::DoubleList: {
-      type_ = Type::List;
       auto &vec = other.ValueDoubleList();
-      alloc_trait::construct(alloc_, &list_v);
+      TVector local_list(alloc_);
+      local_list.reserve(vec.size());
       for (const auto &v : vec) {
-        list_v.emplace_back(v);
+        local_list.emplace_back(v);
       }
+      type_ = Type::List;
+      alloc_trait::construct(alloc_, &list_v, std::move(local_list));
       break;
     }
     case storage::PropertyValue::Type::Map: {
-      type_ = Type::Map;
       auto &map = other.ValueMap();
-      // PropertyValue uses std::allocator, hence copy here
-      alloc_trait::construct(alloc_, &map_v, map.cbegin(), map.cend());
+      TMap local_map(alloc_);
+      for (auto &kv : map) {
+        local_map.emplace(TString(kv.first, alloc_), TypedValue(std::move(kv.second), alloc_));
+      }
+      type_ = Type::Map;
+      alloc_trait::construct(alloc_, &map_v, std::move(local_map));
       break;
     }
     case storage::PropertyValue::Type::TemporalData: {
@@ -896,8 +943,8 @@ TypedValue::TypedValue(TypedValue &&other, allocator_type alloc) : alloc_{alloc}
       if (other.alloc_ == alloc_) {
         alloc_trait::construct(alloc_, &virtual_graph_v, std::move(other.virtual_graph_v));
       } else {
-        auto *graph_ptr =
-            utils::Allocator<VirtualGraph>(alloc_).new_object<VirtualGraph>(std::move(*other.virtual_graph_v));
+        auto *graph_ptr = utils::Allocator<VirtualGraph>(alloc_).new_object<VirtualGraph>(
+            std::move(*other.virtual_graph_v));
         alloc_trait::construct(alloc_, &virtual_graph_v, graph_ptr);
       }
       break;
@@ -1065,7 +1112,11 @@ bool TypedValue::ContainsDeleted() const {
                                  [](auto &vertex_acc) { return vertex_acc.impl_.vertex_->deleted(); }) ||
              std::ranges::any_of(path_v->edges(), [](auto &edge_acc) { return edge_acc.IsDeleted(); });
     case Type::Graph:
+      return std::ranges::any_of(graph_v->vertices(),
+                                 [](const auto &vertex_acc) { return vertex_acc.impl_.vertex_->deleted(); }) ||
+             std::ranges::any_of(graph_v->edges(), [](const auto &edge_acc) { return edge_acc.IsDeleted(); });
     case Type::VirtualGraph:
+      return false;
     case Type::Function:
       throw TypedValueException("Value of unknown type");
     case Type::VectorRef:
@@ -1083,8 +1134,6 @@ bool TypedValue::IsPropertyValue() const {
     case Type::Int:
     case Type::Double:
     case Type::String:
-    case Type::List:
-    case Type::Map:
     case Type::Date:
     case Type::LocalTime:
     case Type::LocalDateTime:
@@ -1095,6 +1144,10 @@ bool TypedValue::IsPropertyValue() const {
     case Type::Point3d:
     case Type::VectorRef:
       return true;
+    case Type::List:
+      return std::ranges::all_of(list_v, [](const auto &elem) { return elem.IsPropertyValue(); });
+    case Type::Map:
+      return std::ranges::all_of(map_v, [](const auto &item) { return item.second.IsPropertyValue(); });
     case Type::Vertex:
     case Type::Edge:
     case Type::VirtualEdge:
@@ -1231,11 +1284,10 @@ DEFINE_TYPED_VALUE_COPY_ASSIGNMENT(const storage::Enum &, Enum, held_inline_.enu
 
 TypedValue &TypedValue::operator=(const Path &other) {
   if (type_ == Type::Path) {
-    auto path = path_v.release();
-    if (path) {
-      utils::Allocator<Path>(alloc_).delete_object(path);
-    }
     auto *path_ptr = utils::Allocator<Path>(alloc_).new_object<Path>(other);
+    if (auto *old_path = path_v.release()) {
+      utils::Allocator<Path>(alloc_).delete_object(old_path);
+    }
     path_v = std::unique_ptr<Path>(path_ptr);
   } else {
     *this = TypedValue(other, alloc_);
@@ -1287,11 +1339,11 @@ TypedValue &TypedValue::operator=(std::map<std::string, TypedValue> &&other) {
 
 TypedValue &TypedValue::operator=(Path &&other) {
   if (type_ == Type::Path) {
-    auto path = path_v.release();
-    if (path) {
-      utils::Allocator<Path>(alloc_).delete_object(path);
+    auto *path_ptr = utils::Allocator<Path>(alloc_).new_object<Path>(std::move(other));
+    if (auto *old_path = path_v.release()) {
+      utils::Allocator<Path>(alloc_).delete_object(old_path);
     }
-    path_v = std::unique_ptr<Path>(utils::Allocator<Path>(alloc_).new_object<Path>(std::move(other)));
+    path_v = std::unique_ptr<Path>(path_ptr);
   } else {
     *this = TypedValue(std::move(other), alloc_);
   }
@@ -1334,36 +1386,34 @@ TypedValue &TypedValue::operator=(const TypedValue &other) {
           held_inline_.edge_v = other.held_inline_.edge_v;
           break;
         case Type::VirtualEdge: {
-          auto *ve = virtual_edge_v.release();
-          if (ve) {
+          VirtualEdge *ve_ptr =
+              other.virtual_edge_v
+                  ? utils::Allocator<VirtualEdge>(alloc_).new_object<VirtualEdge>(*other.virtual_edge_v)
+                  : nullptr;
+          if (auto *ve = virtual_edge_v.release()) {
             utils::Allocator<VirtualEdge>(alloc_).delete_object(ve);
           }
-          if (other.virtual_edge_v) {
-            auto *ve_ptr = utils::Allocator<VirtualEdge>(alloc_).new_object<VirtualEdge>(*other.virtual_edge_v);
-            virtual_edge_v = std::unique_ptr<VirtualEdge>(ve_ptr);
-          }
+          virtual_edge_v = std::unique_ptr<VirtualEdge>(ve_ptr);
           break;
         }
         case Type::VirtualNode: {
-          auto *vn = virtual_node_v.release();
-          if (vn) {
+          VirtualNode *vn_ptr =
+              other.virtual_node_v
+                  ? utils::Allocator<VirtualNode>(alloc_).new_object<VirtualNode>(*other.virtual_node_v)
+                  : nullptr;
+          if (auto *vn = virtual_node_v.release()) {
             utils::Allocator<VirtualNode>(alloc_).delete_object(vn);
           }
-          if (other.virtual_node_v) {
-            auto *vn_ptr = utils::Allocator<VirtualNode>(alloc_).new_object<VirtualNode>(*other.virtual_node_v);
-            virtual_node_v = std::unique_ptr<VirtualNode>(vn_ptr);
-          }
+          virtual_node_v = std::unique_ptr<VirtualNode>(vn_ptr);
           break;
         }
         case Type::Path: {
-          auto *path = path_v.release();
-          if (path) {
+          Path *path_ptr =
+              other.path_v ? utils::Allocator<Path>(alloc_).new_object<Path>(*other.path_v) : nullptr;
+          if (auto *path = path_v.release()) {
             utils::Allocator<Path>(alloc_).delete_object(path);
           }
-          if (other.path_v) {
-            auto *path_ptr = utils::Allocator<Path>(alloc_).new_object<Path>(*other.path_v);
-            path_v = std::unique_ptr<Path>(path_ptr);
-          }
+          path_v = std::unique_ptr<Path>(path_ptr);
           break;
         }
         case Type::Date:
@@ -1382,25 +1432,23 @@ TypedValue &TypedValue::operator=(const TypedValue &other) {
           held_inline_.duration_v = other.held_inline_.duration_v;
           break;
         case Type::Graph: {
-          auto *graph = graph_v.release();
-          if (graph) {
+          Graph *graph_ptr =
+              other.graph_v ? utils::Allocator<Graph>(alloc_).new_object<Graph>(*other.graph_v) : nullptr;
+          if (auto *graph = graph_v.release()) {
             utils::Allocator<Graph>(alloc_).delete_object(graph);
           }
-          if (other.graph_v) {
-            auto *graph_ptr = utils::Allocator<Graph>(alloc_).new_object<Graph>(*other.graph_v);
-            graph_v = std::unique_ptr<Graph>(graph_ptr);
-          }
+          graph_v = std::unique_ptr<Graph>(graph_ptr);
           break;
         }
         case Type::VirtualGraph: {
-          auto *graph = virtual_graph_v.release();
-          if (graph) {
+          VirtualGraph *graph_ptr =
+              other.virtual_graph_v
+                  ? utils::Allocator<VirtualGraph>(alloc_).new_object<VirtualGraph>(*other.virtual_graph_v)
+                  : nullptr;
+          if (auto *graph = virtual_graph_v.release()) {
             utils::Allocator<VirtualGraph>(alloc_).delete_object(graph);
           }
-          if (other.virtual_graph_v) {
-            auto *graph_ptr = utils::Allocator<VirtualGraph>(alloc_).new_object<VirtualGraph>(*other.virtual_graph_v);
-            virtual_graph_v = std::unique_ptr<VirtualGraph>(graph_ptr);
-          }
+          virtual_graph_v = std::unique_ptr<VirtualGraph>(graph_ptr);
           break;
         }
         case Type::Function:
@@ -1421,10 +1469,11 @@ TypedValue &TypedValue::operator=(const TypedValue &other) {
       }
       return *this;
     }
-    // destroy + construct
+    // Prepare replacement on alloc_ before destroying *this so an allocation failure leaves *this intact.
     auto alloc = alloc_;
-    alloc_trait::destroy(alloc, this);
-    alloc_trait::construct(alloc, std::launder(this), other);
+    TypedValue replacement(other, alloc);
+    std::destroy_at(this);
+    std::construct_at(std::launder(this), std::move(replacement), alloc);
     // NOLINTNEXTLINE(cppcoreguidelines-c-copy-assignment-signature,misc-unconventional-assign-operator)
     return *std::launder(this);
   }
@@ -1539,8 +1588,13 @@ TypedValue &TypedValue::MoveAssignComplex(TypedValue &&other) {
 
       return *this;
     }
-    // destroy + construct
     auto orig_mem = alloc_;
+    if (orig_mem != other.alloc_) {
+      TypedValue replacement(std::move(other), orig_mem);
+      std::destroy_at(this);
+      // NOLINTNEXTLINE(cppcoreguidelines-c-copy-assignment-signature,misc-unconventional-assign-operator)
+      return *std::construct_at(std::launder(this), std::move(replacement), orig_mem);
+    }
     std::destroy_at(this);
     // NOLINTNEXTLINE(cppcoreguidelines-c-copy-assignment-signature,misc-unconventional-assign-operator)
     return *std::construct_at(std::launder(this), std::move(other), orig_mem);
@@ -1668,7 +1722,13 @@ TypedValue operator!(const TypedValue &a) {
 
 TypedValue operator-(const TypedValue &a) {
   if (a.IsNull()) return TypedValue(a.alloc_);
-  if (a.IsInt()) return TypedValue(-a.ValueInt(), a.alloc_);
+  if (a.IsInt()) {
+    const auto val = a.ValueInt();
+    if (val == std::numeric_limits<int64_t>::min()) {
+      throw QueryRuntimeException("Integer overflow in unary '-': cannot negate {}.", val);
+    }
+    return TypedValue(-val, a.alloc_);
+  }
   if (a.IsDouble()) return TypedValue(-a.ValueDouble(), a.alloc_);
   if (a.IsDuration()) return TypedValue(-a.ValueDuration(), a.alloc_);
   throw TypedValueException("Invalid unary minus operand type (-{})", a.type());
@@ -1812,7 +1872,7 @@ TypedValue operator+(const TypedValue &a, const TypedValue &b) {
 
     auto append_list = [&list](const TypedValue &v) {
       if (v.IsList()) {
-        auto list2 = v.ValueList();
+        const auto &list2 = v.ValueList();
         list.insert(list.end(), list2.begin(), list2.end());
       } else {
         list.push_back(v);
@@ -1850,7 +1910,11 @@ TypedValue operator+(const TypedValue &a, const TypedValue &b) {
   if (a.IsDouble() || b.IsDouble()) {
     return TypedValue(ToDouble(a) + ToDouble(b), a.alloc_);
   }
-  return TypedValue(a.ValueInt() + b.ValueInt(), a.alloc_);
+  int64_t sum = 0;
+  if (__builtin_add_overflow(a.ValueInt(), b.ValueInt(), &sum)) {
+    throw QueryRuntimeException("Integer overflow in '+' ({} + {}).", a.ValueInt(), b.ValueInt());
+  }
+  return TypedValue(sum, a.alloc_);
 }
 
 TypedValue operator-(const TypedValue &a, const TypedValue &b) {
@@ -1863,7 +1927,11 @@ TypedValue operator-(const TypedValue &a, const TypedValue &b) {
   if (a.IsDouble() || b.IsDouble()) {
     return TypedValue(ToDouble(a) - ToDouble(b), a.alloc_);
   }
-  return TypedValue(a.ValueInt() - b.ValueInt(), a.alloc_);
+  int64_t diff = 0;
+  if (__builtin_sub_overflow(a.ValueInt(), b.ValueInt(), &diff)) {
+    throw QueryRuntimeException("Integer overflow in '-' ({} - {}).", a.ValueInt(), b.ValueInt());
+  }
+  return TypedValue(diff, a.alloc_);
 }
 
 TypedValue operator/(const TypedValue &a, const TypedValue &b) {
@@ -1874,8 +1942,13 @@ TypedValue operator/(const TypedValue &a, const TypedValue &b) {
   if (a.IsDouble() || b.IsDouble()) {
     return TypedValue(ToDouble(a) / ToDouble(b), a.alloc_);
   } else {
-    if (b.ValueInt() == 0LL) throw TypedValueException("Division by zero");
-    return TypedValue(a.ValueInt() / b.ValueInt(), a.alloc_);
+    const auto lhs = a.ValueInt();
+    const auto rhs = b.ValueInt();
+    if (rhs == 0LL) throw TypedValueException("Division by zero");
+    if (lhs == std::numeric_limits<int64_t>::min() && rhs == -1LL) {
+      throw QueryRuntimeException("Integer overflow in '/' ({} / {}).", lhs, rhs);
+    }
+    return TypedValue(lhs / rhs, a.alloc_);
   }
 }
 
@@ -1887,7 +1960,11 @@ TypedValue operator*(const TypedValue &a, const TypedValue &b) {
   if (a.IsDouble() || b.IsDouble()) {
     return TypedValue(ToDouble(a) * ToDouble(b), a.alloc_);
   } else {
-    return TypedValue(a.ValueInt() * b.ValueInt(), a.alloc_);
+    int64_t prod = 0;
+    if (__builtin_mul_overflow(a.ValueInt(), b.ValueInt(), &prod)) {
+      throw QueryRuntimeException("Integer overflow in '*' ({} * {}).", a.ValueInt(), b.ValueInt());
+    }
+    return TypedValue(prod, a.alloc_);
   }
 }
 
@@ -1899,8 +1976,13 @@ TypedValue operator%(const TypedValue &a, const TypedValue &b) {
   if (a.IsDouble() || b.IsDouble()) {
     return TypedValue(static_cast<double>(fmod(ToDouble(a), ToDouble(b))), a.alloc_);
   } else {
-    if (b.ValueInt() == 0LL) throw TypedValueException("Mod with zero");
-    return TypedValue(a.ValueInt() % b.ValueInt(), a.alloc_);
+    const auto lhs = a.ValueInt();
+    const auto rhs = b.ValueInt();
+    if (rhs == 0LL) throw TypedValueException("Mod with zero");
+    if (lhs == std::numeric_limits<int64_t>::min() && rhs == -1LL) {
+      return TypedValue(int64_t{0}, a.alloc_);
+    }
+    return TypedValue(lhs % rhs, a.alloc_);
   }
 }
 
@@ -2024,6 +2106,15 @@ void from_json(nlohmann::json const &j, TypedValue &value) {
 
   if (j.is_boolean()) {
     value = TypedValue(j.get<bool>());
+    return;
+  }
+
+  if (j.is_number_unsigned()) {
+    const auto uval = j.get<uint64_t>();
+    if (uval > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      throw utils::BasicException("Unsigned JSON integer {} exceeds signed 64-bit integer range", uval);
+    }
+    value = TypedValue(static_cast<int64_t>(uval));
     return;
   }
 

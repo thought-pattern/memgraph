@@ -24,9 +24,13 @@ constexpr const char *const k_field_node_to = "node_to";
 
 void InsertBridgeRecord(mgp_graph *graph, mgp_result *result, mgp_memory *memory, const std::uint64_t node_from_id,
                         const std::uint64_t node_to_id) {
-  auto *node_from = mg_utility::GetNodeForInsertion(static_cast<int>(node_from_id), graph, memory);
-  auto *node_to = mg_utility::GetNodeForInsertion(static_cast<int>(node_to_id), graph, memory);
-  if (!node_from || !node_to) return;
+  auto *node_from = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(node_from_id), graph, memory);
+  auto *node_to = mg_utility::GetNodeForInsertion(static_cast<std::int64_t>(node_to_id), graph, memory);
+  if (!node_from || !node_to) {
+    if (node_from) mgp::vertex_destroy(node_from);
+    if (node_to) mgp::vertex_destroy(node_to);
+    return;
+  }
 
   auto *record = mgp::result_new_record(result);
   if (record == nullptr) throw mg_exception::NotEnoughMemoryException();

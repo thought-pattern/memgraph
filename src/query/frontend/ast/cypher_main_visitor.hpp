@@ -1552,13 +1552,12 @@ class CypherMainVisitor : public antlropencypher::MemgraphCypherBaseVisitor {
   ParsingContext context_;
   AstStorage *storage_;
 
-  std::unordered_map<uint8_t, std::variant<Expression *, std::string, std::vector<std::string>,
-                                           std::unordered_map<Expression *, Expression *>>>
-      memory_;
+  std::unordered_map<uint8_t, std::variant<Expression *, std::string, std::vector<std::string>, ConfigMap>> memory_;
   // Set of identifiers from queries.
   std::unordered_set<std::string> users_identifiers;
   // Identifiers that user didn't name.
   std::vector<Identifier **> anonymous_identifiers;
+  size_t cypher_query_depth_{0};
   Query *query_ = nullptr;
   // All return items which are not variables must be aliased in with.
   // We use this variable in visitReturnItem to check if we are in with or

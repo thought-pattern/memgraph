@@ -85,6 +85,9 @@ jobs:
       matrix:
         image_type: [client, full]
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
       - name: Log in to Docker Hub
         if: ${{ inputs.push_to_dockerhub }}
         uses: ./.github/actions/docker-login

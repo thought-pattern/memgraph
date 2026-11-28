@@ -64,12 +64,12 @@ rather than fixed sleep(), so the test remains correct under sanitizer slowdown.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import os
 import random
 import sys
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------------------
 # Driver import: mirror ring/workload.py — use the neo4j driver via common.py

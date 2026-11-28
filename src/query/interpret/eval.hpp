@@ -437,7 +437,76 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     return op.expression1_->Accept(*this) && op.expression2_->Accept(*this);
   }
 
+  static TypedValue EvaluateComparisonStep(const BinaryOperator &cmp, const TypedValue &lhs, const TypedValue &rhs) {
+    std::string_view op_str = "=";
+    try {
+      if (utils::Downcast<const EqualOperator>(&cmp)) {
+        op_str = "=";
+        return lhs == rhs;
+      }
+      if (utils::Downcast<const NotEqualOperator>(&cmp)) {
+        op_str = "<>";
+        return lhs != rhs;
+      }
+      if (utils::Downcast<const LessOperator>(&cmp)) {
+        op_str = "<";
+        return lhs < rhs;
+      }
+      if (utils::Downcast<const GreaterOperator>(&cmp)) {
+        op_str = ">";
+        return lhs > rhs;
+      }
+      if (utils::Downcast<const LessEqualOperator>(&cmp)) {
+        op_str = "<=";
+        return lhs <= rhs;
+      }
+      if (utils::Downcast<const GreaterEqualOperator>(&cmp)) {
+        op_str = ">=";
+        return lhs >= rhs;
+      }
+    } catch (const TypedValueException &) {
+      throw QueryRuntimeException("Invalid types: {} and {} for {}.", lhs.type(), rhs.type(), op_str);
+    }
+    LOG_FATAL("Unexpected operator in chained comparison");
+  }
+
   TypedValue Visit(AndOperator &op) override {
+    if (op.chained_comparison_count_ >= 2U) {
+      std::vector<BinaryOperator *> comparisons(op.chained_comparison_count_, nullptr);
+      Expression *curr = &op;
+      bool valid_chain = true;
+      for (uint32_t idx = op.chained_comparison_count_ - 1U; idx > 0U; --idx) {
+        auto *and_node = utils::Downcast<AndOperator>(curr);
+        auto *rhs_cmp = and_node ? utils::Downcast<BinaryOperator>(and_node->expression2_) : nullptr;
+        if (!and_node || !rhs_cmp) {
+          valid_chain = false;
+          break;
+        }
+        comparisons[idx] = rhs_cmp;
+        curr = and_node->expression1_;
+      }
+      auto *first_cmp = utils::Downcast<BinaryOperator>(curr);
+      if (valid_chain && first_cmp != nullptr) {
+        comparisons[0] = first_cmp;
+        TypedValue lhs = comparisons[0]->expression1_->Accept(*this);
+        TypedValue acc(true);
+        for (auto *cmp : comparisons) {
+          TypedValue rhs = cmp->expression2_->Accept(*this);
+          TypedValue step = EvaluateComparisonStep(*cmp, lhs, rhs);
+          try {
+            acc = acc && step;
+          } catch (const TypedValueException &) {
+            throw QueryRuntimeException("Invalid types: {} and {} for AND.", acc.type(), step.type());
+          }
+          if (acc.IsBool() && !acc.ValueBool()) {
+            return acc;
+          }
+          lhs = std::move(rhs);
+        }
+        return acc;
+      }
+    }
+
     auto value1 = op.expression1_->Accept(*this);
     if (value1.IsBool() && !value1.ValueBool()) {
       // If first expression is false, don't evaluate the second one.
@@ -476,6 +545,38 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
   }
 
   TypedValue Visit(IfOperator &if_operator) override {
+    if (if_operator.simple_case_arm_count_ > 0U) {
+      auto *first_eq = utils::Downcast<EqualOperator>(if_operator.condition_);
+      if (first_eq != nullptr) {
+        TypedValue subject = first_eq->expression1_->Accept(*this);
+        IfOperator *curr = &if_operator;
+        for (uint32_t arm = 0U; arm < if_operator.simple_case_arm_count_; ++arm) {
+          auto *eq = utils::Downcast<EqualOperator>(curr->condition_);
+          MG_ASSERT(eq != nullptr);
+          TypedValue when_val = eq->expression2_->Accept(*this);
+          TypedValue condition;
+          try {
+            condition = (subject == when_val);
+          } catch (const TypedValueException &) {
+            throw QueryRuntimeException("Invalid types: {} and {} for =.", subject.type(), when_val.type());
+          }
+          if (!condition.IsNull()) {
+            if (condition.type() != TypedValue::Type::Bool) {
+              throw QueryRuntimeException("CASE expected boolean expression, got {}.", condition.type());
+            }
+            if (condition.ValueBool()) {
+              return curr->then_expression_->Accept(*this);
+            }
+          }
+          if (arm + 1U < if_operator.simple_case_arm_count_) {
+            curr = utils::Downcast<IfOperator>(curr->else_expression_);
+            MG_ASSERT(curr != nullptr);
+          }
+        }
+        return curr->else_expression_->Accept(*this);
+      }
+    }
+
     auto condition = if_operator.condition_->Accept(*this);
     if (condition.IsNull()) {
       return if_operator.else_expression_->Accept(*this);
@@ -595,7 +696,8 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       lhs_ptr = &lhs;
     }
     auto index = list_indexing.expression2_->Accept(*this);
-    if (!lhs_ptr->IsList() && !lhs_ptr->IsMap() && !lhs_ptr->IsVertex() && !lhs_ptr->IsEdge() && !lhs_ptr->IsNull())
+    if (!lhs_ptr->IsList() && !lhs_ptr->IsMap() && !lhs_ptr->IsVertex() && !lhs_ptr->IsEdge() &&
+        !lhs_ptr->IsVirtualNode() && !lhs_ptr->IsVirtualEdge() && !lhs_ptr->IsNull())
       throw QueryRuntimeException(
           "Expected a list, a map, a node or an edge to index with '[]', got "
           "{}.",
@@ -635,7 +737,27 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       const auto &edge = lhs_ptr->ValueEdge();
       if (ctx_->lazy_vector_refs) return LazyPropertyValue(edge, index.ValueString());
       return {GetProperty(edge, index.ValueString()), GetNameIdMapper(), ctx_->memory};
-    };
+    }
+
+    if (lhs_ptr->IsVirtualNode()) {
+      if (!index.IsString()) throw QueryRuntimeException("Expected a string as a property name, got {}.", index.type());
+      RequireAccessor("Reading a property");
+      auto const maybe_prop_id = dba_->NameToPropertyIfExists(index.ValueString());
+      if (!maybe_prop_id) return TypedValue(ctx_->memory);
+      auto prop_value = lhs_ptr->ValueVirtualNode().GetProperty(*maybe_prop_id);
+      if (prop_value.IsNull()) return TypedValue(ctx_->memory);
+      return {std::move(prop_value), GetNameIdMapper(), ctx_->memory};
+    }
+
+    if (lhs_ptr->IsVirtualEdge()) {
+      if (!index.IsString()) throw QueryRuntimeException("Expected a string as a property name, got {}.", index.type());
+      RequireAccessor("Reading a property");
+      auto const maybe_prop_id = dba_->NameToPropertyIfExists(index.ValueString());
+      if (!maybe_prop_id) return TypedValue(ctx_->memory);
+      auto prop_value = lhs_ptr->ValueVirtualEdge().GetProperty(*maybe_prop_id);
+      if (prop_value.IsNull()) return TypedValue(ctx_->memory);
+      return {std::move(prop_value), GetNameIdMapper(), ctx_->memory};
+    }
 
     // lhs is Null
     return TypedValue(ctx_->memory);
@@ -780,8 +902,6 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
   }
 
   TypedValue Visit(MapProjectionLiteral &literal) override {
-    constexpr std::string_view kAllPropertiesSelector{"*"};
-
     TypedValue::TMap result(ctx_->memory);
     TypedValue::TMap all_properties_lookup(ctx_->memory);
 
@@ -790,18 +910,15 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       return TypedValue(ctx_->memory);
     }
 
-    for (const auto &[property_key, property_value] : literal.elements_) {
-      if (property_key.name == kAllPropertiesSelector.data()) {
-        auto maybe_all_properties_lookup = property_value->Accept(*this);
-
-        if (maybe_all_properties_lookup.type() != TypedValue::Type::Map) {
-          LOG_FATAL("Expected a map from AllPropertiesLookup, got {}.", maybe_all_properties_lookup.type());
-        }
-
-        all_properties_lookup = std::move(maybe_all_properties_lookup.ValueMap());
-        continue;
+    if (literal.all_properties_lookup_ != nullptr) {
+      auto maybe_all_properties_lookup = literal.all_properties_lookup_->Accept(*this);
+      if (maybe_all_properties_lookup.type() != TypedValue::Type::Map) {
+        LOG_FATAL("Expected a map from AllPropertiesLookup, got {}.", maybe_all_properties_lookup.type());
       }
+      all_properties_lookup = std::move(maybe_all_properties_lookup.ValueMap());
+    }
 
+    for (const auto &[property_key, property_value] : literal.elements_) {
       result.emplace(TypedValue::TString(property_key.name, ctx_->memory), property_value->Accept(*this));
     }
 
@@ -918,12 +1035,8 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
     TypedValue::TVector result(ctx_->memory);
     result.reserve(list.size());
     for (auto &element : list) {
-      if (element.IsNull()) {
-        result.emplace_back();
-      } else {
-        frame_writer_.WriteAt(element_symbol, std::move(element));
-        result.emplace_back(extract.expression_->Accept(*this));
-      }
+      frame_writer_.WriteAt(element_symbol, std::move(element));
+      result.emplace_back(extract.expression_->Accept(*this));
     }
     return TypedValue(std::move(result), ctx_->memory);
   }
@@ -1238,8 +1351,11 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
 
   template <class TRecordAccessor>
   TypedValue LazyPropertyValue(const TRecordAccessor &record_accessor, const std::string_view name) {
-    auto raw = GetProperty<true>(record_accessor, name);
-    return MakePropertyValue(record_accessor, dba_->NameToProperty(name), std::move(raw));
+    RequireAccessor("Reading a property");
+    auto const maybe_prop_id = dba_->NameToPropertyIfExists(name);
+    if (!maybe_prop_id) return TypedValue(ctx_->memory);
+    auto raw = GetPropertyById<true>(record_accessor, *maybe_prop_id);
+    return MakePropertyValue(record_accessor, *maybe_prop_id, std::move(raw));
   }
 
   template <bool kCompact, class TRecordAccessor>
@@ -1252,27 +1368,7 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
   }
 
   template <bool kCompact = false, class TRecordAccessor>
-  storage::PropertyValue GetProperty(const TRecordAccessor &record_accessor, const PropertyIx &prop) {
-    RequireAccessor("Reading a property");
-    if (!IsPropertyAllowed(record_accessor, ctx_->properties[prop.ix])) return storage::PropertyValue{};
-    auto maybe_prop = ReadProperty<kCompact>(record_accessor, view_, ctx_->properties[prop.ix]);
-    if (maybe_prop == std::unexpected{storage::Error::NONEXISTENT_OBJECT}) {
-      // This is a very nasty and temporary hack in order to make MERGE work.
-      // The old storage had the following logic when returning an `OLD` view:
-      // `return old ? old : new`. That means that if the `OLD` view didn't
-      // exist, it returned the NEW view. With this hack we simulate that
-      // behavior.
-      // TODO (mferencevic, teon.banek): Remove once MERGE is reimplemented.
-      maybe_prop = ReadProperty<kCompact>(record_accessor, storage::View::NEW, ctx_->properties[prop.ix]);
-    }
-    if (!maybe_prop) ThrowPropertyReadError(maybe_prop.error());
-    return *std::move(maybe_prop);
-  }
-
-  template <bool kCompact = false, class TRecordAccessor>
-  storage::PropertyValue GetProperty(const TRecordAccessor &record_accessor, const std::string_view name) {
-    RequireAccessor("Reading a property");
-    auto prop_id = dba_->NameToProperty(name);
+  storage::PropertyValue GetPropertyById(const TRecordAccessor &record_accessor, storage::PropertyId prop_id) {
     if (!IsPropertyAllowed(record_accessor, prop_id)) return storage::PropertyValue{};
     auto maybe_prop = ReadProperty<kCompact>(record_accessor, view_, prop_id);
     if (maybe_prop == std::unexpected{storage::Error::NONEXISTENT_OBJECT}) {
@@ -1282,10 +1378,24 @@ class ExpressionEvaluator : public ExpressionVisitor<TypedValue> {
       // exist, it returned the NEW view. With this hack we simulate that
       // behavior.
       // TODO (mferencevic, teon.banek): Remove once MERGE is reimplemented.
-      maybe_prop = ReadProperty<kCompact>(record_accessor, view_, prop_id);
+      maybe_prop = ReadProperty<kCompact>(record_accessor, storage::View::NEW, prop_id);
     }
     if (!maybe_prop) ThrowPropertyReadError(maybe_prop.error());
-    return *maybe_prop;
+    return *std::move(maybe_prop);
+  }
+
+  template <bool kCompact = false, class TRecordAccessor>
+  storage::PropertyValue GetProperty(const TRecordAccessor &record_accessor, const PropertyIx &prop) {
+    RequireAccessor("Reading a property");
+    return GetPropertyById<kCompact>(record_accessor, ctx_->properties[prop.ix]);
+  }
+
+  template <bool kCompact = false, class TRecordAccessor>
+  storage::PropertyValue GetProperty(const TRecordAccessor &record_accessor, const std::string_view name) {
+    RequireAccessor("Reading a property");
+    auto const maybe_prop_id = dba_->NameToPropertyIfExists(name);
+    if (!maybe_prop_id) return storage::PropertyValue{};
+    return GetPropertyById<kCompact>(record_accessor, *maybe_prop_id);
   }
 
  private:

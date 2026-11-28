@@ -48,6 +48,7 @@ constexpr std::array<std::string_view, 4> kRecognisedConfigKeys{
     kConfigLimit, kConfigFuzzyDistance, kConfigFuzzyPrefix, kConfigFuzzyTranspositions};
 
 mgp::TextSearchConfig ParseConfig(const mgp::Map &config, bool fuzzy_supported);
+mgp::TextSearchConfig ParseConfigValue(const mgp::Value &config_value, bool fuzzy_supported);
 
 void Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory);
 void FuzzyPhraseSearch(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory);
@@ -143,6 +144,22 @@ mgp::TextSearchConfig TextSearch::ParseConfig(const mgp::Map &config, bool fuzzy
   return parsed;
 }
 
+mgp::TextSearchConfig TextSearch::ParseConfigValue(const mgp::Value &config_value, bool fuzzy_supported) {
+  if (config_value.IsMap()) {
+    return ParseConfig(config_value.ValueMap(), fuzzy_supported);
+  }
+  if (config_value.IsInt()) {
+    const auto raw = config_value.ValueInt();
+    if (raw < 0) {
+      throw std::invalid_argument("text_search config 'limit' must be non-negative.");
+    }
+    mgp::TextSearchConfig parsed{};
+    parsed.limit = static_cast<std::size_t>(raw);
+    return parsed;
+  }
+  throw std::invalid_argument("text_search config must be a map or an integer limit.");
+}
+
 void TextSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *result, mgp_memory *memory) {
   mgp::MemoryDispatcherGuard guard{memory};
   const auto record_factory = mgp::RecordFactory(result);
@@ -151,7 +168,7 @@ void TextSearch::Search(mgp_list *args, mgp_graph *memgraph_graph, mgp_result *r
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
-    const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
+    const auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/true);
     for (const auto &row : mgp::SearchTextIndex(
              memgraph_graph, index_name, search_query, text_search_mode::SPECIFIED_PROPERTIES, config)) {
       auto record = record_factory.NewRecord();
@@ -176,9 +193,10 @@ void TextSearch::FuzzyPhraseSearch(mgp_list *args, mgp_graph *memgraph_graph, mg
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
-    const auto config_map = arguments[2].ValueMap();
-    auto config = ParseConfig(config_map, /*fuzzy_supported=*/true);
-    RejectExplicitNonPrefix(config_map);
+    auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/true);
+    if (arguments[2].IsMap()) {
+      RejectExplicitNonPrefix(arguments[2].ValueMap());
+    }
     config.fuzzy_prefix = true;
     for (const auto &row :
          mgp::SearchTextIndex(memgraph_graph, index_name, search_query, text_search_mode::FUZZY_PHRASE, config)) {
@@ -204,9 +222,10 @@ void TextSearch::FuzzyPhraseSearchEdges(mgp_list *args, mgp_graph *memgraph_grap
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
-    const auto config_map = arguments[2].ValueMap();
-    auto config = ParseConfig(config_map, /*fuzzy_supported=*/true);
-    RejectExplicitNonPrefix(config_map);
+    auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/true);
+    if (arguments[2].IsMap()) {
+      RejectExplicitNonPrefix(arguments[2].ValueMap());
+    }
     config.fuzzy_prefix = true;
     for (const auto &row :
          mgp::SearchTextEdgeIndex(memgraph_graph, index_name, search_query, text_search_mode::FUZZY_PHRASE, config)) {
@@ -230,7 +249,7 @@ void TextSearch::RegexSearch(mgp_list *args, mgp_graph *memgraph_graph, mgp_resu
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
-    const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/false);
+    const auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/false);
     for (const auto &row :
          mgp::SearchTextIndex(memgraph_graph, index_name, search_query, text_search_mode::REGEX, config)) {
       auto record = record_factory.NewRecord();
@@ -254,7 +273,7 @@ void TextSearch::SearchAllProperties(mgp_list *args, mgp_graph *memgraph_graph, 
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = fmt::format("{}:{}", kSearchAllPrefix, arguments[1].ValueString());
-    const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
+    const auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/true);
     for (const auto &row :
          mgp::SearchTextIndex(memgraph_graph, index_name, search_query, text_search_mode::ALL_PROPERTIES, config)) {
       auto record = record_factory.NewRecord();
@@ -297,7 +316,7 @@ void TextSearch::SearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp_resu
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
-    const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
+    const auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/true);
     for (const auto &row : mgp::SearchTextEdgeIndex(
              memgraph_graph, index_name, search_query, text_search_mode::SPECIFIED_PROPERTIES, config)) {
       auto record = record_factory.NewRecord();
@@ -320,7 +339,7 @@ void TextSearch::RegexSearchEdges(mgp_list *args, mgp_graph *memgraph_graph, mgp
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = arguments[1].ValueString();
-    const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/false);
+    const auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/false);
     for (const auto &row :
          mgp::SearchTextEdgeIndex(memgraph_graph, index_name, search_query, text_search_mode::REGEX, config)) {
       auto record = record_factory.NewRecord();
@@ -344,7 +363,7 @@ void TextSearch::SearchAllPropertiesEdges(mgp_list *args, mgp_graph *memgraph_gr
     auto arguments = mgp::List(args);
     const auto index_name = arguments[0].ValueString();
     const auto search_query = fmt::format("{}:{}", kSearchAllPrefix, arguments[1].ValueString());
-    const auto config = ParseConfig(arguments[2].ValueMap(), /*fuzzy_supported=*/true);
+    const auto config = ParseConfigValue(arguments[2], /*fuzzy_supported=*/true);
     for (const auto &row :
          mgp::SearchTextEdgeIndex(memgraph_graph, index_name, search_query, text_search_mode::ALL_PROPERTIES, config)) {
       auto record = record_factory.NewRecord();
@@ -391,7 +410,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnNode, mgp::Type::Node),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -404,7 +423,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnNode, mgp::Type::Node),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -417,7 +436,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnNode, mgp::Type::Node),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -430,7 +449,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnNode, mgp::Type::Node),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -455,7 +474,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnEdge, mgp::Type::Relationship),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -468,7 +487,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnEdge, mgp::Type::Relationship),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -481,7 +500,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnEdge, mgp::Type::Relationship),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},
@@ -494,7 +513,7 @@ extern "C" int mgp_init_module(struct mgp_module *query_module, struct mgp_memor
                  {
                      mgp::Parameter(TextSearch::kParameterIndexName, mgp::Type::String),
                      mgp::Parameter(TextSearch::kParameterSearchQuery, mgp::Type::String),
-                     mgp::Parameter(TextSearch::kParameterConfig, {mgp::Type::Map, mgp::Type::Any}, default_config),
+                     mgp::Parameter(TextSearch::kParameterConfig, mgp::Type::Any, default_config),
                  },
                  {mgp::Return(TextSearch::kReturnEdge, mgp::Type::Relationship),
                   mgp::Return(TextSearch::kReturnScore, mgp::Type::Double)},

@@ -11,9 +11,9 @@
 
 import sys
 
-import pytest
 from common import get_results_length, memgraph
 from gqlalchemy import GQLAlchemyError
+import pytest
 
 
 def test_create_everything_then_drop_graph(memgraph):

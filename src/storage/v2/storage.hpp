@@ -16,6 +16,8 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -46,6 +48,7 @@
 #include "storage/v2/vertex_accessor.hpp"
 #include "storage/v2/vertices_chunked_iterable.hpp"
 #include "storage/v2/vertices_iterable.hpp"
+#include "utils/on_scope_exit.hpp"
 #include "utils/resource_lock.hpp"
 #include "utils/synchronized_metadata_store.hpp"
 
@@ -314,6 +317,14 @@ class Storage {
 
   LabelId NameToLabel(const std::string_view name) const { return LabelId::FromUint(name_id_mapper_->NameToId(name)); }
 
+  std::optional<LabelId> NameToLabelIfExists(std::string_view name) const {
+    const auto id = name_id_mapper_->NameToIdIfExists(name);
+    if (!id) {
+      return std::nullopt;
+    }
+    return LabelId::FromUint(*id);
+  }
+
   PropertyId NameToProperty(const std::string_view name) const {
     return PropertyId::FromUint(name_id_mapper_->NameToId(name));
   }
@@ -328,6 +339,14 @@ class Storage {
 
   EdgeTypeId NameToEdgeType(const std::string_view name) const {
     return EdgeTypeId::FromUint(name_id_mapper_->NameToId(name));
+  }
+
+  std::optional<EdgeTypeId> NameToEdgeTypeIfExists(std::string_view name) const {
+    const auto id = name_id_mapper_->NameToIdIfExists(name);
+    if (!id) {
+      return std::nullopt;
+    }
+    return EdgeTypeId::FromUint(*id);
   }
 
   StorageMode GetStorageMode() const noexcept { return storage_mode_; }
@@ -778,12 +797,13 @@ class Accessor {
 
   std::string TextIndexAggregate(const std::string &index_name, const std::string &search_query,
                                  const std::string &aggregation_query) const {
-    return transaction_.active_indices_->text_->Aggregate(index_name, search_query, aggregation_query);
+    return transaction_.active_indices_->text_->Aggregate(index_name, search_query, aggregation_query, transaction_);
   }
 
   std::string TextEdgeIndexAggregate(const std::string &index_name, const std::string &search_query,
                                      const std::string &aggregation_query) const {
-    return transaction_.active_indices_->text_edge_->Aggregate(index_name, search_query, aggregation_query);
+    return transaction_.active_indices_->text_edge_->Aggregate(
+        index_name, search_query, aggregation_query, transaction_);
   }
 
   std::vector<TextEdgeSearchResult> SearchEdgeTextIndex(const std::string &index_name, const std::string &search_query,
@@ -939,7 +959,7 @@ class Accessor {
 
   virtual utils::small_vector<uint64_t> GetVectorIndexIdsForVertex(Vertex *vertex, PropertyId property) = 0;
 
-  virtual utils::small_vector<float> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const = 0;
+  virtual utils::small_vector<double> GetVectorFromVectorIndex(Vertex *vertex, std::string_view index_name) const = 0;
 
   virtual std::expected<void, storage::StorageIndexDefinitionError> CreateVectorEdgeIndex(
       VectorEdgeIndexSpec spec, ProgressCallback const &on_progress) = 0;
@@ -1013,7 +1033,12 @@ class Accessor {
       -> std::expected<EnumTypeId, EnumStorageError> {
     auto res = storage_->enum_store_.RegisterEnum(name, values);
     if (res) {
-      transaction_.md_deltas.emplace_back(MetadataDelta::enum_create, res.value());
+      auto const eid = res.value();
+      auto *enum_store = &storage_->enum_store_;
+      utils::OnScopeExit rollback{[enum_store, eid]() noexcept { enum_store->RollbackRegisterEnum(eid); }};
+      transaction_.abort_callbacks_.Add([enum_store, eid]() noexcept { enum_store->RollbackRegisterEnum(eid); });
+      transaction_.md_deltas.emplace_back(MetadataDelta::enum_create, eid);
+      rollback.Disable();
     }
     return res;
   }
@@ -1022,16 +1047,29 @@ class Accessor {
       -> std::expected<storage::Enum, storage::EnumStorageError> {
     auto res = storage_->enum_store_.AddValue(name, value);
     if (res) {
-      transaction_.md_deltas.emplace_back(MetadataDelta::enum_alter_add, res.value());
+      auto const added = res.value();
+      auto *enum_store = &storage_->enum_store_;
+      utils::OnScopeExit rollback{[enum_store, added]() noexcept { enum_store->RollbackAddValue(added); }};
+      transaction_.abort_callbacks_.Add([enum_store, added]() noexcept { enum_store->RollbackAddValue(added); });
+      transaction_.md_deltas.emplace_back(MetadataDelta::enum_alter_add, added);
+      rollback.Disable();
     }
     return res;
   }
 
   auto EnumAlterUpdate(std::string_view name, std::string_view old_value, std::string_view new_value)
       -> std::expected<storage::Enum, storage::EnumStorageError> {
+    std::string saved_old{old_value};
     auto res = storage_->enum_store_.UpdateValue(name, old_value, new_value);
     if (res) {
-      transaction_.md_deltas.emplace_back(MetadataDelta::enum_alter_update, res.value(), std::string{old_value});
+      auto const updated = res.value();
+      auto *enum_store = &storage_->enum_store_;
+      utils::OnScopeExit rollback{
+          [enum_store, updated, saved_old]() noexcept { enum_store->RollbackUpdateValue(updated, saved_old); }};
+      transaction_.abort_callbacks_.Add(
+          [enum_store, updated, saved_old]() noexcept { enum_store->RollbackUpdateValue(updated, saved_old); });
+      transaction_.md_deltas.emplace_back(MetadataDelta::enum_alter_update, updated, std::move(saved_old));
+      rollback.Disable();
     }
     return res;
   }
@@ -1040,158 +1078,285 @@ class Accessor {
 
   void SetLabelDescription(std::span<std::string const> label_names, std::string_view desc) {
     auto labels = ResolveLabels(label_names);
-    storage_->description_store_.SetLabel(labels, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetLabel(labels);
+    store->SetLabel(labels, desc);
+    auto restore = [store, labels, prev]() noexcept {
+      if (prev) {
+        store->SetLabel(labels, *prev);
+      } else {
+        store->DeleteLabel(labels);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::LABEL,
                                         std::move(labels),
                                         EdgeTypeId{},
                                         PropertyId{},
                                         std::string{desc});
+    rollback.Disable();
   }
 
   bool DeleteLabelDescription(std::span<std::string const> label_names) {
-    auto labels = ResolveLabels(label_names);
-    auto deleted = storage_->description_store_.DeleteLabel(labels);
-    if (deleted) {
+    auto maybe_labels = ResolveLabelsIfAllExist(label_names);
+    if (!maybe_labels) return false;
+    auto labels = std::move(*maybe_labels);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetLabel(labels);
+    auto deleted = store->DeleteLabel(labels);
+    if (deleted && prev) {
+      auto restore = [store, labels, prev = std::move(*prev)]() noexcept { store->SetLabel(labels, prev); };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::LABEL,
                                           std::move(labels),
                                           EdgeTypeId{},
                                           PropertyId{});
+      rollback.Disable();
     }
     return deleted;
   }
 
   std::optional<std::string> GetLabelDescription(std::span<std::string const> label_names) const {
-    return storage_->description_store_.GetLabel(ResolveLabels(label_names));
+    auto maybe_labels = ResolveLabelsIfAllExist(label_names);
+    if (!maybe_labels) return std::nullopt;
+    return storage_->description_store_.GetLabel(*maybe_labels);
   }
 
   void SetEdgeTypeDescription(std::string_view name, std::string_view desc) {
     auto edge_type = storage_->NameToEdgeType(name);
-    storage_->description_store_.SetEdgeType(edge_type, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeType(edge_type);
+    store->SetEdgeType(edge_type, desc);
+    auto restore = [store, edge_type, prev]() noexcept {
+      if (prev) {
+        store->SetEdgeType(edge_type, *prev);
+      } else {
+        store->DeleteEdgeType(edge_type);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::EDGE_TYPE,
                                         std::vector<LabelId>{},
                                         edge_type,
                                         PropertyId{},
                                         std::string{desc});
+    rollback.Disable();
   }
 
   bool DeleteEdgeTypeDescription(std::string_view name) {
-    auto edge_type = storage_->NameToEdgeType(name);
-    auto deleted = storage_->description_store_.DeleteEdgeType(edge_type);
-    if (deleted) {
+    auto maybe_edge_type = storage_->NameToEdgeTypeIfExists(name);
+    if (!maybe_edge_type) return false;
+    auto edge_type = *maybe_edge_type;
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeType(edge_type);
+    auto deleted = store->DeleteEdgeType(edge_type);
+    if (deleted && prev) {
+      auto restore = [store, edge_type, prev = std::move(*prev)]() noexcept { store->SetEdgeType(edge_type, prev); };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::EDGE_TYPE,
                                           std::vector<LabelId>{},
                                           edge_type,
                                           PropertyId{});
+      rollback.Disable();
     }
     return deleted;
   }
 
   std::optional<std::string> GetEdgeTypeDescription(std::string_view name) const {
-    return storage_->description_store_.GetEdgeType(storage_->NameToEdgeType(name));
+    auto maybe_edge_type = storage_->NameToEdgeTypeIfExists(name);
+    if (!maybe_edge_type) return std::nullopt;
+    return storage_->description_store_.GetEdgeType(*maybe_edge_type);
   }
 
   void SetLabelPropertyDescription(std::span<std::string const> label_qualifier, std::string_view prop_name,
                                    std::string_view desc) {
     auto labels = ResolveLabels(label_qualifier);
     auto prop = storage_->NameToProperty(prop_name);
-    storage_->description_store_.SetLabelProperty(labels, prop, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetLabelProperty(labels, prop);
+    store->SetLabelProperty(labels, prop, desc);
+    auto restore = [store, labels, prop, prev]() noexcept {
+      if (prev) {
+        store->SetLabelProperty(labels, prop, *prev);
+      } else {
+        store->DeleteLabelProperty(labels, prop);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::LABEL_PROPERTY,
                                         std::move(labels),
                                         EdgeTypeId{},
                                         prop,
                                         std::string{desc});
+    rollback.Disable();
   }
 
   bool DeleteLabelPropertyDescription(std::span<std::string const> label_qualifier, std::string_view prop_name) {
-    auto labels = ResolveLabels(label_qualifier);
-    auto prop = storage_->NameToProperty(prop_name);
-    bool deleted = storage_->description_store_.DeleteLabelProperty(labels, prop);
-    if (deleted) {
+    auto maybe_labels = ResolveLabelsIfAllExist(label_qualifier);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_labels || !maybe_prop) return false;
+    auto labels = std::move(*maybe_labels);
+    auto prop = *maybe_prop;
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetLabelProperty(labels, prop);
+    bool deleted = store->DeleteLabelProperty(labels, prop);
+    if (deleted && prev) {
+      auto restore = [store, labels, prop, prev = std::move(*prev)]() noexcept {
+        store->SetLabelProperty(labels, prop, prev);
+      };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::LABEL_PROPERTY,
                                           std::move(labels),
                                           EdgeTypeId{},
                                           prop);
+      rollback.Disable();
     }
     return deleted;
   }
 
   std::optional<std::string> GetLabelPropertyDescription(std::span<std::string const> label_qualifier,
                                                          std::string_view prop_name) const {
-    return storage_->description_store_.GetLabelProperty(ResolveLabels(label_qualifier),
-                                                         storage_->NameToProperty(prop_name));
+    auto maybe_labels = ResolveLabelsIfAllExist(label_qualifier);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_labels || !maybe_prop) return std::nullopt;
+    return storage_->description_store_.GetLabelProperty(*maybe_labels, *maybe_prop);
   }
 
   void SetEdgeTypePropertyDescription(std::string_view edge_type_name, std::string_view prop_name,
                                       std::string_view desc) {
     auto edge_type = storage_->NameToEdgeType(edge_type_name);
     auto prop = storage_->NameToProperty(prop_name);
-    storage_->description_store_.SetEdgeTypeProperty(edge_type, prop, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeTypeProperty(edge_type, prop);
+    store->SetEdgeTypeProperty(edge_type, prop, desc);
+    auto restore = [store, edge_type, prop, prev]() noexcept {
+      if (prev) {
+        store->SetEdgeTypeProperty(edge_type, prop, *prev);
+      } else {
+        store->DeleteEdgeTypeProperty(edge_type, prop);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::EDGE_TYPE_PROPERTY,
                                         std::vector<LabelId>{},
                                         edge_type,
                                         prop,
                                         std::string{desc});
+    rollback.Disable();
   }
 
   bool DeleteEdgeTypePropertyDescription(std::string_view edge_type_name, std::string_view prop_name) {
-    auto edge_type = storage_->NameToEdgeType(edge_type_name);
-    auto prop = storage_->NameToProperty(prop_name);
-    bool deleted = storage_->description_store_.DeleteEdgeTypeProperty(edge_type, prop);
-    if (deleted) {
+    auto maybe_edge_type = storage_->NameToEdgeTypeIfExists(edge_type_name);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_edge_type || !maybe_prop) return false;
+    auto edge_type = *maybe_edge_type;
+    auto prop = *maybe_prop;
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeTypeProperty(edge_type, prop);
+    bool deleted = store->DeleteEdgeTypeProperty(edge_type, prop);
+    if (deleted && prev) {
+      auto restore = [store, edge_type, prop, prev = std::move(*prev)]() noexcept {
+        store->SetEdgeTypeProperty(edge_type, prop, prev);
+      };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::EDGE_TYPE_PROPERTY,
                                           std::vector<LabelId>{},
                                           edge_type,
                                           prop);
+      rollback.Disable();
     }
     return deleted;
   }
 
   std::optional<std::string> GetEdgeTypePropertyDescription(std::string_view edge_type_name,
                                                             std::string_view prop_name) const {
-    return storage_->description_store_.GetEdgeTypeProperty(storage_->NameToEdgeType(edge_type_name),
-                                                            storage_->NameToProperty(prop_name));
+    auto maybe_edge_type = storage_->NameToEdgeTypeIfExists(edge_type_name);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_edge_type || !maybe_prop) return std::nullopt;
+    return storage_->description_store_.GetEdgeTypeProperty(*maybe_edge_type, *maybe_prop);
   }
 
   void SetPropertyDescription(std::string_view prop_name, std::string_view desc) {
     auto prop = storage_->NameToProperty(prop_name);
-    storage_->description_store_.SetProperty(prop, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetProperty(prop);
+    store->SetProperty(prop, desc);
+    auto restore = [store, prop, prev]() noexcept {
+      if (prev) {
+        store->SetProperty(prop, *prev);
+      } else {
+        store->DeleteProperty(prop);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::PROPERTY,
                                         std::vector<LabelId>{},
                                         EdgeTypeId{},
                                         prop,
                                         std::string{desc});
+    rollback.Disable();
   }
 
   bool DeletePropertyDescription(std::string_view prop_name) {
-    auto prop = storage_->NameToProperty(prop_name);
-    bool deleted = storage_->description_store_.DeleteProperty(prop);
-    if (deleted) {
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_prop) return false;
+    auto prop = *maybe_prop;
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetProperty(prop);
+    bool deleted = store->DeleteProperty(prop);
+    if (deleted && prev) {
+      auto restore = [store, prop, prev = std::move(*prev)]() noexcept { store->SetProperty(prop, prev); };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::PROPERTY,
                                           std::vector<LabelId>{},
                                           EdgeTypeId{},
                                           prop);
+      rollback.Disable();
     }
     return deleted;
   }
 
   std::optional<std::string> GetPropertyDescription(std::string_view prop_name) const {
-    return storage_->description_store_.GetProperty(storage_->NameToProperty(prop_name));
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_prop) return std::nullopt;
+    return storage_->description_store_.GetProperty(*maybe_prop);
   }
 
   void SetPropertyValueDescription(std::string_view prop_name, ExternalPropertyValue const &value,
                                    std::string_view desc) {
     auto prop = storage_->NameToProperty(prop_name);
-    storage_->description_store_.SetPropertyValue(prop, value, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetPropertyValue(prop, value);
+    store->SetPropertyValue(prop, value, desc);
+    auto restore = [store, prop, value, prev]() noexcept {
+      if (prev) {
+        store->SetPropertyValue(prop, value, *prev);
+      } else {
+        store->DeletePropertyValue(prop, value);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::PROPERTY_VALUE,
                                         std::vector<LabelId>{},
@@ -1201,12 +1366,22 @@ class Accessor {
                                         std::vector<LabelId>{},
                                         std::vector<LabelId>{},
                                         value);
+    rollback.Disable();
   }
 
   bool DeletePropertyValueDescription(std::string_view prop_name, ExternalPropertyValue const &value) {
-    auto prop = storage_->NameToProperty(prop_name);
-    bool deleted = storage_->description_store_.DeletePropertyValue(prop, value);
-    if (deleted) {
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_prop) return false;
+    auto prop = *maybe_prop;
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetPropertyValue(prop, value);
+    bool deleted = store->DeletePropertyValue(prop, value);
+    if (deleted && prev) {
+      auto restore = [store, prop, value, prev = std::move(*prev)]() noexcept {
+        store->SetPropertyValue(prop, value, prev);
+      };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::PROPERTY_VALUE,
                                           std::vector<LabelId>{},
@@ -1215,13 +1390,16 @@ class Accessor {
                                           std::vector<LabelId>{},
                                           std::vector<LabelId>{},
                                           value);
+      rollback.Disable();
     }
     return deleted;
   }
 
   std::optional<std::string> GetPropertyValueDescription(std::string_view prop_name,
                                                          ExternalPropertyValue const &value) const {
-    return storage_->description_store_.GetPropertyValue(storage_->NameToProperty(prop_name), value);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_prop) return std::nullopt;
+    return storage_->description_store_.GetPropertyValue(*maybe_prop, value);
   }
 
   void SetEdgeTypePatternDescription(std::span<std::string const> from_label_names, std::string_view edge_type_name,
@@ -1229,7 +1407,18 @@ class Accessor {
     auto from_labels = ResolveLabels(from_label_names);
     auto edge_type = storage_->NameToEdgeType(edge_type_name);
     auto to_labels = ResolveLabels(to_label_names);
-    storage_->description_store_.SetEdgeTypePattern(from_labels, edge_type, to_labels, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeTypePattern(from_labels, edge_type, to_labels);
+    store->SetEdgeTypePattern(from_labels, edge_type, to_labels, desc);
+    auto restore = [store, from_labels, edge_type, to_labels, prev]() noexcept {
+      if (prev) {
+        store->SetEdgeTypePattern(from_labels, edge_type, to_labels, *prev);
+      } else {
+        store->DeleteEdgeTypePattern(from_labels, edge_type, to_labels);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::EDGE_TYPE_PATTERN,
                                         std::vector<LabelId>{},
@@ -1238,15 +1427,27 @@ class Accessor {
                                         std::string{desc},
                                         std::move(from_labels),
                                         std::move(to_labels));
+    rollback.Disable();
   }
 
   bool DeleteEdgeTypePatternDescription(std::span<std::string const> from_label_names, std::string_view edge_type_name,
                                         std::span<std::string const> to_label_names) {
-    auto from_labels = ResolveLabels(from_label_names);
-    auto edge_type = storage_->NameToEdgeType(edge_type_name);
-    auto to_labels = ResolveLabels(to_label_names);
-    auto deleted = storage_->description_store_.DeleteEdgeTypePattern(from_labels, edge_type, to_labels);
-    if (deleted) {
+    auto maybe_from = ResolveLabelsIfAllExist(from_label_names);
+    auto maybe_et = storage_->NameToEdgeTypeIfExists(edge_type_name);
+    auto maybe_to = ResolveLabelsIfAllExist(to_label_names);
+    if (!maybe_from || !maybe_et || !maybe_to) return false;
+    auto from_labels = std::move(*maybe_from);
+    auto edge_type = *maybe_et;
+    auto to_labels = std::move(*maybe_to);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeTypePattern(from_labels, edge_type, to_labels);
+    auto deleted = store->DeleteEdgeTypePattern(from_labels, edge_type, to_labels);
+    if (deleted && prev) {
+      auto restore = [store, from_labels, edge_type, to_labels, prev = std::move(*prev)]() noexcept {
+        store->SetEdgeTypePattern(from_labels, edge_type, to_labels, prev);
+      };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::EDGE_TYPE_PATTERN,
                                           std::vector<LabelId>{},
@@ -1254,6 +1455,7 @@ class Accessor {
                                           PropertyId{},
                                           std::move(from_labels),
                                           std::move(to_labels));
+      rollback.Disable();
     }
     return deleted;
   }
@@ -1261,8 +1463,11 @@ class Accessor {
   std::optional<std::string> GetEdgeTypePatternDescription(std::span<std::string const> from_label_names,
                                                            std::string_view edge_type_name,
                                                            std::span<std::string const> to_label_names) const {
-    return storage_->description_store_.GetEdgeTypePattern(
-        ResolveLabels(from_label_names), storage_->NameToEdgeType(edge_type_name), ResolveLabels(to_label_names));
+    auto maybe_from = ResolveLabelsIfAllExist(from_label_names);
+    auto maybe_et = storage_->NameToEdgeTypeIfExists(edge_type_name);
+    auto maybe_to = ResolveLabelsIfAllExist(to_label_names);
+    if (!maybe_from || !maybe_et || !maybe_to) return std::nullopt;
+    return storage_->description_store_.GetEdgeTypePattern(*maybe_from, *maybe_et, *maybe_to);
   }
 
   void SetEdgeTypePatternPropertyDescription(std::span<std::string const> from_label_names,
@@ -1273,7 +1478,18 @@ class Accessor {
     auto edge_type = storage_->NameToEdgeType(edge_type_name);
     auto to_labels = ResolveLabels(to_label_names);
     auto prop = storage_->NameToProperty(prop_name);
-    storage_->description_store_.SetEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop, desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop);
+    store->SetEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop, desc);
+    auto restore = [store, from_labels, edge_type, to_labels, prop, prev]() noexcept {
+      if (prev) {
+        store->SetEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop, *prev);
+      } else {
+        store->DeleteEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop);
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::EDGE_TYPE_PATTERN_PROPERTY,
                                         std::vector<LabelId>{},
@@ -1282,18 +1498,31 @@ class Accessor {
                                         std::string{desc},
                                         std::move(from_labels),
                                         std::move(to_labels));
+    rollback.Disable();
   }
 
   bool DeleteEdgeTypePatternPropertyDescription(std::span<std::string const> from_label_names,
                                                 std::string_view edge_type_name,
                                                 std::span<std::string const> to_label_names,
                                                 std::string_view prop_name) {
-    auto from_labels = ResolveLabels(from_label_names);
-    auto edge_type = storage_->NameToEdgeType(edge_type_name);
-    auto to_labels = ResolveLabels(to_label_names);
-    auto prop = storage_->NameToProperty(prop_name);
-    auto deleted = storage_->description_store_.DeleteEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop);
-    if (deleted) {
+    auto maybe_from = ResolveLabelsIfAllExist(from_label_names);
+    auto maybe_et = storage_->NameToEdgeTypeIfExists(edge_type_name);
+    auto maybe_to = ResolveLabelsIfAllExist(to_label_names);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_from || !maybe_et || !maybe_to || !maybe_prop) return false;
+    auto from_labels = std::move(*maybe_from);
+    auto edge_type = *maybe_et;
+    auto to_labels = std::move(*maybe_to);
+    auto prop = *maybe_prop;
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop);
+    auto deleted = store->DeleteEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop);
+    if (deleted && prev) {
+      auto restore = [store, from_labels, edge_type, to_labels, prop, prev = std::move(*prev)]() noexcept {
+        store->SetEdgeTypePatternProperty(from_labels, edge_type, to_labels, prop, prev);
+      };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::EDGE_TYPE_PATTERN_PROPERTY,
                                           std::vector<LabelId>{},
@@ -1301,6 +1530,7 @@ class Accessor {
                                           prop,
                                           std::move(from_labels),
                                           std::move(to_labels));
+      rollback.Disable();
     }
     return deleted;
   }
@@ -1309,30 +1539,50 @@ class Accessor {
                                                                    std::string_view edge_type_name,
                                                                    std::span<std::string const> to_label_names,
                                                                    std::string_view prop_name) const {
-    return storage_->description_store_.GetEdgeTypePatternProperty(ResolveLabels(from_label_names),
-                                                                   storage_->NameToEdgeType(edge_type_name),
-                                                                   ResolveLabels(to_label_names),
-                                                                   storage_->NameToProperty(prop_name));
+    auto maybe_from = ResolveLabelsIfAllExist(from_label_names);
+    auto maybe_et = storage_->NameToEdgeTypeIfExists(edge_type_name);
+    auto maybe_to = ResolveLabelsIfAllExist(to_label_names);
+    auto maybe_prop = storage_->NameToPropertyIfExists(prop_name);
+    if (!maybe_from || !maybe_et || !maybe_to || !maybe_prop) return std::nullopt;
+    return storage_->description_store_.GetEdgeTypePatternProperty(*maybe_from, *maybe_et, *maybe_to, *maybe_prop);
   }
 
   void SetDatabaseDescription(std::string_view desc) {
-    storage_->description_store_.SetDatabase(desc);
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetDatabase();
+    store->SetDatabase(desc);
+    auto restore = [store, prev]() noexcept {
+      if (prev) {
+        store->SetDatabase(*prev);
+      } else {
+        store->DeleteDatabase();
+      }
+    };
+    utils::OnScopeExit rollback{restore};
+    transaction_.abort_callbacks_.Add(std::move(restore));
     transaction_.md_deltas.emplace_back(MetadataDelta::description_set,
                                         DescriptionTargetKind::DATABASE,
                                         std::vector<LabelId>{},
                                         EdgeTypeId{},
                                         PropertyId{},
                                         std::string{desc});
+    rollback.Disable();
   }
 
   bool DeleteDatabaseDescription() {
-    bool deleted = storage_->description_store_.DeleteDatabase();
-    if (deleted) {
+    auto *store = &storage_->description_store_;
+    auto prev = store->GetDatabase();
+    bool deleted = store->DeleteDatabase();
+    if (deleted && prev) {
+      auto restore = [store, prev = std::move(*prev)]() noexcept { store->SetDatabase(prev); };
+      utils::OnScopeExit rollback{restore};
+      transaction_.abort_callbacks_.Add(std::move(restore));
       transaction_.md_deltas.emplace_back(MetadataDelta::description_delete,
                                           DescriptionTargetKind::DATABASE,
                                           std::vector<LabelId>{},
                                           EdgeTypeId{},
                                           PropertyId{});
+      rollback.Disable();
     }
     return deleted;
   }
@@ -1345,6 +1595,17 @@ class Accessor {
   std::vector<LabelId> ResolveLabels(std::span<std::string const> names) const {
     return names | ranges::views::transform([this](std::string_view name) { return storage_->NameToLabel(name); }) |
            ranges::to<std::vector>();
+  }
+
+  std::optional<std::vector<LabelId>> ResolveLabelsIfAllExist(std::span<std::string const> names) const {
+    std::vector<LabelId> out;
+    out.reserve(names.size());
+    for (auto const &name : names) {
+      auto id = storage_->NameToLabelIfExists(name);
+      if (!id) return std::nullopt;
+      out.push_back(*id);
+    }
+    return out;
   }
 
  public:
@@ -1376,6 +1637,8 @@ class Accessor {
 
   auto GetNameIdMapper() const -> NameIdMapper * { return storage_->name_id_mapper_.get(); }
 
+  auto GetDatabaseUuid() const -> utils::UUID const & { return storage_->uuid(); }
+
   bool CheckIndicesAreReady(IndicesCollection const &required_indices) const {
     return transaction_.active_indices_->CheckIndicesAreReady(required_indices);
   }
@@ -1394,7 +1657,16 @@ class Accessor {
   virtual storage::ttl::TtlInfo GetTtlConfig() const = 0;
 #endif
  protected:
+  void DeferThreadJoinAfterUnlock(std::jthread worker) {
+    if (worker.joinable()) {
+      post_unlock_threads_.push_back(std::move(worker));
+    }
+  }
+
   Storage *storage_;
+  /// Workers whose stop was requested while holding main_lock_; declared before guard_ so they join
+  /// after guard_ releases main_lock_.
+  std::vector<std::jthread> post_unlock_threads_;
   /// One guard for all four ways to hold main_lock_. The mode is mutable state, not a property of
   /// this type: a READ_ONLY hold downgrades to READ, and ReleaseUniqueGuard() leaves nothing held.
   utils::ResourceLockGuard guard_;
@@ -1409,7 +1681,7 @@ class Accessor {
   Result<std::optional<std::unordered_set<Vertex *>>> PrepareDeletableNodes(
       const std::vector<VertexAccessor *> &vertices);
   EdgeInfoForDeletion PrepareDeletableEdges(const std::unordered_set<Vertex *> &vertices,
-                                            const std::vector<EdgeAccessor *> &edges, bool detach) noexcept;
+                                            const std::vector<EdgeAccessor *> &edges, bool detach);
   Result<std::optional<std::vector<EdgeAccessor>>> ClearEdgesOnVertices(
       const std::unordered_set<Vertex *> &vertices, std::unordered_set<Gid> &deleted_edge_ids,
       std::optional<SchemaInfo::ModifyingAccessor> &schema_acc);

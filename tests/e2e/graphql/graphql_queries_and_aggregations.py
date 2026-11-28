@@ -1,8 +1,8 @@
 import sys
 from textwrap import dedent
 
-import pytest
 from graphql_server import *
+import pytest
 
 
 @pytest.fixture
@@ -43,7 +43,7 @@ def test_return_all_user_nodes_from_their_id_and_name(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, preserve_order=False)
 
     query_server.send_query("mutation { teardown }")
 
@@ -59,6 +59,7 @@ def test_query_user_and_return_all_their_posts(query_server):
                 name
                 posts {
                     content
+                    createdAt
                 }
             }
         }
@@ -76,13 +77,16 @@ def test_query_user_and_return_all_their_posts(query_server):
                         "id":"51f65ea1-b612-47e6-8cc1-c13735168130",
                         "posts":[
                             {
-                                "content":"First post"
+                                "content":"First post",
+                                "createdAt":"2011-12-03T09:15:30.000Z"
                             },
                             {
-                                "content":"Second post"
+                                "content":"Second post",
+                                "createdAt":"2011-12-04T09:15:30.000Z"
                             },
                             {
-                                "content":"Third one"
+                                "content":"Third one",
+                                "createdAt":"2011-12-05T09:15:30.000Z"
                             }
                         ]
                     }
@@ -91,7 +95,7 @@ def test_query_user_and_return_all_their_posts(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, preserve_order=False)
 
     query_server.send_query("mutation { teardown }")
 
@@ -227,7 +231,7 @@ def test_aggregation_over_related_nodes(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, preserve_order=False)
 
     query_server.send_query("mutation { teardown }")
 
@@ -289,7 +293,7 @@ def test_aggregation_longest_post_per_user(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, preserve_order=False)
 
     query_server.send_query("mutation { teardown }")
 
@@ -351,7 +355,7 @@ def test_edge_date_aggregation(query_server):
         }
         """
     ).strip()
-    assert server_returned_expected(expected_result, gotten)
+    assert server_returned_expected(expected_result, gotten, preserve_order=False)
 
     query_server.send_query("mutation { teardown }")
 

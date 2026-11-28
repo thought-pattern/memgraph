@@ -31,6 +31,7 @@ Each job's output lands in <log-dir>/<NN-name>/runner.log next to memgraph.log, 
 configs keep their logs; on failure the tail of runner.log is echoed to stdout.
 """
 import argparse
+from dataclasses import dataclass
 import importlib.machinery
 import importlib.util
 import json
@@ -41,12 +42,11 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import yaml
 from gqlalchemy import Memgraph
 from workers import get_worker_object, get_worker_steps
+import yaml
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 

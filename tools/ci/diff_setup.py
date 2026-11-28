@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 
@@ -53,7 +54,17 @@ class DiffSetup:
         }
 
     def _check_diff_workflow(self) -> bool:
-        for file in os.popen(f"git diff --name-only {self._base_branch}").read().splitlines():
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", self._base_branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or f"git diff exited with status {proc.returncode}"
+            print(f"Error: git diff against '{self._base_branch}' failed: {err_msg}", file=sys.stderr)
+            sys.exit(1)
+        for file in proc.stdout.splitlines():
             if file.startswith("licenses/"):
                 continue
             elif file.endswith(".md"):
@@ -113,11 +124,14 @@ class DiffSetup:
 
 
 def print_test_suite(tests: dict, set_env_vars: bool = False) -> None:
-    for build, tests in tests.items():
-        for test, run in tests.items():
-            print(f"run_{build}_{test}={run}")
-            if set_env_vars:
-                os.popen(f"echo run_{build}_{test}={run} >> $GITHUB_OUTPUT")
+    gh_output_path = os.environ.get("GITHUB_OUTPUT", "")
+    for build, suite_tests in tests.items():
+        for test, run in suite_tests.items():
+            line = f"run_{build}_{test}={run}"
+            print(line)
+            if set_env_vars and gh_output_path:
+                with open(gh_output_path, "a", encoding="utf-8") as gh_out:
+                    gh_out.write(line + "\n")
 
 
 def parse_args() -> argparse.Namespace:

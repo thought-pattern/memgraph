@@ -85,8 +85,10 @@ setup_repos() {
     dnf config-manager --set-enabled crb
     # Enable EPEL for additional packages
     dnf install -y epel-release epel-next-release
-    # enable rpm fusion
-    dnf install --nogpgcheck -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm
+    # Authenticate RPM Fusion against the distribution-packaged signing key
+    dnf install -y distribution-gpg-keys
+    rpmkeys --import /usr/share/distribution-gpg-keys/rpmfusion/RPM-GPG-KEY-rpmfusion-free-el-9
+    dnf --setopt=localpkg_gpgcheck=1 install -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-9.noarch.rpm
 }
 
 main "$@"

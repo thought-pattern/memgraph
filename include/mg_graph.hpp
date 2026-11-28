@@ -152,7 +152,7 @@ class Graph : public GraphView<TSize> {
   ///
   /// @return double weight
   double GetWeight(TSize edge_id) const override {
-    if (edge_id < 0 || edge_id >= edges_.size()) {
+    if (!IsEdgeValid(edge_id) || edge_id >= weights_.size()) {
       throw mg_exception::InvalidIDException();
     }
     return weights_[edge_id];
@@ -161,7 +161,7 @@ class Graph : public GraphView<TSize> {
   ///
   ///@brief Return true if graph has weights on edges.
   ///
-  bool IsWeighted() const override { return !weights_.empty(); }
+  bool IsWeighted() const override { return has_weights_; }
 
   /// Creates a node.
   ///
@@ -170,9 +170,12 @@ class Graph : public GraphView<TSize> {
     if (memgraph_to_inner_id_.find(memgraph_id) != memgraph_to_inner_id_.end()) {
       return std::nullopt;
     }
+    if (nodes_.size() >= std::numeric_limits<TSize>::max()) {
+      throw mg_exception::InvalidIDException();
+    }
 
-    auto id = nodes_.size();
-    nodes_.push_back({id});
+    const auto id = static_cast<TSize>(nodes_.size());
+    nodes_.push_back(TNode{id});
     adj_list_.emplace_back();
     neighbours_.emplace_back();
     in_neighbours_.emplace_back();
@@ -206,6 +209,9 @@ class Graph : public GraphView<TSize> {
     if (memgraph_to_inner_edge_id_.find(edge_id) != memgraph_to_inner_edge_id_.end()) {
       return std::nullopt;
     }
+    if (edges_.size() >= k_deleted_edge_id_) {
+      throw mg_exception::InvalidIDException();
+    }
 
     auto fromOpt = GetInnerNodeIdOpt(memgraph_id_from);
     auto toOpt = GetInnerNodeIdOpt(memgraph_id_to);
@@ -213,23 +219,31 @@ class Graph : public GraphView<TSize> {
       return std::nullopt;
     }
 
-    auto from = *fromOpt;
-    auto to = *toOpt;
+    const TSize from = *fromOpt;
+    const TSize to = *toOpt;
 
-    auto id = edges_.size();
+    const auto id = static_cast<TSize>(edges_.size());
     inner_to_memgraph_edge_id_.emplace(id, edge_id);
     memgraph_to_inner_edge_id_.emplace(edge_id, id);
 
-    edges_.push_back({id, from, to});
+    edges_.push_back(TEdge{id, from, to});
     adj_list_[from].push_back(id);
     neighbours_[from].emplace_back(to, id);
     nodes_to_edge_.insert({std::minmax(from, to), id});
-    if (weighted) weights_.push_back(weight);
+    if (weighted) {
+      has_weights_ = true;
+    }
+    weights_.push_back(weight);
 
     if (graph_type == GraphType::kUndirectedGraph) {
-      adj_list_[to].push_back(id);
+      if (to != from) {
+        adj_list_[to].push_back(id);
+      }
       neighbours_[to].emplace_back(from, id);
     } else if (graph_type == GraphType::kDirectedGraph) {
+      if (to != from) {
+        adj_list_[to].push_back(id);
+      }
       in_neighbours_[to].emplace_back(from, id);
     }
 
@@ -280,39 +294,51 @@ class Graph : public GraphView<TSize> {
       throw mg_exception::InvalidIDException();
     }
 
-    auto it = nodes_to_edge_.find(std::minmax(node_from, node_to));
-    if (it == nodes_to_edge_.end()) {
+    const auto [range_start, range_end] = nodes_to_edge_.equal_range(std::minmax(node_from, node_to));
+    auto selected_it = nodes_to_edge_.end();
+    for (auto it = range_start; it != range_end; ++it) {
+      const TSize eid = it->second;
+      if (!IsEdgeValid(eid)) continue;
+      if (edges_[eid].from == node_from && edges_[eid].to == node_to) {
+        selected_it = it;
+        break;
+      }
+      if (edges_[eid].from == node_to && edges_[eid].to == node_from) {
+        const bool is_undirected_entry =
+            std::any_of(neighbours_[node_from].begin(), neighbours_[node_from].end(),
+                        [eid](const TNeighbour &n) { return n.edge_id == eid; });
+        if (is_undirected_entry && selected_it == nodes_to_edge_.end()) {
+          selected_it = it;
+        }
+      }
+    }
+    if (selected_it == nodes_to_edge_.end()) {
       return;
     }
 
-    auto edge_id = it->second;
+    const TSize edge_id = selected_it->second;
+    edges_[edge_id].id = Graph::k_deleted_edge_id_;
+    nodes_to_edge_.erase(selected_it);
 
-    for (auto it = adj_list_[node_from].begin(); it != adj_list_[node_from].end(); ++it) {
-      if (edges_[*it].to == node_to || edges_[*it].from == node_to) {
-        edges_[*it].id = Graph::k_deleted_edge_id_;
-        adj_list_[node_from].erase(it);
-        break;
-      }
-    }
-    for (auto it = adj_list_[node_to].begin(); it != adj_list_[node_to].end(); ++it) {
-      if (edges_[*it].to == node_from || edges_[*it].from == node_from) {
-        edges_[*it].id = Graph::k_deleted_edge_id_;
-        adj_list_[node_to].erase(it);
-        break;
-      }
+    auto mem_edge_it = inner_to_memgraph_edge_id_.find(edge_id);
+    if (mem_edge_it != inner_to_memgraph_edge_id_.end()) {
+      memgraph_to_inner_edge_id_.erase(mem_edge_it->second);
+      inner_to_memgraph_edge_id_.erase(mem_edge_it);
     }
 
-    for (auto it = neighbours_[node_from].begin(); it != neighbours_[node_from].end(); ++it) {
-      if (it->edge_id == edge_id) {
-        neighbours_[node_from].erase(it);
-        break;
-      }
+    std::erase(adj_list_[node_from], edge_id);
+    if (node_to != node_from) {
+      std::erase(adj_list_[node_to], edge_id);
     }
-    for (auto it = neighbours_[node_to].begin(); it != neighbours_[node_to].end(); ++it) {
-      if (it->edge_id == edge_id) {
-        neighbours_[node_to].erase(it);
-        break;
-      }
+
+    auto erase_by_edge_id = [edge_id](std::vector<TNeighbour> &vec) {
+      std::erase_if(vec, [edge_id](const TNeighbour &n) { return n.edge_id == edge_id; });
+    };
+    erase_by_edge_id(neighbours_[node_from]);
+    erase_by_edge_id(in_neighbours_[node_from]);
+    if (node_to != node_from) {
+      erase_by_edge_id(neighbours_[node_to]);
+      erase_by_edge_id(in_neighbours_[node_to]);
     }
   }
 
@@ -406,8 +432,11 @@ class Graph : public GraphView<TSize> {
     nodes_.clear();
     edges_.clear();
     weights_.clear();
+    has_weights_ = false;
     memgraph_to_inner_id_.clear();
     inner_to_memgraph_id_.clear();
+    memgraph_to_inner_edge_id_.clear();
+    inner_to_memgraph_edge_id_.clear();
     nodes_to_edge_.clear();
   }
 
@@ -425,6 +454,7 @@ class Graph : public GraphView<TSize> {
   std::vector<std::vector<TNeighbour>> in_neighbours_;
 
   std::vector<double> weights_;
+  bool has_weights_ = false;
 
   std::vector<TNode> nodes_;
   std::vector<TEdge> edges_;
@@ -437,6 +467,6 @@ class Graph : public GraphView<TSize> {
 
   std::multimap<std::pair<TSize, TSize>, TSize> nodes_to_edge_;
 
-  bool is_transactional_;
+  bool is_transactional_ = false;
 };
 }  // namespace mg_graph

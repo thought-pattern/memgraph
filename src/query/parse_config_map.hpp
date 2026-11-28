@@ -15,7 +15,8 @@
 #include <map>
 #include <optional>
 #include <string>
-#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace memgraph::query {
 
@@ -24,7 +25,7 @@ class TypedValue;
 template <class TResult>
 class ExpressionVisitor;
 
-auto ParseConfigMap(std::unordered_map<Expression *, Expression *> const &config_map,
+auto ParseConfigMap(std::vector<std::pair<Expression *, Expression *>> const &config_map,
                     ExpressionVisitor<TypedValue> &evaluator)
     -> std::optional<std::map<std::string, std::string, std::less<>>>;
 

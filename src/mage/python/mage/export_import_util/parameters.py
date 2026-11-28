@@ -1,7 +1,11 @@
+"""Utilities for parameters."""
+
 from enum import Enum
 
 
 class Parameter(Enum):
+    """Field names used by the export and import formats."""
+
     ID = "id"
     LABELS = "labels"
     PROPERTIES = "properties"

@@ -15,9 +15,9 @@ import sys
 import time
 from typing import List
 
+from common import connect, execute_and_fetch_all
 import mgclient
 import pytest
-from common import connect, execute_and_fetch_all
 
 # Module-level setup
 # -------------------------

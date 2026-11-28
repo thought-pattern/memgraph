@@ -53,6 +53,9 @@ struct SalientConfig {
     bool storage_light_edge{false};
     bool delta_on_identical_property_update{true};
     bool property_store_compression_enabled{false};
+    [[nodiscard]] constexpr bool ShouldSkipDuplicatePropertyUpdate() const noexcept {
+      return !delta_on_identical_property_update;
+    }
     friend bool operator==(const Items &lrh, const Items &rhs) = default;
     friend void to_json(nlohmann::json &data, Items const &items);
     friend void from_json(const nlohmann::json &data, Items &items);
@@ -153,6 +156,8 @@ struct Config {
 
   bool register_metrics{true};
 
+  std::optional<int64_t> tenant_memory_limit{};
+
   friend bool operator==(const Config &lrh, const Config &rhs) = default;
 };
 
@@ -174,15 +179,21 @@ inline auto ReplicationStateRootPath(memgraph::storage::Config const &config) ->
 static inline void UpdatePaths(Config &config, const std::filesystem::path &storage_dir) {
   auto contained = [](const auto &path, const auto &base) -> std::optional<std::filesystem::path> {
     auto rel = std::filesystem::relative(path, base);
-    if (!rel.empty() && rel.native()[0] != '.') {  // Contained
-      return rel;
+    if (rel.empty() || rel.is_absolute()) {
+      return {};
     }
-    return {};
+    for (const auto &part : rel) {
+      if (part == "." || part == "..") {
+        return {};
+      }
+    }
+    return rel;
   };
 
   const auto old_base =
       std::filesystem::weakly_canonical(std::filesystem::absolute(config.durability.storage_directory));
-  config.durability.storage_directory = std::filesystem::weakly_canonical(std::filesystem::absolute(storage_dir));
+  auto new_storage_dir = std::filesystem::weakly_canonical(std::filesystem::absolute(storage_dir));
+  Config::DiskConfig updated_disk = config.disk;
 
   auto UPDATE_PATH = [&](auto to_update) {
     const auto old_path = std::filesystem::weakly_canonical(std::filesystem::absolute(to_update(config.disk)));
@@ -190,7 +201,7 @@ static inline void UpdatePaths(Config &config, const std::filesystem::path &stor
     if (!contained_path) {
       throw StorageConfigException("On-disk directories not contained in root.");
     }
-    to_update(config.disk) = config.durability.storage_directory / *contained_path;
+    to_update(updated_disk) = new_storage_dir / *contained_path;
   };
 
   UPDATE_PATH(std::mem_fn(&Config::DiskConfig::main_storage_directory));
@@ -201,6 +212,9 @@ static inline void UpdatePaths(Config &config, const std::filesystem::path &stor
   UPDATE_PATH(std::mem_fn(&Config::DiskConfig::id_name_mapper_directory));
   UPDATE_PATH(std::mem_fn(&Config::DiskConfig::durability_directory));
   UPDATE_PATH(std::mem_fn(&Config::DiskConfig::wal_directory));
+
+  config.durability.storage_directory = std::move(new_storage_dir);
+  config.disk = std::move(updated_disk);
 }
 
 }  // namespace memgraph::storage

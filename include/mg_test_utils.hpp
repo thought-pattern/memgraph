@@ -39,6 +39,16 @@ class Timer {
   std::chrono::steady_clock::time_point start_time_;
 };
 
+template <typename T>
+constexpr T AbsDiff(T a, T b) {
+  static_assert(std::is_arithmetic_v<T>, "Not an arithmetic type!");
+  if constexpr (std::is_unsigned_v<T>) {
+    return a >= b ? static_cast<T>(a - b) : static_cast<T>(b - a);
+  } else {
+    return static_cast<T>(std::abs(a - b));
+  }
+}
+
 ///
 ///@brief Method that calculates the maximum absolute error between vector components.
 /// The vector type must be an arithmetic type. Vectors must have the same size.
@@ -54,11 +64,11 @@ T MaxAbsoluteError(const std::vector<T> &result, const std::vector<T> &correct) 
 
   assert(result.size() == correct.size());
 
-  auto size = correct.size();
+  const auto size = correct.size();
   T max_absolute_error = 0;
 
-  for (auto index = 0; index < size; index++) {
-    T absolute_distance = std::abs(result[index] - correct[index]);
+  for (std::size_t index = 0; index < size; index++) {
+    T absolute_distance = AbsDiff(result[index], correct[index]);
     max_absolute_error = std::max(max_absolute_error, absolute_distance);
   }
 
@@ -80,16 +90,15 @@ double AverageAbsoluteError(const std::vector<T> &result, const std::vector<T> &
 
   assert(result.size() == correct.size());
 
-  auto size = correct.size();
-  T manhattan_distance = 0;
+  const auto size = correct.size();
+  double manhattan_distance = 0.0;
 
-  for (auto index = 0; index < size; index++) {
-    T absolute_distance = std::abs(result[index] - correct[index]);
-    manhattan_distance += absolute_distance;
+  for (std::size_t index = 0; index < size; index++) {
+    manhattan_distance += static_cast<double>(AbsDiff(result[index], correct[index]));
   }
 
   double average_absolute_error = 0;
-  if (size > 0) average_absolute_error = static_cast<double>(manhattan_distance) / size;
+  if (size > 0) average_absolute_error = manhattan_distance / static_cast<double>(size);
   return average_absolute_error;
 }
 
@@ -108,7 +117,7 @@ bool TestEqualVectors(const std::vector<T> &result, const std::vector<T> &correc
                       double absolute_error = ABSOLUTE_ERROR_EPSILON,
                       double average_error = AVERAGE_ABSOLUTE_ERROR_EPSILON) {
   static_assert(std::is_arithmetic<T>::value, "Not an arithmetic type!");
-  return MaxAbsoluteError(result, correct) < absolute_error && AverageAbsoluteError(result, correct) < absolute_error;
+  return MaxAbsoluteError(result, correct) < absolute_error && AverageAbsoluteError(result, correct) < average_error;
 }
 
 ///
@@ -142,7 +151,8 @@ bool TestEqualUnorderedMaps(const std::unordered_map<std::uint64_t, T> &result,
 
   return std::equal(keys_result.begin(), keys_result.end(), keys_correct.begin(),
                     [&result, &correct, &absolute_error](auto key_result, auto key_correct) {
-                      return std::abs(result.at(key_result) - correct.at(key_correct)) <= absolute_error;
+                      return static_cast<double>(AbsDiff(result.at(key_result), correct.at(key_correct))) <=
+                             absolute_error;
                     });
 }
 
@@ -159,6 +169,7 @@ template <typename T>
 bool TestEqualVectorPairs(const std::vector<std::pair<std::uint64_t, T>> &result,
                           const std::vector<std::pair<std::uint64_t, T>> &correct,
                           double absolute_error = ABSOLUTE_ERROR_EPSILON) {
+  static_assert(std::is_arithmetic<T>::value, "Not an arithmetic type!");
   if (result.size() != correct.size()) return false;
 
   std::vector<std::pair<std::uint64_t, T>> result_cp(result);
@@ -169,7 +180,8 @@ bool TestEqualVectorPairs(const std::vector<std::pair<std::uint64_t, T>> &result
 
   return std::equal(
       result_cp.begin(), result_cp.end(), correct_cp.begin(), [&absolute_error](auto result_cp, auto correct_cp) {
-        return result_cp.first == correct_cp.first && std::abs(result_cp.second - correct_cp.second) <= absolute_error;
+        return result_cp.first == correct_cp.first &&
+               static_cast<double>(AbsDiff(result_cp.second, correct_cp.second)) <= absolute_error;
       });
 }
 }  // namespace mg_test_utility

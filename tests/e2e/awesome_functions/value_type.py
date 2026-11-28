@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import get_bytes, memgraph
+import pytest
 
 TYPE = "type"
 

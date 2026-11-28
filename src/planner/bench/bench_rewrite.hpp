@@ -39,6 +39,14 @@ inline auto RuleNoOp() {
   return TestRewriteRule::Builder{"noop"}.pattern(PatternAdd()).apply([](TestRuleContext &, Match const &) {});
 }
 
+inline auto RuleStepProgress() {
+  return TestRewriteRule::Builder{"step_progress"}
+      .pattern(TestPattern::build(kVarRoot, Op::F, {Var{kVarX}}))
+      .apply([counter = uint64_t{1}](TestRuleContext &ctx, Match const &) mutable {
+        (void)ctx.Make<Op::Const>(counter++);
+      });
+}
+
 inline auto RuleMergeAddMul() {
   return TestRewriteRule::Builder{"merge_add_mul"}
       .pattern(TestPattern::build(kVarAddRoot, Op::Add, {Var{kVarX}, Var{kVarY}}), "add")

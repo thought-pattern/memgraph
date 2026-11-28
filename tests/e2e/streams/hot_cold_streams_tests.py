@@ -22,9 +22,9 @@
 import sys
 
 import common
+from mg_utils import mg_sleep_and_assert
 import mgclient
 import pytest
-from mg_utils import mg_sleep_and_assert
 
 KAFKA_PRODUCER_TIMEOUT = 60
 AFTER_RESUME_MSG = b"after_resume"

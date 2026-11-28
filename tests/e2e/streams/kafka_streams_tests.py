@@ -11,15 +11,15 @@
 # by the Apache License, Version 2.0, included in the file
 # licenses/APL.txt.
 
+from multiprocessing import Process
 import re
 import sys
 import time
-from multiprocessing import Process
 
 import common
+from mg_utils import mg_sleep_and_assert
 import mgclient
 import pytest
-from mg_utils import mg_sleep_and_assert
 
 
 def _get_storage_info(cursor):

@@ -57,11 +57,12 @@ auto PointIndexChangeCollector::PreviousChanges() const -> TrackedChanges const 
 }
 
 void PointIndexChangeCollector::ArchiveCurrentChanges() {
-  if (previous_changes_) {
-    previous_changes_->MergeIntoAndClearOther(current_changes_);
-  } else {
-    previous_changes_.emplace(std::move(current_changes_));
+  if (!previous_changes_) {
+    auto rng = current_changes_ | std::views::keys |
+               std::views::transform([](auto const &key) { return std::pair{key, ChangedVertices{}}; });
+    previous_changes_.emplace(rng.begin(), rng.end());
   }
+  previous_changes_->MergeIntoAndClearOther(current_changes_);
 }
 
 PointIndexChangeCollector::PointIndexChangeCollector(PointIndexContext &ctx)

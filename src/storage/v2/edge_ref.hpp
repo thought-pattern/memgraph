@@ -11,6 +11,9 @@
 
 #pragma once
 
+#include <bit>
+#include <compare>
+#include <cstdint>
 #include <utility>
 
 #include "storage/v2/id_types.hpp"
@@ -20,14 +23,16 @@ namespace memgraph::storage {
 struct Edge;
 
 struct EdgeRef {
-  explicit EdgeRef(Gid gid) : gid(gid) {}
+  explicit EdgeRef(Gid gid) noexcept : gid(gid) {}
 
-  explicit EdgeRef(Edge *ptr) : ptr(ptr) {}
+  explicit EdgeRef(Edge *ptr) noexcept : ptr(ptr) {}
 
-  friend bool operator==(const EdgeRef &lhs, const EdgeRef &rhs) noexcept { return lhs.gid == rhs.gid; }
+  [[nodiscard]] std::uintptr_t RawBits() const noexcept { return std::bit_cast<std::uintptr_t>(*this); }
+
+  friend bool operator==(const EdgeRef &lhs, const EdgeRef &rhs) noexcept { return lhs.RawBits() == rhs.RawBits(); }
 
   friend std::strong_ordering operator<=>(const EdgeRef &lhs, const EdgeRef &rhs) noexcept {
-    return lhs.gid <=> rhs.gid;
+    return lhs.RawBits() <=> rhs.RawBits();
   }
 
   union {
@@ -37,7 +42,7 @@ struct EdgeRef {
 
   template <typename H>
   friend H AbslHashValue(H h, EdgeRef const &edge_ref) {
-    return H::combine(std::move(h), edge_ref.gid);
+    return H::combine(std::move(h), edge_ref.RawBits());
   }
 };
 

@@ -22,8 +22,8 @@ import sys
 
 sys.dont_write_bytecode = True  # keep __pycache__ out of the tools tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from report import merge_links  # noqa: E402
 from report import anon_kb, cpu_s, label, load_jsonl, load_steps, mib, peak_kb, read_build_config, timeline_rows
+from report import merge_links  # noqa: E402
 
 
 def assign_lanes(steps):

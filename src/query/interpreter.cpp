@@ -187,8 +187,7 @@ InstanceStorageInfo GetInstanceStorageInfo() {
           .vm_max_map_count = vm_max_map_count};
 }
 
-TypedValue EvaluateConfigMapToTypedValue(std::unordered_map<Expression *, Expression *> const &config_map,
-                                         ExpressionVisitor<TypedValue> &evaluator,
+TypedValue EvaluateConfigMapToTypedValue(memgraph::query::ConfigMap const &config_map, ExpressionVisitor<TypedValue> &evaluator,
                                          memgraph::utils::MemoryResource *memory) {
   TypedValue::TMap result(memory);
   for (const auto &[key_expr, value_expr] : config_map) {
@@ -196,7 +195,9 @@ TypedValue EvaluateConfigMapToTypedValue(std::unordered_map<Expression *, Expres
     if (!key_tv.IsString()) {
       throw memgraph::query::QueryRuntimeException("Parameter config map keys must be strings, got {}.", key_tv.type());
     }
-    result.emplace(TypedValue::TString(key_tv.ValueString(), memory), value_expr->Accept(evaluator));
+    if (!result.emplace(TypedValue::TString(key_tv.ValueString(), memory), value_expr->Accept(evaluator)).second) {
+      throw memgraph::query::QueryRuntimeException("Duplicate key '{}' in parameter config map.", key_tv.ValueString());
+    }
   }
   return {std::move(result), memory};
 }
@@ -267,13 +268,11 @@ class fmt::formatter<QueryLogWrapper> : public fmt::ostream_formatter {};
 
 std::ostream &operator<<(std::ostream &os, const QueryLogWrapper &qlw) {
   auto final_query = memgraph::utils::NoCopyStr{qlw.query};
+  if (auto masked = memgraph::logging::MaskSensitiveInformation(final_query.view())) {
+    final_query = *std::move(masked);
+  }
 #if MG_ENTERPRISE
   os << "[Run - " << qlw.db_name << "] ";
-  if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
-    if (auto masked = memgraph::logging::MaskSensitiveInformation(final_query.view())) {
-      final_query = *std::move(masked);
-    }
-  }
 #else
   os << "[Run] ";
 #endif
@@ -888,10 +887,10 @@ class CoordQueryHandler final : public query::CoordinatorQueryHandler {
       using enum memgraph::coordination::UpdateConfigStatus;
       case NO_SUCH_COORD:
         throw QueryRuntimeException("Couldn't update config for the coordinator {} because it doesn't exist!",
-                                    std::get<int32_t>(instance));
+                                    std::get<int32_t>(config.data));
       case NO_SUCH_REPL_INSTANCE:
         throw QueryRuntimeException("Couldn't update config for the repl instance {} because it doesn't exist!",
-                                    std::get<std::string>(instance));
+                                    std::get<std::string>(config.data));
       case RAFT_FAILURE:
         throw QueryRuntimeException("Couldn't update config because appending to Raft log failed.");
       case NOT_LEADER:
@@ -970,6 +969,8 @@ class CoordQueryHandler final : public query::CoordinatorQueryHandler {
                                     coordinator_id);
       case RAFT_FAILED:
         throw QueryRuntimeException("Generic Raft failure occurred when removing coordinator {}!", coordinator_id);
+      case RAFT_LOG_ERROR:
+        throw QueryRuntimeException("Writing to Raft log failed. Please retry the operation.");
       case SUCCESS:
         break;
     }
@@ -1452,7 +1453,7 @@ Callback HandleAuthQuery(AuthQuery *auth_query, InterpreterContext *interpreter_
         license::LicenseCheckErrorToString(license_check_result.error(), "advanced authentication features"));
   }
 
-  const auto forbid_on_replica = [has_license = !license_check_result.has_value(),
+  const auto forbid_on_replica = [has_license = license_check_result.has_value(),
                                   is_replica = interpreter_context->repl_state->ReadLock()->IsReplica()]() {
     if (is_replica) {
 #if MG_ENTERPRISE
@@ -2032,23 +2033,34 @@ Callback HandleAuthQuery(AuthQuery *auth_query, InterpreterContext *interpreter_
         return rows;
       };
       return callback;
-    case AuthQuery::Action::SHOW_USERS_FOR_ROLE:
+    case AuthQuery::Action::SHOW_USERS_FOR_ROLE: {
       callback.header = {"users"};
-      callback.fn = [auth, roles = std::move(auth_query->roles_), interpreter = &interpreter] {
+      auto runtime_notifications = std::make_shared<std::vector<Notification>>();
+      callback.notifications_ptr = runtime_notifications;
+      callback.fn = [auth, roles = std::move(auth_query->roles_), runtime_notifications, interpreter = &interpreter] {
         if (roles.empty()) {
           throw QueryRuntimeException("No role name provided for SHOW USERS FOR ROLE");
         }
         const std::string &rolename = roles[0];
 
         std::vector<std::vector<TypedValue>> rows;
-        auto usernames = auth->GetUsernamesForRole(rolename, interpreter->auth_transaction_ptr());
-        rows.reserve(usernames.size());
-        for (auto &&username : usernames) {
-          rows.emplace_back(std::vector<TypedValue>{username});
+        auto result = auth->GetUsernamesForRoleWithDiagnostics(rolename, interpreter->auth_transaction_ptr());
+        if (!result.complete) {
+          runtime_notifications->emplace_back(
+              SeverityLevel::WARNING,
+              NotificationCode::INCOMPLETE_AUTH_LISTING,
+              fmt::format("Role membership listing for '{}' is incomplete; skipped unreadable entry(ies): {}.",
+                          rolename,
+                          utils::JoinVector(result.unreadable_entries, ", ")));
+        }
+        rows.reserve(result.usernames.size());
+        for (auto &&username : result.usernames) {
+          rows.emplace_back(std::vector<TypedValue>{std::move(username)});
         }
         return rows;
       };
       return callback;
+    }
     case AuthQuery::Action::GRANT_DATABASE_TO_USER:
       forbid_on_replica();
 #ifdef MG_ENTERPRISE
@@ -2329,7 +2341,7 @@ Callback HandleReplicationQuery(ReplicationQuery *repl_query, const Parameters &
       if (port.IsInt()) {
         maybe_port = port.ValueInt();
       }
-      if (maybe_port == 7687 && repl_query->role_ == ReplicationQuery::ReplicationRole::REPLICA) {
+      if (maybe_port == config.bolt_port && repl_query->role_ == ReplicationQuery::ReplicationRole::REPLICA) {
         notifications->emplace_back(SeverityLevel::WARNING,
                                     NotificationCode::REPLICA_PORT_WARNING,
                                     "Be careful the replication port must be different from the memgraph port!");
@@ -2447,9 +2459,8 @@ Callback HandleReplicationInfoQuery(ReplicationInfoQuery *repl_query,
 
             auto const sys_info_to_tv = [&](ReplicaSystemInfoState orig) {
               auto info = std::map<std::string, TypedValue>{};
-              info.emplace("ts", TypedValue{static_cast<int64_t>(orig.ts_)});
-              // TODO: behind not implemented
-              info.emplace("behind", TypedValue{/*orig.behind_*/});
+              info.emplace("ts", orig.ts_.has_value() ? TypedValue{static_cast<int64_t>(*orig.ts_)} : TypedValue{});
+              info.emplace("behind", orig.behind_.has_value() ? TypedValue{*orig.behind_} : TypedValue{});
               info.emplace("status", replica_sys_state_to_tv(orig.state_));
               return TypedValue{std::move(info)};
             };
@@ -3019,19 +3030,40 @@ auto VectorIndexConfigFromTypedMap(std::map<std::string, TypedValue, std::less<>
   if (dimension == transformed_map.end()) {
     throw std::invalid_argument("Vector index spec must have a 'dimension' field.");
   }
-  auto dimension_value = static_cast<std::uint16_t>(dimension->second.ValueInt());
+  if (!dimension->second.IsInt()) {
+    throw std::invalid_argument("Vector index 'dimension' must be an integer.");
+  }
+  const auto dimension_raw = dimension->second.ValueInt();
+  if (dimension_raw <= 0 || dimension_raw > static_cast<int64_t>(std::numeric_limits<std::uint16_t>::max())) {
+    throw std::invalid_argument("Vector index 'dimension' must be in the range [1, 65535].");
+  }
+  auto dimension_value = static_cast<std::uint16_t>(dimension_raw);
 
   auto capacity = transformed_map.find(kCapacity);
   if (capacity == transformed_map.end()) {
     throw std::invalid_argument("Vector index spec must have a 'capacity' field.");
   }
-  auto capacity_value = static_cast<std::size_t>(capacity->second.ValueInt());
+  if (!capacity->second.IsInt()) {
+    throw std::invalid_argument("Vector index 'capacity' must be an integer.");
+  }
+  const auto capacity_raw = capacity->second.ValueInt();
+  if (capacity_raw <= 0) {
+    throw std::invalid_argument("Vector index 'capacity' must be a positive integer.");
+  }
+  auto capacity_value = static_cast<std::size_t>(capacity_raw);
 
   auto resize_coefficient_it = transformed_map.find(kResizeCoefficient);
-  auto resize_coefficient =
-      resize_coefficient_it != transformed_map.end() && resize_coefficient_it->second.ValueInt() > 0
-          ? static_cast<std::uint16_t>(resize_coefficient_it->second.ValueInt())
-          : kDefaultResizeCoefficient;
+  std::uint16_t resize_coefficient = kDefaultResizeCoefficient;
+  if (resize_coefficient_it != transformed_map.end()) {
+    if (!resize_coefficient_it->second.IsInt()) {
+      throw std::invalid_argument("Vector index 'resize_coefficient' must be an integer.");
+    }
+    const auto resize_raw = resize_coefficient_it->second.ValueInt();
+    if (resize_raw <= 0 || resize_raw > static_cast<int64_t>(std::numeric_limits<std::uint16_t>::max())) {
+      throw std::invalid_argument("Vector index 'resize_coefficient' must be in the range [1, 65535].");
+    }
+    resize_coefficient = static_cast<std::uint16_t>(resize_raw);
+  }
   auto scalar_kind_it = transformed_map.find(kScalarKind);
   auto scalar_kind = storage::ScalarFromName(
       scalar_kind_it != transformed_map.end() ? scalar_kind_it->second.ValueString() : storage::kDefaultScalarKind);
@@ -3043,27 +3075,41 @@ auto VectorIndexConfigFromTypedMap(std::map<std::string, TypedValue, std::less<>
 }
 }  // namespace
 
-auto ParseVectorIndexConfigMap(std::unordered_map<query::Expression *, query::Expression *> const &config_map,
-                               ExpressionVisitor<TypedValue> &evaluator) -> storage::VectorIndexConfigMap {
+auto ParseVectorIndexConfigMap(ConfigMap const &config_map, ExpressionVisitor<TypedValue> &evaluator)
+    -> storage::VectorIndexConfigMap {
   if (config_map.empty()) {
     throw std::invalid_argument(
         "Vector index config map is empty. Please provide mandatory fields: dimension and capacity.");
   }
-  auto transformed_map = rv::all(config_map) | rv::transform([&evaluator](const auto &pair) {
-                           auto key_expr = pair.first->Accept(evaluator);
-                           auto value_expr = pair.second->Accept(evaluator);
-                           return std::pair{key_expr.ValueString(), value_expr};
-                         }) |
-                         ranges::to<std::map<std::string, query::TypedValue, std::less<>>>;
+  std::map<std::string, query::TypedValue, std::less<>> transformed_map;
+  for (const auto &[key_node, value_node] : config_map) {
+    auto key_expr = key_node->Accept(evaluator);
+    if (!key_expr.IsString()) {
+      throw SemanticException("Vector index config map keys must be strings!");
+    }
+    auto value_expr = value_node->Accept(evaluator);
+    std::string key_str{key_expr.ValueString()};
+    if (!transformed_map.emplace(key_str, std::move(value_expr)).second) {
+      throw SemanticException("Duplicate key '{}' in vector index config map!", key_str);
+    }
+  }
   return VectorIndexConfigFromTypedMap(transformed_map);
 }
 
 stream::CommonStreamInfo GetCommonStreamInfo(StreamQuery *stream_query, ExpressionVisitor<TypedValue> &evaluator) {
-  return {
-      .batch_interval = GetOptionalValue<std::chrono::milliseconds>(stream_query->batch_interval_, evaluator)
-                            .value_or(stream::kDefaultBatchInterval),
-      .batch_size = GetOptionalValue<int64_t>(stream_query->batch_size_, evaluator).value_or(stream::kDefaultBatchSize),
-      .transformation_name = stream_query->transform_name_};
+  auto const batch_interval = GetOptionalValue<std::chrono::milliseconds>(stream_query->batch_interval_, evaluator)
+                                  .value_or(stream::kDefaultBatchInterval);
+  auto const batch_size =
+      GetOptionalValue<int64_t>(stream_query->batch_size_, evaluator).value_or(stream::kDefaultBatchSize);
+  if (batch_interval < integrations::kMinimumInterval) {
+    throw SemanticException("Batch interval has to be positive!");
+  }
+  if (batch_size < integrations::kMinimumSize) {
+    throw SemanticException("Batch size has to be positive!");
+  }
+  return {.batch_interval = batch_interval,
+          .batch_size = batch_size,
+          .transformation_name = stream_query->transform_name_};
 }
 
 std::vector<std::string> EvaluateTopicNames(ExpressionVisitor<TypedValue> &evaluator,
@@ -3091,21 +3137,21 @@ Callback::CallbackFunction GetKafkaCreateCallback(StreamQuery *stream_query, Exp
   }
   auto common_stream_info = GetCommonStreamInfo(stream_query, evaluator);
 
-  const auto get_config_map = [&evaluator](std::unordered_map<Expression *, Expression *> map,
+  const auto get_config_map = [&evaluator](ConfigMap const &map,
                                            std::string_view map_name) -> std::unordered_map<std::string, std::string> {
     std::unordered_map<std::string, std::string> config_map;
-    for (const auto [key_expr, value_expr] : map) {
+    for (const auto &[key_expr, value_expr] : map) {
       const auto key = key_expr->Accept(evaluator);
       const auto value = value_expr->Accept(evaluator);
       if (!key.IsString() || !value.IsString()) {
         throw SemanticException("{} must contain only string keys and values!", map_name);
       }
-      config_map.emplace(key.ValueString(), value.ValueString());
+      if (!config_map.emplace(key.ValueString(), value.ValueString()).second) {
+        throw SemanticException("Duplicate key '{}' in {}!", key.ValueString(), map_name);
+      }
     }
     return config_map;
   };
-
-  db_acc->metric_handles()->streams_created.Increment();
 
   // Make a copy of the user and pass it to the subsystem
   auto owner = interpreter_context->auth_checker->GenQueryUser(user_or_role->username(), user_or_role->rolenames());
@@ -3133,6 +3179,7 @@ Callback::CallbackFunction GetKafkaCreateCallback(StreamQuery *stream_query, Exp
                                                           std::move(owner),
                                                           db_acc,
                                                           interpreter_context);
+    db_acc->metric_handles()->streams_created.Increment();
 
     return std::vector<std::vector<TypedValue>>{};
   };
@@ -3147,7 +3194,6 @@ Callback::CallbackFunction GetPulsarCreateCallback(StreamQuery *stream_query, Ex
     throw SemanticException("Service URL must not be an empty string!");
   }
   auto common_stream_info = GetCommonStreamInfo(stream_query, evaluator);
-  db->metric_handles()->streams_created.Increment();
 
   // Make a copy of the user and pass it to the subsystem
   auto owner = interpreter_context->auth_checker->GenQueryUser(user_or_role->username(), user_or_role->rolenames());
@@ -3167,6 +3213,7 @@ Callback::CallbackFunction GetPulsarCreateCallback(StreamQuery *stream_query, Ex
         std::move(owner),
         db,
         interpreter_context);
+    db->metric_handles()->streams_created.Increment();
 
     return std::vector<std::vector<TypedValue>>{};
   };
@@ -3431,7 +3478,7 @@ Callback HandleSettingQuery(SettingQuery *setting_query, const Parameters &param
         if (!settings) {
           throw QueryRuntimeException("Settings are not available");
         }
-        auto maybe_value = settings->GetValue(setting_name);
+        auto maybe_value = settings->GetRedactedValue(setting_name);
         if (!maybe_value) {
           throw utils::BasicException("Unknown setting name '{}'", setting_name);
         }
@@ -3453,7 +3500,7 @@ Callback HandleSettingQuery(SettingQuery *setting_query, const Parameters &param
         if (!settings) {
           throw QueryRuntimeException("Settings are not available");
         }
-        auto all_settings = settings->AllSettings();
+        auto all_settings = settings->AllSettingsRedacted();
         std::vector<std::vector<TypedValue>> results;
         results.reserve(all_settings.size());
 
@@ -3560,7 +3607,7 @@ Callback HandleParameterQuery(ParameterQuery *parameter_query, const Parameters 
           default:
             std::unreachable();
         }
-        spdlog::info("Set parameter '{}' with value '{}' (scope: {})", parameter_name, value_str, scope);
+        spdlog::info("Set parameter '{}' (scope: {})", parameter_name, scope);
         return std::vector<std::vector<TypedValue>>{};
       };
       return callback;
@@ -4304,7 +4351,39 @@ PreparedQuery PrepareExplainQuery(ParsedQuery parsed_query, std::vector<Notifica
   // looked up using their positions within the string that was parsed. These
   // wouldn't match up if if we were to reuse the AST (produced by parsing the
   // full query string) when given just the inner query to execute.
-  auto inner_query = parsed_query.query_string.substr(kExplainQueryStart.size());
+  const auto strip_keyword_with_leading_comments = [](std::string_view text, std::string_view keyword) -> std::string {
+    size_t pos = 0;
+    while (pos < text.size()) {
+      const auto ch = static_cast<unsigned char>(text[pos]);
+      if (std::isspace(ch) != 0) {
+        ++pos;
+        continue;
+      }
+      if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/') {
+        pos += 2;
+        while (pos < text.size() && text[pos] != '\n' && text[pos] != '\r') {
+          ++pos;
+        }
+        continue;
+      }
+      if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+        const auto end_comment = text.find("*/", pos + 2);
+        pos = (end_comment == std::string_view::npos) ? text.size() : end_comment + 2;
+        continue;
+      }
+      break;
+    }
+    MG_ASSERT(pos + keyword.size() <= text.size() && utils::ToLowerCase(text.substr(pos, keyword.size())) == keyword,
+              "Expected query to start with '{}'",
+              keyword);
+    pos += keyword.size();
+    if (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+      ++pos;
+    }
+    return std::string{text.substr(pos)};
+  };
+
+  auto inner_query = strip_keyword_with_leading_comments(parsed_query.query_string, "explain");
   ParsedQuery parsed_inner_query = ParseQuery(inner_query,
                                               parsed_query.user_parameters,
                                               &interpreter_context->ast_cache,
@@ -4410,7 +4489,40 @@ PreparedQuery PrepareProfileQuery(ParsedQuery parsed_query, bool in_explicit_tra
   // looked up using their positions within the string that was parsed. These
   // wouldn't match up if if we were to reuse the AST (produced by parsing the
   // full query string) when given just the inner query to execute.
-  ParsedQuery parsed_inner_query = ParseQuery(parsed_query.query_string.substr(kProfileQueryStart.size()),
+  const auto strip_profile_keyword = [](std::string_view text) -> std::string {
+    constexpr std::string_view kKeyword = "profile";
+    size_t pos = 0;
+    while (pos < text.size()) {
+      const auto ch = static_cast<unsigned char>(text[pos]);
+      if (std::isspace(ch) != 0) {
+        ++pos;
+        continue;
+      }
+      if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '/') {
+        pos += 2;
+        while (pos < text.size() && text[pos] != '\n' && text[pos] != '\r') {
+          ++pos;
+        }
+        continue;
+      }
+      if (pos + 1 < text.size() && text[pos] == '/' && text[pos + 1] == '*') {
+        const auto end_comment = text.find("*/", pos + 2);
+        pos = (end_comment == std::string_view::npos) ? text.size() : end_comment + 2;
+        continue;
+      }
+      break;
+    }
+    MG_ASSERT(pos + kKeyword.size() <= text.size() && utils::ToLowerCase(text.substr(pos, kKeyword.size())) == kKeyword,
+              "Expected query to start with '{}'",
+              kKeyword);
+    pos += kKeyword.size();
+    if (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+      ++pos;
+    }
+    return std::string{text.substr(pos)};
+  };
+
+  ParsedQuery parsed_inner_query = ParseQuery(strip_profile_keyword(parsed_query.query_string),
                                               parsed_query.user_parameters,
                                               &interpreter_context->ast_cache,
                                               interpreter_context->config.query,
@@ -4429,7 +4541,7 @@ PreparedQuery PrepareProfileQuery(ParsedQuery parsed_query, bool in_explicit_tra
   const auto hops_limit = EvaluateHopsLimit(evaluator, cypher_query->pre_query_directives_.hops_limit_);
 
 #ifdef MG_ENTERPRISE
-  const auto num_workers = interpreter_context->worker_pool ? interpreter_context->worker_pool->GetNumWorkers() : 1;
+  const auto num_workers = interpreter_context->worker_pool ? interpreter_context->worker_pool->GetNumMixedWorkers() : 1;
   auto parallel_execution = EvaluateParallelExecution(cypher_query, evaluator, num_workers);
 #endif
 
@@ -4505,7 +4617,7 @@ PreparedQuery PrepareProfileQuery(ParsedQuery parsed_query, bool in_explicit_tra
                                         cached_auth_checker,
                                         nullptr,
                                         memory_limit,
-                                        frame_change_collector->AnyInListCaches() ? frame_change_collector : nullptr,
+                                        frame_change_collector->AnyCaches() ? frame_change_collector : nullptr,
                                         hops_limit,
                                         interpreter_context->worker_pool,
                                         db_arena_pool
@@ -4724,11 +4836,12 @@ std::vector<std::vector<TypedValue>> AnalyzeGraphQueryHandler::AnalyzeGraphCreat
           const auto &[label_property, values_map] = counter_entry;
           // Extract info
           uint64_t count_property_value = std::accumulate(
-              values_map.begin(), values_map.end(), 0, [](uint64_t prev_value, const auto &prop_value_count) {
+              values_map.begin(), values_map.end(), uint64_t{0}, [](uint64_t prev_value, const auto &prop_value_count) {
                 return prev_value + prop_value_count.second;
               });
-          // num_distinc_values will never be 0
-          double avg_group_size = static_cast<double>(count_property_value) / static_cast<double>(values_map.size());
+          double avg_group_size = values_map.empty()
+                                      ? 0.0
+                                      : static_cast<double>(count_property_value) / static_cast<double>(values_map.size());
           double chi_squared_stat = std::accumulate(
               values_map.begin(), values_map.end(), 0.0, [avg_group_size](double prev_result, const auto &value_entry) {
                 return prev_result + utils::ChiSquaredValue(value_entry.second, avg_group_size);
@@ -4999,8 +5112,7 @@ namespace {
 // Resolves `WITH CONFIG {"order": "ASC"|"DESC"}` for CREATE/DROP INDEX. Must run at execution time
 // rather than parse time: string literals get stripped into parameters, and the AST is cached across
 // calls, so the first call's parameters would be baked into subsequent cache hits.
-std::optional<storage::IndexOrder> ResolveIndexConfigOrder(std::unordered_map<Expression *, Expression *> const &config,
-                                                           Parameters const &parameters) {
+std::optional<storage::IndexOrder> ResolveIndexConfigOrder(ConfigMap const &config, Parameters const &parameters) {
   if (config.empty()) return std::nullopt;
 
   EvaluationContext const evaluation_context{.timestamp = QueryTimestamp(), .parameters = parameters};
@@ -5017,6 +5129,9 @@ std::optional<storage::IndexOrder> ResolveIndexConfigOrder(std::unordered_map<Ex
     std::string_view value_sv{value.ValueString()};
     if (key_sv != "order") {
       throw SemanticException("Unknown index config key '{}'. Supported keys: 'order'.", key_sv);
+    }
+    if (order.has_value()) {
+      throw SemanticException("Duplicate index config key '{}'.", key_sv);
     }
     order = std::invoke([&] {
       if (value_sv == "ASC") return storage::IndexOrder::ASC;
@@ -5263,7 +5378,10 @@ PreparedQuery PrepareEdgeIndexQuery(ParsedQuery parsed_query, bool in_explicit_t
     case EdgeIndexQuery::Action::CREATE: {
       index_notification.code = NotificationCode::CREATE_INDEX;
       const auto &ix_properties = index_query->properties_;
-      if (ix_properties.empty()) {
+      if (index_query->global_) {
+        const auto global_prop_name = ix_properties.empty() ? std::string{} : ix_properties.front().name;
+        index_notification.title = fmt::format("Created global edge property index on property {}.", global_prop_name);
+      } else if (ix_properties.empty()) {
         index_notification.title = fmt::format("Created index on edge-type {}.", index_query->edge_type_.name);
       } else {
         index_notification.title = fmt::format(
@@ -5296,8 +5414,15 @@ PreparedQuery PrepareEdgeIndexQuery(ParsedQuery parsed_query, bool in_explicit_t
                           std::is_same_v<T, storage::IndexDefinitionConfigError> ||
                           std::is_same_v<T, storage::IndexDefinitionAlreadyExistsError>) {
               index_notification.code = NotificationCode::EXISTENT_INDEX;
-              index_notification.title = fmt::format(
-                  "Index on edge-type {} on properties {} already exists.", edge_type_name, properties_stringified);
+              if (global_index) {
+                index_notification.title =
+                    fmt::format("Global edge property index on property {} already exists.", properties_stringified);
+              } else if (properties_stringified.empty()) {
+                index_notification.title = fmt::format("Index on edge-type {} already exists.", edge_type_name);
+              } else {
+                index_notification.title = fmt::format(
+                    "Index on edge-type {} on properties {} already exists.", edge_type_name, properties_stringified);
+              }
             } else if constexpr (std::is_same_v<T, storage::IndexDefinitionCancelationError>) {
               // TODO: could also be SHUTDOWN...but this is good enough for now
               throw HintedAbortError(AbortReason::TERMINATED);
@@ -5313,7 +5438,15 @@ PreparedQuery PrepareEdgeIndexQuery(ParsedQuery parsed_query, bool in_explicit_t
     }
     case EdgeIndexQuery::Action::DROP: {
       index_notification.code = NotificationCode::DROP_INDEX;
-      index_notification.title = fmt::format("Dropped index on edge-type {}.", index_query->edge_type_.name);
+      if (index_query->global_) {
+        index_notification.title =
+            fmt::format("Dropped global edge property index on property {}.", properties_stringified);
+      } else if (properties_stringified.empty()) {
+        index_notification.title = fmt::format("Dropped index on edge-type {}.", index_query->edge_type_.name);
+      } else {
+        index_notification.title = fmt::format(
+            "Dropped index on edge-type {} on property {}.", index_query->edge_type_.name, properties_stringified);
+      }
       handler = [dba,
                  edge_type,
                  label_name = index_query->edge_type_.name,
@@ -5332,8 +5465,15 @@ PreparedQuery PrepareEdgeIndexQuery(ParsedQuery parsed_query, bool in_explicit_t
 
         if (!maybe_index_error) {
           index_notification.code = NotificationCode::NONEXISTENT_INDEX;
-          index_notification.title =
-              fmt::format("Index on edge-type {} on {} doesn't exist.", label_name, properties_stringified);
+          if (global_index) {
+            index_notification.title =
+                fmt::format("Global edge property index on property {} doesn't exist.", properties_stringified);
+          } else if (properties_stringified.empty()) {
+            index_notification.title = fmt::format("Index on edge-type {} doesn't exist.", label_name);
+          } else {
+            index_notification.title =
+                fmt::format("Index on edge-type {} on {} doesn't exist.", label_name, properties_stringified);
+          }
         }
       };
       break;
@@ -5512,8 +5652,23 @@ PreparedQuery PrepareVectorIndexQuery(ParsedQuery parsed_query, bool in_explicit
         });
         utils::OnScopeExit const invalidator(invalidate_plan_cache);
         if (!maybe_error) {
-          index_notification.title =
-              fmt::format("Error while creating vector index {}, for more information check the logs.", index_name);
+          std::visit(
+              [&]<typename T>(T const &) {
+                if constexpr (std::is_same_v<T, storage::IndexDefinitionAlreadyExistsError>) {
+                  index_notification.level = SeverityLevel::WARNING;
+                  index_notification.code = NotificationCode::EXISTENT_INDEX;
+                  index_notification.title = fmt::format("Vector index {} already exists.", index_name);
+                } else if constexpr (std::is_same_v<T, storage::IndexDefinitionConfigError> ||
+                                     std::is_same_v<T, storage::IndexDefinitionError>) {
+                  throw QueryRuntimeException(
+                      "Error while creating vector index {}, for more information check the logs.", index_name);
+                } else if constexpr (std::is_same_v<T, storage::IndexDefinitionCancelationError>) {
+                  throw HintedAbortError(AbortReason::TERMINATED);
+                } else {
+                  static_assert(utils::always_false<T>, "Unhandled error type in vector index creation");
+                }
+              },
+              maybe_error.error());
         }
         return index_notification;
       };
@@ -5623,8 +5778,23 @@ PreparedQuery PrepareCreateVectorEdgeIndexQuery(ParsedQuery parsed_query, bool i
     });
     utils::OnScopeExit const invalidator(invalidate_plan_cache);
     if (!maybe_error) {
-      index_notification.title =
-          fmt::format("Error while creating vector edge index {}, for more information check the logs.", index_name);
+      std::visit(
+          [&]<typename T>(T const &) {
+            if constexpr (std::is_same_v<T, storage::IndexDefinitionAlreadyExistsError>) {
+              index_notification.level = SeverityLevel::WARNING;
+              index_notification.code = NotificationCode::EXISTENT_INDEX;
+              index_notification.title = fmt::format("Vector edge index {} already exists.", index_name);
+            } else if constexpr (std::is_same_v<T, storage::IndexDefinitionConfigError> ||
+                                 std::is_same_v<T, storage::IndexDefinitionError>) {
+              throw QueryRuntimeException(
+                  "Error while creating vector edge index {}, for more information check the logs.", index_name);
+            } else if constexpr (std::is_same_v<T, storage::IndexDefinitionCancelationError>) {
+              throw HintedAbortError(AbortReason::TERMINATED);
+            } else {
+              static_assert(utils::always_false<T>, "Unhandled error type in vector edge index creation");
+            }
+          },
+          maybe_error.error());
     }
     return index_notification;
   };
@@ -5741,7 +5911,8 @@ PreparedQuery PrepareCreateTextEdgeIndexQuery(ParsedQuery parsed_query, bool in_
                       r::to_vector;
   Notification index_notification(SeverityLevel::INFO);
   index_notification.code = NotificationCode::CREATE_INDEX;
-  index_notification.title = fmt::format("Created text index on label {}.", text_edge_index_query->edge_type_.name);
+  index_notification.title =
+      fmt::format("Created text index {} on edge-type {}.", index_name, text_edge_index_query->edge_type_.name);
   handler = [dba,
              edge_type_id,
              index_name,
@@ -5751,7 +5922,7 @@ PreparedQuery PrepareCreateTextEdgeIndexQuery(ParsedQuery parsed_query, bool in_
     if (!maybe_error) {
       index_notification.code = NotificationCode::EXISTENT_INDEX;
       index_notification.title =
-          fmt::format("Text index on label {} with name {} already exists.", edge_type_name, index_name);
+          fmt::format("Text index on edge-type {} with name {} already exists.", edge_type_name, index_name);
     }
   };
 
@@ -5853,7 +6024,7 @@ PreparedQuery PrepareDropAllConstraintsQuery(ParsedQuery parsed_query, bool in_e
             notifications->push_back(constraint_notification);
             return QueryHandlerResult::COMMIT;
           },
-      .rw_type = RWType::NONE};
+      .rw_type = RWType::W};
 }
 
 PreparedQuery PrepareReloadSSLQuery(ParsedQuery parsed_query, bool in_explicit_transaction,
@@ -6291,7 +6462,9 @@ PreparedQuery PrepareFreeMemoryQuery(ParsedQuery parsed_query, bool in_explicit_
                        .query_handler = [storage](AnyStream * /*stream*/,
                                                   std::optional<int> /*n*/) -> std::optional<QueryHandlerResult> {
                          storage->FreeMemory();
-                         memory::PurgeUnusedMemory();
+                         if (!memory::PurgeUnusedMemory()) {
+                           throw QueryRuntimeException("Failed to purge unused allocator memory.");
+                         }
                          return QueryHandlerResult::COMMIT;
                        },
                        .rw_type = RWType::NONE};
@@ -6771,10 +6944,11 @@ std::vector<ActiveUserInfo> GetActiveUsersInfo(InterpreterContext *interpreter_c
     std::vector<ActiveUserInfo> info;
     info.reserve(interpreters_.size());
     for (const auto &interpreter : interpreters_) {
-      // Not an atomic snapshot: db and user come from separate locked reads, so they may skew -- ok here.
+      auto const session_snapshot = interpreter->foreign_session_view_.load(std::memory_order_acquire);
+      if (!session_snapshot) continue;
+      // Not an atomic snapshot: db and session come from separate locked reads, so they may skew -- ok here.
       auto db_view = interpreter->current_db_.foreign_db_view();
-      auto session_info = interpreter->GetSessionInfoSnapshot();
-      info.push_back({std::move(session_info), std::move(db_view.name), db_view.marked_for_deletion});
+      info.push_back({*session_snapshot, std::move(db_view.name), db_view.marked_for_deletion});
     }
 
     return info;
@@ -7072,7 +7246,7 @@ PreparedQuery PrepareRecoverSnapshotQuery(ParsedQuery parsed_query, bool in_expl
 
 PreparedQuery PrepareShowSnapshotsQuery(ParsedQuery parsed_query, bool in_explicit_transaction, CurrentDB &current_db) {
   if (in_explicit_transaction) {
-    throw ShowSchemaInfoInMulticommandTxException();
+    throw ShowSnapshotsInMulticommandTxException();
   }
 
   MG_ASSERT(current_db.db_acc_, "Show Snapshots query expects a current DB");
@@ -7118,7 +7292,7 @@ PreparedQuery PrepareShowSnapshotsQuery(ParsedQuery parsed_query, bool in_explic
 PreparedQuery PrepareShowNextSnapshotQuery(ParsedQuery parsed_query, bool in_explicit_transaction,
                                            CurrentDB &current_db) {
   if (in_explicit_transaction) {
-    throw ShowSchemaInfoInMulticommandTxException();
+    throw ShowSnapshotsInMulticommandTxException();
   }
 
   MG_ASSERT(current_db.db_acc_, "Show Next Snapshot query expects a current DB");
@@ -7672,8 +7846,8 @@ Callback HandleTransactionQueueQuery(TransactionQueueQuery *transaction_query,
   Callback callback;
   switch (transaction_query->action_) {
     case TransactionQueueQuery::Action::SHOW_TRANSACTIONS: {
-      auto show_transactions = [user_or_role = std::move(user_or_role),
-                                privilege_checker = std::move(privilege_checker),
+      auto show_transactions = [user_or_role,
+                                privilege_checker,
                                 status_filter = transaction_query->status_filter_](const auto &interpreters) {
         return ShowTransactions(interpreters, user_or_role.get(), privilege_checker, status_filter);
       };
@@ -7684,10 +7858,17 @@ Callback HandleTransactionQueueQuery(TransactionQueueQuery *transaction_query,
       const bool include_background_tasks =
           transaction_query->status_filter_.empty() ||
           std::ranges::contains(transaction_query->status_filter_, TransactionQueueQuery::StatusFilter::RUNNING);
-      callback.fn = [interpreter_context, show_transactions = std::move(show_transactions), include_background_tasks] {
+      callback.fn = [interpreter_context,
+                     show_transactions = std::move(show_transactions),
+                     user_or_role = std::move(user_or_role),
+                     privilege_checker = std::move(privilege_checker),
+                     include_background_tasks] {
         auto results = interpreter_context->interpreters.WithLock(show_transactions);
         if (include_background_tasks && interpreter_context->dbms_handler) {
-          interpreter_context->dbms_handler->ForEach([&results](auto db_acc) {
+          interpreter_context->dbms_handler->ForEach([&results, &user_or_role, &privilege_checker](auto db_acc) {
+            if (user_or_role && *user_or_role && !privilege_checker(user_or_role.get(), db_acc->name())) {
+              return;
+            }
             auto *storage = db_acc->storage();
             if (storage->GetStorageMode() == storage::StorageMode::ON_DISK_TRANSACTIONAL) return;
             auto *mem_storage = static_cast<storage::InMemoryStorage *>(storage);
@@ -7937,7 +8118,7 @@ PreparedQuery PrepareDatabaseInfoQuery(ParsedQuery parsed_query, bool in_explici
           results.push_back({TypedValue(label_index_mark),
                              TypedValue(storage->LabelToName(item)),
                              TypedValue(),
-                             TypedValue(static_cast<int>(ai->label_->ApproximateVertexCount(item)))});
+                             TypedValue(static_cast<int64_t>(ai->label_->ApproximateVertexCount(item)))});
         }
         for (const auto &[label, properties, order] : info.label_properties) {
           auto const prop_path_to_name = [&](storage::PropertyPath const &property_path) {
@@ -7950,32 +8131,32 @@ PreparedQuery PrepareDatabaseInfoQuery(ParsedQuery parsed_query, bool in_explici
               {TypedValue(type_mark),
                TypedValue(storage->LabelToName(label)),
                TypedValue(std::move(props)),
-               TypedValue(static_cast<int>(ai->label_properties_->ApproximateVertexCount(label, properties)))});
+               TypedValue(static_cast<int64_t>(ai->label_properties_->ApproximateVertexCount(label, properties)))});
         }
         for (const auto &item : info.edge_type) {
           results.push_back({TypedValue(edge_type_index_mark),
                              TypedValue(storage->EdgeTypeToName(item)),
                              TypedValue(),
-                             TypedValue(static_cast<int>(ai->edge_type_->ApproximateEdgeCount(item)))});
+                             TypedValue(static_cast<int64_t>(ai->edge_type_->ApproximateEdgeCount(item)))});
         }
         for (const auto &item : info.edge_type_property) {
-          results.push_back(
-              {TypedValue(edge_type_property_index_mark),
-               TypedValue(storage->EdgeTypeToName(item.first)),
-               TypedValue(storage->PropertyToName(item.second)),
-               TypedValue(static_cast<int>(ai->edge_type_properties_->ApproximateEdgeCount(item.first, item.second)))});
+          results.push_back({TypedValue(edge_type_property_index_mark),
+                             TypedValue(storage->EdgeTypeToName(item.first)),
+                             TypedValue(storage->PropertyToName(item.second)),
+                             TypedValue(static_cast<int64_t>(
+                                 ai->edge_type_properties_->ApproximateEdgeCount(item.first, item.second)))});
         }
         for (const auto &item : info.edge_property) {
           results.push_back({TypedValue(edge_property_index_mark),
                              TypedValue(),
                              TypedValue(storage->PropertyToName(item)),
-                             TypedValue(static_cast<int>(ai->edge_property_->ApproximateEdgeCount(item)))});
+                             TypedValue(static_cast<int64_t>(ai->edge_property_->ApproximateEdgeCount(item)))});
         }
         for (const auto &item : info.vertex_property) {
           results.push_back({TypedValue(vertex_property_index_mark),
                              TypedValue(),
                              TypedValue(storage->PropertyToName(item)),
-                             TypedValue(static_cast<int>(ai->vertex_property_->ApproximateVertexCount(item)))});
+                             TypedValue(static_cast<int64_t>(ai->vertex_property_->ApproximateVertexCount(item)))});
         }
         for (const auto &[index_name, label, properties] : info.text_indices) {
           auto prop_names =
@@ -7986,7 +8167,7 @@ PreparedQuery PrepareDatabaseInfoQuery(ParsedQuery parsed_query, bool in_explici
               {TypedValue(fmt::format("{} (name: {})", text_label_index_mark, index_name)),
                TypedValue(storage->LabelToName(label)),
                TypedValue(std::move(prop_names)),
-               TypedValue(static_cast<int>(ai->text_->ApproximateVerticesTextCount(index_name).value_or(0)))});
+               TypedValue(static_cast<int64_t>(ai->text_->ApproximateVerticesTextCount(index_name).value_or(0)))});
         }
         for (const auto &[index_name, label, properties] : info.text_edge_indices) {
           auto prop_names =
@@ -7997,14 +8178,14 @@ PreparedQuery PrepareDatabaseInfoQuery(ParsedQuery parsed_query, bool in_explici
               {TypedValue(fmt::format("{} (name: {})", text_edge_type_index_mark, index_name)),
                TypedValue(storage->EdgeTypeToName(label)),
                TypedValue(std::move(prop_names)),
-               TypedValue(static_cast<int>(ai->text_edge_->ApproximateEdgesTextCount(index_name).value_or(0)))});
+               TypedValue(static_cast<int64_t>(ai->text_edge_->ApproximateEdgesTextCount(index_name).value_or(0)))});
         }
         for (const auto &[label_id, prop_id] : info.point_label_property) {
           results.push_back(
               {TypedValue(point_label_property_index_mark),
                TypedValue(storage->LabelToName(label_id)),
                TypedValue(storage->PropertyToName(prop_id)),
-               TypedValue(static_cast<int>(ai->point_->ApproximatePointCount(label_id, prop_id).value_or(0)))});
+               TypedValue(static_cast<int64_t>(ai->point_->ApproximatePointCount(label_id, prop_id).value_or(0)))});
         }
 
         for (const auto &spec : info.vector_indices_spec) {
@@ -8012,7 +8193,7 @@ PreparedQuery PrepareDatabaseInfoQuery(ParsedQuery parsed_query, bool in_explici
           results.push_back({TypedValue(vector_label_property_index_mark),
                              TypedValue(spec.label_filter.Format([&](auto id) { return storage->LabelToName(id); })),
                              TypedValue(storage->PropertyToName(spec.property)),
-                             TypedValue(static_cast<int>(count))});
+                             TypedValue(static_cast<int64_t>(count))});
         }
 
         for (const auto &spec : info.vector_edge_indices_spec) {
@@ -8021,7 +8202,7 @@ PreparedQuery PrepareDatabaseInfoQuery(ParsedQuery parsed_query, bool in_explici
               {TypedValue(vector_edge_property_index_mark),
                TypedValue(spec.edge_type_filter.Format([&](auto id) { return storage->EdgeTypeToName(id); })),
                TypedValue(storage->PropertyToName(spec.property)),
-               TypedValue(static_cast<int>(count))});
+               TypedValue(static_cast<int64_t>(count))});
         }
 
         std::ranges::sort(results, [&label_index_mark](const auto &record_1, const auto &record_2) {
@@ -8302,6 +8483,7 @@ PreparedQuery PrepareSystemInfoQuery(ParsedQuery parsed_query, bool in_explicit_
                  TypedValue(utils::GetReadableSize(static_cast<double>(s.peak_memory_res)))},
                 {TypedValue("tenant_memory_limit"), TypedValue(std::string("unlimited"))},
                 {TypedValue("storage_isolation_level"), TypedValue(IsolationLevelToString(s.isolation_level))},
+                {TypedValue("health"), TypedValue(std::string("suspended"))},
             };
             return std::pair{results, QueryHandlerResult::NOTHING};
           };
@@ -8647,6 +8829,7 @@ PreparedQuery PrepareConstraintQuery(ParsedQuery parsed_query, bool in_explicit_
                     }
                   },
                   error);
+              return;
             }
             switch (maybe_constraint_error.value()) {
               case storage::UniqueConstraints::CreationStatus::EMPTY_PROPERTIES:
@@ -8688,8 +8871,9 @@ PreparedQuery PrepareConstraintQuery(ParsedQuery parsed_query, bool in_explicit_
                      label,
                      label_name = constraint_query->constraint_.label.name,
                      constraint_type,
+                     if_not_exists = constraint_query->if_not_exists_,
                      properties_stringified = std::move(properties_stringified),
-                     properties = std::move(properties)](Notification & /**/) {
+                     properties = std::move(properties)](Notification &constraint_notification) {
             auto maybe_constraint_error = dba->CreateTypeConstraint(label, properties[0], constraint_type);
 
             if (!maybe_constraint_error) {
@@ -8698,8 +8882,11 @@ PreparedQuery PrepareConstraintQuery(ParsedQuery parsed_query, bool in_explicit_
                   [storage,
                    &label_name,
                    &properties_stringified,
-                   constraint_type]<typename T>(T const &arg) {  // TODO: using universal reference gives clang tidy
-                                                                 // error but it used above with no problem?
+                   constraint_type,
+                   if_not_exists,
+                   &constraint_notification]<typename T>(
+                      T const &arg) {  // TODO: using universal reference gives clang tidy
+                                       // error but it used above with no problem?
                     using ErrorType = std::remove_cvref_t<T>;
                     if constexpr (std::is_same_v<ErrorType, storage::ConstraintViolation>) {
                       auto &violation = arg;
@@ -8712,10 +8899,19 @@ PreparedQuery PrepareConstraintQuery(ParsedQuery parsed_query, bool in_explicit_
                           label_name,
                           property_name);
                     } else if constexpr (std::is_same_v<ErrorType, storage::ConstraintDefinitionError>) {
-                      throw QueryRuntimeException("Constraint IS TYPED {} on :{}({}) already exists",
-                                                  storage::TypeConstraintKindToString(constraint_type),
-                                                  label_name,
-                                                  properties_stringified);
+                      if (if_not_exists) {
+                        constraint_notification.code = NotificationCode::EXISTENT_CONSTRAINT;
+                        constraint_notification.title =
+                            fmt::format("Constraint IS TYPED {} on label {} on property {} already exists.",
+                                        storage::TypeConstraintKindToString(constraint_type),
+                                        label_name,
+                                        properties_stringified);
+                      } else {
+                        throw QueryRuntimeException("Constraint IS TYPED {} on :{}({}) already exists",
+                                                    storage::TypeConstraintKindToString(constraint_type),
+                                                    label_name,
+                                                    properties_stringified);
+                      }
                     } else if constexpr (std::is_same_v<ErrorType, storage::ConstraintDefinitionCancelationError>) {
                       // TODO: could also be SHUTDOWN...but this is good enough for now
                       throw HintedAbortError(AbortReason::TERMINATED);
@@ -8841,7 +9037,7 @@ PreparedQuery PrepareConstraintQuery(ParsedQuery parsed_query, bool in_explicit_
             notifications->push_back(constraint_notification);
             return QueryHandlerResult::COMMIT;
           },
-      .rw_type = RWType::NONE};
+      .rw_type = RWType::W};
 }
 
 #ifdef MG_ENTERPRISE
@@ -9087,6 +9283,9 @@ PreparedQuery PrepareMultiDatabaseQuery(ParsedQuery parsed_query, InterpreterCon
                 case dbms::DbmsHandler::SuspendError::ACTIVE_CONNECTIONS:
                   throw QueryRuntimeException("Database {} has active connections; cannot suspend while in use.",
                                               db_name);
+                case dbms::DbmsHandler::SuspendError::DURABILITY_FAILED:
+                  throw QueryRuntimeException(
+                      "Failed to persist suspended state for database {}. Disk I/O error.", db_name);
               }
             }
             std::vector<std::vector<TypedValue>> status;
@@ -9301,10 +9500,11 @@ PreparedQuery PrepareShowDatabasesQuery(ParsedQuery parsed_query, InterpreterCon
       for (const auto &name : all) {
         // `name` is a std::string (all_names) or a TypedValue (auth allowed-list); normalize.
         const std::string ns{TypedValue(name).ValueString()};
-        // status_of carries the HOT/COLD string. A granted name not in the
-        // snapshot (e.g. a stale grant) defaults to HOT, matching the pre-cold-aware listing.
         auto it = status_of.find(ns);
-        const std::string state = (it != status_of.end()) ? it->second : std::string{"HOT"};
+        if (it == status_of.end()) {
+          continue;
+        }
+        const std::string &state = it->second;
         // A DROPPING husk has already been erased from items_ by DeferDelete; calling health_of
         // would throw UnknownDatabaseException and fall back to "ready" — misleading.  Report
         // "draining" directly, matching the semantic implied by the DROPPING state.
@@ -9599,6 +9799,7 @@ PreparedQuery PrepareSessionSettingQuery(ParsedQuery parsed_query, Interpreter *
     if (auto err = flags::run_time::ValidateSessionSettingValue(name, value); err.has_value()) {
       throw utils::BasicException(*err);
     }
+    value = flags::run_time::NormalizeSessionSettingValue(name, value);
   }
 
   auto handler = [interpreter, action = query->action_, name = std::move(name), value = std::move(value)]() mutable {
@@ -9706,6 +9907,20 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       auto node_indexes = nlohmann::json::array();
       auto edge_indexes = nlohmann::json::array();
       auto index_info = db_acc->ListAllIndices();
+      auto const vector_match_mode_to_str = [](storage::VectorMatchMode mode) -> std::string_view {
+        switch (mode) {
+          case storage::VectorMatchMode::SINGLE:
+            return "single";
+          case storage::VectorMatchMode::WILDCARD:
+            return "wildcard";
+          case storage::VectorMatchMode::ANY_OF:
+            return "any";
+          case storage::VectorMatchMode::ALL_OF:
+            return "all";
+        }
+        return "any";
+      };
+
       // Vertex label indices
       for (const auto label_id : index_info.label) {
 #ifdef MG_ENTERPRISE
@@ -9724,8 +9939,17 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       // Vertex label property indices
       for (const auto &[label_id, property_paths, order] : index_info.label_properties) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
-          continue;
+        if (auth_checker) {
+          if (!auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
+            continue;
+          }
+          const bool props_readable = std::ranges::all_of(property_paths, [&](const storage::PropertyPath &path) {
+            return !path.empty() && auth_checker->HasPropertyPermission(
+                                        std::span{&label_id, 1}, path[0], AuthQuery::PropertyPermissionType::READ);
+          });
+          if (!props_readable) {
+            continue;
+          }
         }
 #endif
         auto const path_to_name = [&](const storage::PropertyPath &property_path) {
@@ -9741,11 +9965,36 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
             {"type", type},
         }));
       }
+      // Global vertex property indices
+      for (const auto &property : index_info.vertex_property) {
+#ifdef MG_ENTERPRISE
+        if (auth_checker && (!auth_checker->HasGlobalPrivilegeOnVertices(AuthQuery::FineGrainedPrivilege::READ) ||
+                             !auth_checker->HasPropertyPermission(std::span<storage::LabelId const>{},
+                                                                  property,
+                                                                  AuthQuery::PropertyPermissionType::READ))) {
+          continue;
+        }
+#endif
+        node_indexes.push_back(nlohmann::json::object({
+            {"properties", {storage->PropertyToName(property)}},
+            {"count", storage_acc->ApproximateVertexCount(property)},
+            {"type", "vertex_property"},
+        }));
+      }
       // Vertex label text
       for (const auto &[index_name, label_id, properties] : index_info.text_indices) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
-          continue;
+        if (auth_checker) {
+          if (!auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
+            continue;
+          }
+          const bool props_readable = std::ranges::all_of(properties, [&](storage::PropertyId prop_id) {
+            return auth_checker->HasPropertyPermission(
+                std::span{&label_id, 1}, prop_id, AuthQuery::PropertyPermissionType::READ);
+          });
+          if (!props_readable) {
+            continue;
+          }
         }
 #endif
         auto prop_names = properties | rv::transform([storage](const storage::PropertyId &property) {
@@ -9762,7 +10011,9 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       // Vertex label property_point
       for (const auto &[label_id, property] : index_info.point_label_property) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
+        if (auth_checker && (!auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ) ||
+                             !auth_checker->HasPropertyPermission(
+                                 std::span{&label_id, 1}, property, AuthQuery::PropertyPermissionType::READ))) {
           continue;
         }
 #endif
@@ -9777,14 +10028,30 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       for (const auto &spec : index_info.vector_indices_spec) {
 #ifdef MG_ENTERPRISE
         if (auth_checker) {
-          // Wildcard requires global READ on vertices; non-wildcard requires READ on every listed
-          // label (Has(span<...>) matches any one, which would leak the full label set).
-          const bool authorized =
-              spec.label_filter.ids.empty()
-                  ? auth_checker->HasGlobalPrivilegeOnVertices(AuthQuery::FineGrainedPrivilege::READ)
-                  : std::ranges::all_of(spec.label_filter.ids, [&](auto label) {
-                      return auth_checker->Has(std::span{&label, 1}, AuthQuery::FineGrainedPrivilege::READ);
-                    });
+          // Wildcard requires global READ on vertices and global property READ; non-wildcard requires READ on every
+          // listed label and property READ for the matching label rule.
+          bool authorized = false;
+          if (spec.label_filter.ids.empty()) {
+            authorized = auth_checker->HasGlobalPrivilegeOnVertices(AuthQuery::FineGrainedPrivilege::READ) &&
+                         auth_checker->HasPropertyPermission(std::span<storage::LabelId const>{},
+                                                             spec.property,
+                                                             AuthQuery::PropertyPermissionType::READ);
+          } else {
+            const bool labels_ok = std::ranges::all_of(spec.label_filter.ids, [&](auto label) {
+              return auth_checker->Has(std::span{&label, 1}, AuthQuery::FineGrainedPrivilege::READ);
+            });
+            const bool props_ok =
+                spec.label_filter.mode == storage::VectorMatchMode::ALL_OF
+                    ? auth_checker->HasPropertyPermission(
+                          std::span<storage::LabelId const>{spec.label_filter.ids.data(), spec.label_filter.ids.size()},
+                          spec.property,
+                          AuthQuery::PropertyPermissionType::READ)
+                    : std::ranges::all_of(spec.label_filter.ids, [&](auto label) {
+                        return auth_checker->HasPropertyPermission(
+                            std::span{&label, 1}, spec.property, AuthQuery::PropertyPermissionType::READ);
+                      });
+            authorized = labels_ok && props_ok;
+          }
           if (!authorized) continue;
         }
 #endif
@@ -9793,10 +10060,12 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
           label_names.push_back(storage->LabelToName(label));
         }
         const auto count = storage_acc->ApproximateVerticesVectorCount(spec.index_name).value_or(0);
-        node_indexes.push_back(nlohmann::json::object({{"labels", std::move(label_names)},
-                                                       {"properties", {storage->PropertyToName(spec.property)}},
-                                                       {"count", count},
-                                                       {"type", "label+property_vector"}}));
+        node_indexes.push_back(
+            nlohmann::json::object({{"labels", std::move(label_names)},
+                                    {"label_match_mode", vector_match_mode_to_str(spec.label_filter.mode)},
+                                    {"properties", {storage->PropertyToName(spec.property)}},
+                                    {"count", count},
+                                    {"type", "label+property_vector"}}));
       }
 
       // Edge type indices
@@ -9816,7 +10085,9 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       // Edge type property indices
       for (const auto &[type, property] : index_info.edge_type_property) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(type, AuthQuery::FineGrainedPrivilege::READ)) {
+        if (auth_checker && (!auth_checker->Has(type, AuthQuery::FineGrainedPrivilege::READ) ||
+                             !auth_checker->HasPropertyPermission(
+                                 type, property, AuthQuery::PropertyPermissionType::READ))) {
           continue;
         }
 #endif
@@ -9829,6 +10100,13 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       }
       // Edge property indices
       for (const auto &property : index_info.edge_property) {
+#ifdef MG_ENTERPRISE
+        if (auth_checker &&
+            (!auth_checker->HasGlobalPrivilegeOnEdges(AuthQuery::FineGrainedPrivilege::READ) ||
+             !auth_checker->HasGlobalEdgePropertyPermission(property, AuthQuery::PropertyPermissionType::READ))) {
+          continue;
+        }
+#endif
         edge_indexes.push_back(nlohmann::json::object({
             {"properties", {storage->PropertyToName(property)}},
             {"count", storage_acc->ApproximateEdgeCount(property)},
@@ -9839,12 +10117,18 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       for (const auto &spec : index_info.vector_edge_indices_spec) {
 #ifdef MG_ENTERPRISE
         if (auth_checker) {
-          // Wildcard requires global READ on edges; non-wildcard requires READ on every listed edge type.
-          const bool authorized = spec.edge_type_filter.ids.empty()
-                                      ? auth_checker->HasGlobalPrivilegeOnEdges(AuthQuery::FineGrainedPrivilege::READ)
-                                      : std::ranges::all_of(spec.edge_type_filter.ids, [&](auto et) {
-                                          return auth_checker->Has(et, AuthQuery::FineGrainedPrivilege::READ);
-                                        });
+          // Wildcard requires global READ on edges and global edge property READ; non-wildcard requires READ on every
+          // listed edge type and property READ on each.
+          const bool authorized =
+              spec.edge_type_filter.ids.empty()
+                  ? (auth_checker->HasGlobalPrivilegeOnEdges(AuthQuery::FineGrainedPrivilege::READ) &&
+                     auth_checker->HasGlobalEdgePropertyPermission(
+                         spec.property, AuthQuery::PropertyPermissionType::READ))
+                  : std::ranges::all_of(spec.edge_type_filter.ids, [&](auto et) {
+                      return auth_checker->Has(et, AuthQuery::FineGrainedPrivilege::READ) &&
+                             auth_checker->HasPropertyPermission(
+                                 et, spec.property, AuthQuery::PropertyPermissionType::READ);
+                    });
           if (!authorized) continue;
         }
 #endif
@@ -9853,26 +10137,37 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
           edge_type_names.push_back(storage->EdgeTypeToName(et));
         }
         const auto count = storage_acc->ApproximateEdgesVectorCount(spec.index_name).value_or(0);
-        edge_indexes.push_back(nlohmann::json::object({{"edge_type", std::move(edge_type_names)},
-                                                       {"properties", {storage->PropertyToName(spec.property)}},
-                                                       {"count", count},
-                                                       {"type", "edge_type+property_vector"}}));
+        edge_indexes.push_back(
+            nlohmann::json::object({{"edge_type", std::move(edge_type_names)},
+                                    {"edge_type_match_mode", vector_match_mode_to_str(spec.edge_type_filter.mode)},
+                                    {"properties", {storage->PropertyToName(spec.property)}},
+                                    {"count", count},
+                                    {"type", "edge_type+property_vector"}}));
       }
       // Edge type text
       for (const auto &[index_name, edge_type, properties] : index_info.text_edge_indices) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(edge_type, AuthQuery::FineGrainedPrivilege::READ)) {
-          continue;
+        if (auth_checker) {
+          if (!auth_checker->Has(edge_type, AuthQuery::FineGrainedPrivilege::READ)) {
+            continue;
+          }
+          const bool props_readable = std::ranges::all_of(properties, [&](storage::PropertyId prop_id) {
+            return auth_checker->HasPropertyPermission(edge_type, prop_id, AuthQuery::PropertyPermissionType::READ);
+          });
+          if (!props_readable) {
+            continue;
+          }
         }
 #endif
         auto prop_names =
             properties |
             rv::transform([storage](storage::PropertyId property_id) { return storage->PropertyToName(property_id); }) |
             r::to_vector;
-        node_indexes.push_back(
+        edge_indexes.push_back(
             nlohmann::json::object({{"edge_type", {storage->EdgeTypeToName(edge_type)}},
                                     {"properties", std::move(prop_names)},
                                     {"count", storage_acc->ApproximateEdgesTextCount(index_name).value_or(0)},
+                                    {"text", index_name},
                                     {"type", "edge_type_text"}}));
       }
       json.emplace("node_indexes", std::move(node_indexes));
@@ -9884,7 +10179,9 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       // Existence
       for (const auto &[label_id, property] : constraint_info.existence) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
+        if (auth_checker && (!auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ) ||
+                             !auth_checker->HasPropertyPermission(
+                                 std::span{&label_id, 1}, property, AuthQuery::PropertyPermissionType::READ))) {
           continue;
         }
 #endif
@@ -9895,8 +10192,17 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       // Unique
       for (const auto &[label_id, properties] : constraint_info.unique) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
-          continue;
+        if (auth_checker) {
+          if (!auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
+            continue;
+          }
+          const bool props_readable = std::ranges::all_of(properties, [&](storage::PropertyId prop_id) {
+            return auth_checker->HasPropertyPermission(
+                std::span{&label_id, 1}, prop_id, AuthQuery::PropertyPermissionType::READ);
+          });
+          if (!props_readable) {
+            continue;
+          }
         }
 #endif
         auto json_properties = nlohmann::json::array();
@@ -9910,7 +10216,9 @@ PreparedQuery PrepareShowSchemaInfoQuery(const ParsedQuery &parsed_query, Curren
       // Type
       for (const auto &[label_id, property, constraint_kind] : constraint_info.type) {
 #ifdef MG_ENTERPRISE
-        if (auth_checker && !auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ)) {
+        if (auth_checker && (!auth_checker->Has(std::span{&label_id, 1}, AuthQuery::FineGrainedPrivilege::READ) ||
+                             !auth_checker->HasPropertyPermission(
+                                 std::span{&label_id, 1}, property, AuthQuery::PropertyPermissionType::READ))) {
           continue;
         }
 #endif
@@ -10067,9 +10375,11 @@ PreparedQuery PrepareTenantProfileQuery([[maybe_unused]] ParsedQuery parsed_quer
         throw QueryException("Unknown tenant profile limit key: '{}'", key);
       }
       if (lv.type == UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT) {
-        const auto result = static_cast<int64_t>(lv.mem_limit.value) * static_cast<int64_t>(lv.mem_limit.scale);
-        if (result <= 0) throw QueryException("Memory limit overflow or non-positive value");
-        return result;
+        if (lv.mem_limit.value == 0 || lv.mem_limit.scale == 0 ||
+            lv.mem_limit.value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / lv.mem_limit.scale) {
+          throw QueryException("Memory limit overflow or non-positive value");
+        }
+        return static_cast<int64_t>(lv.mem_limit.value * lv.mem_limit.scale);
       }
       if (lv.type == UserProfileQuery::LimitValueResult::Type::UNLIMITED) {
         return 0;
@@ -10264,7 +10574,12 @@ PreparedQuery PrepareUserProfileQuery(ParsedQuery parsed_query, InterpreterConte
         case query::UserProfileQuery::LimitValueResult::Type::MEMORY_LIMIT: {
           const auto val = limit_value.mem_limit.expr->Accept(evaluator);
           if (val.IsInt() && val.ValueInt() > 0) {
-            limit_value.mem_limit.value = val.ValueInt();
+            const auto raw_value = static_cast<uint64_t>(val.ValueInt());
+            if (limit_value.mem_limit.scale == 0 ||
+                raw_value > std::numeric_limits<uint64_t>::max() / limit_value.mem_limit.scale) {
+              throw QueryException("Memory limit overflow.");
+            }
+            limit_value.mem_limit.value = raw_value;
           } else {
             throw QueryException("Expected positive integer value for memory limit.");
           }
@@ -10453,17 +10768,21 @@ PreparedQuery PrepareUserProfileQuery(ParsedQuery parsed_query, InterpreterConte
         if (!user_or_role) {
           throw QueryException("Expected user or role.");
         }
-        (void)auth->GetProfileForUser(*user_or_role);  // Throws if user doesn't exist
+        const auto existing_resource = resource_monitor ? resource_monitor->FindUser(*user_or_role) : nullptr;
+        if (!existing_resource) {
+          (void)auth->GetProfileForUser(*user_or_role);  // Throws if user doesn't exist
+        }
+        const utils::UserResources default_resource{};
+        const utils::UserResources &resource_ref = existing_resource ? *existing_resource : default_resource;
         std::vector<std::vector<TypedValue>> res;
-        const auto resource = resource_monitor->GetUser(*user_or_role);
         // Session usage
-        const auto [session_usage, session_limit] = resource->GetSessions();
+        const auto [session_usage, session_limit] = resource_ref.GetSessions();
         res.emplace_back(std::vector<TypedValue>{
             TypedValue(auth::UserProfiles::kLimits[(int)auth::UserProfiles::Limits::kSessions]),
             TypedValue(static_cast<int64_t>(session_usage)),
             session_limit == -1 ? TypedValue("UNLIMITED") : TypedValue(static_cast<int64_t>(session_limit))});
         // Transaction memory usage
-        const auto [tm_usage, tm_limit] = resource->GetTransactionsMemory();
+        const auto [tm_usage, tm_limit] = resource_ref.GetTransactionsMemory();
         const auto unlimited = tm_limit == utils::TransactionsMemoryResource::kUnlimited;
         res.emplace_back(std::vector<TypedValue>{
             TypedValue(auth::UserProfiles::kLimits[(int)auth::UserProfiles::Limits::kTransactionsMemory]),
@@ -10619,7 +10938,10 @@ void Interpreter::SetCurrentDB() { current_db_.SetCurrentDB(interpreter_context_
 
 Interpreter::ParseRes Interpreter::Parse(const std::string &query_string, UserParameters_fn params_getter,
                                          QueryExtras const &extras) {
-  memgraph::logging::EmitSessionTraceEvent("Accepted query: {}", query_string);
+  auto const masked_trace_query = memgraph::logging::MaskSensitiveInformation(query_string);
+  memgraph::logging::EmitSessionTraceEvent(
+      "Accepted query: {}",
+      masked_trace_query ? std::string_view{*masked_trace_query} : std::string_view{query_string});
 #ifdef MG_ENTERPRISE
   if (!flags::CoordinationSetupInstance().IsCoordinator()) {
     MG_ASSERT(user_or_role_, "Trying to prepare a query without a query user.");
@@ -10715,7 +11037,12 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
   // statement carries a literal, which is then replaced.
   auto shown_query = std::invoke([&]() -> std::string {
     auto const *auth = utils::Downcast<AuthQuery>(parsed_query.query);
-    if (!auth) return parsed_query.query_string;
+    if (!auth) {
+      if (auto masked = memgraph::logging::MaskSensitiveInformation(parsed_query.query_string)) {
+        return *std::move(masked);
+      }
+      return parsed_query.query_string;
+    }
     auto const user_name = [auth] {
       bool const plain = std::ranges::all_of(auth->user_, [](unsigned char c) { return std::isalnum(c) || c == '_'; });
       return plain ? auth->user_ : fmt::format("`{}`", auth->user_);
@@ -10760,7 +11087,7 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
 
     SetupInterpreterTransaction(extras);
     memgraph::logging::EmitSessionTraceEvent(
-        "Query [{}] associated with transaction [{}]", parsed_query.query_string, current_transaction_.value_or(0));
+        "Query [{}] associated with transaction [{}]", transaction_queries_->back(), current_transaction_.value_or(0));
   }
 
   auto *const cypher_query = utils::Downcast<CypherQuery>(parsed_query.query);
@@ -11398,10 +11725,10 @@ void Interpreter::SetupInterpreterTransaction(const QueryExtras &extras) {
   current_transaction_ = tx_id;
   transaction_start_time_ = std::chrono::system_clock::now();
   transaction_start_steady_ = std::chrono::steady_clock::now();
-  // Release publishes the start-time writes above to verifier-holding readers.
-  transaction_status_.store(TransactionStatus::ACTIVE, std::memory_order_release);
   session_log_ctx_.SetTxId(tx_id);
   metadata_ = GenOptional(extras.metadata_pv);
+  // Release publishes start-time, tx-id, and metadata writes above to verifier-holding readers.
+  transaction_status_.store(TransactionStatus::ACTIVE, std::memory_order_release);
 }
 
 void Interpreter::FinishAutocommitNothing() {
@@ -11871,9 +12198,13 @@ void Interpreter::Commit() {
     };
 
     auto const commit_method = utils::Overloaded{main_commit, replica_commit};
-    [[maybe_unused]] auto sync_result =
-        std::visit(commit_method, interpreter_context_->repl_state->Lock()->ReplicationData());
-    // TODO: something with sync_result
+    auto const sync_result = std::visit(commit_method, interpreter_context_->repl_state->Lock()->ReplicationData());
+    if (sync_result == memgraph::system::AllSyncReplicaStatus::SomeCommitsUnconfirmed) {
+      commit_notification_.emplace(
+          SeverityLevel::WARNING,
+          NotificationCode::SYNC_REPLICATION_FAILURE,
+          ReplicationFailureMessage("Failed to confirm system transaction commit on all synchronous replicas."));
+    }
     return;
   }
   auto *db = current_db_.db_acc_->get();
@@ -11925,7 +12256,6 @@ void Interpreter::Commit() {
   }
 
   auto *metric_handles = (*current_db_.db_acc_)->metric_handles();
-  utils::OnScopeExit const update_metrics([metric_handles]() { metric_handles->committed_transactions.Increment(); });
 
   std::optional<TriggerContext> trigger_context = std::nullopt;
   if (current_db_.trigger_context_collector_) {
@@ -12045,6 +12375,9 @@ void Interpreter::Commit() {
   }
 
   bool const txn_committed = maybe_commit_error.has_value() || replication_error_committed;
+  if (txn_committed && metric_handles) {
+    metric_handles->committed_transactions.Increment();
+  }
 
   // The ordered execution of after commit triggers is heavily depending on the exclusiveness of
   // db_accessor_->Commit(): only one of the transactions can be commiting at the same time, so when the commit is

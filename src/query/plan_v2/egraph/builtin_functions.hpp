@@ -26,8 +26,7 @@ namespace memgraph::query::plan::v2 {
 /// model.
 enum class BuiltinKind : std::uint8_t {
   Unknown,  ///< UDFs / unrecognised builtins; no facts derived.
-  Range,    ///< Cypher range. Only the two-bound form has a derivable length;
-            ///< the optional step form is left unknown.
+  Range,    ///< Cypher range(start, end[, step]) with known integer bounds and non-zero step.
   Size,     ///< Cypher size(list); folds to the list's known length, no eval.
 };
 

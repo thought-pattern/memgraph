@@ -43,27 +43,32 @@ inline void free_tracking(void *ptr, int flags = 0) {
   }
 }
 
-inline auto realloc_tracking(void *ptr, size_t size, int flags = 0) -> bool {
+struct ReallocCharge {
+  bool tracked{false};
+  size_t prev_size{0};
+  size_t next_size{0};
+};
+
+inline auto prepare_realloc_tracking(void *ptr, size_t size, ReallocCharge &charge, int flags = 0) -> bool {
   if (memgraph::memory::IsQueryTracked()) [[unlikely]] {
-    const auto prev_size = ptr ? je_sallocx(ptr, flags) : 0;
-    const auto next_size = size > 0 ? je_nallocx(size, flags) : 0;
-    if (next_size > prev_size) {  // increasing memory
-      return memgraph::memory::TrackAllocOnCurrentThread(next_size - prev_size);
-    } else if (next_size < prev_size) {  // decreasing memory
-      memgraph::memory::TrackFreeOnCurrentThread(prev_size - next_size);
+    charge.tracked = true;
+    charge.prev_size = ptr ? je_sallocx(ptr, flags) : 0;
+    charge.next_size = size > 0 ? je_nallocx(size, flags) : 0;
+    if (charge.next_size > charge.prev_size) {  // increasing memory
+      return memgraph::memory::TrackAllocOnCurrentThread(charge.next_size - charge.prev_size);
+    } else if (charge.next_size < charge.prev_size) {  // decreasing memory
+      memgraph::memory::TrackFreeOnCurrentThread(charge.prev_size - charge.next_size);
     }
   }
   return true;
 }
 
-inline void failed_realloc_tracking(void *ptr, size_t size, int flags = 0) {
-  if (memgraph::memory::IsQueryTracked()) [[unlikely]] {
-    const auto prev_size = ptr ? je_sallocx(ptr, flags) : 0;
-    const auto next_size = size > 0 ? je_nallocx(size, flags) : 0;
-    if (next_size > prev_size) {  // failed while increasing memory
-      memgraph::memory::TrackFreeOnCurrentThread(next_size - prev_size);
-    } else if (next_size < prev_size) {                                    // failed while decreasing memory
-      memgraph::memory::TrackAllocOnCurrentThread(prev_size - next_size);  // fail silently
+inline void rollback_failed_realloc_tracking(const ReallocCharge &charge) {
+  if (charge.tracked) [[unlikely]] {
+    if (charge.next_size > charge.prev_size) {  // failed while increasing memory
+      memgraph::memory::TrackFreeOnCurrentThread(charge.next_size - charge.prev_size);
+    } else if (charge.next_size < charge.prev_size) {  // failed while decreasing memory
+      memgraph::memory::TrackAllocOnCurrentThread(charge.prev_size - charge.next_size);
     }
   }
 }
@@ -112,12 +117,22 @@ extern "C" void *calloc(size_t count, size_t size) {
 extern "C" void *realloc(void *ptr, size_t size) {
   // Warm up jemalloc thread state before any tracking helper can trigger OOM handling.
   memgraph::memory::EnsureJemallocThreadStateInitialized();
-  if (!realloc_tracking(ptr, size)) [[unlikely]] {
+  if (ptr != nullptr && size == 0) {
+    // Handle zero-size resize explicitly as free + nullptr so `ptr` is never inspected after deallocation.
+    free_tracking(ptr);
+    je_free(ptr);
+    return nullptr;
+  }
+  ReallocCharge charge{};
+  if (!prepare_realloc_tracking(ptr, size, charge)) [[unlikely]] {
     return nullptr;
   }
   void *const res = je_realloc(ptr, size);
   if (res == nullptr) [[unlikely]] {
-    failed_realloc_tracking(ptr, size);
+    rollback_failed_realloc_tracking(charge);
+  } else if (size == 0 && charge.tracked) [[unlikely]] {
+    // realloc(nullptr, 0) returned a minimum-sized allocation while next_size was 0.
+    memgraph::memory::TrackAllocOnCurrentThread(je_sallocx(res, 0));
   }
   return res;
 }

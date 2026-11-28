@@ -4,7 +4,7 @@
 
 int main() {
   rocksdb_options_t *options = rocksdb_options_create();
-  rocksdb_free(options);
+  rocksdb_options_destroy(options);
 
   return EXIT_SUCCESS;
 }

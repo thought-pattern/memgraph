@@ -1,7 +1,7 @@
 import os
 
 
-def encode_chunk(visible_gpu: int | None, model_id: str, texts: list[str], batch_size: int):
+def encode_chunk(visible_gpu, model_id: str, texts: list[str], batch_size: int):
     """
     Runs in a spawned process. Returns (count, embeddings_as_list)
     """
@@ -15,8 +15,8 @@ def encode_chunk(visible_gpu: int | None, model_id: str, texts: list[str], batch
     os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    import torch
     from sentence_transformers import SentenceTransformer
+    import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = SentenceTransformer(model_id, device=device)

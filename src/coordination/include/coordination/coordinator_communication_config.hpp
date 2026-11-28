@@ -32,6 +32,11 @@ namespace memgraph::coordination {
 
 inline constexpr auto *kDefaultManagementServerIp = "0.0.0.0";
 
+inline auto HasValidClusterMutualTls(std::optional<utils::TlsConfig> const &tls_config) -> bool {
+  return tls_config.has_value() && !tls_config->cert_file.empty() && !tls_config->key_file.empty() &&
+         !tls_config->ca_file.empty();
+}
+
 // Used for updating configuration of both coordinators and data instances
 struct UpdateInstanceConfig {
   std::variant<int32_t, std::string> data;

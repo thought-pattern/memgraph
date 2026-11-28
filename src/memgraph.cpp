@@ -81,6 +81,7 @@
 #include "system/system.hpp"
 #include "telemetry/telemetry.hpp"
 #include "utils/build_info.hpp"
+#include "utils/credential_redaction.hpp"
 #include "utils/file.hpp"
 #include "utils/logging.hpp"
 #include "utils/nofile_limit.hpp"
@@ -163,10 +164,31 @@ void WarnDeprecatedFlags() {
   return !FLAGS_strict_flag_check;
 }
 
+struct CypherlInitOutcome {
+  bool file_opened{false};
+  std::size_t succeeded{0};
+  std::size_t failed{0};
+};
+
+void LogCypherlInitOutcome(std::string_view label, std::string const &path, CypherlInitOutcome const &outcome) {
+  if (!outcome.file_opened) {
+    spdlog::error("Could not open {} '{}'; no queries were executed.", label, path);
+  } else if (outcome.failed > 0) {
+    spdlog::warn("Finished running queries from {} '{}' with errors ({} succeeded, {} failed).",
+                 label,
+                 path,
+                 outcome.succeeded,
+                 outcome.failed);
+  } else {
+    spdlog::info("Running queries from {} successfully finished ({} succeeded, 0 failed).", label, outcome.succeeded);
+  }
+}
+
 // TODO: move elsewhere so that we can remove need of interpreter.hpp
-void InitFromCypherlFile(memgraph::query::InterpreterContext &ctx,
-                         std::optional<memgraph::dbms::DatabaseAccess> &db_acc, std::string cypherl_file_path,
-                         memgraph::audit::Log *audit_log = nullptr) {
+CypherlInitOutcome InitFromCypherlFile(memgraph::query::InterpreterContext &ctx,
+                                       std::optional<memgraph::dbms::DatabaseAccess> &db_acc,
+                                       std::string cypherl_file_path,
+                                       memgraph::audit::Log *audit_log = nullptr) {
   auto interpreter = std::invoke([&ctx, &db_acc]() {
     if (db_acc.has_value()) {
       return memgraph::query::Interpreter{&ctx, *db_acc};
@@ -187,32 +209,37 @@ void InitFromCypherlFile(memgraph::query::InterpreterContext &ctx,
                                        static_cast<uint64_t>(memgraph::auth::Permission::COORDINATOR_WRITE));
 #endif
 
+  CypherlInitOutcome outcome;
   std::ifstream file(cypherl_file_path);
   if (!file.is_open()) {
-    spdlog::trace("Could not find init file {}", cypherl_file_path);
-    return;
+    spdlog::warn("Could not open init file {}", cypherl_file_path);
+    return outcome;
   }
+  outcome.file_opened = true;
 
   std::string line;
   while (std::getline(file, line)) {
     if (!line.empty()) {
+      const auto redacted_line = memgraph::utils::RedactQueryCredentials(line);
       try {
-        // TODO remove security issue
-        spdlog::trace("Executing line: {}", line);
+        spdlog::trace("Executing line: {}", redacted_line);
         auto results = interpreter.Prepare(line, memgraph::query::no_params_fn, {});
         memgraph::query::DiscardValueResultStream stream;
         interpreter.Pull(&stream, {}, results.qid);
+        ++outcome.succeeded;
       } catch (std::exception const &e) {
+        ++outcome.failed;
         spdlog::warn("Exception occurred while executing one line. The rest of the init-file will be run. {}",
                      e.what());
       }
       if (audit_log) {
-        audit_log->Record("", "", line, {}, std::string{memgraph::dbms::kDefaultDB});
+        audit_log->Record("", "", redacted_line, {}, std::string{memgraph::dbms::kDefaultDB});
       }
     }
   }
 
   file.close();
+  return outcome;
 }
 
 using memgraph::communication::ServerContext;
@@ -221,12 +248,12 @@ using memgraph::communication::ServerContext;
 // on the main thread. This avoids running shutdown logic (which does logging,
 // memory allocation, mutex acquisition, etc.) inside an async signal handler
 // where those operations are undefined behaviour.
-void BlockShutdownSignals() {
+bool BlockShutdownSignals() noexcept {
   sigset_t mask;
   sigemptyset(&mask);
   sigaddset(&mask, SIGTERM);
   sigaddset(&mask, SIGINT);
-  MG_ASSERT(pthread_sigmask(SIG_BLOCK, &mask, nullptr) == 0, "Failed to block shutdown signals!");
+  return pthread_sigmask(SIG_BLOCK, &mask, nullptr) == 0;
 }
 
 // Wait for SIGTERM or SIGINT on the calling (main) thread, then run the
@@ -290,6 +317,9 @@ void CleanDataDir(std::filesystem::path const &data_directory) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  // Block SIGTERM/SIGINT before spawning any allocator or worker thread so every thread inherits
+  // the blocked mask and the main thread consumes shutdown signals synchronously via sigwait().
+  bool const shutdown_signals_blocked = BlockShutdownSignals();
   memgraph::memory::SetHooks();
   memgraph::memory::EnableBackgroundThreads();
   google::SetUsageMessage("Memgraph database server");
@@ -317,12 +347,18 @@ int main(int argc, char **argv) {
   memgraph::flags::SetExperimental(flags_experimental);
   auto *maybe_experimental = std::getenv(kMgExperimentalEnabled);
   if (maybe_experimental) {
+    if (!memgraph::flags::ValidExperimentalFlag(maybe_experimental)) {
+      std::cerr << "Invalid experimental feature list in " << kMgExperimentalEnabled << ": " << maybe_experimental
+                << "\n";
+      return EXIT_FAILURE;
+    }
     auto env_experimental = memgraph::flags::ReadExperimental(maybe_experimental);
     memgraph::flags::AppendExperimental(env_experimental);
   }
   // Initialize the logger. Done after experimental setup so that we could print which experimental features are enabled
   // even if --also-log-to-stderr is false
   memgraph::flags::InitializeLogger();
+  MG_ASSERT(shutdown_signals_blocked, "Failed to block shutdown signals!");
 
   {
     const auto build_info = memgraph::utils::GetBuildInfo();
@@ -346,9 +382,11 @@ int main(int argc, char **argv) {
   // than during static destruction.
   auto const page_cache_releaser = memgraph::utils::InstallPageCacheReleaser();
 
-  // Fail fast if --cluster-{cert,key,ca}-file are partially configured.
+  // Fail fast if --cluster-{cert,key,ca}-file, Bolt TLS, or Bolt worker count are invalid.
   // Must run after logger init so the fatal message is delivered.
   memgraph::flags::ValidateIntraClusterTLSFlags();
+  memgraph::flags::ValidateBoltTLSFlags();
+  memgraph::flags::ValidateBoltWorkerFlags();
 
   // Initialize the cluster TLS singletons from the cluster flags. Every
   // ClusterView ServerContext/ClientContext below will atomic-load from
@@ -362,11 +400,6 @@ int main(int argc, char **argv) {
       LOG_FATAL("Failed to initialize cluster client TLS: {}", r.error().msg);
     }
   }
-
-  // Block SIGTERM/SIGINT as early as possible so that every thread we spawn
-  // inherits the blocked mask.  The main thread will consume them
-  // synchronously via sigwait() later.
-  BlockShutdownSignals();
 
   // Unhandled exception handler init.
   std::set_terminate(&memgraph::utils::TerminateHandler);
@@ -518,9 +551,6 @@ int main(int argc, char **argv) {
   }
 
   auto data_directory = std::filesystem::path(FLAGS_data_directory);
-  CleanDataDir(data_directory);
-  memgraph::flags::CleanLogsDir();
-
   memgraph::utils::EnsureDirOrDie(data_directory);
   // Verify that the user that started the process is the same user that is
   // the owner of the storage directory.
@@ -541,6 +571,8 @@ int main(int argc, char **argv) {
             FLAGS_data_dir_lock_acquisition_timeout_sec);
 
   spdlog::trace("Successfully acquired lock on data directory");
+  CleanDataDir(data_directory);
+  memgraph::flags::CleanLogsDir();
 
   const auto memory_limit = memgraph::flags::GetMemoryLimit();
   // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
@@ -616,13 +648,9 @@ int main(int argc, char **argv) {
     MG_ASSERT(audit_log.Start(), "Failed to open audit file {}", data_directory / "audit");
   }
   // Setup SIGUSR2 to be used for reopening audit log files, when e.g. logrotate
-  // rotates our audit logs.
+  // rotates our audit logs. Signal handler only posts an async-signal-safe wakeup.
   MG_ASSERT(memgraph::utils::SignalHandler::RegisterHandler(memgraph::utils::Signal::User2,
-                                                            [&audit_log]() {
-                                                              if (audit_log.ReopenLog()) {
-                                                                spdlog::info("Successfully reopened audit log");
-                                                              }
-                                                            }),
+                                                            [&audit_log]() noexcept { audit_log.RequestReopen(); }),
             "Unable to register SIGUSR2 handler!");
 
   // End enterprise features initialization
@@ -763,10 +791,24 @@ int main(int argc, char **argv) {
 
 #endif
 
+  int extracted_bolt_port = FLAGS_bolt_port;
+  if (auto const *maybe_env_bolt_port = std::getenv(kMgBoltPort); maybe_env_bolt_port != nullptr) {
+    auto const parsed_bolt_port = ParseBoltPortOverride(maybe_env_bolt_port);
+    if (!parsed_bolt_port.has_value()) {
+      spdlog::error(
+          "Invalid {} environment variable '{}': expected an integer port in [0, 65535]. Shutting down Memgraph.",
+          kMgBoltPort,
+          maybe_env_bolt_port);
+      return EXIT_FAILURE;
+    }
+    extracted_bolt_port = static_cast<int>(*parsed_bolt_port);
+  }
+
   // Default interpreter configuration
   memgraph::query::InterpreterConfig const interp_config{
       .query = {.allow_load_csv = FLAGS_allow_load_csv},
       .replication_replica_check_frequency = std::chrono::seconds(FLAGS_replication_replica_check_frequency_sec),
+      .bolt_port = extracted_bolt_port,
       .default_kafka_bootstrap_servers = FLAGS_kafka_bootstrap_servers,
       .default_pulsar_service_url = FLAGS_pulsar_service_url,
       .stream_transaction_conflict_retries = FLAGS_stream_transaction_conflict_retries,
@@ -795,9 +837,7 @@ int main(int argc, char **argv) {
           ah->CreateUser(maybe_username, maybe_password, nullptr, nullptr);
         } else if (maybe_pass_file) {
           const auto [username, password] = LoadUsernameAndPassword(maybe_pass_file);
-          if (!username.empty() && !password.empty()) {
-            ah->CreateUser(username, password, nullptr, nullptr);
-          }
+          ah->CreateUser(username, password, nullptr, nullptr);
         }
       };
 
@@ -902,13 +942,6 @@ int main(int argc, char **argv) {
 
   auto system = memgraph::system::System{db_config.durability.storage_directory, FLAGS_data_recovery_on_startup};
 
-  int const extracted_bolt_port = [&]() {
-    if (auto *maybe_env_bolt_port = std::getenv(kMgBoltPort); maybe_env_bolt_port) {
-      return std::stoi(maybe_env_bolt_port);
-    }
-    return FLAGS_bolt_port;
-  }();  // iile
-
 // singleton coordinator state
 #ifdef MG_ENTERPRISE
   using memgraph::coordination::CoordinatorInstanceInitConfig;
@@ -942,10 +975,10 @@ int main(int argc, char **argv) {
     }
 
     auto maybe_ssl = memgraph::flags::TlsConfigFromClusterFlags();
-    if (!maybe_ssl.has_value()) {
-      spdlog::warn(memgraph::utils::MessageWithLink(
-          "Running HA without intra-cluster TLS. Replication, coordinator, and management traffic is unencrypted.",
-          "https://memgr.ph/cluster-tls"));
+    if (!memgraph::coordination::HasValidClusterMutualTls(maybe_ssl)) {
+      throw std::runtime_error(
+          "High-availability management listeners require intra-cluster mutual TLS "
+          "(--cluster-cert-file, --cluster-key-file, and --cluster-ca-file).");
     }
 
     if (is_coordinator_instance) {
@@ -1027,9 +1060,11 @@ int main(int argc, char **argv) {
 
 #ifdef MG_ENTERPRISE
   memgraph::metrics::Metrics().SetInstanceStatusResolver(
-      [&coordinator_state]() -> std::vector<memgraph::coordination::InstanceStatus> {
-        if (!coordinator_state || !coordinator_state->IsCoordinator()) return {};
-        return coordinator_state->ShowInstances().value_or(std::vector<memgraph::coordination::InstanceStatus>{});
+      [&coordinator_state]() -> std::optional<std::vector<memgraph::coordination::InstanceStatus>> {
+        if (!coordinator_state || !coordinator_state->IsCoordinator()) {
+          return std::vector<memgraph::coordination::InstanceStatus>{};
+        }
+        return coordinator_state->ShowInstances();
       });
 #endif
 
@@ -1075,6 +1110,7 @@ int main(int argc, char **argv) {
   unsigned io_n_threads = FLAGS_bolt_num_workers;
 
   if (GetSchedulerType() == SchedulerType::PRIORITY_QUEUE_WITH_SIDECAR) {
+    memgraph::flags::ValidateBoltWorkerFlags();
     // Register each worker thread with the Python interpreter at startup.
     // This pre-initializes Python thread states to prevent "PyGILState_Ensure: Couldn't create
     // thread-state for new thread" errors when many threads simultaneously try to call Python
@@ -1094,6 +1130,7 @@ int main(int argc, char **argv) {
   }
 
   // Used by interpreter context
+  memgraph::flags::ValidateBoltTLSFlags();
   std::string service_name = "Bolt";
   auto bolt_server_context = !FLAGS_bolt_key_file.empty() && !FLAGS_bolt_cert_file.empty()
                                  ? ServerContext(FLAGS_bolt_key_file, FLAGS_bolt_cert_file)
@@ -1139,22 +1176,22 @@ int main(int argc, char **argv) {
   if (!FLAGS_init_file.empty()) {
     spdlog::info("Running init file...");
 #ifdef MG_ENTERPRISE
-    if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
-      InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_file, &audit_log);
-    } else {
-      InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_file);
-    }
+    auto const init_outcome =
+        memgraph::license::global_license_checker.IsEnterpriseValidFast()
+            ? InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_file, &audit_log)
+            : InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_file);
 #else
-    InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_file);
+    auto const init_outcome = InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_file);
 #endif
+    LogCypherlInitOutcome("init file", FLAGS_init_file, init_outcome);
   }
 
   // Tied to coord initialization, must happen after coordinator is initialized
   auto *maybe_ha_init_file = std::getenv(kMgHaClusterInitQueries);
   if (maybe_ha_init_file) {
     spdlog::trace("Initializing coordinator using cypher file.");
-    InitFromCypherlFile(interpreter_context_, db_acc, maybe_ha_init_file);
-    spdlog::trace("Coordinator initialized using cypher file.");
+    auto const ha_init_outcome = InitFromCypherlFile(interpreter_context_, db_acc, maybe_ha_init_file);
+    LogCypherlInitOutcome("HA cluster init file", maybe_ha_init_file, ha_init_outcome);
   }
 
   // Triggers can execute query procedures, so we need to reload the modules first and then the triggers.
@@ -1205,14 +1242,12 @@ int main(int argc, char **argv) {
   auto server_endpoint = memgraph::communication::v2::ServerEndpoint{boost::asio::ip::make_address(FLAGS_bolt_address),
                                                                      static_cast<uint16_t>(extracted_bolt_port)};
 #ifdef MG_ENTERPRISE
-  memgraph::glue::Context session_context{.endpoint = server_endpoint,
-                                          .ic = &interpreter_context_,
+  memgraph::glue::Context session_context{.ic = &interpreter_context_,
                                           .auth = auth_.get(),
                                           .audit_log = &audit_log,
                                           .worker_pool_ = worker_pool_ ? &*worker_pool_ : nullptr};
 #else
-  memgraph::glue::Context session_context{.endpoint = server_endpoint,
-                                          .ic = &interpreter_context_,
+  memgraph::glue::Context session_context{.ic = &interpreter_context_,
                                           .auth = auth_.get(),
                                           .worker_pool_ = worker_pool_ ? &*worker_pool_ : nullptr};
 #endif
@@ -1256,11 +1291,16 @@ int main(int argc, char **argv) {
     telemetry->AddExceptionCollector();
     telemetry->Start();
   }
-  memgraph::license::LicenseInfoSender license_info_sender(telemetry_server,
-                                                           memgraph::glue::run_id_,
-                                                           machine_id,
-                                                           memory_limit,
-                                                           memgraph::license::global_license_checker.GetLicenseInfo());
+  std::optional<memgraph::license::LicenseInfoSender> license_info_sender;
+  if (FLAGS_telemetry_enabled) {
+    license_info_sender.emplace(telemetry_server,
+                                memgraph::glue::run_id_,
+                                machine_id,
+                                memory_limit,
+                                memgraph::license::global_license_checker.GetLicenseInfo(),
+                                std::chrono::seconds(8 * 60 * 60),
+                                FLAGS_telemetry_enabled);
+  }
 
   memgraph::glue::SafeAuth websocket_auth{auth_.get()};
   memgraph::communication::websocket::Server websocket_server{
@@ -1310,9 +1350,12 @@ int main(int argc, char **argv) {
     // a race condition when a transaction is accepted during server shutdown.
     spdlog::trace("Shutting down handler!");
 
-    // STOP LICENSE SENDER IMMEDIATELY
-    // Prevents blocking on license HTTP requests during shutdown
-    license_info_sender.Stop();
+    // STOP LICENSE CHECKER AND SENDER IMMEDIATELY
+    // Prevents background settings revalidation or HTTP requests during shutdown
+    memgraph::license::global_license_checker.Finalize();
+    if (license_info_sender) {
+      license_info_sender->Stop();
+    }
 
     // STOP TELEMETRY IMMEDIATELY
     // Prevents blocking on telemetry HTTP requests during shutdown
@@ -1399,15 +1442,14 @@ int main(int argc, char **argv) {
     db_acc.emplace(dbms_handler->Get());
     MG_ASSERT(*db_acc, "Failed to gain access to the main database");
 #ifdef MG_ENTERPRISE
-    if (memgraph::license::global_license_checker.IsEnterpriseValidFast()) {
-      InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_data_file, &audit_log);
-    } else {
-      InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_data_file);
-    }
+    auto const init_data_outcome =
+        memgraph::license::global_license_checker.IsEnterpriseValidFast()
+            ? InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_data_file, &audit_log)
+            : InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_data_file);
 #else
-    InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_data_file);
+    auto const init_data_outcome = InitFromCypherlFile(interpreter_context_, db_acc, FLAGS_init_data_file);
 #endif
-    spdlog::info("Running queries from init data file successfully finished.");
+    LogCypherlInitOutcome("init data file", FLAGS_init_data_file, init_data_outcome);
   }
 
   spdlog::info("Memgraph successfully started!");

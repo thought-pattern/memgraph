@@ -15,6 +15,7 @@
 #include <array>
 #include <functional>
 #include <limits>
+#include <list>
 #include <memory>
 #include <ranges>
 #include <span>
@@ -366,7 +367,11 @@ class ReturnBodyContext : public HierarchicalTreeVisitor {
     auto it = has_aggregation_.end();
     auto elements_it = literal.elements_.begin();
     std::advance(it, -literal.elements_.size());
-    if (literal.GetTypeInfo() == MapProjectionLiteral::kType) {
+    if constexpr (std::is_same_v<TLiteral, MapProjectionLiteral>) {
+      if (literal.all_properties_lookup_ != nullptr) {
+        std::advance(it, -1);
+        it = has_aggregation_.erase(it);
+      }
       // Erase the map variable. Grammar-wise, it's a variable and thus never has aggregations.
       std::advance(it, -1);
       it = has_aggregation_.erase(it);
@@ -382,7 +387,11 @@ class ReturnBodyContext : public HierarchicalTreeVisitor {
     }
     has_aggregation_.emplace_back(has_aggr);
     if (has_aggr) {
-      for (auto expression_ptr : literal_group_by) group_by_.emplace_back(expression_ptr);
+      for (auto expression_ptr : literal_group_by) {
+        if (!IsGroupConstant(expression_ptr, symbol_table_)) {
+          group_by_.emplace_back(expression_ptr);
+        }
+      }
     }
   }
 
@@ -503,12 +512,15 @@ class ReturnBodyContext : public HierarchicalTreeVisitor {
     MG_ASSERT(has_aggregation_.size() >= coalesce.expressions_.size(),
               "Expected >= {} has_aggregation_ flags for COALESCE arguments",
               has_aggregation_.size());
-    bool has_aggr = false;
-    for (size_t i = 0; i < coalesce.expressions_.size(); ++i) {
-      has_aggr = has_aggr || has_aggregation_.back();
-      has_aggregation_.pop_back();
+    std::vector<ExpressionPart> parts;
+    parts.reserve(coalesce.expressions_.size());
+    auto it = has_aggregation_.end();
+    std::advance(it, -static_cast<std::ptrdiff_t>(coalesce.expressions_.size()));
+    for (auto *expr : coalesce.expressions_) {
+      parts.push_back(ExpressionPart{.expression = expr, .has_aggregation = *it});
+      it = has_aggregation_.erase(it);
     }
-    has_aggregation_.emplace_back(has_aggr);
+    has_aggregation_.emplace_back(AddGroupingKeys(parts));
     return true;
   }
 
@@ -538,26 +550,25 @@ class ReturnBodyContext : public HierarchicalTreeVisitor {
   }
 
   bool PreVisit(ListSlicingOperator &list_slicing) override {
+    std::vector<ExpressionPart> parts;
+    parts.reserve(3);
     list_slicing.list_->Accept(*this);
-    bool list_has_aggr = has_aggregation_.back();
+    bool const list_has_aggr = has_aggregation_.back();
     has_aggregation_.pop_back();
-    bool has_aggr = list_has_aggr;
+    parts.push_back(ExpressionPart{.expression = list_slicing.list_, .has_aggregation = list_has_aggr});
     if (list_slicing.lower_bound_) {
       list_slicing.lower_bound_->Accept(*this);
-      has_aggr = has_aggr || has_aggregation_.back();
+      bool const lower_has_aggr = has_aggregation_.back();
       has_aggregation_.pop_back();
+      parts.push_back(ExpressionPart{.expression = list_slicing.lower_bound_, .has_aggregation = lower_has_aggr});
     }
     if (list_slicing.upper_bound_) {
       list_slicing.upper_bound_->Accept(*this);
-      has_aggr = has_aggr || has_aggregation_.back();
+      bool const upper_has_aggr = has_aggregation_.back();
       has_aggregation_.pop_back();
+      parts.push_back(ExpressionPart{.expression = list_slicing.upper_bound_, .has_aggregation = upper_has_aggr});
     }
-    if (has_aggr && !list_has_aggr) {
-      // We need to group by the list expression, because it didn't have an
-      // aggregation inside.
-      group_by_.emplace_back(list_slicing.list_);
-    }
-    has_aggregation_.emplace_back(has_aggr);
+    has_aggregation_.emplace_back(AddGroupingKeys(parts));
     return false;
   }
 
@@ -583,14 +594,15 @@ class ReturnBodyContext : public HierarchicalTreeVisitor {
     MG_ASSERT(function.arguments_.size() <= has_aggregation_.size(),
               "Expected as many has_aggregation_ flags as there are"
               "function arguments.");
-    bool has_aggr = false;
+    std::vector<ExpressionPart> parts;
+    parts.reserve(function.arguments_.size());
     auto it = has_aggregation_.end();
-    std::advance(it, -function.arguments_.size());
-    while (it != has_aggregation_.end()) {
-      has_aggr = has_aggr || *it;
+    std::advance(it, -static_cast<std::ptrdiff_t>(function.arguments_.size()));
+    for (auto *arg : function.arguments_) {
+      parts.push_back(ExpressionPart{.expression = arg, .has_aggregation = *it});
       it = has_aggregation_.erase(it);
     }
-    has_aggregation_.emplace_back(has_aggr);
+    has_aggregation_.emplace_back(AddGroupingKeys(parts));
     return true;
   }
 
@@ -606,10 +618,10 @@ class ReturnBodyContext : public HierarchicalTreeVisitor {
     bool const has_aggr = aggr1 || aggr2;                                                    \
     if (has_aggr && !(aggr1 && aggr2)) {                                                     \
       /* Group by the expression which does not contain aggregation. */                      \
-      if (aggr1 && !IsConstantLiteral(op.expression2_)) {                                    \
+      if (aggr1 && !IsGroupConstant(op.expression2_, symbol_table_)) {                       \
         group_by_.emplace_back(op.expression2_);                                             \
       }                                                                                      \
-      if (aggr2 && !IsConstantLiteral(op.expression1_)) {                                    \
+      if (aggr2 && !IsGroupConstant(op.expression1_, symbol_table_)) {                       \
         group_by_.emplace_back(op.expression1_);                                             \
       }                                                                                      \
     }                                                                                        \
@@ -1177,6 +1189,15 @@ std::unordered_set<Symbol> CollectPatternComprehensionSymbols(const std::vector<
   SubqueryResultSymbolCollector collector(symbol_table, symbols);
   for (auto *clause : clauses) {
     clause->Accept(collector);
+  }
+  return symbols;
+}
+
+std::unordered_set<Symbol> CollectPatternComprehensionSymbols(Expression *expression, const SymbolTable &symbol_table) {
+  std::unordered_set<Symbol> symbols;
+  if (expression) {
+    SubqueryResultSymbolCollector collector(symbol_table, symbols);
+    expression->Accept(collector);
   }
   return symbols;
 }

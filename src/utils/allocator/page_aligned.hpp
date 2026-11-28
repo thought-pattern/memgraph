@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <new>
 
 #include "utils/db_aware_allocator.hpp"
@@ -26,6 +27,7 @@ namespace memgraph::utils {
 template <typename T>
 struct PageAlignedAllocator {
   static constexpr std::size_t PAGE_SIZE = 4096;
+  static constexpr std::size_t MAX_ALIGNED_SIZE = (std::numeric_limits<std::size_t>::max() / PAGE_SIZE) * PAGE_SIZE;
   using value_type = T;
 
   PageAlignedAllocator() = default;
@@ -33,10 +35,19 @@ struct PageAlignedAllocator {
   template <class U>
   explicit PageAlignedAllocator(const PageAlignedAllocator<U> & /*other*/) noexcept {}
 
+  static constexpr std::size_t ComputeAlignedSize(std::size_t n) {
+    if (sizeof(T) > 0 && n > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+      throw std::bad_array_new_length();
+    }
+    const auto raw_size = std::max(n * sizeof(T), PAGE_SIZE);
+    if (raw_size > MAX_ALIGNED_SIZE) {
+      throw std::bad_alloc();
+    }
+    return ((raw_size - 1) / PAGE_SIZE + 1) * PAGE_SIZE;
+  }
+
   auto allocate(std::size_t n) -> T * {
-    auto size = std::max(n * sizeof(T), PAGE_SIZE);
-    // Round up to the nearest multiple of PAGE_SIZE
-    size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    const auto size = ComputeAlignedSize(n);
     return static_cast<T *>(memory::DbAllocateBytes(size, memory::tls_db_arena_state.arena, PAGE_SIZE));
   }
 
@@ -44,8 +55,8 @@ struct PageAlignedAllocator {
     // NOTE: jemalloc tracks the owning arena per-extent in its own metadata, so GC can safely
     // free query-thread allocations regardless of which thread calls deallocate.
     // Recalculate the actual allocated size (mirroring allocate) for sized deallocation.
-    auto size = std::max(n * sizeof(T), PAGE_SIZE);
-    size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    const auto raw_size = std::max(n * sizeof(T), PAGE_SIZE);
+    const auto size = ((raw_size - 1) / PAGE_SIZE + 1) * PAGE_SIZE;
     memory::DbDeallocateBytes(static_cast<void *>(p), size, PAGE_SIZE);
   }
 

@@ -238,6 +238,7 @@ bool SymbolGenerator::PostVisit(CypherUnion &cypher_union) {
     throw SemanticException("All subqueries in an UNION must have the same column names.");
   }
 
+  cypher_union.union_symbols_.clear();
   // The union's columns are the user's RETURN names, so a later `*` sees them. A column named like a scoped CALL
   // import stays a column, so a distinct UNION keys on it, but is hidden: after the CALL that name is the import.
   for (const auto &name : scope.curr_return_names) {
@@ -554,6 +555,10 @@ bool SymbolGenerator::PostVisit(Match &) {
 }
 
 bool SymbolGenerator::PreVisit(Foreach &for_each) {
+  // Evaluate the input list expression in the enclosing scope before binding the loop variable, so `FOREACH (xs IN xs | ...)`
+  // resolves the RHS `xs` to the outer variable rather than the unwritten inner loop slot.
+  for_each.named_expression_->expression_->Accept(*this);
+
   const auto &name = for_each.named_expression_->name_;
   auto const call_subquery_base = scopes_.back().call_subquery_base;
   scopes_.emplace_back(Scope());
@@ -561,7 +566,10 @@ bool SymbolGenerator::PreVisit(Foreach &for_each) {
   scopes_.back().call_subquery_base = call_subquery_base;
   for_each.named_expression_->MapTo(
       CreateSymbol(name, true, Symbol::Type::ANY, for_each.named_expression_->token_position_));
-  return true;
+  for (auto *clause : for_each.clauses_) {
+    clause->Accept(*this);
+  }
+  return false;
 }
 
 bool SymbolGenerator::PostVisit([[maybe_unused]] Foreach &for_each) {
@@ -1007,7 +1015,8 @@ bool SymbolGenerator::PreVisit(NodeAtom &node_atom) {
   }
   auto check_node_semantic = [&node_atom, &scope, this]() {
     const auto &node_name = node_atom.identifier_->name_;
-    if ((scope.in_create || scope.in_merge) && node_atom.HasLabelsOrProperties() && HasSymbol(node_name)) {
+    auto const from = scope.call_subquery_base.value_or(0);
+    if ((scope.in_create || scope.in_merge) && node_atom.HasLabelsOrProperties() && HasSymbol(node_name, from)) {
       throw SemanticException("Cannot create node '" + node_name +
                               "' with labels or properties, because it is already declared.");
     }
@@ -1148,11 +1157,18 @@ bool SymbolGenerator::PreVisit(EdgeAtom &edge_atom) {
   edge_atom.identifier_->Accept(*this);
   scopes_[scope_idx].in_pattern_atom_identifier = false;
   if (edge_atom.total_weight_) {
-    if (HasSymbol(edge_atom.total_weight_->name_)) {
+    auto const from = scopes_[scope_idx].call_subquery_base.value_or(0);
+    if (HasSymbol(edge_atom.total_weight_->name_, from)) {
       throw RedeclareVariableError(edge_atom.total_weight_->name_);
     }
-    edge_atom.total_weight_->MapTo(GetOrCreateSymbol(
-        edge_atom.total_weight_->name_, edge_atom.total_weight_->user_declared_, Symbol::Type::NUMBER));
+    bool const shadows_outer = from != 0 && HasSymbol(edge_atom.total_weight_->name_);
+    edge_atom.total_weight_->MapTo(
+        shadows_outer ? CreateSymbol(edge_atom.total_weight_->name_,
+                                     edge_atom.total_weight_->user_declared_,
+                                     Symbol::Type::NUMBER)
+                      : GetOrCreateSymbol(edge_atom.total_weight_->name_,
+                                          edge_atom.total_weight_->user_declared_,
+                                          Symbol::Type::NUMBER));
   }
   return false;
 }
@@ -1215,8 +1231,8 @@ void SymbolGenerator::VisitWithIdentifiers(std::vector<Expression *> exprs,
     expr->Accept(*this);
   }
   --scopes_[scope_idx].element_lambda_depth;
-  // Restore back to previous symbols.
-  for (const auto &prev : prev_symbols) {
+  // Restore back to previous symbols in LIFO order so repeated names restore the original outer binding.
+  for (const auto &prev : prev_symbols | std::views::reverse) {
     const auto &prev_symbol = prev.first;
     const auto &identifier = prev.second;
     if (prev_symbol) {

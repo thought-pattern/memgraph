@@ -18,11 +18,11 @@ Large scale stress test. Tests only node creation.
 The idea is to run this test on machines with huge amount of memory e.g. 2TB.
 """
 
+from collections import defaultdict
 import logging
 import multiprocessing
 import random
 import time
-from collections import defaultdict
 
 from common import argument_session, connection_argument_parser
 

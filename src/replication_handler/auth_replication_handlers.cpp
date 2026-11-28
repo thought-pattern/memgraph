@@ -139,85 +139,8 @@ void DropAuthDataHandler(memgraph::system::ReplicaHandlerAccessToState &system_s
 bool SystemRecoveryHandler(auth::SynchedAuth &auth, auth::Auth::Config auth_config,
                            const std::vector<auth::User> &users, const std::vector<auth::Role> &roles,
                            const std::vector<auth::UserProfiles::Profile> &profiles) {
-  return auth.WithLock([&](auto &locked_auth) {
-    // Update config
-    locked_auth.SetConfig(std::move(auth_config));
-
-    // Profiles are only supported with a license
-    if (license::global_license_checker.IsEnterpriseValidFast()) {
-      // Get all current profiles
-      auto old_profiles = locked_auth.AllProfiles();
-      // Save incoming profiles
-      for (const auto &profile : profiles) {
-        // Missing profile. A membership write that fails throws rather than returning false, so the catch is
-        // what the sibling user and role loops below do for the same reason.
-        try {
-          if (!locked_auth.CreateOrUpdateProfile(profile.name, profile.limits, profile.usernames)) {
-            spdlog::debug("SystemRecoveryHandler: Failed to save profile");
-            return false;
-          }
-        } catch (const auth::AuthException &) {
-          spdlog::debug("SystemRecoveryHandler: Failed to save profile");
-          return false;
-        }
-        std::erase_if(old_profiles, [&](const auto &p) { return p.name == profile.name; });
-      }
-      // Delete all the leftover profiles
-      for (const auto &profile : old_profiles) {
-        if (locked_auth.DropProfile(profile.name) != auth::UserProfiles::DropResult::kDropped) {
-          spdlog::debug("SystemRecoveryHandler: Failed to remove profile \"{}\".", profile.name);
-          return false;
-        }
-      }
-    }
-
-    // Roles are only supported with a license
-    if (license::global_license_checker.IsEnterpriseValidFast()) {
-      // Get all current roles
-      auto old_roles = locked_auth.AllRolenames();
-      // Save incoming roles
-      for (const auto &role : roles) {
-        // Missing roles
-        try {
-          locked_auth.SaveRole(role);
-        } catch (const auth::AuthException &) {
-          spdlog::debug("SystemRecoveryHandler: Failed to save role");
-          return false;
-        }
-        std::erase(old_roles, role.rolename());
-      }
-      // Delete all the leftover roles
-      for (const auto &role : old_roles) {
-        if (!locked_auth.RemoveRole(role, /*force=*/true)) {
-          spdlog::debug("SystemRecoveryHandler: Failed to remove role \"{}\".", role);
-          return false;
-        }
-      }
-    }
-
-    // Get all current users
-    auto old_users = locked_auth.AllUsernames();
-    // Save incoming users
-    for (const auto &user : users) {
-      // Missing users
-      try {
-        locked_auth.SaveUser(user);
-      } catch (const auth::AuthException &) {
-        spdlog::debug("SystemRecoveryHandler: Failed to save user");
-        return false;
-      }
-      std::erase(old_users, user.username());
-    }
-    // Delete all the leftover users
-    for (const auto &user : old_users) {
-      if (!locked_auth.RemoveUser(user)) {
-        spdlog::debug("SystemRecoveryHandler: Failed to remove user \"{}\".", user);
-        return false;
-      }
-    }
-    // Success
-    return true;
-  });
+  return auth::AuthLayer{auth}.ApplySystemRecovery(
+      std::move(auth_config), users, roles, profiles, license::global_license_checker.IsEnterpriseValidFast());
 }
 
 void Register(replication::RoleReplicaData const &data, system::ReplicaHandlerAccessToState &system_state_access,

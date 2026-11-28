@@ -1,9 +1,9 @@
 # Build Memgraph with Python 3.5+ support and run Memgraph so that it loads
 # this file as a Query Module. The procedure implemented in this module is just
 # a rewrite of the `example.c` procedure.
-import mgp
-
 import copy
+
+import mgp
 
 
 @mgp.read_proc
@@ -37,7 +37,7 @@ def procedure(context: mgp.ProcCtx,
     if isinstance(required_arg, (mgp.Edge, mgp.Vertex)):
         props = dict(required_arg.properties.items())
     elif isinstance(required_arg, mgp.Path):
-        start_vertex, = required_arg.vertices
+        start_vertex = required_arg.vertices[0]
         props = dict(start_vertex.properties.items())
     # Count the vertices and edges in the database; this may take a while.
     vertex_count = 0
@@ -81,8 +81,9 @@ def write_procedure(context: mgp.ProcCtx,
     # Collect all the vertices that has the required property with the same
     # value
     vertices_to_connect = []
+    missing = object()
     for v in context.graph.vertices:
-        if v.properties[property_name] == property_value:
+        if v.properties.get(property_name, missing) == property_value:
             vertices_to_connect.append(v)
     # Create the new vertex and set its property
     vertex = context.graph.create_vertex()

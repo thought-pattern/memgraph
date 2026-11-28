@@ -10,6 +10,12 @@
 // licenses/APL.txt.
 #pragma once
 
+#include <cstdint>
+#include <expected>
+#include <string>
+#include <string_view>
+
+#include "flags/scheduler.hpp"
 #include "gflags/gflags.h"
 
 // Bolt server flags.
@@ -25,3 +31,15 @@ DECLARE_string(bolt_cert_file);
 DECLARE_string(bolt_key_file);
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 // DECLARE_string(bolt_server_name_for_init); Moved to run_time_configurable
+
+namespace memgraph::flags {
+
+inline constexpr int32_t kMaxPriorityQueueBoltWorkers = 1024;
+
+std::expected<void, std::string> CheckBoltTLSFlags(std::string_view cert_file, std::string_view key_file);
+void ValidateBoltTLSFlags();
+
+std::expected<void, std::string> CheckBoltWorkersForScheduler(int32_t bolt_num_workers, SchedulerType scheduler_type);
+void ValidateBoltWorkerFlags();
+
+}  // namespace memgraph::flags

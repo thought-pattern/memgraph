@@ -12,9 +12,9 @@
 import sys
 import time
 
-import pytest
 from common import execute_and_fetch_all
 from mg_utils import mg_sleep_and_assert_collection
+import pytest
 
 
 @pytest.mark.parametrize(

@@ -390,11 +390,7 @@ std::optional<Value> GetAuthDataV5(TSession &session, const Marker marker) {
 
 template <typename TSession>
 State SendSuccessMessage(TSession &session) {
-  // Neo4j's Java driver 4.1.1+ requires connection_id.
-  // The only usage in the mentioned version is for logging purposes.
-  // Because it's not critical for the regular usage of the driver
-  // we send a hardcoded value for now.
-  map_t metadata{{"connection_id", "bolt-1"}};
+  map_t metadata{{"connection_id", "bolt-" + session.UUID()}};
   if (auto server_name = session.GetServerNameForInit(); server_name) {
     metadata.insert({"server", std::move(*server_name)});
   }

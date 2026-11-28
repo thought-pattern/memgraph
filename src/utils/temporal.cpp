@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <compare>
 #include <cstdint>
 #include <ctime>
@@ -542,14 +543,14 @@ int64_t LocalDateTime::MicrosecondsSinceEpoch() const {
 
 int64_t LocalDateTime::SecondsSinceEpoch() const {
   namespace chrono = std::chrono;
-  return chrono::duration_cast<chrono::seconds>(chrono::microseconds(MicrosecondsSinceEpoch())).count();
+  return chrono::floor<chrono::seconds>(chrono::microseconds(MicrosecondsSinceEpoch())).count();
 }
 
 int64_t LocalDateTime::SubSecondsAsNanoseconds() const {
   namespace chrono = std::chrono;
-  return chrono::duration_cast<chrono::nanoseconds>(chrono::microseconds(MicrosecondsSinceEpoch()) -
-                                                    chrono::seconds(SecondsSinceEpoch()))
-      .count();
+  const auto total_us = chrono::microseconds(MicrosecondsSinceEpoch());
+  const auto whole_seconds = chrono::floor<chrono::seconds>(total_us);
+  return chrono::duration_cast<chrono::nanoseconds>(total_us - whole_seconds).count();
 }
 
 // NOTE: Should be removed, but too many tests relly on it
@@ -1119,13 +1120,29 @@ constexpr To CastChronoDouble(const double value) {
 }  // namespace
 
 Duration::Duration(const DurationParameters &parameters) {
-  microseconds = (CastChronoDouble<std::chrono::days, std::chrono::microseconds>(parameters.day) +
-                  CastChronoDouble<std::chrono::hours, std::chrono::microseconds>(parameters.hour) +
-                  CastChronoDouble<std::chrono::minutes, std::chrono::microseconds>(parameters.minute) +
-                  CastChronoDouble<std::chrono::seconds, std::chrono::microseconds>(parameters.second) +
-                  CastChronoDouble<std::chrono::milliseconds, std::chrono::microseconds>(parameters.millisecond) +
-                  CastChronoDouble<std::chrono::microseconds, std::chrono::microseconds>(parameters.microsecond))
-                     .count();
+  constexpr double kInt64MinAsDouble = -9223372036854775808.0;
+  constexpr double kTwoPow63 = 9223372036854775808.0;
+  int64_t total_us = 0;
+  const auto add_scaled = [&total_us](const double value, const double scale_to_us) {
+    if (!std::isfinite(value)) {
+      throw temporal::InvalidArgumentException("Duration component must be finite.");
+    }
+    const double scaled = value * scale_to_us;
+    if (!std::isfinite(scaled) || scaled < kInt64MinAsDouble || scaled >= kTwoPow63) {
+      throw temporal::InvalidArgumentException("Duration component overflows 64-bit microseconds.");
+    }
+    const auto component_us = static_cast<int64_t>(scaled);
+    if (__builtin_add_overflow(total_us, component_us, &total_us)) {
+      throw temporal::InvalidArgumentException("Duration overflows 64-bit microseconds.");
+    }
+  };
+  add_scaled(parameters.day, 86'400'000'000.0);
+  add_scaled(parameters.hour, 3'600'000'000.0);
+  add_scaled(parameters.minute, 60'000'000.0);
+  add_scaled(parameters.second, 1'000'000.0);
+  add_scaled(parameters.millisecond, 1'000.0);
+  add_scaled(parameters.microsecond, 1.0);
+  microseconds = total_us;
 }
 
 int64_t Duration::Days() const {

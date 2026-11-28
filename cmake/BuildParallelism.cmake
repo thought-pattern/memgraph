@@ -156,26 +156,95 @@ elseif(MG_LIMIT_PARALLELISM_BY_MEMORY)
         endif()
         _mg_memory_budget_mb(mg_budget_mb)
 
-        if(MG_COMPILE_JOBS GREATER 0)
-            set(mg_compile_jobs ${MG_COMPILE_JOBS})
+        math(EXPR mg_min_dual_pool_mb
+             "${MG_MEMORY_PER_COMPILE_JOB_MB} + ${MG_MEMORY_PER_LINK_JOB_MB}")
+        if(MG_COMPILE_JOBS LESS_EQUAL 0
+           AND MG_LINK_JOBS LESS_EQUAL 0
+           AND mg_budget_mb LESS mg_min_dual_pool_mb)
+            # Budget cannot hold one heavy compile and one heavy link simultaneously;
+            # serialize both step kinds through a single shared slot.
+            set_property(GLOBAL PROPERTY JOB_POOLS mg_shared=1)
+            set(CMAKE_JOB_POOL_COMPILE mg_shared)
+            set(CMAKE_JOB_POOL_LINK mg_shared)
+            message(STATUS
+                "Build parallelism: 1 shared compile/link slot "
+                "(${mg_budget_mb} MiB usable, ${mg_cores} cores usable)")
         else()
-            _mg_jobs_for_budget(mg_compile_jobs
-                                ${mg_budget_mb} ${MG_MEMORY_PER_COMPILE_JOB_MB} ${mg_cores})
-        endif()
+            if(MG_COMPILE_JOBS GREATER 0 AND MG_LINK_JOBS GREATER 0)
+                set(mg_compile_jobs ${MG_COMPILE_JOBS})
+                set(mg_link_jobs ${MG_LINK_JOBS})
+            elseif(MG_COMPILE_JOBS GREATER 0)
+                set(mg_compile_jobs ${MG_COMPILE_JOBS})
+                math(EXPR mg_remaining_mb
+                     "${mg_budget_mb} - (${mg_compile_jobs} * ${MG_MEMORY_PER_COMPILE_JOB_MB})")
+                if(mg_remaining_mb LESS ${MG_MEMORY_PER_LINK_JOB_MB})
+                    set(mg_remaining_mb ${MG_MEMORY_PER_LINK_JOB_MB})
+                endif()
+                math(EXPR mg_remaining_cores "${mg_cores} - ${mg_compile_jobs}")
+                if(mg_remaining_cores LESS 1)
+                    set(mg_remaining_cores 1)
+                endif()
+                _mg_jobs_for_budget(mg_link_jobs
+                                    ${mg_remaining_mb} ${MG_MEMORY_PER_LINK_JOB_MB} ${mg_remaining_cores})
+            elseif(MG_LINK_JOBS GREATER 0)
+                set(mg_link_jobs ${MG_LINK_JOBS})
+                math(EXPR mg_remaining_mb
+                     "${mg_budget_mb} - (${mg_link_jobs} * ${MG_MEMORY_PER_LINK_JOB_MB})")
+                if(mg_remaining_mb LESS ${MG_MEMORY_PER_COMPILE_JOB_MB})
+                    set(mg_remaining_mb ${MG_MEMORY_PER_COMPILE_JOB_MB})
+                endif()
+                math(EXPR mg_remaining_cores "${mg_cores} - ${mg_link_jobs}")
+                if(mg_remaining_cores LESS 1)
+                    set(mg_remaining_cores 1)
+                endif()
+                _mg_jobs_for_budget(mg_compile_jobs
+                                    ${mg_remaining_mb} ${MG_MEMORY_PER_COMPILE_JOB_MB} ${mg_remaining_cores})
+            else()
+                # Partition the single usable memory and core budget across both pools
+                # so concurrent compile + link targets never double-spend mg_budget_mb.
+                math(EXPR mg_link_reserve_mb "${mg_budget_mb} / 4")
+                if(mg_link_reserve_mb LESS ${MG_MEMORY_PER_LINK_JOB_MB})
+                    set(mg_link_reserve_mb ${MG_MEMORY_PER_LINK_JOB_MB})
+                endif()
+                math(EXPR mg_compile_budget_mb "${mg_budget_mb} - ${mg_link_reserve_mb}")
+                math(EXPR mg_compile_core_cap "${mg_cores} - 1")
+                if(mg_compile_core_cap LESS 1)
+                    set(mg_compile_core_cap 1)
+                endif()
+                _mg_jobs_for_budget(mg_compile_jobs
+                                    ${mg_compile_budget_mb} ${MG_MEMORY_PER_COMPILE_JOB_MB} ${mg_compile_core_cap})
 
-        if(MG_LINK_JOBS GREATER 0)
-            set(mg_link_jobs ${MG_LINK_JOBS})
-        else()
-            _mg_jobs_for_budget(mg_link_jobs
-                                ${mg_budget_mb} ${MG_MEMORY_PER_LINK_JOB_MB} ${mg_cores})
-        endif()
+                math(EXPR mg_remaining_for_link_mb
+                     "${mg_budget_mb} - (${mg_compile_jobs} * ${MG_MEMORY_PER_COMPILE_JOB_MB})")
+                math(EXPR mg_link_core_cap "${mg_cores} - ${mg_compile_jobs}")
+                if(mg_link_core_cap LESS 1)
+                    set(mg_link_core_cap 1)
+                endif()
+                _mg_jobs_for_budget(mg_link_jobs
+                                    ${mg_remaining_for_link_mb} ${MG_MEMORY_PER_LINK_JOB_MB} ${mg_link_core_cap})
 
-        set_property(GLOBAL PROPERTY JOB_POOLS
-                     mg_compile=${mg_compile_jobs} mg_link=${mg_link_jobs})
-        set(CMAKE_JOB_POOL_COMPILE mg_compile)
-        set(CMAKE_JOB_POOL_LINK mg_link)
-        message(STATUS
-            "Build parallelism: ${mg_compile_jobs} compile / ${mg_link_jobs} link "
-            "(${mg_budget_mb} MiB usable, ${mg_cores} cores usable)")
+                math(EXPR mg_leftover_mb
+                     "${mg_budget_mb} - (${mg_compile_jobs} * ${MG_MEMORY_PER_COMPILE_JOB_MB}) - (${mg_link_jobs} * ${MG_MEMORY_PER_LINK_JOB_MB})")
+                math(EXPR mg_leftover_cores
+                     "${mg_cores} - ${mg_compile_jobs} - ${mg_link_jobs}")
+                if(MG_MEMORY_PER_COMPILE_JOB_MB GREATER 0
+                   AND mg_leftover_mb GREATER_EQUAL ${MG_MEMORY_PER_COMPILE_JOB_MB}
+                   AND mg_leftover_cores GREATER 0)
+                    math(EXPR mg_extra_compile "${mg_leftover_mb} / ${MG_MEMORY_PER_COMPILE_JOB_MB}")
+                    if(mg_extra_compile GREATER ${mg_leftover_cores})
+                        set(mg_extra_compile ${mg_leftover_cores})
+                    endif()
+                    math(EXPR mg_compile_jobs "${mg_compile_jobs} + ${mg_extra_compile}")
+                endif()
+            endif()
+
+            set_property(GLOBAL PROPERTY JOB_POOLS
+                         mg_compile=${mg_compile_jobs} mg_link=${mg_link_jobs})
+            set(CMAKE_JOB_POOL_COMPILE mg_compile)
+            set(CMAKE_JOB_POOL_LINK mg_link)
+            message(STATUS
+                "Build parallelism: ${mg_compile_jobs} compile / ${mg_link_jobs} link "
+                "(${mg_budget_mb} MiB usable, ${mg_cores} cores usable)")
+        endif()
     endif()
 endif()

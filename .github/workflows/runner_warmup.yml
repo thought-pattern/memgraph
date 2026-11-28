@@ -34,8 +34,12 @@ jobs:
       - name: Set Architecture
         run: |
           uname_arch="$(uname -m)"
-          [[ "$uname_arch" ]] && ARCH="amd" || ARCH="arm"
-          echo "Memgraph build architecture: $ARCH"
+          if [[ "$uname_arch" == "aarch64" || "$uname_arch" == "arm64" ]]; then
+            ARCH="arm"
+          else
+            ARCH="amd"
+          fi
+          echo "Memgraph build architecture: $ARCH ($uname_arch)"
           echo "ARCH=${ARCH}" >> $GITHUB_ENV
 
       - name: Clean up Docker

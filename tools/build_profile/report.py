@@ -13,12 +13,12 @@ against the memory they used.
               [--json FILE] [--trace FILE]
 """
 import argparse
+from collections import defaultdict
 import csv
 import json
 import os
 import re
 import sys
-from collections import defaultdict
 
 KIB = 1024.0
 

@@ -11,8 +11,8 @@
 
 import sys
 
-import pytest
 from common import Row, cursor, execute_and_fetch_all
+import pytest
 
 
 def test_show_index_info(cursor):

@@ -16,9 +16,9 @@ import argparse
 import os
 import sys
 
-import mgclient
 from behave import configuration
 from behave.__main__ import main as behave_main
+import mgclient
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 

@@ -182,6 +182,9 @@ Database::Database(storage::Config config)
     db_total_memory_tracker_.SetMaximumHardLimit(global_max);
     db_total_memory_tracker_.SetHardLimit(0);
   }
+  if (config.tenant_memory_limit && *config.tenant_memory_limit > 0) {
+    db_total_memory_tracker_.SetHardLimit(*config.tenant_memory_limit);
+  }
 
   if (config.salient.storage_mode == memgraph::storage::StorageMode::ON_DISK_TRANSACTIONAL || config.force_on_disk ||
       utils::DirExists(config.disk.main_storage_directory)) {
@@ -204,6 +207,7 @@ Database::Database(storage::Config config)
   // Recovery adopts the uuid of the snapshot or WAL it recovered from, which need not be the one the
   // registration was made under.
   metrics_.Rebind(storage_->uuid());
+  streams_->BindStorageUuid(storage_->uuid());
 }
 
 DatabaseInfo Database::GetInfo() const {
@@ -245,16 +249,147 @@ void Database::StopAllBackgroundTasks() {
 }
 
 void Database::SwitchToOnDisk() {
+  std::vector<std::string> label_index_names;
+  std::vector<std::pair<std::string, std::string>> label_prop_index_names;
+  std::vector<std::pair<std::string, std::string>> existence_constraint_names;
+  std::vector<std::pair<std::string, std::vector<std::string>>> unique_constraint_names;
+  std::vector<std::string> unsupported_items;
+
+  {
+    auto old_acc = storage_->ReadOnlyAccess();
+    const auto indices = old_acc->ListAllIndices();
+    const auto constraints = old_acc->ListAllConstraints();
+
+    for (const auto &lbl : indices.label) {
+      label_index_names.push_back(storage_->LabelToName(lbl));
+    }
+    for (const auto &entry : indices.label_properties) {
+      const auto &lbl_name = storage_->LabelToName(entry.label);
+      if (entry.order != storage::IndexOrder::ASC || entry.properties.size() != 1 || entry.properties[0].size() != 1) {
+        unsupported_items.push_back(fmt::format("label-property index on :{}", lbl_name));
+      } else {
+        label_prop_index_names.emplace_back(lbl_name, storage_->PropertyToName(entry.properties[0][0]));
+      }
+    }
+    for (const auto &et : indices.edge_type) {
+      unsupported_items.push_back(fmt::format("edge-type index on :{}", storage_->EdgeTypeToName(et)));
+    }
+    for (const auto &[et, prop] : indices.edge_type_property) {
+      unsupported_items.push_back(
+          fmt::format("edge-type-property index on :{}({})", storage_->EdgeTypeToName(et), storage_->PropertyToName(prop)));
+    }
+    for (const auto &prop : indices.edge_property) {
+      unsupported_items.push_back(fmt::format("global edge-property index on ({})", storage_->PropertyToName(prop)));
+    }
+    for (const auto &prop : indices.vertex_property) {
+      unsupported_items.push_back(fmt::format("global vertex-property index on ({})", storage_->PropertyToName(prop)));
+    }
+    for (const auto &spec : indices.text_indices) {
+      unsupported_items.push_back(fmt::format("text index '{}'", spec.index_name));
+    }
+    for (const auto &spec : indices.text_edge_indices) {
+      unsupported_items.push_back(fmt::format("edge text index '{}'", spec.index_name));
+    }
+    for (const auto &[lbl, prop] : indices.point_label_property) {
+      unsupported_items.push_back(
+          fmt::format("point index on :{}({})", storage_->LabelToName(lbl), storage_->PropertyToName(prop)));
+    }
+    for (const auto &spec : indices.vector_indices_spec) {
+      unsupported_items.push_back(fmt::format("vector index '{}'", spec.index_name));
+    }
+    for (const auto &spec : indices.vector_edge_indices_spec) {
+      unsupported_items.push_back(fmt::format("edge vector index '{}'", spec.index_name));
+    }
+
+    for (const auto &[lbl, prop] : constraints.existence) {
+      existence_constraint_names.emplace_back(storage_->LabelToName(lbl), storage_->PropertyToName(prop));
+    }
+    for (const auto &[lbl, props] : constraints.unique) {
+      std::vector<std::string> prop_names;
+      prop_names.reserve(props.size());
+      for (const auto &prop : props) {
+        prop_names.push_back(storage_->PropertyToName(prop));
+      }
+      unique_constraint_names.emplace_back(storage_->LabelToName(lbl), std::move(prop_names));
+    }
+    for (const auto &[lbl, prop, kind] : constraints.type) {
+      (void)kind;
+      unsupported_items.push_back(
+          fmt::format("property-type constraint on :{}({})", storage_->LabelToName(lbl), storage_->PropertyToName(prop)));
+    }
+  }
+
+  if (!unsupported_items.empty()) {
+    std::string joined;
+    for (size_t i = 0; i < unsupported_items.size(); ++i) {
+      if (i > 0) joined += ", ";
+      joined += unsupported_items[i];
+    }
+    throw utils::BasicException(
+        "Cannot switch to on-disk storage mode because the following schema definitions are not supported on disk and "
+        "would be lost: {}. Drop them first and retry.",
+        joined);
+  }
+
+  // Clear cached plans tied to the previous storage's label/property IDs and bind the replacement backend to plan_cache_.
+  plan_cache_.WithLock([](query::PlanCache_t &cache) { cache.reset(); });
+
   // Preserve the database protector factory from the previous storage
   // This ensures consistent behavior for async operations (indexer, TTL) across storage transitions
   auto preserved_factory = storage_->get_database_protector_factory();
   const memory::DbArenaScope db_arena_scope{this};
-  storage_ = std::make_unique<memgraph::storage::DiskStorage>(std::move(storage_->config_),
-                                                              std::make_unique<storage::PlanInvalidatorDefault>(),
+  auto next_config = std::move(storage_->config_);
+  next_config.salient.storage_mode = storage::StorageMode::ON_DISK_TRANSACTIONAL;
+  storage_ = std::make_unique<memgraph::storage::DiskStorage>(std::move(next_config),
+                                                              std::make_unique<PlanInvalidatorForDatabase>(plan_cache_),
                                                               metrics_.handles(),
                                                               preserved_factory,
                                                               db_arena_.get(),
                                                               &db_embedding_memory_tracker_);
+  streams_->BindStorageUuid(storage_->uuid());
+
+  if (!label_index_names.empty() || !label_prop_index_names.empty() || !existence_constraint_names.empty() ||
+      !unique_constraint_names.empty()) {
+    auto disk_acc = storage_->UniqueAccess();
+    for (const auto &lbl_name : label_index_names) {
+      if (!disk_acc->CreateIndex(storage_->NameToLabel(lbl_name)).has_value()) {
+        throw utils::BasicException("Failed to preserve label index on :{} while switching to on-disk storage mode.",
+                                    lbl_name);
+      }
+    }
+    for (const auto &[lbl_name, prop_name] : label_prop_index_names) {
+      storage::PropertiesPaths paths{storage::PropertyPath{storage_->NameToProperty(prop_name)}};
+      if (!disk_acc->CreateIndex(storage_->NameToLabel(lbl_name), std::move(paths), storage::IndexOrder::ASC).has_value()) {
+        throw utils::BasicException(
+            "Failed to preserve label-property index on :{}({}) while switching to on-disk storage mode.",
+            lbl_name,
+            prop_name);
+      }
+    }
+    for (const auto &[lbl_name, prop_name] : existence_constraint_names) {
+      if (!disk_acc->CreateExistenceConstraint(storage_->NameToLabel(lbl_name), storage_->NameToProperty(prop_name))
+               .has_value()) {
+        throw utils::BasicException(
+            "Failed to preserve existence constraint on :{}({}) while switching to on-disk storage mode.",
+            lbl_name,
+            prop_name);
+      }
+    }
+    for (const auto &[lbl_name, prop_names] : unique_constraint_names) {
+      std::set<storage::PropertyId> prop_ids;
+      for (const auto &prop_name : prop_names) {
+        prop_ids.insert(storage_->NameToProperty(prop_name));
+      }
+      if (!disk_acc->CreateUniqueConstraint(storage_->NameToLabel(lbl_name), prop_ids).has_value()) {
+        throw utils::BasicException(
+            "Failed to preserve uniqueness constraint on :{} while switching to on-disk storage mode.", lbl_name);
+      }
+    }
+    if (!disk_acc->PrepareForCommitPhase(storage::CommitArgs::make_main(nullptr)).has_value()) {
+      throw utils::BasicException("Failed to persist schema metadata while switching to on-disk storage mode.");
+    }
+    disk_acc->FinalizeTransaction();
+  }
 }
 
 }  // namespace memgraph::dbms

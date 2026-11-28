@@ -154,10 +154,11 @@ DEFINE_bool(storage_parallel_snapshot_creation, false,
             "If true, snapshots will be created using --storage-snapshot-thread-count number of treads.");
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_uint64(storage_snapshot_thread_count,
-              std::max(static_cast<uint64_t>(memgraph::utils::GetSafeHardwareConcurrency()),
-                       memgraph::storage::Config::Durability().snapshot_thread_count),
-              "The number of threads used to create snapshots.");
+DEFINE_VALIDATED_uint64(storage_snapshot_thread_count,
+                        std::max(static_cast<uint64_t>(memgraph::utils::GetSafeHardwareConcurrency()),
+                                 memgraph::storage::Config::Durability().snapshot_thread_count),
+                        "The number of threads used to create snapshots.",
+                        FLAG_IN_RANGE(1, std::numeric_limits<uint64_t>::max()));
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_uint64(storage_snapshot_writeback_window_mib,
@@ -180,10 +181,11 @@ DEFINE_bool(storage_release_sent_snapshot_page_cache,
             "again. Set to true to free the memory sooner on an instance that syncs a replica once.");
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-DEFINE_uint64(storage_recovery_thread_count,
-              std::max(static_cast<uint64_t>(memgraph::utils::GetSafeHardwareConcurrency()),
-                       memgraph::storage::Config::Durability().recovery_thread_count),
-              "The number of threads used to recover persisted data from disk.");
+DEFINE_VALIDATED_uint64(storage_recovery_thread_count,
+                        std::max(static_cast<uint64_t>(memgraph::utils::GetSafeHardwareConcurrency()),
+                                 memgraph::storage::Config::Durability().recovery_thread_count),
+                        "The number of threads used to recover persisted data from disk.",
+                        FLAG_IN_RANGE(1, std::numeric_limits<uint64_t>::max()));
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 DEFINE_bool(storage_enable_schema_metadata, false,

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <list>
 #include <memory>
 
@@ -42,13 +43,14 @@ class Listener : public std::enable_shared_from_this<Listener> {
   void WriteToAll(std::shared_ptr<std::string> message);
   std::optional<boost::asio::ip::tcp::endpoint> GetEndpoint() const;
 
-  bool HasErrorHappened() const { return error_happened_; }
+  bool HasErrorHappened() const { return error_happened_.load(std::memory_order_acquire); }
 
  private:
   Listener(boost::asio::io_context &ioc, ServerContext *context, tcp::endpoint endpoint, AuthenticationInterface &auth);
 
   void DoAccept();
   void OnAccept(boost::beast::error_code ec, tcp::socket socket);
+  void RegisterSession(std::shared_ptr<Session> session);
 
   boost::asio::io_context &ioc_;
   ServerContext *context_;
@@ -57,6 +59,6 @@ class Listener : public std::enable_shared_from_this<Listener> {
   AcceptRetryLogThrottle accept_log_throttle_;
   utils::Synchronized<std::list<std::shared_ptr<Session>>, utils::SpinLock> sessions_;
   AuthenticationInterface &auth_;
-  bool error_happened_{false};
+  std::atomic<bool> error_happened_{false};
 };
 }  // namespace memgraph::communication::websocket

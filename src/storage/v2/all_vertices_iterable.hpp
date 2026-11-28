@@ -31,11 +31,11 @@ class AllVerticesIterable final {
   View view_;
   // exclusive upper bound; vertices created after this iterable opened are out of scope.
   Gid max_gid_;
-  std::optional<VertexAccessor> vertex_;
 
  public:
   class Iterator final {
     AllVerticesIterable *self_;
+    std::optional<VertexAccessor> vertex_;
     utils::SkipListDb<Vertex>::Iterator it_;
 
    public:

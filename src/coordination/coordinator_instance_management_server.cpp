@@ -23,7 +23,8 @@ namespace memgraph::coordination {
 
 CoordinatorInstanceManagementServer::CoordinatorInstanceManagementServer(
     const ManagementServerConfig &config, std::optional<utils::TlsConfig> const &tls_config)
-    : rpc_server_context_{communication::CreateServerContext(tls_config)},
+    : has_mutual_tls_{HasValidClusterMutualTls(tls_config)},
+      rpc_server_context_{communication::CreateServerContext(tls_config)},
       rpc_server_{config.endpoint, &rpc_server_context_, kCoordInstanceManagementServerThreads} {}
 
 CoordinatorInstanceManagementServer::~CoordinatorInstanceManagementServer() {
@@ -37,7 +38,14 @@ CoordinatorInstanceManagementServer::~CoordinatorInstanceManagementServer() {
   }
 }
 
-bool CoordinatorInstanceManagementServer::Start() { return rpc_server_.Start(); }
+bool CoordinatorInstanceManagementServer::Start() {
+  if (!has_mutual_tls_ || !rpc_server_context_.use_ssl()) {
+    spdlog::error(
+        "Refusing to start coordinator management server without intra-cluster mutual TLS (cert, key, and CA).");
+    return false;
+  }
+  return rpc_server_.Start();
+}
 
 }  // namespace memgraph::coordination
 #endif

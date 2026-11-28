@@ -3,6 +3,7 @@ from math import floor, log2
 from typing import Dict, List
 
 import mgp
+
 from mage.max_flow.bfs_weight_min_max import BFS_find_weight_min_max
 
 
@@ -85,7 +86,7 @@ def ford_fulkerson_capacity_scaling(
     if not isinstance(start_v, mgp.Vertex) or not isinstance(end_v, mgp.Vertex):
         return []
 
-    max_weight, min_weight = BFS_find_weight_min_max(start_v, edge_property)
+    max_weight, _ = BFS_find_weight_min_max(start_v, edge_property)
 
     if max_weight <= 0:
         return []
@@ -103,7 +104,7 @@ def ford_fulkerson_capacity_scaling(
         flow_bottleneck = DFS_path_finding(augmenting_path, start_v, end_v, edge_property, delta, edge_flows)
 
         if flow_bottleneck == -1:
-            if delta < min_weight:
+            if delta == 0:
                 break
             delta //= 2
             continue
@@ -115,7 +116,7 @@ def ford_fulkerson_capacity_scaling(
                 elif augmenting_path[i - 1] == e.to_vertex.id:
                     edge_flows[e.id] = edge_flows.get(e.id, 0) - flow_bottleneck
                 else:
-                    raise Exception("path is not ordered correctly")
+                    raise RuntimeError("path is not ordered correctly")
 
         paths_and_flows.append((augmenting_path, flow_bottleneck))
 
@@ -124,56 +125,55 @@ def ford_fulkerson_capacity_scaling(
 
 def DFS_path_finding(
     path: List,
-    current_v: mgp.Vertex,
+    start_v: mgp.Vertex,
     end_v: mgp.Vertex,
     edge_property: str,
     delta: mgp.Number,
     edge_flows: Dict,
 ) -> mgp.Number:
     """
-    Finds augmenting path for max_flow algorithm using recursive DFS
+    Finds augmenting path for max_flow algorithm using an explicit-stack DFS
     with minimum edge weight delta, as defined by capacity scaling.
-
-    :param path: list for storing path, elements are
-                 alternating mgp.VertexId and mgp.Edge
-    :param delta: lower bound for path flow
-    :param edge_flows: dict containing existing flows of edges
-
-    :return: flow_bottleneck, smallest remaining capacity on the path,
-             -1 if no path to end_node is found
     """
+    visited = {start_v.id}
+    path_capacities = []
+    stack = [(start_v, chain(start_v.out_edges, start_v.in_edges))]
 
-    # instead of using residual edges, we check for in_edges with flow
-    for edge in chain(current_v.out_edges, current_v.in_edges):
-        # skip edges without the flow property to allow heterogeneous graphs
-        if edge_property not in edge.properties:
-            continue
+    while stack:
+        current_v, edges = stack[-1]
+        advanced = False
+        for edge in edges:
+            # skip edges without the flow property to allow heterogeneous graphs
+            if edge_property not in edge.properties:
+                continue
 
-        if edge.from_vertex == current_v:
-            to_v = edge.to_vertex
-            remaining_capacity = edge.properties[edge_property] - edge_flows.get(edge.id, 0)
-        else:
-            to_v = edge.from_vertex
-            remaining_capacity = edge_flows.get(edge.id, 0)
+            if edge.from_vertex == current_v:
+                to_v = edge.to_vertex
+                remaining_capacity = edge.properties.get(edge_property, 0.0) - edge_flows.get(edge.id, 0)
+            else:
+                to_v = edge.from_vertex
+                remaining_capacity = edge_flows.get(edge.id, 0)
 
-        if to_v.id in path:
-            continue
+            if to_v.id in visited or remaining_capacity <= delta:
+                continue
 
-        if remaining_capacity > delta:
+            visited.add(to_v.id)
             path.append(edge)
             path.append(to_v.id)
+            path_capacities.append(remaining_capacity)
 
             if to_v.id == end_v.id:
-                # found path
-                return remaining_capacity
+                return min(path_capacities)
 
-            flow_bottleneck = DFS_path_finding(path, to_v, end_v, edge_property, delta, edge_flows)
-            if flow_bottleneck != -1:
-                # function call found path, propagate back
-                return min(remaining_capacity, flow_bottleneck)
+            stack.append((to_v, chain(to_v.out_edges, to_v.in_edges)))
+            advanced = True
+            break
 
-    # no path found with this vertex, remove it and its edge
-    del path[-2:]
+        if not advanced:
+            stack.pop()
+            if stack:
+                del path[-2:]
+                path_capacities.pop()
 
     return -1
 

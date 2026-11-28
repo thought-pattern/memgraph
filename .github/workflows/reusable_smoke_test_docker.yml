@@ -78,14 +78,19 @@ jobs:
 
       - name: Determine Input Types
         run: |
-          # default to latest daily build (from the previous day)
+          set -euo pipefail
           if [ -z "$INPUT_VERSION" ]; then
-            version="$(date -d "yesterday" +%Y%m%d)"
+            version="latest"
           else
             version="$INPUT_VERSION"
           fi
 
-          read image_source image < <(python3 tools/ci/workflow_image_setup.py "${version}" "$INPUT_ARCH" "$INPUT_MALLOC" "$INPUT_CUDA" "$INPUT_RELWITHDEBINFO" "$INPUT_IMAGE_TYPE")
+          resolved="$(python3 tools/ci/workflow_image_setup.py "${version}" "$INPUT_ARCH" "$INPUT_MALLOC" "$INPUT_CUDA" "$INPUT_RELWITHDEBINFO" "$INPUT_IMAGE_TYPE")"
+          read -r image_source image <<< "$resolved"
+          if [[ -z "$image_source" || -z "$image" || "$image" == "fail" ]]; then
+            echo "::error::Failed to resolve test image for version='${version}' arch='${INPUT_ARCH}' image_type='${INPUT_IMAGE_TYPE}'" >&2
+            exit 1
+          fi
           echo "TEST_IMAGE=${image}" >> $GITHUB_ENV
           echo "TEST_IMAGE_SOURCE=${image_source}" >> $GITHUB_ENV
 
@@ -98,14 +103,21 @@ jobs:
       - name: Load Test Image (URL)
         if: ${{ env.TEST_IMAGE_SOURCE == 'url' }}
         run: |
-          curl -L ${{ env.TEST_IMAGE }} > image.tar.gz
+          curl -L "${{ env.TEST_IMAGE }}" > image.tar.gz
           load_output=$(docker load -i image.tar.gz)
 
-          # grab each repo:tag, drop the ":latest" one, pick the first real tag
+          # Prefer a non-:latest tag when multiple tags are loaded; fall back to the first loaded tag
           repo_tag=$(echo "$load_output" \
             | awk -F': ' '/Loaded image:/ {print $2}' \
-            | grep -v ':latest$' \
+            | { grep -v ':latest$' || true; } \
             | head -n1)
+          if [[ -z "$repo_tag" ]]; then
+            repo_tag=$(echo "$load_output" | awk -F': ' '/Loaded image:/ {print $2}' | head -n1)
+          fi
+          if [[ -z "$repo_tag" ]]; then
+            echo "::error::Failed to extract loaded Docker image reference from image.tar.gz"
+            exit 1
+          fi
 
           rm image.tar.gz
           echo "MEMGRAPH_DOCKERHUB_IMAGE=${repo_tag}" >> $GITHUB_ENV

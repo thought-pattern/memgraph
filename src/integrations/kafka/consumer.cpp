@@ -16,6 +16,7 @@
 #include <algorithm>
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <unordered_set>
 
@@ -42,14 +43,66 @@
 namespace memgraph::integrations::kafka {
 
 namespace {
-std::expected<std::vector<Message>, std::string> GetBatch(RdKafka::KafkaConsumer &consumer, const ConsumerInfo &info,
-                                                          std::atomic<bool> &is_running) {
+void RewindUncommittedBatch(RdKafka::KafkaConsumer &consumer, const std::vector<Message> &batch,
+                            std::vector<RdKafka::TopicPartition *> &last_assignment) {
+  if (batch.empty()) {
+    return;
+  }
+
+  std::map<std::pair<std::string, int32_t>, int64_t> first_offsets;
+  for (const auto &msg : batch) {
+    auto key = std::make_pair(std::string{msg.TopicName()}, msg.Partition());
+    if (auto it = first_offsets.find(key); it == first_offsets.end() || msg.Offset() < it->second) {
+      first_offsets[std::move(key)] = msg.Offset();
+    }
+  }
+
+  std::vector<RdKafka::TopicPartition *> assigned;
+  if (consumer.assignment(assigned) != RdKafka::ERR_NO_ERROR || assigned.empty()) {
+    RdKafka::TopicPartition::destroy(assigned);
+    assigned.clear();
+    for (const auto &[topic_part, offset] : first_offsets) {
+      assigned.push_back(RdKafka::TopicPartition::create(topic_part.first, topic_part.second, offset));
+    }
+  } else {
+    if (consumer.position(assigned) != RdKafka::ERR_NO_ERROR) {
+      RdKafka::TopicPartition::destroy(assigned);
+      assigned.clear();
+      for (const auto &[topic_part, offset] : first_offsets) {
+        assigned.push_back(RdKafka::TopicPartition::create(topic_part.first, topic_part.second, offset));
+      }
+    } else {
+      for (auto *tp : assigned) {
+        if (auto it = first_offsets.find({tp->topic(), tp->partition()}); it != first_offsets.end()) {
+          tp->set_offset(it->second);
+        }
+      }
+    }
+  }
+
+  if (consumer.assign(assigned) == RdKafka::ERR_NO_ERROR) {
+    RdKafka::TopicPartition::destroy(last_assignment);
+    last_assignment = std::move(assigned);
+  } else {
+    RdKafka::TopicPartition::destroy(last_assignment);
+    last_assignment = std::move(assigned);
+  }
+}
+
+std::expected<std::vector<Message>, std::string> GetBatch(
+    RdKafka::KafkaConsumer &consumer, const ConsumerInfo &info, std::atomic<bool> &is_running,
+    std::vector<RdKafka::TopicPartition *> *last_assignment = nullptr,
+    std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
   std::vector<Message> batch{};
 
   batch.reserve(info.batch_size);
 
   auto remaining_timeout_in_ms = info.batch_interval.count();
   auto start = std::chrono::steady_clock::now();
+  if (deadline.has_value()) {
+    const auto until_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - start).count();
+    remaining_timeout_in_ms = std::min(remaining_timeout_in_ms, std::max<int64_t>(0, until_deadline));
+  }
 
   bool run_batch = true;
   for (int64_t i = 0; remaining_timeout_in_ms > 0 && i < info.batch_size && is_running.load(); ++i) {
@@ -72,6 +125,9 @@ std::expected<std::vector<Message>, std::string> GetBatch(RdKafka::KafkaConsumer
                      info.consumer_name,
                      msg->errstr(),
                      msg->err());
+        if (last_assignment != nullptr && !batch.empty()) {
+          RewindUncommittedBatch(consumer, batch, *last_assignment);
+        }
         return std::unexpected{std::move(error)};
     }
 
@@ -82,6 +138,10 @@ std::expected<std::vector<Message>, std::string> GetBatch(RdKafka::KafkaConsumer
     auto now = std::chrono::steady_clock::now();
     auto took = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
     remaining_timeout_in_ms = remaining_timeout_in_ms - took.count();
+    if (deadline.has_value()) {
+      const auto until_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now).count();
+      remaining_timeout_in_ms = std::min(remaining_timeout_in_ms, std::max<int64_t>(0, until_deadline));
+    }
     start = now;
   }
 
@@ -96,12 +156,22 @@ void CheckAndDestroyLastAssignmentIfNeeded(RdKafka::KafkaConsumer &consumer, con
                                          fmt::format("Couldn't restore commited offsets: '{}'", RdKafka::err2str(err)));
     }
     RdKafka::TopicPartition::destroy(last_assignment);
+    last_assignment.clear();
   }
 }
 
 void TryToConsumeBatch(RdKafka::KafkaConsumer &consumer, const ConsumerInfo &info,
-                       const ConsumerFunction &consumer_function, const std::vector<Message> &batch) {
+                       const ConsumerFunction &consumer_function, const std::vector<Message> &batch,
+                       std::vector<RdKafka::TopicPartition *> &last_assignment) {
+  bool batch_applied = false;
+  utils::OnScopeExit rewind_on_reject([&]() {
+    if (!batch_applied) {
+      RewindUncommittedBatch(consumer, batch, last_assignment);
+    }
+  });
   consumer_function(batch);
+  batch_applied = true;
+
   std::vector<RdKafka::TopicPartition *> partitions;
   utils::OnScopeExit clear_partitions([&]() { RdKafka::TopicPartition::destroy(partitions); });
 
@@ -144,6 +214,11 @@ std::span<const char> Message::Payload() const {
 int64_t Message::Timestamp() const {
   const auto *c_message = message_->c_ptr();
   return rd_kafka_message_timestamp(c_message, nullptr);
+}
+
+int32_t Message::Partition() const {
+  const auto *c_message = message_->c_ptr();
+  return c_message->partition;
 }
 
 int64_t Message::Offset() const {
@@ -215,10 +290,11 @@ Consumer::Consumer(ConsumerInfo info, ConsumerFunction consumer_function, Consum
   }
 
   consumer_ = std::unique_ptr<RdKafka::KafkaConsumer, std::move_only_function<void(RdKafka::KafkaConsumer *)>>(
-      RdKafka::KafkaConsumer::create(conf.get(), error), [this](auto *consumer) {
-        this->StopConsuming();
-        consumer->close();
-        delete consumer;
+      RdKafka::KafkaConsumer::create(conf.get(), error), [](auto *consumer) {
+        if (consumer != nullptr) {
+          consumer->close();
+          delete consumer;
+        }
       });
 
   if (consumer_ == nullptr) {
@@ -262,8 +338,9 @@ Consumer::Consumer(ConsumerInfo info, ConsumerFunction consumer_function, Consum
 
 Consumer::~Consumer() {
   StopIfRunning();
-  consumer_->close();
+  consumer_.reset();
   RdKafka::TopicPartition::destroy(last_assignment_);
+  last_assignment_.clear();
 }
 
 void Consumer::Start() {
@@ -351,22 +428,55 @@ void Consumer::Check(std::optional<std::chrono::milliseconds> timeout, std::opti
     }
   }
 
+  std::map<std::pair<std::string, int32_t>, int64_t> first_seen_offsets;
+  utils::OnScopeExit capture_post_poll_assignment([this, &first_seen_offsets] {
+    if (!last_assignment_.empty()) {
+      return;
+    }
+    std::vector<RdKafka::TopicPartition *> assigned;
+    if (consumer_->assignment(assigned) != RdKafka::ERR_NO_ERROR || assigned.empty()) {
+      RdKafka::TopicPartition::destroy(assigned);
+      return;
+    }
+    if (consumer_->position(assigned) != RdKafka::ERR_NO_ERROR) {
+      RdKafka::TopicPartition::destroy(assigned);
+      return;
+    }
+    for (auto *tp : assigned) {
+      if (auto it = first_seen_offsets.find({tp->topic(), tp->partition()}); it != first_seen_offsets.end()) {
+        tp->set_offset(it->second);
+      }
+    }
+    last_assignment_ = std::move(assigned);
+  });
+
   const auto num_of_batches = limit_batches.value_or(kDefaultCheckBatchLimit);
   const auto timeout_to_use = timeout.value_or(kDefaultCheckTimeout);
   const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + timeout_to_use;
   for (int64_t i = 0; i < num_of_batches;) {
     const auto now = std::chrono::steady_clock::now();
     // NOLINTNEXTLINE (modernize-use-nullptr)
-    if (now - start >= timeout_to_use) {
+    if (now >= deadline) {
       throw ConsumerCheckFailedException(info_.consumer_name, "timeout reached");
     }
-    auto maybe_batch = GetBatch(*consumer_, info_, is_running_);
+    auto maybe_batch = GetBatch(*consumer_, info_, is_running_, nullptr, deadline);
 
     if (!maybe_batch) {
       throw ConsumerCheckFailedException(info_.consumer_name, maybe_batch.error());
     }
 
     const auto &batch = maybe_batch.value();
+
+    if (last_assignment_.empty()) {
+      for (const auto &msg : batch) {
+        first_seen_offsets.try_emplace({std::string(msg.TopicName()), msg.Partition()}, msg.Offset());
+      }
+    }
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw ConsumerCheckFailedException(info_.consumer_name, "timeout reached");
+    }
 
     if (batch.empty()) {
       continue;
@@ -411,39 +521,54 @@ void Consumer::StartConsuming() {
     thread_.join();
   };
 
+  bool started = false;
   is_running_.store(true);
+  utils::OnScopeExit reset_on_failed_start([this, &started] {
+    if (!started) {
+      is_running_.store(false);
+    }
+  });
 
   CheckAndDestroyLastAssignmentIfNeeded(*consumer_, info_, last_assignment_);
 
   thread_ = thread_factory_([this] {
-    static constexpr auto kMaxThreadNameSize = utils::GetMaxThreadNameSize();
-    const auto full_thread_name = "Cons#" + info_.consumer_name;
+    utils::OnScopeExit clear_running([this] { is_running_.store(false); });
+    try {
+      static constexpr auto kMaxThreadNameSize = utils::GetMaxThreadNameSize();
+      const auto full_thread_name = "Cons#" + info_.consumer_name;
 
-    utils::ThreadSetName(full_thread_name.substr(0, kMaxThreadNameSize));
+      utils::ThreadSetName(full_thread_name.substr(0, kMaxThreadNameSize));
 
-    while (is_running_) {
-      auto maybe_batch = GetBatch(*consumer_, info_, is_running_);
-      if (!maybe_batch) {
-        throw ConsumerReadMessagesFailedException(info_.consumer_name, maybe_batch.error());
+      while (is_running_) {
+        auto maybe_batch = GetBatch(*consumer_, info_, is_running_, &last_assignment_);
+        if (!maybe_batch) {
+          spdlog::warn(
+              "Error happened in consumer {} while reading messages: {}!", info_.consumer_name, maybe_batch.error());
+          break;
+        }
+        const auto &batch = maybe_batch.value();
+
+        if (batch.empty()) {
+          continue;
+        }
+
+        spdlog::info("Kafka consumer {} is processing a batch", info_.consumer_name);
+
+        try {
+          TryToConsumeBatch(*consumer_, info_, consumer_function_, batch, last_assignment_);
+        } catch (const std::exception &e) {
+          spdlog::warn("Error happened in consumer {} while processing a batch: {}!", info_.consumer_name, e.what());
+          break;
+        }
+        spdlog::info("Kafka consumer {} finished processing", info_.consumer_name);
       }
-      const auto &batch = maybe_batch.value();
-
-      if (batch.empty()) {
-        continue;
-      }
-
-      spdlog::info("Kafka consumer {} is processing a batch", info_.consumer_name);
-
-      try {
-        TryToConsumeBatch(*consumer_, info_, consumer_function_, batch);
-      } catch (const std::exception &e) {
-        spdlog::warn("Error happened in consumer {} while processing a batch: {}!", info_.consumer_name, e.what());
-        break;
-      }
-      spdlog::info("Kafka consumer {} finished processing", info_.consumer_name);
+    } catch (const std::exception &e) {
+      spdlog::warn("Unhandled error in Kafka consumer {}: {}!", info_.consumer_name, e.what());
+    } catch (...) {
+      spdlog::warn("Unhandled unknown error in Kafka consumer {}!", info_.consumer_name);
     }
-    is_running_.store(false);
   });
+  started = true;
 }
 
 void Consumer::StartConsumingWithLimit(uint64_t limit_batches, std::optional<std::chrono::milliseconds> timeout) const {
@@ -458,18 +583,23 @@ void Consumer::StartConsumingWithLimit(uint64_t limit_batches, std::optional<std
 
   const auto timeout_to_use = timeout.value_or(kDefaultCheckTimeout);
   const auto start = std::chrono::steady_clock::now();
+  const auto deadline = start + timeout_to_use;
 
   for (uint64_t batch_count = 0; batch_count < limit_batches;) {
-    const auto now = std::chrono::steady_clock::now();
-    if (now - start >= timeout_to_use) {
+    if (std::chrono::steady_clock::now() >= deadline) {
       throw ConsumerStartFailedException(info_.consumer_name, "Timeout reached");
     }
 
-    const auto maybe_batch = GetBatch(*consumer_, info_, is_running_);
+    const auto maybe_batch = GetBatch(*consumer_, info_, is_running_, &last_assignment_, deadline);
     if (!maybe_batch) {
       throw ConsumerReadMessagesFailedException(info_.consumer_name, maybe_batch.error());
     }
     const auto &batch = maybe_batch.value();
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+      RewindUncommittedBatch(*consumer_, batch, last_assignment_);
+      throw ConsumerStartFailedException(info_.consumer_name, "Timeout reached");
+    }
 
     if (batch.empty()) {
       continue;
@@ -478,7 +608,7 @@ void Consumer::StartConsumingWithLimit(uint64_t limit_batches, std::optional<std
 
     spdlog::info("Kafka consumer {} is processing a batch", info_.consumer_name);
 
-    TryToConsumeBatch(*consumer_, info_, consumer_function_, batch);
+    TryToConsumeBatch(*consumer_, info_, consumer_function_, batch, last_assignment_);
 
     spdlog::info("Kafka consumer {} finished processing", info_.consumer_name);
   }
@@ -500,6 +630,8 @@ std::expected<void, std::string> Consumer::SetConsumerOffsets(int64_t offset) {
     offset = RD_KAFKA_OFFSET_END;
   }
 
+  RdKafka::TopicPartition::destroy(last_assignment_);
+  last_assignment_.clear();
   cb_.set_offset(offset);
   if (const auto err = consumer_->subscribe(info_.topics); err != RdKafka::ERR_NO_ERROR) {
     return std::unexpected{
